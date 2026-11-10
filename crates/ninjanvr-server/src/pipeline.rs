@@ -302,95 +302,7 @@ pub fn write_contained_media_file(
     filename: &str,
     bytes: &[u8],
 ) -> std::io::Result<PathBuf> {
-    use std::io::{Error, ErrorKind};
-    if filename.is_empty()
-        || filename.starts_with('.')
-        || filename.contains('/')
-        || filename.contains('\\')
-        || filename.contains("..")
-        || filename.contains('\0')
-    {
-        return Err(Error::new(ErrorKind::InvalidInput, "unsafe media filename"));
-    }
-    if std::fs::symlink_metadata(media_dir).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Err(Error::new(
-            ErrorKind::PermissionDenied,
-            "refusing to write through symlinked media_dir",
-        ));
-    }
-    std::fs::create_dir_all(media_dir)?;
-    let Ok(rel) = target_dir.strip_prefix(media_dir) else {
-        return Err(Error::new(
-            ErrorKind::PermissionDenied,
-            "target directory must reside inside media_dir",
-        ));
-    };
-    let mut cur = media_dir.to_path_buf();
-    for comp in rel.components() {
-        match comp {
-            std::path::Component::Normal(part) => {
-                cur.push(part);
-                if let Ok(meta) = std::fs::symlink_metadata(&cur)
-                    && (meta.file_type().is_symlink() || !meta.file_type().is_dir())
-                {
-                    return Err(Error::new(
-                        ErrorKind::PermissionDenied,
-                        "refusing to traverse symlinked or non-directory media subdirectory",
-                    ));
-                }
-            }
-            _ => {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    "invalid path component in target media directory",
-                ));
-            }
-        }
-    }
-    std::fs::create_dir_all(target_dir)?;
-    let canon_media = std::fs::canonicalize(media_dir)?;
-    let canon_target = std::fs::canonicalize(target_dir)?;
-    if !canon_target.starts_with(&canon_media) {
-        return Err(Error::new(
-            ErrorKind::PermissionDenied,
-            "target directory escapes media_dir",
-        ));
-    }
-    let dst_path = target_dir.join(filename);
-    if let Ok(dst_meta) = std::fs::symlink_metadata(&dst_path)
-        && (dst_meta.file_type().is_symlink() || !dst_meta.file_type().is_file())
-    {
-        return Err(Error::new(
-            ErrorKind::PermissionDenied,
-            "refusing to overwrite symlink or non-regular file in media_dir",
-        ));
-    }
-    let tmp_name = format!(".{filename}.{}.tmp", random_suffix());
-    let tmp_path = target_dir.join(tmp_name);
-    if std::fs::symlink_metadata(&tmp_path).is_ok() {
-        let _ = std::fs::remove_file(&tmp_path);
-    }
-    {
-        use std::io::Write;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.custom_flags(nix::libc::O_NOFOLLOW);
-        }
-        let mut tmp_file = opts.open(&tmp_path)?;
-        if let Err(err) = tmp_file.write_all(bytes) {
-            drop(tmp_file);
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(err);
-        }
-    }
-    if let Err(err) = std::fs::rename(&tmp_path, &dst_path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(err);
-    }
-    Ok(dst_path)
+    crate::media_lifecycle::write_contained_media_file(media_dir, target_dir, filename, bytes)
 }
 
 /// Decodes a high-resolution snapshot from `bytes` with strict header-dimension and memory allocation bounds
@@ -608,7 +520,7 @@ pub fn diff_live_vision_config(
         motion: json_differs(&current.motion, &next.motion),
         state_rois: current.state_rois != next.state_rois,
         regions: json_differs(&current.zones, &next.zones)
-            || current.objects.mask != next.objects.mask,
+            || json_differs(&current.objects, &next.objects),
         lines: json_differs(&current.lines, &next.lines),
         privacy_mask: current.privacy_mask != next.privacy_mask,
     }
@@ -628,7 +540,7 @@ pub fn apply_live_vision_config(
     }
     if delta.regions {
         current.zones = next.zones.clone();
-        current.objects.mask = next.objects.mask.clone();
+        current.objects = next.objects.clone();
     }
     if delta.lines {
         current.lines = next.lines.clone();
@@ -664,6 +576,560 @@ pub async fn try_watchdog_camera_reboot(
         .reboot_camera(&client, camera, &effective_cam_cfg)
         .await
         .is_ok()
+}
+
+/// Summary returned by [`CameraVisionSession::step_frame`] after processing one decoded YUV420p frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameStepSummary {
+    pub enabled: bool,
+    pub is_night_ir: bool,
+    pub detect_calls: u64,
+    pub active_tracks_len: usize,
+    pub ended_tracks_len: usize,
+}
+
+/// Stateful per-camera vision session owning motion detection, ROI state monitoring,
+/// multi-object tracking, active review lifecycle, and MQTT/WebSocket edge-trigger state.
+pub struct CameraVisionSession {
+    pub camera: String,
+    pub cam_arc: Arc<str>,
+    pub safe_cam_file: String,
+    pub cam_cfg: CameraConfig,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub motion_detector: SimdMotionDetector,
+    pub roi_monitor: CameraRoiStateMonitor,
+    pub tracker: ByteTracker,
+    pub preview_sampler: crate::preview_frames::PreviewFrameSampler,
+    pub tensor_buf: Vec<u8>,
+    pub active_review: Option<ActiveReviewState>,
+    pub track_snapshots: HashMap<String, TrackPersistSnapshot>,
+    pub normalized_priv_mask: Value,
+    pub prev_motion_on: bool,
+    pub prev_label_counts: BTreeMap<String, usize>,
+    pub prev_total_objs: usize,
+    pub prev_night_ir: bool,
+    pub consecutive_tamper_frames: u32,
+    pub tamper_threshold_frames: u32,
+}
+
+impl CameraVisionSession {
+    pub fn new(
+        camera: impl Into<String>,
+        cam_cfg: CameraConfig,
+        model_dims: (u32, u32, bool),
+    ) -> Self {
+        let camera = camera.into();
+        let (width, height, _) =
+            sanitize_yuv420p_dimensions(cam_cfg.detect.width, cam_cfg.detect.height);
+        let fps = cam_cfg.detect.fps.clamp(1, 30);
+        let motion_detector = SimdMotionDetector::new(width, height, cam_cfg.motion.clone());
+        let roi_monitor = CameraRoiStateMonitor::new(&cam_cfg.state_rois);
+        let tracker = ByteTracker::new(&camera, width, height, &cam_cfg);
+        let preview_sampler = crate::preview_frames::PreviewFrameSampler::default();
+        let (model_w, model_h, _) = model_dims;
+        let init_tensor_len = (model_w as usize)
+            .saturating_mul(model_h as usize)
+            .saturating_mul(3);
+        let tensor_buf = vec![0u8; init_tensor_len];
+        let cam_arc: Arc<str> = Arc::from(camera.as_str());
+        let safe_cam_file = sanitize_filename_component(&camera);
+        let normalized_priv_mask =
+            normalize_privacy_mask_for_resolution(&cam_cfg.privacy_mask, width, height);
+        let mut prev_label_counts = BTreeMap::new();
+        for lbl in &cam_cfg.objects.track {
+            prev_label_counts.insert(lbl.clone(), 0);
+        }
+        Self {
+            camera,
+            cam_arc,
+            safe_cam_file,
+            cam_cfg,
+            width,
+            height,
+            fps,
+            motion_detector,
+            roi_monitor,
+            tracker,
+            preview_sampler,
+            tensor_buf,
+            active_review: None,
+            track_snapshots: HashMap::new(),
+            normalized_priv_mask,
+            prev_motion_on: false,
+            prev_label_counts,
+            prev_total_objs: 0,
+            prev_night_ir: false,
+            consecutive_tamper_frames: 0,
+            tamper_threshold_frames: (fps * 4).max(12),
+        }
+    }
+
+    pub fn reset_stream_edge_state(&mut self) {
+        self.prev_motion_on = false;
+        self.prev_label_counts.clear();
+        for lbl in &self.cam_cfg.objects.track {
+            self.prev_label_counts.insert(lbl.clone(), 0);
+        }
+        self.prev_total_objs = 0;
+        self.prev_night_ir = false;
+        self.consecutive_tamper_frames = 0;
+        self.tamper_threshold_frames = (self.fps * 4).max(12);
+    }
+
+    /// Applies live-editable vision settings (`motion`, `state_rois`, `zones`/`masks`, `lines`, `privacy_mask`)
+    /// without restarting the decoder process.
+    pub fn apply_live_config_if_changed(
+        &mut self,
+        next_cfg: &CameraConfig,
+    ) -> LiveVisionConfigDelta {
+        let delta = diff_live_vision_config(&self.cam_cfg, next_cfg);
+        if delta.any() {
+            apply_live_vision_config(&mut self.cam_cfg, next_cfg, &delta);
+            if delta.motion {
+                self.motion_detector =
+                    SimdMotionDetector::new(self.width, self.height, self.cam_cfg.motion.clone());
+            }
+            if delta.state_rois {
+                self.roi_monitor.reconfigure(&self.cam_cfg.state_rois);
+            }
+            if delta.regions {
+                self.tracker.reconfigure_regions(&self.cam_cfg);
+            }
+            if delta.privacy_mask {
+                self.normalized_priv_mask = normalize_privacy_mask_for_resolution(
+                    &self.cam_cfg.privacy_mask,
+                    self.width,
+                    self.height,
+                );
+            }
+        }
+        delta
+    }
+
+    /// Publishes idle MQTT/WS state and flushes any open review segment when the camera is disabled.
+    pub async fn handle_camera_disabled(&mut self, pipeline: &VisionPipeline) {
+        if self.prev_motion_on {
+            self.prev_motion_on = false;
+            pipeline
+                .comms
+                .publish_topic(&format!("{}/motion", self.camera), "OFF");
+        }
+        for (lbl, cnt) in &mut self.prev_label_counts {
+            if *cnt != 0 {
+                *cnt = 0;
+                pipeline
+                    .comms
+                    .publish_topic(&format!("{}/{lbl}", self.camera), "0");
+            }
+        }
+        if self.prev_total_objs != 0 {
+            self.prev_total_objs = 0;
+            pipeline
+                .comms
+                .publish_topic(&format!("{}/all", self.camera), "0");
+        }
+        pipeline.comms.update_camera_activity_with_night(
+            &self.camera,
+            false,
+            Vec::new(),
+            0,
+            self.prev_night_ir,
+        );
+        pipeline
+            .close_active_review(&self.camera, &mut self.active_review, "camera disable")
+            .await;
+    }
+
+    /// Publishes offline MQTT/WS state, flushes any open review segment, and clears track snapshots
+    /// when the substream decoder disconnects.
+    pub async fn handle_stream_disconnected(&mut self, pipeline: &VisionPipeline) {
+        pipeline
+            .comms
+            .publish_topic(&format!("{}/motion", self.camera), "OFF");
+        for lbl in &self.cam_cfg.objects.track {
+            pipeline
+                .comms
+                .publish_topic(&format!("{}/{lbl}", self.camera), "0");
+        }
+        pipeline
+            .comms
+            .publish_topic(&format!("{}/all", self.camera), "0");
+        pipeline
+            .comms
+            .update_camera_activity_with_night(&self.camera, false, Vec::new(), 0, false);
+        pipeline
+            .close_active_review(&self.camera, &mut self.active_review, "stream disconnect")
+            .await;
+        self.track_snapshots.clear();
+    }
+
+    /// Steps a single decoded YUV420p frame through tamper detection, SIMD motion, ROI state
+    /// evaluation, OpenVINO object detection, ByteTrack, MQTT/WS publishing, preview sampling,
+    /// and event/review lifecycle persistence.
+    pub async fn step_frame(
+        &mut self,
+        pipeline: &VisionPipeline,
+        frame_data: Arc<Vec<u8>>,
+        now: f64,
+        frame_count: u64,
+    ) -> FrameStepSummary {
+        let rt_flags = pipeline.comms.get_camera_flags(&self.camera);
+        {
+            let mut ledger = pipeline.activity_ledger.write().await;
+            ledger
+                .entry(self.camera.clone())
+                .or_default()
+                .set_record_enabled(rt_flags.enabled && rt_flags.record);
+        }
+        if !rt_flags.enabled {
+            self.handle_camera_disabled(pipeline).await;
+            return FrameStepSummary::default();
+        }
+
+        let width = self.width;
+        let height = self.height;
+        let yuv_frame = YuvFrame {
+            camera: self.cam_arc.clone(),
+            timestamp: now,
+            width,
+            height,
+            data: frame_data,
+        };
+        let is_night_ir = is_frame_night_ir(&yuv_frame.data, width, height);
+        self.tracker.set_night_mode(is_night_ir);
+        {
+            let active_preset = pipeline
+                .camera_driver_runtime
+                .get_active_preset(&self.camera, self.cam_cfg.onvif.return_preset.as_deref())
+                .await;
+            self.tracker.set_active_preset(active_preset.as_deref());
+        }
+
+        let _ = pipeline
+            .evaluate_camera_tamper(
+                &self.camera,
+                &yuv_frame.data,
+                width,
+                height,
+                now,
+                &mut self.consecutive_tamper_frames,
+                self.tamper_threshold_frames,
+            )
+            .await;
+
+        // 1. SIMD Motion Detection on Y-plane
+        let motion_boxes = if rt_flags.enabled && rt_flags.detect {
+            self.motion_detector.detect(&yuv_frame)
+        } else {
+            Vec::new()
+        };
+        let motion_px: u32 = motion_boxes
+            .iter()
+            .fold(0u32, |acc, b| acc.saturating_add(b.area()))
+            .min(width.saturating_mul(height));
+
+        if rt_flags.enabled && rt_flags.detect && !self.roi_monitor.is_empty() {
+            let _ = pipeline
+                .evaluate_camera_roi_states(
+                    &self.camera,
+                    &yuv_frame.data,
+                    width,
+                    height,
+                    now,
+                    &motion_boxes,
+                    &mut self.roi_monitor,
+                    false,
+                )
+                .await;
+        }
+
+        // 2. Dynamic Region Cropping & AI Object Detection
+        let active_det = pipeline
+            .detector
+            .named_detector(self.cam_cfg.detect.detector.as_deref())
+            .unwrap_or_else(|| pipeline.detector.clone());
+        let (model_w, model_h, bgr_order) = active_det.model_dimensions();
+        let needed_tensor_len = (model_w as usize)
+            .saturating_mul(model_h as usize)
+            .saturating_mul(3);
+        if self.tensor_buf.len() != needed_tensor_len {
+            self.tensor_buf.resize(needed_tensor_len, 0);
+        }
+        let tracked_boxes = self.tracker.non_stationary_boxes(&motion_boxes);
+        let regions = if rt_flags.enabled && rt_flags.detect {
+            compute_inference_regions(
+                width,
+                height,
+                model_w.max(model_h),
+                &motion_boxes,
+                &tracked_boxes,
+            )
+        } else {
+            Vec::new()
+        };
+
+        let (raw_detections, returned_tensor_buf, batch_detect_calls) = if regions.is_empty() {
+            (Vec::new(), std::mem::take(&mut self.tensor_buf), 0u64)
+        } else {
+            let det_engine = active_det.clone();
+            let frame_for_infer = yuv_frame.clone();
+            let regions_for_infer = regions.clone();
+            let motion_for_infer = motion_boxes.clone();
+            let tracked_for_infer = tracked_boxes.clone();
+            let mut buf = std::mem::take(&mut self.tensor_buf);
+            match tokio::task::spawn_blocking(move || {
+                let mut dets_out = Vec::new();
+                let mut calls = 0u64;
+                for region in &regions_for_infer {
+                    crop_yuv420p_to_tensor_nhwc(
+                        &frame_for_infer,
+                        region,
+                        model_w,
+                        model_h,
+                        bgr_order,
+                        &mut buf,
+                    );
+                    calls += 1;
+                    let mut dets = det_engine.detect_region(&buf, *region, width, height, 0.40);
+                    dets.retain(|d| {
+                        motion_for_infer.iter().any(|mb| mb.intersects(&d.bbox))
+                            || tracked_for_infer.iter().any(|tb| tb.intersects(&d.bbox))
+                    });
+                    dets_out.extend(dets);
+                }
+                (dets_out, buf, calls)
+            })
+            .await
+            {
+                Ok(res) => res,
+                Err(join_err) => {
+                    warn!(
+                        "Inference blocking task failed for {}: {join_err:#}",
+                        self.camera
+                    );
+                    (Vec::new(), vec![0u8; needed_tensor_len], 0)
+                }
+            }
+        };
+        self.tensor_buf = returned_tensor_buf;
+
+        // 3. Multi-Object Tracking (ByteTrack)
+        let (active_tracks, ended_tracks) =
+            self.tracker
+                .update(now, &raw_detections, &regions, &self.cam_cfg);
+
+        // 4. Publish real-time motion, per-label MQTT counts, and WS camera_activity
+        let motion_on = !motion_boxes.is_empty();
+        let mut cur_label_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for lbl in self.prev_label_counts.keys() {
+            cur_label_counts.insert(lbl.clone(), 0);
+        }
+        for t in &active_tracks {
+            *cur_label_counts.entry(t.label.clone()).or_default() += 1;
+        }
+
+        let mut activity_changed = false;
+        if motion_on != self.prev_motion_on {
+            self.prev_motion_on = motion_on;
+            activity_changed = true;
+            pipeline.comms.publish_topic(
+                &format!("{}/motion", self.camera),
+                if motion_on { "ON" } else { "OFF" },
+            );
+        }
+
+        for (lbl, &cnt) in &cur_label_counts {
+            if self.prev_label_counts.get(lbl).copied().unwrap_or(0) != cnt {
+                activity_changed = true;
+                pipeline
+                    .comms
+                    .publish_topic(&format!("{}/{lbl}", self.camera), cnt.to_string());
+            }
+        }
+        self.prev_label_counts = cur_label_counts;
+
+        if active_tracks.len() != self.prev_total_objs {
+            self.prev_total_objs = active_tracks.len();
+            activity_changed = true;
+            pipeline.comms.publish_topic(
+                &format!("{}/all", self.camera),
+                self.prev_total_objs.to_string(),
+            );
+        }
+
+        if is_night_ir != self.prev_night_ir {
+            self.prev_night_ir = is_night_ir;
+            activity_changed = true;
+        }
+
+        if activity_changed
+            || !active_tracks.is_empty()
+            || (motion_on && frame_count.is_multiple_of(5))
+        {
+            let max_area = motion_boxes.iter().map(|b| b.area()).max().unwrap_or(0);
+            let objs_json: Vec<Value> = active_tracks
+                .iter()
+                .map(|t| {
+                    let ratio = (t.bbox.width() as f32) / (t.bbox.height().max(1) as f32);
+                    json!({
+                        "id": t.id,
+                        "label": t.label,
+                        "stationary": t.stationary,
+                        "area": t.bbox.area(),
+                        "ratio": ratio,
+                        "score": t.score,
+                        "sub_label": t.inferred_sub_label
+                    })
+                })
+                .collect();
+            pipeline.comms.update_camera_activity_with_night(
+                &self.camera,
+                motion_on,
+                objs_json,
+                max_area,
+                is_night_ir,
+            );
+        }
+
+        // 5. Record activity into in-memory ring buffer for RecordingEngine
+        {
+            let mut ledger = pipeline.activity_ledger.write().await;
+            ledger
+                .entry(self.camera.clone())
+                .or_default()
+                .record_sample(
+                    now,
+                    motion_px,
+                    active_tracks.len() as u32,
+                    regions.len() as u32,
+                );
+        }
+
+        // 6. Store zero-copy YuvFrame in memory on every frame for lazy high-res snapshots
+        pipeline
+            .latest_yuv_frames
+            .write()
+            .await
+            .insert(self.camera.clone(), yuv_frame.clone());
+        pipeline
+            .camera_metrics
+            .write()
+            .await
+            .entry(self.camera.clone())
+            .or_default()
+            .last_frame_ts = now;
+
+        // 6b. Live event-strip preview frames
+        let moving_objects = active_tracks.iter().any(|t| !t.stationary);
+        let fast_object = active_tracks.iter().any(|t| {
+            !t.stationary
+                && matches!(
+                    t.label.as_str(),
+                    "car" | "truck" | "bus" | "motorcycle" | "bicycle"
+                )
+        });
+        if self.cam_cfg.record.enabled
+            && self
+                .preview_sampler
+                .should_write(now, motion_on, moving_objects, fast_object)
+        {
+            let store = pipeline.preview_frames.clone();
+            let frame_for_preview = yuv_frame.clone();
+            let mask_for_preview = self.normalized_priv_mask.clone();
+            let cam_for_preview = self.camera.clone();
+            let ts_ms = (now.max(0.0) * 1000.0) as u64;
+            tokio::task::spawn_blocking(move || {
+                let mut rgb = yuv420p_to_rgb_image_scaled(
+                    &frame_for_preview,
+                    None,
+                    &[],
+                    Some(crate::preview_frames::PREVIEW_FRAME_HEIGHT),
+                );
+                apply_privacy_masks_from_value(&mut rgb, &mask_for_preview);
+                match encode_image_jpeg_with_quality(
+                    &rgb,
+                    crate::preview_frames::PREVIEW_FRAME_JPEG_QUALITY,
+                ) {
+                    Ok(jpeg) => {
+                        if let Err(err) = store.write_frame(&cam_for_preview, ts_ms, &jpeg) {
+                            warn!("Failed to write preview frame for {cam_for_preview}: {err}");
+                        }
+                    }
+                    Err(err) => {
+                        warn!("Failed to encode preview frame for {cam_for_preview}: {err:#}");
+                    }
+                }
+            });
+        }
+
+        if frame_count == 1 || frame_count.is_multiple_of(150) {
+            let annotated: Vec<(BoundingBox, [u8; 3])> = if self.cam_cfg.snapshots.bounding_box {
+                active_tracks
+                    .iter()
+                    .map(|t| (t.bbox, [31, 119, 180]))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let frame_for_latest = yuv_frame.clone();
+            let mask_for_latest = self.normalized_priv_mask.clone();
+            let media_root_for_latest = pipeline.media_dir.clone();
+            let clips_dir_for_latest = pipeline.media_dir.join("clips");
+            let latest_name = format!("latest_{}.jpg", self.safe_cam_file);
+            if let Ok(Some(jpeg_bytes)) = tokio::task::spawn_blocking(move || {
+                let mut rgb =
+                    yuv420p_to_rgb_image_scaled(&frame_for_latest, None, &annotated, Some(360));
+                apply_privacy_masks_from_value(&mut rgb, &mask_for_latest);
+                let Ok(jpeg_bytes) = encode_image_jpeg(&rgb) else {
+                    return None;
+                };
+                if let Err(err) = write_contained_media_file(
+                    &media_root_for_latest,
+                    &clips_dir_for_latest,
+                    &latest_name,
+                    &jpeg_bytes,
+                ) {
+                    warn!("Failed to write latest frame {latest_name}: {err:#}");
+                }
+                Some(jpeg_bytes)
+            })
+            .await
+            {
+                pipeline
+                    .latest_frames
+                    .write()
+                    .await
+                    .insert(self.camera.clone(), jpeg_bytes);
+            }
+        }
+
+        // 7. Persist Events, Timeline entries, and ReviewSegments
+        let ctx = FrameLifecycleCtx {
+            camera: &self.camera,
+            cam_cfg: &self.cam_cfg,
+            frame: &yuv_frame,
+            now,
+        };
+        pipeline
+            .process_lifecycle_events(
+                &ctx,
+                &active_tracks,
+                &ended_tracks,
+                &mut self.active_review,
+                &mut self.track_snapshots,
+            )
+            .await;
+
+        FrameStepSummary {
+            enabled: true,
+            is_night_ir,
+            detect_calls: batch_detect_calls,
+            active_tracks_len: active_tracks.len(),
+            ended_tracks_len: ended_tracks.len(),
+        }
+    }
 }
 
 pub struct VisionPipeline {
@@ -710,12 +1176,60 @@ impl VisionPipeline {
         }
     }
 
-    async fn run_camera_vision_loop(
+    /// Persists a `ReviewItemDto` on the blocking pool and publishes the corresponding
+    /// `{type, before, after}` WebSocket message on the `"reviews"` topic when successful.
+    pub async fn persist_and_publish_review_dto(
         &self,
-        camera: String,
-        mut cam_cfg: CameraConfig,
-        sub_url: String,
+        camera: &str,
+        dto: &ReviewItemDto,
+        before_dto: &ReviewItemDto,
+        ws_msg_type: &str,
+        context_label: &str,
+    ) -> bool {
+        let db_clone = self.db.clone();
+        let dto_for_db = dto.clone();
+        match tokio::task::spawn_blocking(move || db_clone.insert_review_segment(&dto_for_db)).await
+        {
+            Ok(Ok(())) => {
+                self.comms.publish_json(
+                    "reviews",
+                    &json!({
+                        "type": ws_msg_type,
+                        "before": before_dto,
+                        "after": dto
+                    }),
+                );
+                true
+            }
+            Ok(Err(err)) => {
+                warn!("Failed to persist review segment on {context_label} for {camera}: {err:#}");
+                false
+            }
+            Err(join_err) => {
+                warn!(
+                    "Blocking task failed persisting review segment on {context_label} for {camera}: {join_err:#}"
+                );
+                false
+            }
+        }
+    }
+
+    /// Closes and flushes `active_review` (if `Some`) with `type: "end"`.
+    pub async fn close_active_review(
+        &self,
+        camera: &str,
+        active_review: &mut Option<ActiveReviewState>,
+        context_label: &str,
     ) {
+        if let Some(rev) = active_review.take() {
+            let dto = rev.to_dto(camera, Some(rev.last_activity_time));
+            let before_dto = rev.prev_dto.unwrap_or_else(|| dto.clone());
+            self.persist_and_publish_review_dto(camera, &dto, &before_dto, "end", context_label)
+                .await;
+        }
+    }
+
+    async fn run_camera_vision_loop(&self, camera: String, cam_cfg: CameraConfig, sub_url: String) {
         let (width, height, frame_byte_len) =
             sanitize_yuv420p_dimensions(cam_cfg.detect.width, cam_cfg.detect.height);
         let fps = cam_cfg.detect.fps.clamp(1, 30);
@@ -729,23 +1243,9 @@ impl VisionPipeline {
             return;
         };
 
-        let mut motion_detector = SimdMotionDetector::new(width, height, cam_cfg.motion.clone());
-        let mut roi_monitor = CameraRoiStateMonitor::new(&cam_cfg.state_rois);
-        let mut tracker = ByteTracker::new(&camera, width, height, &cam_cfg);
-        let mut preview_sampler = crate::preview_frames::PreviewFrameSampler::default();
-        let (model_w, model_h, _) = self.detector.model_dimensions();
-        let init_tensor_len = (model_w as usize)
-            .saturating_mul(model_h as usize)
-            .saturating_mul(3);
-        let mut tensor_buf = vec![0u8; init_tensor_len];
-        let mut active_review: Option<ActiveReviewState> = None;
-        let mut track_snapshots: HashMap<String, TrackPersistSnapshot> = HashMap::new();
-
+        let mut session =
+            CameraVisionSession::new(camera.clone(), cam_cfg, self.detector.model_dimensions());
         let ffmpeg_bin = resolve_ffmpeg_bin();
-        let cam_arc: Arc<str> = Arc::from(camera.as_str());
-        let safe_cam_file = sanitize_filename_component(&camera);
-        let mut normalized_priv_mask =
-            normalize_privacy_mask_for_resolution(&cam_cfg.privacy_mask, width, height);
         let mut last_live_config_check = unix_now_f64();
         let mut consecutive_stall_cycles = 0u32;
         let mut last_watchdog_reboot_ts = 0.0f64;
@@ -798,15 +1298,7 @@ impl VisionPipeline {
                 let mut frame_count = 0u64;
                 let mut detect_calls = 0u64;
                 let mut window_start = unix_now_f64();
-                let mut prev_motion_on = false;
-                let mut prev_label_counts: BTreeMap<String, usize> = BTreeMap::new();
-                for lbl in &cam_cfg.objects.track {
-                    prev_label_counts.insert(lbl.clone(), 0);
-                }
-                let mut prev_total_objs = 0usize;
-                let mut prev_night_ir = false;
-                let mut consecutive_tamper_frames = 0u32;
-                let tamper_threshold_frames = (fps * 4).max(12);
+                session.reset_stream_edge_state();
 
                 while tokio::time::timeout(
                     FRAME_READ_TIMEOUT,
@@ -845,29 +1337,8 @@ impl VisionPipeline {
                         last_live_config_check = now;
                         let next_cfg = self.config.read().await.cameras.get(&camera).cloned();
                         if let Some(next_cfg) = next_cfg {
-                            let delta = diff_live_vision_config(&cam_cfg, &next_cfg);
+                            let delta = session.apply_live_config_if_changed(&next_cfg);
                             if delta.any() {
-                                apply_live_vision_config(&mut cam_cfg, &next_cfg, &delta);
-                                if delta.motion {
-                                    motion_detector = SimdMotionDetector::new(
-                                        width,
-                                        height,
-                                        cam_cfg.motion.clone(),
-                                    );
-                                }
-                                if delta.state_rois {
-                                    roi_monitor.reconfigure(&cam_cfg.state_rois);
-                                }
-                                if delta.regions {
-                                    tracker.reconfigure_regions(&cam_cfg);
-                                }
-                                if delta.privacy_mask {
-                                    normalized_priv_mask = normalize_privacy_mask_for_resolution(
-                                        &cam_cfg.privacy_mask,
-                                        width,
-                                        height,
-                                    );
-                                }
                                 info!("Applied live vision config to {camera}: {delta:?}");
                                 self.log_hub.push_ninjanvr(
                                     "INFO",
@@ -878,408 +1349,16 @@ impl VisionPipeline {
                         }
                     }
 
-                    let rt_flags = self.comms.get_camera_flags(&camera);
-                    {
-                        let mut ledger = self.activity_ledger.write().await;
-                        ledger
-                            .entry(camera.clone())
-                            .or_default()
-                            .set_record_enabled(rt_flags.enabled && rt_flags.record);
-                    }
-                    if !rt_flags.enabled {
-                        if prev_motion_on {
-                            prev_motion_on = false;
-                            self.comms.publish_topic(&format!("{camera}/motion"), "OFF");
-                        }
-                        for (lbl, cnt) in &mut prev_label_counts {
-                            if *cnt != 0 {
-                                *cnt = 0;
-                                self.comms.publish_topic(&format!("{camera}/{lbl}"), "0");
-                            }
-                        }
-                        if prev_total_objs != 0 {
-                            prev_total_objs = 0;
-                            self.comms.publish_topic(&format!("{camera}/all"), "0");
-                        }
-                        self.comms.update_camera_activity_with_night(
-                            &camera,
-                            false,
-                            Vec::new(),
-                            0,
-                            prev_night_ir,
-                        );
-                        if let Some(rev) = active_review.take() {
-                            let dto = rev.to_dto(&camera, Some(rev.last_activity_time));
-                            let db_clone = self.db.clone();
-                            let dto_for_db = dto.clone();
-                            match tokio::task::spawn_blocking(move || {
-                                db_clone.insert_review_segment(&dto_for_db)
-                            })
-                            .await
-                            {
-                                Ok(Ok(())) => {
-                                    let before_dto = rev.prev_dto.unwrap_or_else(|| dto.clone());
-                                    self.comms.publish_json(
-                                        "reviews",
-                                        &json!({
-                                            "type": "end",
-                                            "before": before_dto,
-                                            "after": dto
-                                        }),
-                                    );
-                                }
-                                Ok(Err(err)) => {
-                                    warn!(
-                                        "Failed to persist review segment on camera disable for {camera}: {err:#}"
-                                    );
-                                }
-                                Err(join_err) => {
-                                    warn!(
-                                        "Blocking task failed persisting review segment on camera disable for {camera}: {join_err:#}"
-                                    );
-                                }
-                            }
-                        }
+                    let step = session
+                        .step_frame(self, frame_data.clone(), now, frame_count)
+                        .await;
+                    if !step.enabled {
                         tokio::task::yield_now().await;
                         continue;
                     }
+                    detect_calls += step.detect_calls;
 
-                    let yuv_frame = YuvFrame {
-                        camera: cam_arc.clone(),
-                        timestamp: now,
-                        width,
-                        height,
-                        data: frame_data.clone(),
-                    };
-                    let is_night_ir = is_frame_night_ir(&yuv_frame.data, width, height);
-                    tracker.set_night_mode(is_night_ir);
-                    {
-                        let presets_guard = self.ptz_active_presets.read().await;
-                        if let Some(active_preset_opt) = presets_guard.get(&camera) {
-                            tracker.set_active_preset(active_preset_opt.as_deref());
-                        } else {
-                            tracker.set_active_preset(cam_cfg.onvif.return_preset.as_deref());
-                        }
-                    }
-
-                    let _ = self
-                        .evaluate_camera_tamper(
-                            &camera,
-                            &yuv_frame.data,
-                            width,
-                            height,
-                            now,
-                            &mut consecutive_tamper_frames,
-                            tamper_threshold_frames,
-                        )
-                        .await;
-
-                    // 1. SIMD Motion Detection on Y-plane
-                    let motion_boxes = if rt_flags.enabled && rt_flags.detect {
-                        motion_detector.detect(&yuv_frame)
-                    } else {
-                        Vec::new()
-                    };
-                    let motion_px: u32 = motion_boxes
-                        .iter()
-                        .fold(0u32, |acc, b| acc.saturating_add(b.area()))
-                        .min(width.saturating_mul(height));
-
-                    if rt_flags.enabled && rt_flags.detect && !roi_monitor.is_empty() {
-                        let _ = self
-                            .evaluate_camera_roi_states(
-                                &camera,
-                                &yuv_frame.data,
-                                width,
-                                height,
-                                now,
-                                &motion_boxes,
-                                &mut roi_monitor,
-                                false,
-                            )
-                            .await;
-                    }
-
-                    // 2. Dynamic Region Cropping & AI Object Detection (only when motion or non-stationary objects exist)
-                    let active_det = self
-                        .detector
-                        .named_detector(cam_cfg.detect.detector.as_deref())
-                        .unwrap_or_else(|| self.detector.clone());
-                    let (model_w, model_h, bgr_order) = active_det.model_dimensions();
-                    let needed_tensor_len = (model_w as usize)
-                        .saturating_mul(model_h as usize)
-                        .saturating_mul(3);
-                    if tensor_buf.len() != needed_tensor_len {
-                        tensor_buf.resize(needed_tensor_len, 0);
-                    }
-                    let tracked_boxes = tracker.non_stationary_boxes(&motion_boxes);
-                    let regions = if rt_flags.enabled && rt_flags.detect {
-                        compute_inference_regions(
-                            width,
-                            height,
-                            model_w.max(model_h),
-                            &motion_boxes,
-                            &tracked_boxes,
-                        )
-                    } else {
-                        Vec::new()
-                    };
-
-                    let (raw_detections, returned_tensor_buf, batch_detect_calls) = if regions
-                        .is_empty()
-                    {
-                        (Vec::new(), tensor_buf, 0u64)
-                    } else {
-                        let det_engine = active_det.clone();
-                        let frame_for_infer = yuv_frame.clone();
-                        let regions_for_infer = regions.clone();
-                        let motion_for_infer = motion_boxes.clone();
-                        let tracked_for_infer = tracked_boxes.clone();
-                        let mut buf = std::mem::take(&mut tensor_buf);
-                        match tokio::task::spawn_blocking(move || {
-                            let mut dets_out = Vec::new();
-                            let mut calls = 0u64;
-                            for region in &regions_for_infer {
-                                crop_yuv420p_to_tensor_nhwc(
-                                    &frame_for_infer,
-                                    region,
-                                    model_w,
-                                    model_h,
-                                    bgr_order,
-                                    &mut buf,
-                                );
-                                calls += 1;
-                                let mut dets =
-                                    det_engine.detect_region(&buf, *region, width, height, 0.40);
-                                dets.retain(|d| {
-                                    motion_for_infer.iter().any(|mb| mb.intersects(&d.bbox))
-                                        || tracked_for_infer.iter().any(|tb| tb.intersects(&d.bbox))
-                                });
-                                dets_out.extend(dets);
-                            }
-                            (dets_out, buf, calls)
-                        })
-                        .await
-                        {
-                            Ok(res) => res,
-                            Err(join_err) => {
-                                warn!("Inference blocking task failed for {camera}: {join_err:#}");
-                                (Vec::new(), vec![0u8; needed_tensor_len], 0)
-                            }
-                        }
-                    };
-                    tensor_buf = returned_tensor_buf;
-                    detect_calls += batch_detect_calls;
-
-                    // 3. Multi-Object Tracking (ByteTrack)
-                    let (active_tracks, ended_tracks) =
-                        tracker.update(now, &raw_detections, &regions, &cam_cfg);
-
-                    // 4. Publish real-time motion, per-label MQTT counts, and WS camera_activity
-                    let motion_on = !motion_boxes.is_empty();
-                    let mut cur_label_counts: BTreeMap<String, usize> = BTreeMap::new();
-                    for lbl in prev_label_counts.keys() {
-                        cur_label_counts.insert(lbl.clone(), 0);
-                    }
-                    for t in &active_tracks {
-                        *cur_label_counts.entry(t.label.clone()).or_default() += 1;
-                    }
-
-                    let mut activity_changed = false;
-                    if motion_on != prev_motion_on {
-                        prev_motion_on = motion_on;
-                        activity_changed = true;
-                        self.comms.publish_topic(
-                            &format!("{camera}/motion"),
-                            if motion_on { "ON" } else { "OFF" },
-                        );
-                    }
-
-                    for (lbl, &cnt) in &cur_label_counts {
-                        if prev_label_counts.get(lbl).copied().unwrap_or(0) != cnt {
-                            activity_changed = true;
-                            self.comms
-                                .publish_topic(&format!("{camera}/{lbl}"), cnt.to_string());
-                        }
-                    }
-                    prev_label_counts = cur_label_counts;
-
-                    if active_tracks.len() != prev_total_objs {
-                        prev_total_objs = active_tracks.len();
-                        activity_changed = true;
-                        self.comms
-                            .publish_topic(&format!("{camera}/all"), prev_total_objs.to_string());
-                    }
-
-                    if is_night_ir != prev_night_ir {
-                        prev_night_ir = is_night_ir;
-                        activity_changed = true;
-                    }
-
-                    if activity_changed
-                        || !active_tracks.is_empty()
-                        || (motion_on && frame_count.is_multiple_of(5))
-                    {
-                        let max_area = motion_boxes.iter().map(|b| b.area()).max().unwrap_or(0);
-                        let objs_json: Vec<Value> = active_tracks
-                            .iter()
-                            .map(|t| {
-                                let ratio =
-                                    (t.bbox.width() as f32) / (t.bbox.height().max(1) as f32);
-                                json!({
-                                    "id": t.id,
-                                    "label": t.label,
-                                    "stationary": t.stationary,
-                                    "area": t.bbox.area(),
-                                    "ratio": ratio,
-                                    "score": t.score,
-                                    "sub_label": t.inferred_sub_label
-                                })
-                            })
-                            .collect();
-                        self.comms.update_camera_activity_with_night(
-                            &camera,
-                            motion_on,
-                            objs_json,
-                            max_area,
-                            is_night_ir,
-                        );
-                    }
-
-                    // 5. Record activity into in-memory ring buffer for RecordingEngine
-                    {
-                        let mut ledger = self.activity_ledger.write().await;
-                        ledger.entry(camera.clone()).or_default().record_sample(
-                            now,
-                            motion_px,
-                            active_tracks.len() as u32,
-                            regions.len() as u32,
-                        );
-                    }
-
-                    // 6. Store zero-copy YuvFrame in memory on every frame for lazy high-res snapshots,
-                    // and throttle disk fallback persistence (`latest_{camera}.jpg`) to every 150 frames (~30s).
-                    self.latest_yuv_frames
-                        .write()
-                        .await
-                        .insert(camera.clone(), yuv_frame.clone());
-                    self.camera_metrics
-                        .write()
-                        .await
-                        .entry(camera.clone())
-                        .or_default()
-                        .last_frame_ts = now;
-
-                    // 6b. Live event-strip preview frames, sampled from this already-decoded
-                    // frame: no extra decoder or ffmpeg, just a downscale + small JPEG.
-                    let moving_objects = active_tracks.iter().any(|t| !t.stationary);
-                    let fast_object = active_tracks.iter().any(|t| {
-                        !t.stationary
-                            && matches!(
-                                t.label.as_str(),
-                                "car" | "truck" | "bus" | "motorcycle" | "bicycle"
-                            )
-                    });
-                    if cam_cfg.record.enabled
-                        && preview_sampler.should_write(now, motion_on, moving_objects, fast_object)
-                    {
-                        let store = self.preview_frames.clone();
-                        let frame_for_preview = yuv_frame.clone();
-                        let mask_for_preview = normalized_priv_mask.clone();
-                        let cam_for_preview = camera.clone();
-                        let ts_ms = (now.max(0.0) * 1000.0) as u64;
-                        tokio::task::spawn_blocking(move || {
-                            let mut rgb = yuv420p_to_rgb_image_scaled(
-                                &frame_for_preview,
-                                None,
-                                &[],
-                                Some(crate::preview_frames::PREVIEW_FRAME_HEIGHT),
-                            );
-                            apply_privacy_masks_from_value(&mut rgb, &mask_for_preview);
-                            match encode_image_jpeg_with_quality(
-                                &rgb,
-                                crate::preview_frames::PREVIEW_FRAME_JPEG_QUALITY,
-                            ) {
-                                Ok(jpeg) => {
-                                    if let Err(err) =
-                                        store.write_frame(&cam_for_preview, ts_ms, &jpeg)
-                                    {
-                                        warn!(
-                                            "Failed to write preview frame for {cam_for_preview}: {err}"
-                                        );
-                                    }
-                                }
-                                Err(err) => {
-                                    warn!(
-                                        "Failed to encode preview frame for {cam_for_preview}: {err:#}"
-                                    );
-                                }
-                            }
-                        });
-                    }
-
-                    if frame_count == 1 || frame_count.is_multiple_of(150) {
-                        let annotated: Vec<(BoundingBox, [u8; 3])> =
-                            if cam_cfg.snapshots.bounding_box {
-                                active_tracks
-                                    .iter()
-                                    .map(|t| (t.bbox, [31, 119, 180]))
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
-                        let frame_for_latest = yuv_frame.clone();
-                        let mask_for_latest = normalized_priv_mask.clone();
-                        let media_root_for_latest = self.media_dir.clone();
-                        let clips_dir_for_latest = self.media_dir.join("clips");
-                        let latest_name = format!("latest_{safe_cam_file}.jpg");
-                        if let Ok(Some(jpeg_bytes)) = tokio::task::spawn_blocking(move || {
-                            let mut rgb = yuv420p_to_rgb_image_scaled(
-                                &frame_for_latest,
-                                None,
-                                &annotated,
-                                Some(360),
-                            );
-                            apply_privacy_masks_from_value(&mut rgb, &mask_for_latest);
-                            let Ok(jpeg_bytes) = encode_image_jpeg(&rgb) else {
-                                return None;
-                            };
-                            if let Err(err) = write_contained_media_file(
-                                &media_root_for_latest,
-                                &clips_dir_for_latest,
-                                &latest_name,
-                                &jpeg_bytes,
-                            ) {
-                                warn!("Failed to write latest frame {latest_name}: {err:#}");
-                            }
-                            Some(jpeg_bytes)
-                        })
-                        .await
-                        {
-                            self.latest_frames
-                                .write()
-                                .await
-                                .insert(camera.clone(), jpeg_bytes);
-                        }
-                    }
-
-                    // 7. Persist Events, Timeline entries, and ReviewSegments
-                    let ctx = FrameLifecycleCtx {
-                        camera: &camera,
-                        cam_cfg: &cam_cfg,
-                        frame: &yuv_frame,
-                        now,
-                    };
-                    self.process_lifecycle_events(
-                        &ctx,
-                        &active_tracks,
-                        &ended_tracks,
-                        &mut active_review,
-                        &mut track_snapshots,
-                    )
-                    .await;
-
-                    // 8. Update rolling FPS metrics every 5 seconds
+                    // Update rolling FPS metrics every 5 seconds
                     let elapsed = (now - window_start).max(0.1);
                     if elapsed >= 5.0 {
                         let c_fps = ((frame_count as f64 / elapsed) * 10.0).round() / 10.0;
@@ -1292,7 +1371,7 @@ impl VisionPipeline {
                                 detection_fps: d_fps,
                                 pid: child_pid,
                                 last_frame_ts: now,
-                                night_mode: is_night_ir,
+                                night_mode: step.is_night_ir,
                             },
                         );
                         frame_count = 0;
@@ -1312,46 +1391,7 @@ impl VisionPipeline {
                     m.pid = 0;
                 }
             }
-            self.comms.publish_topic(&format!("{camera}/motion"), "OFF");
-            for lbl in &cam_cfg.objects.track {
-                self.comms.publish_topic(&format!("{camera}/{lbl}"), "0");
-            }
-            self.comms.publish_topic(&format!("{camera}/all"), "0");
-            self.comms
-                .update_camera_activity_with_night(&camera, false, Vec::new(), 0, false);
-            if let Some(rev) = active_review.take() {
-                let dto = rev.to_dto(&camera, Some(rev.last_activity_time));
-                let db_clone = self.db.clone();
-                let dto_for_db = dto.clone();
-                match tokio::task::spawn_blocking(move || {
-                    db_clone.insert_review_segment(&dto_for_db)
-                })
-                .await
-                {
-                    Ok(Ok(())) => {
-                        let before_dto = rev.prev_dto.unwrap_or_else(|| dto.clone());
-                        self.comms.publish_json(
-                            "reviews",
-                            &json!({
-                                "type": "end",
-                                "before": before_dto,
-                                "after": dto
-                            }),
-                        );
-                    }
-                    Ok(Err(err)) => {
-                        warn!(
-                            "Failed to persist review segment on stream disconnect for {camera}: {err:#}"
-                        );
-                    }
-                    Err(join_err) => {
-                        warn!(
-                            "Blocking task failed persisting review segment on stream disconnect for {camera}: {join_err:#}"
-                        );
-                    }
-                }
-            }
-            track_snapshots.clear();
+            session.handle_stream_disconnected(self).await;
             if self.comms.set_camera_availability(&camera, false) {
                 self.log_hub.push_ninjanvr(
                     "WARNING",
@@ -1455,18 +1495,8 @@ impl VisionPipeline {
                         }),
                         has_been_reviewed: false,
                     };
-                    let db_clone = self.db.clone();
-                    let insert_res =
-                        tokio::task::spawn_blocking(move || db_clone.insert_review_segment(&dto))
-                            .await
-                            .unwrap_or_else(|e| {
-                                Err(anyhow::anyhow!("spawn_blocking join error: {e}"))
-                            });
-                    if let Err(err) = insert_res {
-                        warn!(
-                            "Failed to persist camera tamper review segment for {camera}: {err:#}"
-                        );
-                    }
+                    self.persist_and_publish_review_dto(camera, &dto, &dto, "new", "camera tamper")
+                        .await;
                 }
                 return true;
             }
@@ -1571,30 +1601,8 @@ impl VisionPipeline {
             }),
             has_been_reviewed: false,
         };
-        let db_clone = self.db.clone();
-        let dto_for_db = dto.clone();
-        let insert_res =
-            tokio::task::spawn_blocking(move || db_clone.insert_review_segment(&dto_for_db))
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking join error: {e}")));
-        match insert_res {
-            Ok(()) => {
-                self.comms.publish_json(
-                    "reviews",
-                    &json!({
-                        "type": "new",
-                        "before": dto,
-                        "after": dto
-                    }),
-                );
-            }
-            Err(err) => {
-                warn!(
-                    "Failed to persist ROI anomaly review segment for {camera} (roi={}): {err:#}",
-                    tr.roi_name
-                );
-            }
-        }
+        self.persist_and_publish_review_dto(camera, &dto, &dto, "new", "ROI anomaly")
+            .await;
     }
 
     async fn prune_false_positive_track_from_review(
@@ -1630,37 +1638,55 @@ impl VisionPipeline {
         };
         if let ReviewFalsePositiveTransition::DeleteEmptyReview {
             review_id,
-            persisted_in_db: true,
+            persisted_in_db,
             before_dto,
             closed_dto,
         } = prune_false_positive_from_active_review(active_review, track_id, camera, now, |_| {
             has_remaining_alert
         }) {
-            let db_for_del = self.db.clone();
+            let media_dir = self.media_dir.clone();
             let rev_id_for_del = review_id.clone();
-            match tokio::task::spawn_blocking(move || {
-                db_for_del.delete_reviews(std::slice::from_ref(&rev_id_for_del))
-            })
-            .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(err)) => {
-                    warn!("Failed to delete false-positive review {review_id}: {err:#}");
+            let thumb_for_del = closed_dto.thumb_path.clone();
+            if persisted_in_db {
+                let db_for_del = self.db.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::media_lifecycle::delete_reviews_with_artifacts(
+                        &db_for_del,
+                        &media_dir,
+                        std::slice::from_ref(&rev_id_for_del),
+                        &ninjanvr_db::CameraScope::All,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(err)) => {
+                        warn!("Failed to delete false-positive review {review_id}: {err:#}");
+                    }
+                    Err(join_err) => {
+                        warn!(
+                            "Blocking task failed deleting false-positive review {review_id}: {join_err:#}"
+                        );
+                    }
                 }
-                Err(join_err) => {
-                    warn!(
-                        "Blocking task failed deleting false-positive review {review_id}: {join_err:#}"
+                self.comms.publish_json(
+                    "reviews",
+                    &json!({
+                        "type": "end",
+                        "before": before_dto,
+                        "after": closed_dto
+                    }),
+                );
+            } else {
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::media_lifecycle::cleanup_review_media_artifacts(
+                        &media_dir,
+                        &rev_id_for_del,
+                        Some(&thumb_for_del),
                     );
-                }
+                })
+                .await;
             }
-            self.comms.publish_json(
-                "reviews",
-                &json!({
-                    "type": "end",
-                    "before": before_dto,
-                    "after": closed_dto
-                }),
-            );
         }
     }
 
@@ -2571,44 +2597,18 @@ impl VisionPipeline {
 
             if decision.should_flush {
                 let dto = rev.to_dto(camera, decision.end_time);
-                let db_for_rev = self.db.clone();
-                let dto_for_rev = dto.clone();
-                let rev_id_for_log = rev.id.clone();
-                let cam_for_rev = camera.to_string();
-
-                let review_persisted = match tokio::task::spawn_blocking(move || {
-                    if let Err(err) = db_for_rev.insert_review_segment(&dto_for_rev) {
-                        warn!(
-                            "Failed to persist review segment {} for {}: {err:#}",
-                            rev_id_for_log, cam_for_rev
-                        );
-                        return false;
-                    }
-                    true
-                })
-                .await
-                {
-                    Ok(ok) => ok,
-                    Err(join_err) => {
-                        warn!(
-                            "Blocking task failed persisting review segment {} on {camera}: {join_err:#}",
-                            rev.id
-                        );
-                        false
-                    }
-                };
+                let before_dto = rev.prev_dto.clone().unwrap_or_else(|| dto.clone());
+                let review_persisted = self
+                    .persist_and_publish_review_dto(
+                        camera,
+                        &dto,
+                        &before_dto,
+                        decision.ws_msg_type,
+                        "lifecycle cutoff/checkpoint",
+                    )
+                    .await;
 
                 if review_persisted {
-                    let before_dto = rev.prev_dto.clone().unwrap_or_else(|| dto.clone());
-                    self.comms.publish_json(
-                        "reviews",
-                        &json!({
-                            "type": decision.ws_msg_type,
-                            "before": before_dto,
-                            "after": dto
-                        }),
-                    );
-
                     rev.is_new = false;
                     rev.dirty = false;
                     rev.prev_dto = Some(dto);
@@ -2789,6 +2789,11 @@ mod tests {
         let comms = Arc::new(CommsHub::new());
         let detector = Arc::new(AiDetectorEngine::new(&cfg));
 
+        let ptz_active_presets = Arc::new(RwLock::new(HashMap::new()));
+        let camera_driver_runtime =
+            crate::camera_protocols::CameraDriverRuntime::with_active_presets(
+                ptz_active_presets.clone(),
+            );
         let pipeline = VisionPipeline {
             config: Arc::new(RwLock::new(cfg)),
             db,
@@ -2801,8 +2806,8 @@ mod tests {
             camera_metrics: Arc::new(RwLock::new(HashMap::new())),
             media_dir,
             log_hub: crate::LogBufferHub::new(),
-            ptz_active_presets: Arc::new(RwLock::new(HashMap::new())),
-            camera_driver_runtime: crate::camera_protocols::CameraDriverRuntime::new(),
+            ptz_active_presets,
+            camera_driver_runtime,
             snapshot_http_client: build_snapshot_http_client(),
             high_res_snapshot_semaphore: Arc::new(Semaphore::new(
                 MAX_CONCURRENT_HIGH_RES_SNAPSHOT_TASKS,
@@ -4801,6 +4806,124 @@ cameras:
             }),
             "crossing a line with siren=true must publish a 'siren' event"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn camera_vision_session_steps_frames_applies_live_config_and_flushes_review_on_disable_or_disconnect()
+     {
+        let (pipeline, tmp_dir) = build_isolated_pipeline("camera-vision-session");
+        let camera = "front_door";
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.detect.width = 320;
+        cam_cfg.detect.height = 180;
+        cam_cfg.detect.fps = 5;
+        cam_cfg.record.enabled = true;
+        cam_cfg.snapshots.enabled = true;
+
+        let mut session = CameraVisionSession::new(
+            camera,
+            cam_cfg.clone(),
+            pipeline.detector.model_dimensions(),
+        );
+        let (_, _, frame_len) = sanitize_yuv420p_dimensions(320, 180);
+        let frame_a = Arc::new(vec![110u8; frame_len]);
+        let mut frame_b_vec = vec![110u8; frame_len];
+        for y in 40..120 {
+            for x in 60..180 {
+                frame_b_vec[y * 320 + x] = 245;
+            }
+        }
+        let frame_b = Arc::new(frame_b_vec);
+
+        // 1. Step two frames through CameraVisionSession
+        let step1 = session.step_frame(&pipeline, frame_a, 1000.0, 1).await;
+        assert!(step1.enabled);
+        let step2 = session.step_frame(&pipeline, frame_b, 1001.0, 2).await;
+        assert!(step2.enabled);
+        assert!(pipeline.latest_yuv_frames.read().await.contains_key(camera));
+        assert!(pipeline.latest_frames.read().await.contains_key(camera));
+
+        // 2. Apply live config update without restarting session
+        let mut updated_cfg = cam_cfg.clone();
+        updated_cfg.motion.threshold = cam_cfg.motion.threshold + 12;
+        updated_cfg.privacy_mask = json!(["0.1,0.1,0.4,0.1,0.4,0.4,0.1,0.4"]);
+        let delta = session.apply_live_config_if_changed(&updated_cfg);
+        assert!(delta.motion);
+        assert!(delta.privacy_mask);
+        assert!(!session.apply_live_config_if_changed(&updated_cfg).any());
+
+        // 3. Open an active review and verify camera disable flushes it to SQLite and clears active_review
+        session.active_review = Some(ActiveReviewState {
+            id: "rev_session_disable_1".to_string(),
+            start_time: 1000.0,
+            last_activity_time: 1002.0,
+            last_backup_time: 1000.0,
+            severity: "alert".to_string(),
+            thumb_path: "/clips/review/thumb-rev_session_disable_1.webp".to_string(),
+            thumb_time: 1001.0,
+            best_score: 0.91,
+            detections: vec!["trk_1".to_string()],
+            objects: vec!["person".to_string()],
+            sub_labels: Vec::new(),
+            sub_label_score: None,
+            detected_attributes: Vec::new(),
+            zones: Vec::new(),
+            provenance: None,
+            is_new: false,
+            dirty: true,
+            prev_dto: None,
+        });
+        pipeline
+            .comms
+            .set_camera_flags(camera, Some(false), None, None, None, None);
+        let step_disabled = session
+            .step_frame(&pipeline, Arc::new(vec![110u8; frame_len]), 1003.0, 3)
+            .await;
+        assert!(!step_disabled.enabled);
+        assert!(session.active_review.is_none());
+        let saved_reviews = pipeline.db.query_reviews(&ReviewFilter::default()).unwrap();
+        assert_eq!(saved_reviews.len(), 1);
+        assert_eq!(saved_reviews[0].id, "rev_session_disable_1");
+        assert_eq!(saved_reviews[0].end_time, Some(1002.0));
+
+        // 4. Re-enable camera, open a second review, and verify stream disconnect flushes it and clears snapshots
+        pipeline
+            .comms
+            .set_camera_flags(camera, Some(true), None, None, None, None);
+        session.track_snapshots.insert(
+            "trk_2".to_string(),
+            TrackPersistSnapshot {
+                best_score: 0.88,
+                ..Default::default()
+            },
+        );
+        session.active_review = Some(ActiveReviewState {
+            id: "rev_session_disconnect_2".to_string(),
+            start_time: 1010.0,
+            last_activity_time: 1015.0,
+            last_backup_time: 1010.0,
+            severity: "alert".to_string(),
+            thumb_path: "/clips/review/thumb-rev_session_disconnect_2.webp".to_string(),
+            thumb_time: 1012.0,
+            best_score: 0.94,
+            detections: vec!["trk_2".to_string()],
+            objects: vec!["car".to_string()],
+            sub_labels: Vec::new(),
+            sub_label_score: None,
+            detected_attributes: Vec::new(),
+            zones: Vec::new(),
+            provenance: None,
+            is_new: false,
+            dirty: true,
+            prev_dto: None,
+        });
+        session.handle_stream_disconnected(&pipeline).await;
+        assert!(session.active_review.is_none());
+        assert!(session.track_snapshots.is_empty());
+        let saved_reviews_after = pipeline.db.query_reviews(&ReviewFilter::default()).unwrap();
+        assert_eq!(saved_reviews_after.len(), 2);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

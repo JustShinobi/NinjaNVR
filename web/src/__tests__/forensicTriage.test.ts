@@ -677,4 +677,323 @@ describe("ForensicTriageModule — createForensicTriageController", () => {
       nextReview: reviews[0],
     });
   });
+
+  test("toggleFalsePositive, verifyWithAi, addEventToDataset (with fallback auto-annotate), and fetchEnrolledFaceNames enforce sequence freshness", async () => {
+    const calls: RecordedFetchCall[] = [];
+    let pendingVerifyResolver: (() => void) | null = null;
+    let triggerFallbackAutoAnnotate = false;
+
+    const fetchImpl: typeof fetch = (async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = init?.method || "GET";
+      const body =
+        typeof init?.body === "string"
+          ? (JSON.parse(init.body) as Record<string, unknown>)
+          : null;
+      calls.push({ url, method, body });
+
+      if (url === "/api/faces") {
+        return jsonResponse(200, {
+          faces: {
+            "Zoe ": ["z1.jpg"],
+            " alice": ["a1.jpg", "a2.jpg"],
+            Alice: ["dup.jpg"],
+            "  ": ["blank.jpg"],
+          },
+        });
+      }
+
+      if (url.endsWith("/false_positive") && method === "PUT") {
+        if (url.includes("ev_fp_fallback")) {
+          return jsonResponse(404, { error: "Not found" });
+        }
+        return jsonResponse(200, {
+          status: "ok",
+          false_positive: Boolean(body?.false_positive),
+        });
+      }
+
+      if (url.endsWith("/false-positive") && method === "POST") {
+        return jsonResponse(200, {
+          status: "ok",
+          false_positive: Boolean(body?.false_positive),
+        });
+      }
+
+      if (url.endsWith("/verify-ai")) {
+        if (url.includes("ev_stale")) {
+          return new Promise<Response>((resolve) => {
+            pendingVerifyResolver = () =>
+              resolve(
+                jsonResponse(200, {
+                  verified: true,
+                  verified_by: "gemini-2.5-flash",
+                  confidence: 0.96,
+                  reason: "Person clearly standing on porch",
+                })
+              );
+          });
+        }
+        return jsonResponse(200, {
+          is_true_positive: true,
+          provider: "openai",
+          model: "gpt-4o",
+          confidence: 0.91,
+          reason: "Confirmed delivery driver",
+        });
+      }
+
+      if (url.startsWith("/api/dataset/samples/from-event")) {
+        if (triggerFallbackAutoAnnotate) {
+          return jsonResponse(200, {
+            id: "ds_ev_fallback",
+            sample_kind: "true_positive",
+            split: "train",
+            auto_annotate_attempted: false,
+            annotations: [],
+          });
+        }
+        return jsonResponse(200, {
+          id: "ds_ev_direct",
+          sample_kind: "ai_annotated",
+          split: "val",
+          annotations: [
+            { class_id: 0, label: "person", cx: 0.5, cy: 0.5, w: 0.2, h: 0.4 },
+            { class_id: 2, label: "car", cx: 0.2, cy: 0.7, w: 0.3, h: 0.2 },
+          ],
+        });
+      }
+
+      if (url === "/api/dataset/samples/ds_ev_fallback/auto-annotate") {
+        return jsonResponse(200, {
+          id: "ds_ev_fallback",
+          sample_kind: "ai_annotated",
+          split: "train",
+          annotations: [
+            { class_id: 0, label: "person", cx: 0.4, cy: 0.5, w: 0.2, h: 0.5 },
+            { class_id: 1, label: "face", cx: 0.4, cy: 0.3, w: 0.08, h: 0.1 },
+            { class_id: 11, label: "package", cx: 0.45, cy: 0.75, w: 0.1, h: 0.1 },
+          ],
+        });
+      }
+
+      return jsonResponse(404, { error: "Not found" });
+    }) as typeof fetch;
+
+    const controller = createForensicTriageController({ fetchImpl });
+
+    // 1. fetchEnrolledFaceNames returns sorted unique non-empty names
+    const names = await controller.fetchEnrolledFaceNames();
+    expect(names).toEqual(["alice", "Zoe"]);
+
+    // 2. toggleFalsePositive tries canonical PUT /false_positive first and falls back to POST /false-positive on 404/405
+    controller.setActiveTarget("event", "ev_fp_1");
+    const fpRes = await controller.toggleFalsePositive("ev_fp_1", false);
+    expect(fpRes).toEqual({
+      stale: false,
+      shouldApply: true,
+      ok: true,
+      nextFp: true,
+    });
+    expect(calls.find((c) => c.url === "/api/events/ev_fp_1/false_positive")).toEqual({
+      url: "/api/events/ev_fp_1/false_positive",
+      method: "PUT",
+      body: { false_positive: true },
+    });
+
+    controller.setActiveTarget("event", "ev_fp_fallback");
+    const fpFallbackRes = await controller.toggleFalsePositive(
+      "ev_fp_fallback",
+      true
+    );
+    expect(fpFallbackRes).toEqual({
+      stale: false,
+      shouldApply: true,
+      ok: true,
+      nextFp: false,
+    });
+    expect(
+      calls.find((c) => c.url === "/api/events/ev_fp_fallback/false_positive")
+    ).toEqual({
+      url: "/api/events/ev_fp_fallback/false_positive",
+      method: "PUT",
+      body: { false_positive: false },
+    });
+    expect(
+      calls.find((c) => c.url === "/api/events/ev_fp_fallback/false-positive")
+    ).toEqual({
+      url: "/api/events/ev_fp_fallback/false-positive",
+      method: "POST",
+      body: { false_positive: false },
+    });
+
+    // 3. verifyWithAi marks stale when active event changes while request is in flight
+    controller.setActiveTarget("event", "ev_stale");
+    const staleVerifyPromise = controller.verifyWithAi("ev_stale");
+    controller.setActiveTarget("event", "ev_fresh");
+    const freshVerifyRes = await controller.verifyWithAi("ev_fresh");
+
+    expect(freshVerifyRes.ok).toBe(true);
+    expect(freshVerifyRes.stale).toBe(false);
+    expect(freshVerifyRes.shouldApply).toBe(true);
+    expect(freshVerifyRes.verified).toBe(true);
+    expect(freshVerifyRes.verifiedBy).toBe("openai");
+    expect(freshVerifyRes.reason).toBe("Confirmed delivery driver");
+
+    expect(pendingVerifyResolver).not.toBeNull();
+    pendingVerifyResolver!();
+    const staleVerifyRes = await staleVerifyPromise;
+    expect(staleVerifyRes.ok).toBe(true);
+    expect(staleVerifyRes.stale).toBe(true);
+    expect(staleVerifyRes.shouldApply).toBe(false);
+    expect(staleVerifyRes.verified).toBe(true);
+    expect(staleVerifyRes.verifiedBy).toBe("gemini-2.5-flash");
+
+    // 4. addEventToDataset: direct AI annotation vs fallback /auto-annotate
+    controller.setActiveTarget("event", "ev_direct");
+    const dsDirect = await controller.addEventToDataset({
+      eventId: "ev_direct",
+      camera: "front_door",
+      label: "person",
+      timestamp: 1700000100,
+      autoAnnotate: true,
+    });
+    expect(dsDirect).toEqual({
+      stale: false,
+      shouldApply: true,
+      ok: true,
+      id: "ds_ev_direct",
+      split: "val",
+      autoAnnotated: true,
+      annotationCount: 2,
+    });
+
+    triggerFallbackAutoAnnotate = true;
+    controller.setActiveTarget("event", "ev_fallback");
+    const dsFallback = await controller.addEventToDataset({
+      eventId: "ev_fallback",
+      camera: "front_door",
+      label: "person",
+      autoAnnotate: true,
+    });
+    expect(dsFallback).toEqual({
+      stale: false,
+      shouldApply: true,
+      ok: true,
+      id: "ds_ev_fallback",
+      split: "train",
+      autoAnnotated: true,
+      annotationCount: 3,
+    });
+    expect(
+      calls.some(
+        (c) =>
+          c.url === "/api/dataset/samples/ds_ev_fallback/auto-annotate" &&
+          c.method === "POST"
+      )
+    ).toBe(true);
+  });
+
+  test("batchAssignFaceSubLabel falls back to /api/events/{id}/sub_label on 422 and guarantees backfill_events: true runs when final item falls back", async () => {
+    const calls: RecordedFetchCall[] = [];
+    const itemSuccessLog: Array<{ id: string; name: string | null }> = [];
+
+    const fetchImpl: typeof fetch = (async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = init?.method || "GET";
+      const body =
+        typeof init?.body === "string"
+          ? (JSON.parse(init.body) as Record<string, unknown>)
+          : null;
+      calls.push({ url, method, body });
+
+      if (url === "/api/faces/Erik/enroll") {
+        // Simulate det_2 (the final item in the batch) having no detectable face crop (422)
+        if (body?.event_id === "det_2") {
+          return jsonResponse(422, {
+            message: "No detectable face crop in event snapshot",
+          });
+        }
+        return jsonResponse(200, {
+          sample_count: 2,
+          backfilled_events: body?.backfill_events ? 4 : 0,
+        });
+      }
+
+      if (url === "/api/events/det_2/sub_label") {
+        return jsonResponse(200, {
+          status: "ok",
+          sub_label: body?.sub_label ?? null,
+        });
+      }
+
+      return jsonResponse(404, {});
+    }) as typeof fetch;
+
+    const controller = createForensicTriageController({ fetchImpl });
+    const res = await controller.batchAssignFaceSubLabel({
+      items: [
+        { id: "rev_1", primaryEventId: "det_1" },
+        { id: "rev_2", primaryEventId: "det_2" },
+      ],
+      rawName: "Erik",
+      onItemSuccess: (id, name) => itemSuccessLog.push({ id, name }),
+    });
+
+    expect(res).toEqual({
+      ok: true,
+      invalidName: false,
+      cleanName: "Erik",
+      total: 2,
+      succeededIds: ["rev_1", "rev_2"],
+      failedIds: [],
+      totalBackfilled: 4,
+    });
+    expect(itemSuccessLog).toEqual([
+      { id: "rev_1", name: "Erik" },
+      { id: "rev_2", name: "Erik" },
+    ]);
+
+    // 1. det_1 enrolled with backfill_events: false
+    // 2. det_2 attempted /enroll with backfill_events: true -> 422 -> fell back to /api/events/det_2/sub_label
+    // 3. Because det_1 succeeded /enroll without backfill_events: true and det_2's /enroll failed, backfill_events: true was triggered on det_1
+    expect(calls).toEqual([
+      {
+        url: "/api/faces/Erik/enroll",
+        method: "POST",
+        body: {
+          event_id: "det_1",
+          assign_sub_label: true,
+          backfill_events: false,
+        },
+      },
+      {
+        url: "/api/faces/Erik/enroll",
+        method: "POST",
+        body: {
+          event_id: "det_2",
+          assign_sub_label: true,
+          backfill_events: true,
+        },
+      },
+      {
+        url: "/api/events/det_2/sub_label",
+        method: "POST",
+        body: {
+          sub_label: "Erik",
+          sub_label_score: 1.0,
+          enroll_face: true,
+        },
+      },
+      {
+        url: "/api/faces/Erik/enroll",
+        method: "POST",
+        body: {
+          event_id: "det_1",
+          assign_sub_label: true,
+          backfill_events: true,
+        },
+      },
+    ]);
+  });
 });

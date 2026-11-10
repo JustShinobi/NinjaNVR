@@ -448,4 +448,199 @@ describe("probeCameraHardwareAndPtz and cameraHardwareCache (ports & adapters se
     expect(snap.ptzEnabled).toBe(false);
     expect(snap.presets).toEqual(["Entry"]);
   });
+
+  test("applyHardwarePatch merges optimistic state and invalidates + invokes onConfigPersisted + re-probes on config-persisting patches", async () => {
+    const calls: Array<{ url: string; method: string; body: Record<string, unknown> | null }> = [];
+    let probeCount = 0;
+
+    const mockFetch: typeof fetch = (async (input, init) => {
+      const url = String(input);
+      const method = init?.method || "GET";
+      const body =
+        typeof init?.body === "string"
+          ? (JSON.parse(init.body) as Record<string, unknown>)
+          : null;
+      calls.push({ url, method, body });
+
+      if (method === "POST" && url === "/api/porch_cam/hardware") {
+        return new Response(
+          JSON.stringify({
+            success: true,
+            state: body?.brightness !== undefined ? { brightness: body.brightness } : {},
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      if (method === "GET" && url.startsWith("/api/porch_cam/hardware")) {
+        probeCount += 1;
+        return new Response(
+          JSON.stringify(
+            makeBaseHardwareInfo({
+              camera: "porch_cam",
+              onvif_configured: true,
+              missing_requirements: [],
+              state: { brightness: 65, status_led: false, day_night_mode: "night" },
+            })
+          ),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      if (method === "GET" && url.startsWith("/api/porch_cam/ptz/info")) {
+        return new Response(
+          JSON.stringify({ enabled: true, online: true, active_preset: "Home" }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      return new Response("{}", { status: 404 });
+    }) as typeof fetch;
+
+    const controller = createCameraHardwareCacheController(mockFetch);
+    controller.setHardware(
+      "porch_cam",
+      makeBaseHardwareInfo({ camera: "porch_cam" })
+    );
+
+    // 1. State-only patch merges optimistically without re-probing
+    let configPersistedCalls = 0;
+    const patchRes = await controller.applyHardwarePatch(
+      "porch_cam",
+      { brightness: 80, status_led: false },
+      {
+        onConfigPersisted: () => {
+          configPersistedCalls += 1;
+        },
+      }
+    );
+    expect(patchRes.ok).toBe(true);
+    expect(patchRes.hardware?.state.brightness).toBe(80);
+    expect(patchRes.hardware?.state.status_led).toBe(false);
+    expect(controller.getHardware("porch_cam")?.state.brightness).toBe(80);
+    expect(configPersistedCalls).toBe(0);
+    expect(probeCount).toBe(0);
+
+    // 2. Config-persisting patch invalidates cache, runs onConfigPersisted, and triggers force re-probe
+    const persistRes = await controller.applyHardwarePatch(
+      "porch_cam",
+      { apply_suggested_onvif: true, cloud_password: "tapo-secret" },
+      {
+        onConfigPersisted: async () => {
+          configPersistedCalls += 1;
+        },
+      }
+    );
+    expect(persistRes.ok).toBe(true);
+    expect(configPersistedCalls).toBe(1);
+    expect(probeCount).toBe(1);
+    expect(persistRes.hardware?.onvif_configured).toBe(true);
+    expect(persistRes.hardware?.missing_requirements).toEqual([]);
+    expect(controller.getPtzInfo("porch_cam")?.active_preset).toBe("Home");
+  });
+
+  test("gotoPtzPreset, savePtzPreset, and deletePtzPreset mutate endpoints and keep cached CameraPtzInfo in sync", async () => {
+    const calls: Array<{ url: string; method: string; body: Record<string, unknown> | null }> = [];
+    let forceFallbackDelete = false;
+    const mockFetch: typeof fetch = (async (input, init) => {
+      const url = String(input);
+      const method = init?.method || "GET";
+      const body =
+        typeof init?.body === "string"
+          ? (JSON.parse(init.body) as Record<string, unknown>)
+          : null;
+      calls.push({ url, method, body });
+
+      if (url === "/api/driveway/ptz/preset") {
+        return new Response(JSON.stringify({ success: true }), { status: 200 });
+      }
+      if (url === "/api/driveway/ptz/preset/save") {
+        return new Response(
+          JSON.stringify({
+            success: true,
+            token: body?.token || "3",
+            mode: "onvif",
+          }),
+          { status: 200 }
+        );
+      }
+      if (method === "DELETE" && url.startsWith("/api/driveway/ptz/preset/")) {
+        if (forceFallbackDelete) {
+          return new Response("method not allowed", { status: 405 });
+        }
+        return new Response(JSON.stringify({ success: true }), { status: 200 });
+      }
+      if (method === "POST" && url === "/api/driveway/ptz/preset/delete") {
+        return new Response(JSON.stringify({ success: true }), { status: 200 });
+      }
+      return new Response("{}", { status: 404 });
+    }) as typeof fetch;
+
+    const controller = createCameraHardwareCacheController(mockFetch);
+    controller.setPtzInfo("driveway", {
+      enabled: true,
+      online: true,
+      presets: [
+        { token: "1", name: "Home" },
+        { token: "2", name: "Gate" },
+      ],
+      preset_names: ["Home", "Gate"],
+      active_preset: "Home",
+    });
+
+    // 1. gotoPtzPreset updates cached active_preset
+    const gotoRes = await controller.gotoPtzPreset("driveway", "Gate");
+    expect(gotoRes.ok).toBe(true);
+    expect(gotoRes.ptz?.active_preset).toBe("Gate");
+    expect(controller.getPtzInfo("driveway")?.active_preset).toBe("Gate");
+    expect(calls[0]).toEqual({
+      url: "/api/driveway/ptz/preset",
+      method: "POST",
+      body: { preset: "Gate" },
+    });
+
+    // 2. savePtzPreset adds preset and updates active_preset
+    const saveRes = await controller.savePtzPreset("driveway", "Mailbox", "3");
+    expect(saveRes.ok).toBe(true);
+    expect(saveRes.ptz?.active_preset).toBe("Mailbox");
+    expect(saveRes.ptz?.preset_names).toEqual(["Home", "Gate", "Mailbox"]);
+    expect(controller.getPtzInfo("driveway")?.presets).toEqual([
+      { token: "1", name: "Home" },
+      { token: "2", name: "Gate" },
+      { token: "3", name: "Mailbox" },
+    ]);
+    expect(calls[1]).toEqual({
+      url: "/api/driveway/ptz/preset/save",
+      method: "POST",
+      body: { name: "Mailbox", token: "3" },
+    });
+
+    // 3. deletePtzPreset tries canonical DELETE /api/{cam}/ptz/preset/{token} first and clears active_preset when active preset is deleted
+    const delRes = await controller.deletePtzPreset("driveway", "3");
+    expect(delRes.ok).toBe(true);
+    expect(delRes.ptz?.active_preset).toBeNull();
+    expect(delRes.ptz?.preset_names).toEqual(["Home", "Gate"]);
+    expect(controller.getPtzInfo("driveway")?.preset_names).toEqual([
+      "Home",
+      "Gate",
+    ]);
+    expect(calls[2]).toEqual({
+      url: "/api/driveway/ptz/preset/3",
+      method: "DELETE",
+      body: null,
+    });
+
+    // 4. deletePtzPreset falls back to POST /api/{cam}/ptz/preset/delete when DELETE returns 404/405
+    forceFallbackDelete = true;
+    const fallbackDelRes = await controller.deletePtzPreset("driveway", "2");
+    expect(fallbackDelRes.ok).toBe(true);
+    expect(fallbackDelRes.ptz?.preset_names).toEqual(["Home"]);
+    expect(calls[3]).toEqual({
+      url: "/api/driveway/ptz/preset/2",
+      method: "DELETE",
+      body: null,
+    });
+    expect(calls[4]).toEqual({
+      url: "/api/driveway/ptz/preset/delete",
+      method: "POST",
+      body: { token: "2" },
+    });
+  });
 });

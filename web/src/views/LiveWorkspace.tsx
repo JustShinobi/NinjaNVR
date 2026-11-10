@@ -94,17 +94,18 @@ import { resolveCanvasThemePalette } from "../utils/themeTokens";
 import { LiveMsePlayer, PushToTalkButton, VodHlsPlayer } from "../components/VideoPlayers";
 import {
   CAMERA_HUD_CONTROL_DESCRIPTORS,
-  applyDeletedPresetToPtzInfo,
-  applySavedPresetToPtzInfo,
+  applyCameraHardwarePatch,
   cameraHardwareCache,
+  deleteCameraPtzPreset,
+  gotoCameraPtzPreset,
   isCameraHardwareControlsSupported,
   isCameraPtzEnabled,
-  mergeOptimisticCameraHardwareInfo,
   probeCameraHardwareAndPtz,
   resolveCameraCapabilitySnapshot,
   resolveCameraPtzPresets,
   resolveCameraPushToTalkCapability,
   resolveCameraZoomSupported,
+  saveCameraPtzPreset,
   setCachedCameraHardware,
   setCachedCameraPtzInfo,
   subscribeCameraHardwareCache,
@@ -754,21 +755,20 @@ export const TacticalPtzHudOverlay: React.FC<{
     if (!clean || !targetCam) return;
     await lifecycleRef.current?.stopMove(false);
     try {
-      const res = await fetch(`/api/${encodeURIComponent(targetCam)}/ptz/preset`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ preset: clean }),
-      });
+      if (
+        ptzInfoRef.current &&
+        !cameraHardwareCache.getCachedCameraPtzInfo(targetCam)
+      ) {
+        setCachedCameraPtzInfo(targetCam, ptzInfoRef.current);
+      }
+      const res = await gotoCameraPtzPreset(targetCam, clean);
       if (
         res.ok &&
+        res.ptz &&
         activeCameraRef.current === targetCam &&
         onPtzUpdateRef.current
       ) {
-        onPtzUpdateRef.current(targetCam, {
-          ...(ptzInfoRef.current || { enabled: true }),
-          active_preset: clean,
-        });
+        onPtzUpdateRef.current(targetCam, res.ptz);
       }
     } catch {
       // ignore
@@ -780,37 +780,20 @@ export const TacticalPtzHudOverlay: React.FC<{
     const targetCam = (camera || "").trim();
     if (!cleanName || !targetCam) return;
     try {
-      const res = await fetch(
-        `/api/${encodeURIComponent(targetCam)}/ptz/preset/save`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
-          body: JSON.stringify({ name: cleanName }),
-        }
-      );
-      const data = await res.json().catch(() => null);
+      if (
+        ptzInfoRef.current &&
+        !cameraHardwareCache.getCachedCameraPtzInfo(targetCam)
+      ) {
+        setCachedCameraPtzInfo(targetCam, ptzInfoRef.current);
+      }
+      const res = await saveCameraPtzPreset(targetCam, cleanName);
       if (
         res.ok &&
-        data?.success &&
+        res.ptz &&
         activeCameraRef.current === targetCam &&
         onPtzUpdateRef.current
       ) {
-        const nextPtz = applySavedPresetToPtzInfo(
-          ptzInfoRef.current || { enabled: true },
-          String(data.token || cleanName),
-          cleanName,
-          Array.isArray(data.presets) ? data.presets : undefined,
-          data.preset_names &&
-            typeof data.preset_names === "object" &&
-            !Array.isArray(data.preset_names)
-            ? data.preset_names
-            : undefined
-        );
-        if (nextPtz) {
-          setCachedCameraPtzInfo(targetCam, nextPtz);
-          onPtzUpdateRef.current(targetCam, nextPtz);
-        }
+        onPtzUpdateRef.current(targetCam, res.ptz);
         setNewPresetName("");
         setShowPresetInput(false);
       }
@@ -827,33 +810,20 @@ export const TacticalPtzHudOverlay: React.FC<{
     );
     const tokToDelete = matchItem?.token || activePreset;
     try {
-      const res = await fetch(
-        `/api/${encodeURIComponent(targetCam)}/ptz/preset/${encodeURIComponent(tokToDelete)}`,
-        {
-          method: "DELETE",
-          credentials: "include",
-        }
-      );
-      const data = await res.json().catch(() => null);
+      if (
+        ptzInfoRef.current &&
+        !cameraHardwareCache.getCachedCameraPtzInfo(targetCam)
+      ) {
+        setCachedCameraPtzInfo(targetCam, ptzInfoRef.current);
+      }
+      const res = await deleteCameraPtzPreset(targetCam, tokToDelete);
       if (
         res.ok &&
+        res.ptz &&
         activeCameraRef.current === targetCam &&
         onPtzUpdateRef.current
       ) {
-        const nextPtz = applyDeletedPresetToPtzInfo(
-          ptzInfoRef.current || { enabled: true },
-          tokToDelete,
-          Array.isArray(data?.presets) ? data.presets : undefined,
-          data?.preset_names &&
-            typeof data.preset_names === "object" &&
-            !Array.isArray(data.preset_names)
-            ? data.preset_names
-            : undefined
-        );
-        if (nextPtz) {
-          setCachedCameraPtzInfo(targetCam, nextPtz);
-          onPtzUpdateRef.current(targetCam, nextPtz);
-        }
+        onPtzUpdateRef.current(targetCam, res.ptz);
       }
     } catch {
       // ignore
@@ -865,25 +835,20 @@ export const TacticalPtzHudOverlay: React.FC<{
     if (!targetCam || hwBusy) return;
     setHwBusy(true);
     try {
-      const res = await fetch(`/api/${encodeURIComponent(targetCam)}/hardware`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify(patch),
-      });
-      const data = await res.json().catch(() => null);
-      const curHw = hardwareInfoRef.current;
+      if (
+        hardwareInfoRef.current &&
+        !cameraHardwareCache.getCachedCameraHardware(targetCam)
+      ) {
+        setCachedCameraHardware(targetCam, hardwareInfoRef.current);
+      }
+      const res = await applyCameraHardwarePatch(targetCam, patch);
       if (
         res.ok &&
+        res.hardware &&
         activeCameraRef.current === targetCam &&
-        curHw &&
         onHardwareUpdateRef.current
       ) {
-        const nextHw = mergeOptimisticCameraHardwareInfo(curHw, patch, data);
-        if (nextHw) {
-          setCachedCameraHardware(targetCam, nextHw);
-          onHardwareUpdateRef.current(targetCam, nextHw);
-        }
+        onHardwareUpdateRef.current(targetCam, res.hardware);
       }
     } catch {
       // ignore

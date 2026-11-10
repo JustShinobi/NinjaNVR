@@ -10,15 +10,463 @@
 //! `sync_all`, atomic rename) and `go2rtc.yaml`, swaps the in-memory config, and
 //! optionally invalidates cached per-camera driver state in `CameraDriverRuntime`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use ninjanvr_config::{DEFAULT_GO2RTC_SHM_PATH, NinjaConfig};
-use tokio::sync::{Mutex, MutexGuard, RwLock};
+use ninjanvr_infer::AiDetectorEngine;
+use serde_json::Value;
+use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 
 use crate::camera_protocols::CameraDriverRuntime;
+
+/// Typed error returned by transactional `ConfigCoordinator` commit operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigCommitError {
+    Validation(String),
+    Persistence(String),
+}
+
+impl std::fmt::Display for ConfigCommitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Validation(msg) | Self::Persistence(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl std::error::Error for ConfigCommitError {}
+
+/// Outcome of a structured configuration patch commit.
+#[derive(Debug, Clone)]
+pub struct StructuredConfigCommitOutcome {
+    pub config: NinjaConfig,
+    pub api_config: Value,
+    pub scrubbed_raw_yaml: String,
+    pub invalidated_cameras: Vec<String>,
+}
+
+/// Outcome of a detector model deployment commit.
+#[derive(Debug, Clone)]
+pub enum ModelDeployOutcome {
+    Deployed { loaded: bool, persisted: bool },
+    RolledBack { previous_model_path: String },
+}
+
+/// Validates that `raw` is a safe `.txt` labelmap path without `..`, dotfiles, symlinks,
+/// or sensitive system prefixes.
+pub fn is_safe_labelmap_path_str(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.contains("..")
+        || trimmed.contains('\\')
+        || trimmed.chars().any(|c| c.is_control())
+    {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    for forbidden_prefix in [
+        "/proc",
+        "/sys",
+        "/etc",
+        "/dev",
+        "/root",
+        "/var/run",
+        "/run/secrets",
+    ] {
+        if lower == forbidden_prefix || lower.starts_with(&format!("{forbidden_prefix}/")) {
+            return false;
+        }
+    }
+    let path = Path::new(trimmed);
+    if !path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("txt"))
+    {
+        return false;
+    }
+    let mut normal_segments: Vec<String> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::ParentDir | std::path::Component::CurDir => return false,
+            std::path::Component::Normal(os) => {
+                let Some(s) = os.to_str() else {
+                    return false;
+                };
+                if s.starts_with('.') {
+                    return false;
+                }
+                normal_segments.push(s.to_ascii_lowercase());
+            }
+            _ => {}
+        }
+    }
+    if path.is_absolute()
+        && let Some(first) = normal_segments.first().map(String::as_str)
+    {
+        if matches!(first, "proc" | "sys" | "etc" | "dev" | "root") {
+            return false;
+        }
+        let second = normal_segments.get(1).map(String::as_str);
+        if (first == "var" && second == Some("run"))
+            || (first == "run" && second == Some("secrets"))
+        {
+            return false;
+        }
+    }
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return false;
+    }
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        let canon_str = canon.to_string_lossy().to_ascii_lowercase();
+        for forbidden_prefix in [
+            "/proc",
+            "/sys",
+            "/etc",
+            "/dev",
+            "/root",
+            "/var/run",
+            "/run/secrets",
+        ] {
+            if canon_str == forbidden_prefix
+                || canon_str.starts_with(&format!("{forbidden_prefix}/"))
+            {
+                return false;
+            }
+        }
+        if !canon
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("txt"))
+        {
+            return false;
+        }
+        if canon
+            .file_name()
+            .and_then(|f| f.to_str())
+            .is_none_or(|f| f.starts_with('.'))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Validates both the primary `model.labelmap_path` and every detector's `model.labelmap_path`.
+pub fn validate_config_labelmap_paths(cfg: &NinjaConfig) -> std::result::Result<(), &'static str> {
+    if !is_safe_labelmap_path_str(&cfg.model.labelmap_path) {
+        return Err(
+            "Invalid model.labelmap_path: must be a safe .txt path without '..', dotfiles, or system paths",
+        );
+    }
+    for det in cfg.detectors.values() {
+        if let Some(ref m) = det.model
+            && !is_safe_labelmap_path_str(&m.labelmap_path)
+        {
+            return Err(
+                "Invalid detector model.labelmap_path: must be a safe .txt path without '..', dotfiles, or system paths",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Returns `true` when a YAML mapping key holds a secret or credential that must be scrubbed.
+pub fn is_sensitive_yaml_secret_key_name(key: &str) -> bool {
+    matches!(
+        key.trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "password"
+            | "cloud_password"
+            | "pass"
+            | "passwd"
+            | "pwd"
+            | "api_key"
+            | "apikey"
+            | "secret"
+            | "client_secret"
+            | "token"
+            | "access_token"
+            | "auth_token"
+            | "webhook_secret"
+            | "jwt_secret"
+    )
+}
+
+fn collect_yaml_sensitive_secrets(val: &serde_yaml::Value, out: &mut Vec<String>) {
+    match val {
+        serde_yaml::Value::Mapping(map) => {
+            for (k, v) in map {
+                if let Some(k_str) = k.as_str()
+                    && is_sensitive_yaml_secret_key_name(k_str)
+                {
+                    let scalar_opt = match v {
+                        serde_yaml::Value::String(s) => Some(s.clone()),
+                        serde_yaml::Value::Number(n) => Some(n.to_string()),
+                        _ => None,
+                    };
+                    if let Some(s) = scalar_opt {
+                        let t = s.trim();
+                        if !t.is_empty()
+                            && !t.eq_ignore_ascii_case("null")
+                            && t != "~"
+                            && t != "***"
+                            && t != "*"
+                        {
+                            out.push(t.to_string());
+                            if t.contains('"') {
+                                out.push(t.replace('"', "\\\""));
+                            }
+                            if t.contains('\'') {
+                                out.push(t.replace('\'', "''"));
+                            }
+                            for line in s.lines() {
+                                let lt = line.trim();
+                                if lt.len() >= 3 && lt != "***" {
+                                    out.push(lt.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                collect_yaml_sensitive_secrets(v, out);
+            }
+        }
+        serde_yaml::Value::Sequence(seq) => {
+            for item in seq {
+                collect_yaml_sensitive_secrets(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Scrubs RTSP/HTTP URL credentials, sensitive YAML keys (including multiline block scalars),
+/// and known secret values from `raw_yaml`.
+pub fn scrub_raw_yaml_secrets_strict(raw_yaml: &str, cfg: &NinjaConfig) -> String {
+    let base_scrubbed = ninjanvr_config::scrub_yaml_credentials(raw_yaml);
+    let mut out = String::with_capacity(base_scrubbed.len());
+    let mut skip_block_scalar_indent: Option<usize> = None;
+    for chunk in base_scrubbed.split_inclusive('\n') {
+        let (line_body, newline) = if let Some(stripped) = chunk.strip_suffix("\r\n") {
+            (stripped, "\r\n")
+        } else if let Some(stripped) = chunk.strip_suffix('\n') {
+            (stripped, "\n")
+        } else {
+            (chunk, "")
+        };
+        let trimmed_start = line_body.trim_start();
+        let line_indent = line_body.len() - trimmed_start.len();
+        if let Some(base_indent) = skip_block_scalar_indent {
+            if trimmed_start.is_empty() || line_indent > base_indent {
+                continue;
+            }
+            skip_block_scalar_indent = None;
+        }
+        if trimmed_start.starts_with('#') || trimmed_start.is_empty() {
+            out.push_str(chunk);
+            continue;
+        }
+        let after_list = trimmed_start
+            .strip_prefix("- ")
+            .map_or(trimmed_start, |s| s.trim_start());
+        let prefix_len = line_body.len() - after_list.len();
+        let leading_prefix = &line_body[..prefix_len];
+        if let Some((raw_k, raw_v)) = after_list.split_once(':')
+            && is_sensitive_yaml_secret_key_name(raw_k)
+        {
+            let val_trimmed = raw_v.trim();
+            let unquoted = val_trimmed.trim_matches('"').trim_matches('\'').trim();
+            if unquoted.is_empty()
+                || unquoted.starts_with('#')
+                || unquoted.starts_with('|')
+                || unquoted.starts_with('>')
+            {
+                skip_block_scalar_indent = Some(line_indent);
+                out.push_str(leading_prefix);
+                out.push_str(raw_k.trim_end());
+                out.push_str(": \"***\"");
+                out.push_str(newline);
+                continue;
+            }
+            if !unquoted.eq_ignore_ascii_case("null") && unquoted != "~" && unquoted != "***" {
+                out.push_str(leading_prefix);
+                out.push_str(raw_k.trim_end());
+                out.push_str(": \"***\"");
+                out.push_str(newline);
+                continue;
+            }
+        }
+        out.push_str(line_body);
+        out.push_str(newline);
+    }
+
+    let mut known_secrets: Vec<String> = Vec::new();
+    if let Ok(parsed_yaml) = serde_yaml::from_str::<serde_yaml::Value>(raw_yaml) {
+        collect_yaml_sensitive_secrets(&parsed_yaml, &mut known_secrets);
+    }
+    if let Some(ref p) = cfg.mqtt.password {
+        let t = p.trim();
+        if !t.is_empty() && t != "***" && t != "*" {
+            known_secrets.push(t.to_string());
+        }
+    }
+    if let Some(ref k) = cfg.genai.api_key {
+        let t = k.trim();
+        if !t.is_empty() && t != "***" && t != "*" {
+            known_secrets.push(t.to_string());
+        }
+    }
+    for cam in cfg.cameras.values() {
+        if let Some(ref p) = cam.onvif.password {
+            let t = p.trim();
+            if !t.is_empty() && t != "***" && t != "*" {
+                known_secrets.push(t.to_string());
+            }
+        }
+        if let Some(ref cp) = cam.hardware.cloud_password {
+            let t = cp.trim();
+            if !t.is_empty() && t != "***" && t != "*" {
+                known_secrets.push(t.to_string());
+            }
+        }
+    }
+    for secret in &known_secrets {
+        if secret.len() >= 3 && out.contains(secret.as_str()) {
+            out = out.replace(secret.as_str(), "***");
+        }
+    }
+    out
+}
+
+/// Builds a sanitized, camera-scoped JSON representation of `cfg` for `/api/config`.
+pub fn to_scoped_api_config(cfg: &NinjaConfig, allowed_cameras: Option<&[String]>) -> Value {
+    let mut api_cfg = if validate_config_labelmap_paths(cfg).is_ok() {
+        cfg.to_api_config()
+    } else {
+        let mut safe_clone = cfg.clone();
+        if !is_safe_labelmap_path_str(&safe_clone.model.labelmap_path) {
+            safe_clone.model.labelmap_path = "/openvino-model/coco_91cl_bkgr.txt".to_string();
+        }
+        for det in safe_clone.detectors.values_mut() {
+            if let Some(ref mut m) = det.model
+                && !is_safe_labelmap_path_str(&m.labelmap_path)
+            {
+                m.labelmap_path = "/openvino-model/coco_91cl_bkgr.txt".to_string();
+            }
+        }
+        safe_clone.to_api_config()
+    };
+
+    if let Some(allowed) = allowed_cameras {
+        let is_cam_permitted = |cam_name: &str| allowed.iter().any(|a| a == cam_name || a == "*");
+        if let Some(cams_obj) = api_cfg.get_mut("cameras").and_then(|v| v.as_object_mut()) {
+            cams_obj.retain(|k, _| is_cam_permitted(k));
+        }
+        if let Some(streams_obj) = api_cfg
+            .get_mut("go2rtc")
+            .and_then(|g| g.get_mut("streams"))
+            .and_then(|v| v.as_object_mut())
+        {
+            streams_obj.retain(|k, _| {
+                let base_cam = k.strip_suffix("_sub").unwrap_or(k);
+                is_cam_permitted(base_cam)
+            });
+        }
+        if let Some(groups_obj) = api_cfg
+            .get_mut("camera_groups")
+            .and_then(|v| v.as_object_mut())
+        {
+            groups_obj.retain(|_, grp_val| {
+                if let Some(cams_arr) = grp_val.get_mut("cameras").and_then(|v| v.as_array_mut()) {
+                    cams_arr.retain(|c| c.as_str().is_some_and(is_cam_permitted));
+                    !cams_arr.is_empty()
+                } else {
+                    false
+                }
+            });
+        }
+        if let Some(profiles_obj) = api_cfg.get_mut("profiles").and_then(|v| v.as_object_mut()) {
+            for prof_val in profiles_obj.values_mut() {
+                if let Some(prof_cams) = prof_val.get_mut("cameras").and_then(|v| v.as_object_mut())
+                {
+                    prof_cams.retain(|k, _| is_cam_permitted(k));
+                }
+                for arr_key in ["disabled_alerts_cameras", "disabled_record_cameras"] {
+                    if let Some(arr) = prof_val.get_mut(arr_key).and_then(|v| v.as_array_mut()) {
+                        arr.retain(|c| c.as_str().is_some_and(is_cam_permitted));
+                    }
+                }
+            }
+        }
+        if let Some(rooms_arr) = api_cfg
+            .get_mut("ui")
+            .and_then(|u| u.get_mut("floorplan"))
+            .and_then(|f| f.get_mut("rooms"))
+            .and_then(|v| v.as_array_mut())
+        {
+            for room in rooms_arr.iter_mut() {
+                if let Some(room_obj) = room.as_object_mut()
+                    && let Some(cam_str) = room_obj.get("camera").and_then(|v| v.as_str())
+                    && !cam_str.is_empty()
+                    && !is_cam_permitted(cam_str)
+                {
+                    room_obj.insert("camera".to_string(), Value::Null);
+                }
+            }
+        }
+    }
+    api_cfg
+}
+
+/// A deploy is rolled back only when it would take a working detector offline: the new model
+/// failed to load while the previous one was running. When no model was loaded before (no
+/// OpenVINO runtime, first deploy) the new config is kept so a later runtime fix picks it up.
+pub fn should_rollback_model_deploy(was_loaded: bool, now_loaded: bool) -> bool {
+    was_loaded && !now_loaded
+}
+
+/// Computes which cameras require `CameraDriverRuntime` cache invalidation when transitioning
+/// from `prev_cfg` to `next_cfg`.
+pub fn diff_driver_invalidated_cameras(
+    prev_cfg: &NinjaConfig,
+    next_cfg: &NinjaConfig,
+) -> Vec<String> {
+    let mut changed = Vec::new();
+    for (cam, prev_cam) in &prev_cfg.cameras {
+        match next_cfg.cameras.get(cam) {
+            None => changed.push(cam.clone()),
+            Some(next_cam) => {
+                let onvif_diff = serde_json::to_value(&prev_cam.onvif).ok()
+                    != serde_json::to_value(&next_cam.onvif).ok();
+                let hw_diff = serde_json::to_value(&prev_cam.hardware).ok()
+                    != serde_json::to_value(&next_cam.hardware).ok();
+                let ffmpeg_diff = serde_json::to_value(&prev_cam.ffmpeg.inputs).ok()
+                    != serde_json::to_value(&next_cam.ffmpeg.inputs).ok();
+                let webui_diff = prev_cam.webui_url != next_cam.webui_url;
+                let upstream_diff =
+                    prev_cfg.infer_camera_upstream(cam) != next_cfg.infer_camera_upstream(cam);
+                if onvif_diff || hw_diff || ffmpeg_diff || webui_diff || upstream_diff {
+                    changed.push(cam.clone());
+                }
+            }
+        }
+    }
+    for cam in next_cfg.cameras.keys() {
+        if !prev_cfg.cameras.contains_key(cam) && !changed.contains(cam) {
+            changed.push(cam.clone());
+        }
+    }
+    changed
+}
 
 /// Atomically persists `raw_yaml` to `path` using a randomized `0o600` `O_NOFOLLOW`
 /// temporary file in the same directory followed by `sync_all()` and `rename()`.
@@ -144,12 +592,6 @@ impl ConfigCoordinator {
         &self.config
     }
 
-    /// Acquires the instance-scoped configuration commit lock so full config saves,
-    /// structured patches, model deployments, and camera mutations never interleave.
-    pub async fn lock_commit(&self) -> MutexGuard<'_, ()> {
-        self.commit_lock.lock().await
-    }
-
     /// Persists `cfg.raw_yaml` atomically to `cfg.config_path` (when non-empty) and
     /// synchronizes the `go2rtc` configuration to `DEFAULT_GO2RTC_SHM_PATH`.
     pub fn persist_and_sync_go2rtc(cfg: &NinjaConfig) -> Result<()> {
@@ -177,6 +619,171 @@ impl ConfigCoordinator {
             }
         }
         Ok(())
+    }
+
+    /// Atomically validates, restores scrubbed secrets from the previous config, persists
+    /// `config.yml` and `go2rtc.yaml`, reloads `detector`, swaps the active `NinjaConfig`,
+    /// and invalidates any modified cameras in `camera_runtime`.
+    pub async fn commit_raw_yaml(
+        &self,
+        raw_yaml: &str,
+        detector: Option<&Arc<AiDetectorEngine>>,
+        camera_runtime: Option<&CameraDriverRuntime>,
+    ) -> std::result::Result<NinjaConfig, ConfigCommitError> {
+        let _commit_guard = self.commit_lock.lock().await;
+        let prev_cfg = self.config.read().await.clone();
+        let path = prev_cfg.config_path.clone();
+        let mut next_cfg = NinjaConfig::from_yaml_str(raw_yaml, path)
+            .map_err(|err| ConfigCommitError::Validation(err.to_string()))?;
+        validate_config_labelmap_paths(&next_cfg)
+            .map_err(|msg| ConfigCommitError::Validation(msg.to_string()))?;
+        next_cfg.restore_scrubbed_from_previous(&prev_cfg);
+        validate_config_labelmap_paths(&next_cfg)
+            .map_err(|msg| ConfigCommitError::Validation(msg.to_string()))?;
+
+        let invalidated_cameras = diff_driver_invalidated_cameras(&prev_cfg, &next_cfg);
+        let go2rtc_target = self.go2rtc_config_path.clone();
+        let det_opt = detector.cloned();
+        let next_cfg =
+            tokio::task::spawn_blocking(move || -> std::result::Result<NinjaConfig, String> {
+                Self::persist_and_sync_go2rtc_with_path(&next_cfg, &go2rtc_target)
+                    .map_err(|err| err.to_string())?;
+                if let Some(det) = det_opt {
+                    det.reload(&next_cfg);
+                }
+                Ok(next_cfg)
+            })
+            .await
+            .map_err(|e| ConfigCommitError::Persistence(e.to_string()))?
+            .map_err(ConfigCommitError::Persistence)?;
+
+        *self.config.write().await = next_cfg.clone();
+        if let Some(rt) = camera_runtime {
+            for cam in &invalidated_cameras {
+                rt.invalidate_camera(cam);
+            }
+        }
+        Ok(next_cfg)
+    }
+
+    /// Atomically applies a structured JSON configuration patch, validates labelmap paths,
+    /// persists `config.yml` and `go2rtc.yaml`, reloads `detector`, swaps the active `NinjaConfig`,
+    /// and invalidates any modified cameras in `camera_runtime`.
+    pub async fn commit_structured_patch(
+        &self,
+        patch: &Value,
+        detector: Option<&Arc<AiDetectorEngine>>,
+        camera_runtime: Option<&CameraDriverRuntime>,
+    ) -> std::result::Result<StructuredConfigCommitOutcome, ConfigCommitError> {
+        let _commit_guard = self.commit_lock.lock().await;
+        let prev_cfg = self.config.read().await.clone();
+        let mut next_cfg = prev_cfg.clone();
+        next_cfg
+            .apply_structured_json(patch)
+            .map_err(|err| ConfigCommitError::Validation(format!("{err:#}")))?;
+        validate_config_labelmap_paths(&next_cfg)
+            .map_err(|msg| ConfigCommitError::Validation(msg.to_string()))?;
+
+        let invalidated_cameras = diff_driver_invalidated_cameras(&prev_cfg, &next_cfg);
+        let go2rtc_target = self.go2rtc_config_path.clone();
+        let det_opt = detector.cloned();
+        let (next_cfg, api_config, scrubbed_raw_yaml) = tokio::task::spawn_blocking(
+            move || -> std::result::Result<(NinjaConfig, Value, String), String> {
+                Self::persist_and_sync_go2rtc_with_path(&next_cfg, &go2rtc_target)
+                    .map_err(|err| err.to_string())?;
+                if let Some(det) = det_opt {
+                    det.reload(&next_cfg);
+                }
+                let api_cfg = next_cfg.to_api_config();
+                let raw_yaml = scrub_raw_yaml_secrets_strict(&next_cfg.raw_yaml, &next_cfg);
+                Ok((next_cfg, api_cfg, raw_yaml))
+            },
+        )
+        .await
+        .map_err(|e| ConfigCommitError::Persistence(e.to_string()))?
+        .map_err(ConfigCommitError::Persistence)?;
+
+        *self.config.write().await = next_cfg.clone();
+        if let Some(rt) = camera_runtime {
+            for cam in &invalidated_cameras {
+                rt.invalidate_camera(cam);
+            }
+        }
+        Ok(StructuredConfigCommitOutcome {
+            config: next_cfg,
+            api_config,
+            scrubbed_raw_yaml,
+            invalidated_cameras,
+        })
+    }
+
+    /// Atomically applies a detector `model_patch`, reloads `detector` with `labelmap`,
+    /// rolls back `detector` if the new model would take a previously working detector offline,
+    /// and otherwise persists `config.yml` and swaps the active `NinjaConfig`.
+    pub async fn deploy_detector_model(
+        &self,
+        model_patch: &Value,
+        labelmap: BTreeMap<i32, String>,
+        detector: &Arc<AiDetectorEngine>,
+    ) -> std::result::Result<ModelDeployOutcome, ConfigCommitError> {
+        let _commit_guard = self.commit_lock.lock().await;
+        let prev_cfg = self.config.read().await.clone();
+        let mut next_cfg = prev_cfg.clone();
+        next_cfg
+            .apply_structured_json(model_patch)
+            .map_err(|err| ConfigCommitError::Validation(format!("{err:#}")))?;
+        validate_config_labelmap_paths(&next_cfg)
+            .map_err(|msg| ConfigCommitError::Validation(msg.to_string()))?;
+
+        let det_for_reload = detector.clone();
+        let cfg_for_reload = next_cfg.clone();
+        let (was_loaded, now_loaded) = tokio::task::spawn_blocking(move || {
+            let was_loaded = det_for_reload.runtime_catalog().loaded;
+            det_for_reload.reload(&cfg_for_reload);
+            let now_loaded = det_for_reload.runtime_catalog().loaded;
+            if !should_rollback_model_deploy(was_loaded, now_loaded) {
+                det_for_reload.set_labelmap(labelmap);
+            }
+            (was_loaded, now_loaded)
+        })
+        .await
+        .map_err(|e| ConfigCommitError::Persistence(format!("Detector reload task failed: {e}")))?;
+
+        if should_rollback_model_deploy(was_loaded, now_loaded) {
+            let det_for_rollback = detector.clone();
+            let prev_for_rollback = prev_cfg.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                det_for_rollback.reload(&prev_for_rollback);
+            })
+            .await;
+            return Ok(ModelDeployOutcome::RolledBack {
+                previous_model_path: prev_cfg.model.path,
+            });
+        }
+
+        let go2rtc_target = self.go2rtc_config_path.clone();
+        let cfg_for_persist = next_cfg.clone();
+        let persisted_res = tokio::task::spawn_blocking(move || {
+            Self::persist_and_sync_go2rtc_with_path(&cfg_for_persist, &go2rtc_target)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
+        .and_then(|r| r);
+
+        let persisted = match persisted_res {
+            Ok(()) => true,
+            Err(err) => {
+                warn!("Uploaded model is active but config.yml could not be updated: {err:#}");
+                false
+            }
+        };
+        if persisted || next_cfg.config_path.as_os_str().is_empty() {
+            *self.config.write().await = next_cfg;
+        }
+        Ok(ModelDeployOutcome::Deployed {
+            loaded: now_loaded,
+            persisted,
+        })
     }
 
     /// Serializes a camera-scoped configuration mutation under the instance commit lock,
@@ -513,5 +1120,121 @@ cameras:
             Some("Profile000"),
             "other cameras in CameraDriverRuntime must remain untouched"
         );
+    }
+
+    #[tokio::test]
+    async fn commit_raw_yaml_and_structured_patch_restore_secrets_and_invalidate_modified_cameras()
+    {
+        use serde_json::json;
+
+        let dir = TempTestDir::new("transactional_commits");
+        let cfg_path = dir.path().join("config.yml");
+        let go2rtc_path = dir.path().join("go2rtc.yaml");
+        let initial_yaml = r#"
+mqtt:
+  enabled: true
+  password: "mqtt_super_secret_pw"
+cameras:
+  front_door:
+    enabled: true
+    onvif:
+      host: "192.0.2.10"
+      port: 2020
+      user: "admin"
+      password: "onvif_secret_password"
+    ffmpeg:
+      inputs:
+        - path: rtsp://admin:rtsp_secret@192.0.2.10:554/stream1
+          roles: [detect, record]
+  side_gate:
+    enabled: true
+    onvif:
+      host: "192.0.2.11"
+      port: 80
+    ffmpeg:
+      inputs:
+        - path: rtsp://admin:gate_secret@192.0.2.11:554/stream1
+          roles: [detect, record]
+"#;
+        let initial_cfg = NinjaConfig::from_yaml_str(initial_yaml, cfg_path.clone()).unwrap();
+        persist_config_yaml_atomically(&cfg_path, &initial_cfg.raw_yaml).unwrap();
+
+        let coordinator = ConfigCoordinator::new(Arc::new(RwLock::new(initial_cfg.clone())))
+            .with_go2rtc_config_path(&go2rtc_path);
+        let runtime = CameraDriverRuntime::new();
+        runtime.set_profile(
+            "front_door",
+            "http://192.0.2.10:2020/onvif/service",
+            "profile_1",
+        );
+        runtime.set_profile(
+            "side_gate",
+            "http://192.0.2.11:80/onvif/ptz_service",
+            "Profile000",
+        );
+
+        // 1. Raw YAML save with scrubbed secrets restores secrets and invalidates only changed camera
+        let scrubbed_base = scrub_raw_yaml_secrets_strict(&initial_cfg.raw_yaml, &initial_cfg);
+        let scrubbed_update = scrubbed_base.replace("192.0.2.10", "192.0.2.99");
+        let committed = coordinator
+            .commit_raw_yaml(&scrubbed_update, None, Some(&runtime))
+            .await
+            .expect("commit_raw_yaml should succeed");
+        assert_eq!(
+            committed.mqtt.password.as_deref(),
+            Some("mqtt_super_secret_pw")
+        );
+        assert_eq!(
+            committed.cameras["front_door"].onvif.password.as_deref(),
+            Some("onvif_secret_password")
+        );
+        assert_eq!(
+            runtime.get_profile("front_door", "http://192.0.2.10:2020/onvif/service"),
+            None,
+            "modified camera must be invalidated on raw YAML save"
+        );
+        assert_eq!(
+            runtime
+                .get_profile("side_gate", "http://192.0.2.11:80/onvif/ptz_service")
+                .as_deref(),
+            Some("Profile000"),
+            "unmodified camera must keep its cached profile"
+        );
+
+        // 2. Unsafe labelmap path in structured patch is rejected without modifying config
+        let bad_patch = json!({
+            "model": {
+                "labelmap_path": "/etc/passwd"
+            }
+        });
+        assert!(matches!(
+            coordinator
+                .commit_structured_patch(&bad_patch, None, Some(&runtime))
+                .await,
+            Err(ConfigCommitError::Validation(_))
+        ));
+
+        // 3. Valid structured patch updates side_gate while keeping front_door intact, invalidating only side_gate
+        let good_patch = json!({
+            "cameras": {
+                "front_door": {},
+                "side_gate": {
+                    "onvif": {
+                        "port": 8080
+                    }
+                }
+            }
+        });
+        let outcome = coordinator
+            .commit_structured_patch(&good_patch, None, Some(&runtime))
+            .await
+            .expect("structured patch should succeed");
+        assert_eq!(outcome.invalidated_cameras, vec!["side_gate".to_string()]);
+        assert_eq!(
+            runtime.get_profile("side_gate", "http://192.0.2.11:80/onvif/ptz_service"),
+            None
+        );
+        assert!(!outcome.scrubbed_raw_yaml.contains("mqtt_super_secret_pw"));
+        assert!(!outcome.scrubbed_raw_yaml.contains("onvif_secret_password"));
     }
 }

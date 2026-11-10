@@ -18,11 +18,9 @@ import {
 import { SettingsScopeDivider } from "../../components/SettingsScopeDivider";
 import {
   CAMERA_PROTOCOL_CATALOG,
+  applyCameraHardwarePatch,
   findCameraProtocolDescriptor,
   getCachedCameraHardware,
-  invalidateCameraHardwareCache,
-  isConfigPersistenceHardwarePatch,
-  mergeOptimisticCameraHardwareInfo,
   probeCameraHardwareAndPtz,
   setCachedCameraHardware,
 } from "../../utils/cameraCapabilities";
@@ -875,26 +873,11 @@ export const ChannelsStreamsSection: React.FC<{
     if (!targetCam) return;
     setHwProbeBusy(true);
     try {
-      const res = await fetch(`/api/${encodeURIComponent(targetCam)}/hardware`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify(patch),
-      });
-      const data = await res.json().catch(() => null);
-      if (inspectorCamRef.current !== targetCam) return;
-      if (res.ok && data?.success) {
-        const isConfigPersistencePatch = isConfigPersistenceHardwarePatch(patch);
-        setHwProbeResult((prev) => {
-          const base = prev ?? getCachedCameraHardware(targetCam);
-          const merged = mergeOptimisticCameraHardwareInfo(base, patch, data);
-          if (merged) {
-            setCachedCameraHardware(targetCam, merged);
-          }
-          return merged;
-        });
-        if (isConfigPersistencePatch) {
-          invalidateCameraHardwareCache(targetCam);
+      if (hwProbeResult && !getCachedCameraHardware(targetCam)) {
+        setCachedCameraHardware(targetCam, hwProbeResult);
+      }
+      const res = await applyCameraHardwarePatch(targetCam, patch, {
+        onConfigPersisted: async () => {
           try {
             const cfgRes = await fetch("/api/config", { credentials: "include" });
             if (cfgRes.ok) {
@@ -904,7 +887,12 @@ export const ChannelsStreamsSection: React.FC<{
           } catch {
             // ignore
           }
-          void handleRunHardwareDiscovery(true);
+        },
+      });
+      if (inspectorCamRef.current !== targetCam) return;
+      if (res.ok) {
+        if (res.hardware) {
+          setHwProbeResult(res.hardware);
         }
         notify(
           isPt
@@ -912,7 +900,11 @@ export const ChannelsStreamsSection: React.FC<{
             : `Applied hardware control on '${targetCam}'`
         );
       } else {
-        notify(data?.error || data?.message || "Hardware control request failed");
+        const errMsg =
+          (typeof res.data?.error === "string" && res.data.error) ||
+          (typeof res.data?.message === "string" && res.data.message) ||
+          "Hardware control request failed";
+        notify(errMsg);
       }
     } catch {
       if (inspectorCamRef.current === targetCam) {

@@ -12,6 +12,7 @@ import {
   resolveKnownPlateLabel,
   validateLicensePlateFormat,
 } from "./configYaml";
+import { shouldRunFallbackAutoAnnotate } from "./datasetStudio";
 
 export {
   DEFAULT_LPR_FORMAT_REGEX,
@@ -20,6 +21,17 @@ export {
   resolveKnownPlateLabel,
   validateLicensePlateFormat,
 };
+
+export function isSafeDatasetSampleId(id: unknown): id is string {
+  return (
+    typeof id === "string" &&
+    id.length > 0 &&
+    id.length <= 128 &&
+    id !== "." &&
+    !id.includes("..") &&
+    /^[A-Za-z0-9_.-]+$/.test(id)
+  );
+}
 
 export const MAX_FORENSIC_EXPORT_WINDOW_SEC = 86400;
 export const REVIEW_PRESETS_STORAGE_KEY = "ninjanvr_saved_filters";
@@ -675,6 +687,57 @@ export interface SaveForensicNoteResult {
   shouldApply: boolean;
 }
 
+export interface ToggleFalsePositiveOptions {
+  getActiveTargetId?: () => string | null | undefined;
+  isCancelled?: () => boolean;
+}
+
+export interface ToggleFalsePositiveResult {
+  stale: boolean;
+  shouldApply: boolean;
+  ok: boolean;
+  nextFp: boolean;
+  message?: string;
+}
+
+export interface VerifyWithAiOptions {
+  getActiveTargetId?: () => string | null | undefined;
+  isCancelled?: () => boolean;
+}
+
+export interface VerifyWithAiResult {
+  stale: boolean;
+  shouldApply: boolean;
+  ok: boolean;
+  verified: boolean;
+  verifiedBy?: string;
+  reason?: string;
+  error?: string;
+  falsePositive?: boolean;
+  aiVerification?: AiVerificationResult;
+}
+
+export interface AddEventToDatasetOptions {
+  eventId: string;
+  camera: string;
+  label: string;
+  timestamp?: number;
+  autoAnnotate?: boolean;
+  getActiveTargetId?: () => string | null | undefined;
+  isCancelled?: () => boolean;
+}
+
+export interface AddEventToDatasetResult {
+  stale: boolean;
+  shouldApply: boolean;
+  ok: boolean;
+  id?: string;
+  split?: string;
+  autoAnnotated: boolean;
+  annotationCount: number;
+  error?: string;
+}
+
 export interface ForensicTriageController {
   setActiveTarget: (
     targetKind: "event" | "review",
@@ -685,10 +748,16 @@ export interface ForensicTriageController {
   fetchEnrolledFaces: (
     options?: FetchEnrolledFacesOptions
   ) => Promise<EnrolledFaceProfileItem[]>;
+  fetchEnrolledFaceNames: (
+    options?: FetchEnrolledFacesOptions
+  ) => Promise<string[]>;
   assignFaceSubLabel: (
     options: AssignFaceSubLabelOptions
   ) => Promise<AssignFaceSubLabelResult>;
   batchAssignFaceSubLabel: (
+    options: BatchAssignFaceSubLabelOptions
+  ) => Promise<BatchAssignFaceSubLabelResult>;
+  batchAssignFace: (
     options: BatchAssignFaceSubLabelOptions
   ) => Promise<BatchAssignFaceSubLabelResult>;
   saveLicensePlate: (
@@ -697,6 +766,18 @@ export interface ForensicTriageController {
   saveForensicNote: (
     options: SaveForensicNoteOptions
   ) => Promise<SaveForensicNoteResult>;
+  toggleFalsePositive: (
+    eventId: string,
+    currentFp: boolean,
+    options?: ToggleFalsePositiveOptions
+  ) => Promise<ToggleFalsePositiveResult>;
+  verifyWithAi: (
+    eventId: string,
+    options?: VerifyWithAiOptions
+  ) => Promise<VerifyWithAiResult>;
+  addEventToDataset: (
+    params: AddEventToDatasetOptions
+  ) => Promise<AddEventToDatasetResult>;
   loadFilterPresets: {
     (kind: "review"): SavedReviewFilterPreset[];
     (kind: "explore"): SavedExploreFilterPreset[];
@@ -753,10 +834,16 @@ export function createForensicTriageController(
 
   let mutationSeq = 0;
   let targetEpoch = 0;
-  const opSeqByKind: Record<"face" | "plate" | "note", number> = {
+  const opSeqByKind: Record<
+    "face" | "plate" | "note" | "falsePositive" | "verifyAi" | "dataset",
+    number
+  > = {
     face: 0,
     plate: 0,
     note: 0,
+    falsePositive: 0,
+    verifyAi: 0,
+    dataset: 0,
   };
   const activeTargetByKind: Record<"event" | "review", string | null> = {
     event: null,
@@ -792,7 +879,7 @@ export function createForensicTriageController(
   const getMutationSequence = (): number => mutationSeq;
 
   const evaluateMutationFreshness = (
-    opKind: "face" | "plate" | "note",
+    opKind: "face" | "plate" | "note" | "falsePositive" | "verifyAi" | "dataset",
     reqEpoch: number,
     reqOpSeq: number,
     targetKind: "event" | "review",
@@ -1168,6 +1255,8 @@ export function createForensicTriageController(
     const succeededIds: string[] = [];
     const failedIds: string[] = [];
     let totalBackfilled = 0;
+    let lastEnrolledEventId: string | null = null;
+    let backfillRan = false;
 
     options.onProgress?.({
       active: true,
@@ -1183,21 +1272,28 @@ export function createForensicTriageController(
         const primaryEventId = (item.primaryEventId || item.id).trim();
         const isLast = i === normalizedItems.length - 1;
         if (primaryEventId) {
-          const res = enrollInGallery
-            ? await fetchFn(
-                `/api/faces/${encodeURIComponent(cleanName)}/enroll`,
-                {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  credentials: "include",
-                  body: JSON.stringify({
-                    event_id: primaryEventId,
-                    assign_sub_label: true,
-                    backfill_events: isLast,
-                  }),
-                }
-              )
-            : await fetchFn(
+          let res: Response;
+          if (enrollInGallery) {
+            res = await fetchFn(
+              `/api/faces/${encodeURIComponent(cleanName)}/enroll`,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                credentials: "include",
+                body: JSON.stringify({
+                  event_id: primaryEventId,
+                  assign_sub_label: true,
+                  backfill_events: isLast,
+                }),
+              }
+            );
+            if (res.ok) {
+              lastEnrolledEventId = primaryEventId;
+              if (isLast) {
+                backfillRan = true;
+              }
+            } else {
+              res = await fetchFn(
                 `/api/events/${encodeURIComponent(primaryEventId)}/sub_label`,
                 {
                   method: "POST",
@@ -1206,10 +1302,26 @@ export function createForensicTriageController(
                   body: JSON.stringify({
                     sub_label: cleanName,
                     sub_label_score: 1.0,
-                    enroll_face: false,
+                    enroll_face: true,
                   }),
                 }
               );
+            }
+          } else {
+            res = await fetchFn(
+              `/api/events/${encodeURIComponent(primaryEventId)}/sub_label`,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                credentials: "include",
+                body: JSON.stringify({
+                  sub_label: cleanName,
+                  sub_label_score: 1.0,
+                  enroll_face: false,
+                }),
+              }
+            );
+          }
           if (res.ok) {
             succeededIds.push(item.id);
             const data = await res.json().catch(() => null);
@@ -1238,6 +1350,37 @@ export function createForensicTriageController(
           });
         }
       }
+
+      if (
+        enrollInGallery &&
+        lastEnrolledEventId &&
+        !backfillRan &&
+        !options.isCancelled?.()
+      ) {
+        const bfRes = await fetchFn(
+          `/api/faces/${encodeURIComponent(cleanName)}/enroll`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+            body: JSON.stringify({
+              event_id: lastEnrolledEventId,
+              assign_sub_label: true,
+              backfill_events: true,
+            }),
+          }
+        ).catch(() => null);
+        if (bfRes?.ok) {
+          const bfData = await bfRes.json().catch(() => null);
+          const bf = Number(
+            (bfData as Record<string, unknown> | null)?.backfilled_events || 0
+          );
+          if (Number.isFinite(bf) && bf > 0) {
+            totalBackfilled += bf;
+          }
+        }
+      }
+
       return {
         ok: succeededIds.length > 0,
         invalidName: false,
@@ -1389,6 +1532,390 @@ export function createForensicTriageController(
       message,
       stale,
       shouldApply,
+    };
+  };
+
+  const fetchEnrolledFaceNames = async (
+    options?: FetchEnrolledFacesOptions
+  ): Promise<string[]> => {
+    const profiles = await fetchEnrolledFaces(options);
+    return Array.from(
+      new Set(profiles.map((p) => p.name.trim()).filter(Boolean))
+    ).sort((a, b) => a.localeCompare(b));
+  };
+
+  const toggleFalsePositive = async (
+    eventId: string,
+    currentFp: boolean,
+    options?: ToggleFalsePositiveOptions
+  ): Promise<ToggleFalsePositiveResult> => {
+    const cleanEventId = (eventId || "").trim();
+    const desiredFp = !currentFp;
+    if (!cleanEventId) {
+      return {
+        stale: false,
+        shouldApply: false,
+        ok: false,
+        nextFp: currentFp,
+      };
+    }
+
+    mutationSeq += 1;
+    const reqOpSeq = ++opSeqByKind.falsePositive;
+    const reqEpoch = targetEpoch;
+
+    let res = await fetchFn(
+      `/api/events/${encodeURIComponent(cleanEventId)}/false_positive`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ false_positive: desiredFp }),
+      }
+    );
+    if (res.status === 404 || res.status === 405) {
+      res = await fetchFn(
+        `/api/events/${encodeURIComponent(cleanEventId)}/false-positive`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ false_positive: desiredFp }),
+        }
+      );
+    }
+
+    const rawData = await res.json().catch(() => null);
+    const rec =
+      rawData && typeof rawData === "object"
+        ? (rawData as Record<string, unknown>)
+        : null;
+    const resolvedFp =
+      rec && typeof rec.false_positive === "boolean"
+        ? rec.false_positive
+        : res.ok
+        ? desiredFp
+        : currentFp;
+    const message =
+      rec && typeof rec.message === "string"
+        ? rec.message
+        : rec && typeof rec.error === "string"
+        ? rec.error
+        : undefined;
+
+    const { stale, shouldApply } = evaluateMutationFreshness(
+      "falsePositive",
+      reqEpoch,
+      reqOpSeq,
+      "event",
+      cleanEventId,
+      res.ok,
+      options?.getActiveTargetId,
+      options?.isCancelled
+    );
+
+    return {
+      stale,
+      shouldApply,
+      ok: res.ok,
+      nextFp: resolvedFp,
+      ...(message ? { message } : {}),
+    };
+  };
+
+  const verifyWithAi = async (
+    eventId: string,
+    options?: VerifyWithAiOptions
+  ): Promise<VerifyWithAiResult> => {
+    const cleanEventId = (eventId || "").trim();
+    if (!cleanEventId) {
+      return {
+        stale: false,
+        shouldApply: false,
+        ok: false,
+        verified: false,
+        error: "Missing event ID",
+      };
+    }
+
+    mutationSeq += 1;
+    const reqOpSeq = ++opSeqByKind.verifyAi;
+    const reqEpoch = targetEpoch;
+
+    const res = await fetchFn(
+      `/api/events/${encodeURIComponent(cleanEventId)}/verify-ai`,
+      {
+        method: "POST",
+        credentials: "include",
+      }
+    );
+
+    const rawData = await res.json().catch(() => null);
+    const rec =
+      rawData && typeof rawData === "object"
+        ? (rawData as Record<string, unknown>)
+        : null;
+
+    const { stale, shouldApply } = evaluateMutationFreshness(
+      "verifyAi",
+      reqEpoch,
+      reqOpSeq,
+      "event",
+      cleanEventId,
+      Boolean(res.ok && rec),
+      options?.getActiveTargetId,
+      options?.isCancelled
+    );
+
+    if (!res.ok || !rec) {
+      const errMsg =
+        (rec && typeof rec.error === "string" && rec.error) ||
+        (rec && typeof rec.message === "string" && rec.message) ||
+        "Vision AI Judge verification failed";
+      return {
+        stale,
+        shouldApply: false,
+        ok: false,
+        verified: false,
+        error: errMsg,
+      };
+    }
+
+    const nestedVerdict =
+      rec.ai_verification && typeof rec.ai_verification === "object"
+        ? (rec.ai_verification as Partial<AiVerificationResult>)
+        : null;
+    const rawConf = Number(nestedVerdict?.confidence ?? rec.confidence ?? 0.9);
+    const isTruePositive =
+      typeof rec.verified === "boolean"
+        ? rec.verified
+        : typeof nestedVerdict?.is_true_positive === "boolean"
+        ? nestedVerdict.is_true_positive
+        : Boolean(rec.is_true_positive);
+    const reason = String(
+      nestedVerdict?.reason || rec.reason || "Verified by Vision AI Judge"
+    );
+    const verifiedBy =
+      (typeof rec.verified_by === "string" && rec.verified_by) ||
+      (typeof rec.verifiedBy === "string" && rec.verifiedBy) ||
+      (typeof nestedVerdict?.provider === "string" && nestedVerdict.provider) ||
+      (typeof rec.provider === "string" && rec.provider) ||
+      (typeof nestedVerdict?.model === "string" && nestedVerdict.model) ||
+      (typeof rec.model === "string" && rec.model) ||
+      undefined;
+
+    const aiVerification: AiVerificationResult = {
+      is_true_positive: isTruePositive,
+      confidence: Number.isFinite(rawConf) ? rawConf : 0.9,
+      reason,
+      provider:
+        typeof nestedVerdict?.provider === "string"
+          ? nestedVerdict.provider
+          : typeof rec.provider === "string"
+          ? rec.provider
+          : undefined,
+      model:
+        typeof nestedVerdict?.model === "string"
+          ? nestedVerdict.model
+          : typeof rec.model === "string"
+          ? rec.model
+          : undefined,
+      verified_at:
+        typeof nestedVerdict?.verified_at === "number"
+          ? nestedVerdict.verified_at
+          : typeof rec.verified_at === "number"
+          ? rec.verified_at
+          : undefined,
+    };
+
+    return {
+      stale,
+      shouldApply,
+      ok: true,
+      verified: isTruePositive,
+      ...(verifiedBy ? { verifiedBy } : {}),
+      reason,
+      ...(rec.false_positive !== undefined
+        ? { falsePositive: Boolean(rec.false_positive) }
+        : {}),
+      aiVerification,
+    };
+  };
+
+  const addEventToDataset = async (
+    params: AddEventToDatasetOptions
+  ): Promise<AddEventToDatasetResult> => {
+    const cleanEventId = (params.eventId || "").trim();
+    if (!cleanEventId) {
+      return {
+        stale: false,
+        shouldApply: false,
+        ok: false,
+        autoAnnotated: false,
+        annotationCount: 0,
+        error: "Missing event ID",
+      };
+    }
+
+    mutationSeq += 1;
+    const reqOpSeq = ++opSeqByKind.dataset;
+    const reqEpoch = targetEpoch;
+    const autoAnnotate = params.autoAnnotate ?? true;
+
+    const requestBody = JSON.stringify({
+      event_id: cleanEventId,
+      camera: params.camera,
+      label: params.label,
+      ...(params.timestamp !== undefined ? { timestamp: params.timestamp } : {}),
+      auto_annotate: autoAnnotate,
+    });
+
+    let res = await fetchFn(
+      `/api/dataset/samples/from-event/${encodeURIComponent(cleanEventId)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: requestBody,
+      }
+    );
+    if (res.status === 404 || res.status === 405) {
+      res = await fetchFn("/api/dataset/samples/from-event", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: requestBody,
+      });
+    }
+
+    const rawData = await res.json().catch(() => null);
+    const data =
+      rawData && typeof rawData === "object"
+        ? (rawData as Record<string, unknown> & {
+            sample?: Record<string, unknown> | null;
+          })
+        : null;
+
+    if (!res.ok || !data) {
+      const { stale } = evaluateMutationFreshness(
+        "dataset",
+        reqEpoch,
+        reqOpSeq,
+        "event",
+        cleanEventId,
+        false,
+        params.getActiveTargetId,
+        params.isCancelled
+      );
+      const errMsg =
+        (data && typeof data.error === "string" && data.error) ||
+        (data && typeof data.message === "string" && data.message) ||
+        "Failed to add event snapshot to training dataset";
+      return {
+        stale,
+        shouldApply: false,
+        ok: false,
+        autoAnnotated: false,
+        annotationCount: 0,
+        error: errMsg,
+      };
+    }
+
+    const rawSampleId = String(
+      data.id || data.sample?.id || `ds_${cleanEventId}`
+    ).trim();
+    const sampleKind = String(
+      data.sample_kind || data.sample?.sample_kind || ""
+    )
+      .trim()
+      .toLowerCase();
+    let split = String(data.split || data.sample?.split || "train");
+    const initialAnns = Array.isArray(data.annotations)
+      ? data.annotations
+      : Array.isArray(data.sample?.annotations)
+      ? data.sample.annotations
+      : null;
+
+    let autoAnnotated = Boolean(
+      data.auto_annotated === true ||
+        sampleKind === "ai_annotated" ||
+        (initialAnns && initialAnns.length > 0 && data.auto_annotate_attempted !== false)
+    );
+    let annotationCount = Array.isArray(initialAnns)
+      ? initialAnns.length
+      : typeof data.annotation_count === "number"
+      ? data.annotation_count
+      : 0;
+
+    if (
+      !autoAnnotated &&
+      isSafeDatasetSampleId(rawSampleId) &&
+      shouldRunFallbackAutoAnnotate(
+        data as {
+          sample_kind?: string;
+          sample?: { sample_kind?: string } | null;
+          auto_annotate_attempted?: boolean;
+          auto_annotate_error?: string | null;
+        },
+        autoAnnotate
+      )
+    ) {
+      try {
+        const aiRes = await fetchFn(
+          `/api/dataset/samples/${encodeURIComponent(
+            rawSampleId
+          )}/auto-annotate`,
+          {
+            method: "POST",
+            credentials: "include",
+          }
+        );
+        const aiRaw = await aiRes.json().catch(() => null);
+        const aiData =
+          aiRaw && typeof aiRaw === "object"
+            ? (aiRaw as Record<string, unknown> & {
+                sample?: Record<string, unknown> | null;
+              })
+            : null;
+        if (aiRes.ok && aiData) {
+          const anns = aiData.annotations ?? aiData.sample?.annotations;
+          if (Array.isArray(anns)) {
+            annotationCount = anns.length;
+            autoAnnotated = true;
+          } else if (typeof aiData.annotation_count === "number") {
+            annotationCount = aiData.annotation_count;
+            autoAnnotated = true;
+          } else {
+            autoAnnotated = true;
+          }
+          if (aiData.split || aiData.sample?.split) {
+            split = String(aiData.split || aiData.sample?.split);
+          }
+        }
+      } catch {
+        // Keep sample even if AI teacher is offline
+      }
+    }
+
+    const { stale, shouldApply } = evaluateMutationFreshness(
+      "dataset",
+      reqEpoch,
+      reqOpSeq,
+      "event",
+      cleanEventId,
+      true,
+      params.getActiveTargetId,
+      params.isCancelled
+    );
+
+    return {
+      stale,
+      shouldApply,
+      ok: true,
+      id: rawSampleId,
+      split,
+      autoAnnotated,
+      annotationCount,
     };
   };
 
@@ -1567,10 +2094,15 @@ export function createForensicTriageController(
     invalidatePendingMutations,
     getMutationSequence,
     fetchEnrolledFaces,
+    fetchEnrolledFaceNames,
     assignFaceSubLabel,
     batchAssignFaceSubLabel,
+    batchAssignFace: batchAssignFaceSubLabel,
     saveLicensePlate,
     saveForensicNote,
+    toggleFalsePositive,
+    verifyWithAi,
+    addEventToDataset,
     loadFilterPresets,
     saveFilterPreset,
     deleteFilterPreset,

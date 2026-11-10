@@ -1973,6 +1973,17 @@ impl RecordingEngine {
     }
 
     async fn run_retention_cleanup_loop(&self) {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        loop {
+            let expire_interval = self.run_retention_pass_once(unix_now_f64()).await;
+            tokio::time::sleep(std::time::Duration::from_secs(expire_interval)).await;
+        }
+    }
+
+    /// Executes a single deterministic retention, quota-eviction, cold-compaction, tier-migration,
+    /// and expired share-artifact cleanup pass at `now` (Unix epoch seconds), returning the
+    /// configured `expire_interval` in seconds.
+    pub async fn run_retention_pass_once(&self, now: f64) -> u64 {
         let recordings_root = self.media_dir.join("recordings");
         let ffmpeg_bin = resolve_ffmpeg_bin();
         struct CameraRetentionEntry {
@@ -1993,8 +2004,7 @@ impl RecordingEngine {
             compact_preset: String,
             compact_hwaccel: String,
         }
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-        loop {
+        {
             let (expire_interval, camera_retentions, global_quota_gb, global_min_free_gb): (
                 u64,
                 Vec<CameraRetentionEntry>,
@@ -2098,7 +2108,6 @@ impl RecordingEngine {
             };
             let configured_cold_dir = tier_cfg.cold_dir.clone();
 
-            let now = unix_now_f64();
             for CameraRetentionEntry {
                 camera,
                 continuous_days,
@@ -2452,7 +2461,7 @@ impl RecordingEngine {
             let db_maint = self.db.clone();
             let _ = tokio::task::spawn_blocking(move || db_maint.run_maintenance()).await;
 
-            tokio::time::sleep(std::time::Duration::from_secs(expire_interval)).await;
+            expire_interval
         }
     }
 

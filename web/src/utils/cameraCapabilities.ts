@@ -532,9 +532,20 @@ function deduplicatePresetItems(items: OnvifPresetItem[]): OnvifPresetItem[] {
   return out;
 }
 
+export type CameraHardwareInfo = CameraHardwareInfoResponse;
+export type CameraPtzInfo = CameraPtzInfoResponse;
+
+export interface SavedPresetInput {
+  name?: string;
+  token?: string;
+  mode?: string;
+  presets?: string[];
+  preset_names?: Record<string, string>;
+}
+
 export function applySavedPresetToPtzInfo(
   prev: CameraPtzInfoResponse | null | undefined,
-  token: string,
+  tokenOrInput: string | SavedPresetInput,
   name?: string,
   serverPresets?: string[],
   serverPresetNames?: Record<string, string>
@@ -542,11 +553,22 @@ export function applySavedPresetToPtzInfo(
   if (!prev) {
     return null;
   }
-  const cleanToken = (token || "").trim();
-  const cleanName = (name ?? token ?? "").trim() || cleanToken;
+  const isObj =
+    typeof tokenOrInput === "object" && tokenOrInput !== null;
+  const rawToken = isObj ? tokenOrInput.token || "" : tokenOrInput || "";
+  const rawName = isObj ? tokenOrInput.name : name;
+  const resolvedServerPresets = isObj
+    ? tokenOrInput.presets ?? serverPresets
+    : serverPresets;
+  const resolvedServerPresetNames = isObj
+    ? tokenOrInput.preset_names ?? serverPresetNames
+    : serverPresetNames;
+
+  const cleanToken = rawToken.trim();
+  const cleanName = (rawName ?? rawToken ?? "").trim() || cleanToken;
   const effectiveToken = cleanToken || cleanName;
   const effectiveName =
-    (effectiveToken && serverPresetNames?.[effectiveToken]?.trim()) ||
+    (effectiveToken && resolvedServerPresetNames?.[effectiveToken]?.trim()) ||
     cleanName ||
     effectiveToken;
 
@@ -561,13 +583,13 @@ export function applySavedPresetToPtzInfo(
   }
 
   let rawItems: OnvifPresetItem[];
-  if (Array.isArray(serverPresets)) {
-    rawItems = serverPresets
+  if (Array.isArray(resolvedServerPresets)) {
+    rawItems = resolvedServerPresets
       .map((rawTok) => (rawTok || "").trim())
       .filter(Boolean)
       .map((tok) => {
         const mappedName =
-          serverPresetNames?.[tok]?.trim() ||
+          resolvedServerPresetNames?.[tok]?.trim() ||
           (tok === effectiveToken ? effectiveName : undefined) ||
           existingByKey.get(tok)?.name ||
           tok;
@@ -583,7 +605,7 @@ export function applySavedPresetToPtzInfo(
   } else {
     rawItems = (prev.presets || []).map((p) => {
       const tok = (p.token || "").trim();
-      const mapped = tok && serverPresetNames?.[tok]?.trim();
+      const mapped = tok && resolvedServerPresetNames?.[tok]?.trim();
       if (tok === effectiveToken || p.name.trim() === effectiveName) {
         return {
           token: effectiveToken || tok,
@@ -607,6 +629,9 @@ export function applySavedPresetToPtzInfo(
   const nextPresets = deduplicatePresetItems(rawItems);
   return {
     ...prev,
+    ...(isObj && typeof tokenOrInput.mode === "string"
+      ? { mode: tokenOrInput.mode }
+      : {}),
     presets: nextPresets,
     preset_names: nextPresets.map((p) => p.name),
     active_preset: effectiveName,
@@ -753,23 +778,73 @@ export function buildCameraHardwareCacheKey(
   )}:${profTok}:${vsTok}:${proto}`;
 }
 
+export interface ApplyCameraHardwarePatchOptions {
+  onConfigPersisted?: () => Promise<void> | void;
+  fetchImpl?: typeof fetch;
+}
+
+export interface CameraHardwareMutationResult {
+  ok: boolean;
+  status: number;
+  data: Record<string, unknown>;
+  hardware: CameraHardwareInfo | null;
+}
+
+export interface CameraPtzMutationResult {
+  ok: boolean;
+  status: number;
+  data: Record<string, unknown>;
+  ptz: CameraPtzInfo | null;
+}
+
 export interface CameraHardwareCacheController {
   getCachedCameraHardware: (cam: string) => CameraHardwareInfoResponse | null;
   setCachedCameraHardware: (
     cam: string,
     info: CameraHardwareInfoResponse | null
   ) => void;
+  getHardware: (cam: string) => CameraHardwareInfoResponse | null;
+  setHardware: (cam: string, info: CameraHardwareInfoResponse | null) => void;
   getCachedCameraPtzInfo: (cam: string) => CameraPtzInfoResponse | null;
   setCachedCameraPtzInfo: (
     cam: string,
     info: CameraPtzInfoResponse | null
   ) => void;
+  getPtzInfo: (cam: string) => CameraPtzInfoResponse | null;
+  setPtzInfo: (cam: string, info: CameraPtzInfoResponse | null) => void;
   invalidateCameraHardwareCache: (cam?: string) => void;
+  invalidate: (cam?: string) => void;
   probeCameraHardwareAndPtz: (
     cam: string,
     options?: ProbeCameraHardwareOptions,
     fetchImpl?: typeof fetch
   ) => Promise<CameraHardwareProbeSnapshot>;
+  probe: (
+    cam: string,
+    options?: ProbeCameraHardwareOptions,
+    fetchImpl?: typeof fetch
+  ) => Promise<CameraHardwareProbeSnapshot>;
+  applyHardwarePatch: (
+    camera: string,
+    patch: Record<string, unknown>,
+    options?: ApplyCameraHardwarePatchOptions
+  ) => Promise<CameraHardwareMutationResult>;
+  gotoPtzPreset: (
+    camera: string,
+    preset: string,
+    options?: { fetchImpl?: typeof fetch }
+  ) => Promise<CameraPtzMutationResult>;
+  savePtzPreset: (
+    camera: string,
+    name: string,
+    token?: string,
+    options?: { fetchImpl?: typeof fetch }
+  ) => Promise<CameraPtzMutationResult>;
+  deletePtzPreset: (
+    camera: string,
+    tokenOrName: string,
+    options?: { fetchImpl?: typeof fetch }
+  ) => Promise<CameraPtzMutationResult>;
   getSnapshot: () => {
     hardwareByCam: Record<string, CameraHardwareInfoResponse>;
     ptzByCam: Record<string, CameraPtzInfoResponse>;
@@ -777,12 +852,25 @@ export interface CameraHardwareCacheController {
   subscribe: (listener: CameraHardwareCacheListener) => () => void;
 }
 
-export function createCameraHardwareCacheController(): CameraHardwareCacheController {
+export function createCameraHardwareCacheController(
+  defaultFetchOrOptions?:
+    | typeof fetch
+    | {
+        fetchImpl?: typeof fetch;
+      }
+): CameraHardwareCacheController {
+  const defaultFetchImpl: typeof fetch | undefined =
+    typeof defaultFetchOrOptions === "function"
+      ? defaultFetchOrOptions
+      : defaultFetchOrOptions?.fetchImpl;
   const hardwareByCam = new Map<string, CameraHardwareInfoResponse>();
   const ptzByCam = new Map<string, CameraPtzInfoResponse>();
   const configKeyByCam = new Map<string, string>();
   const inFlightByCam = new Map<string, Promise<CameraHardwareProbeSnapshot>>();
   const listeners = new Set<CameraHardwareCacheListener>();
+
+  const resolveFetch = (override?: typeof fetch): typeof fetch =>
+    override ?? defaultFetchImpl ?? ((input, init) => fetch(input, init));
 
   const notify = (cam?: string) => {
     for (const listener of listeners) {
@@ -867,10 +955,9 @@ export function createCameraHardwareCacheController(): CameraHardwareCacheContro
       typeof options === "function"
         ? { fetchImpl: options as unknown as typeof fetch }
         : options || {};
-    const fetchFn: typeof fetch =
-      fetchImpl ??
-      resolvedOptions.fetchImpl ??
-      ((input, init) => fetch(input, init));
+    const fetchFn: typeof fetch = resolveFetch(
+      fetchImpl ?? resolvedOptions.fetchImpl
+    );
     const timeoutMs = resolvedOptions.timeoutMs ?? 3500;
     const includePtz = resolvedOptions.includePtz ?? true;
     const force = Boolean(resolvedOptions.force);
@@ -982,6 +1069,272 @@ export function createCameraHardwareCacheController(): CameraHardwareCacheContro
     }
   };
 
+  const applyHardwarePatch = async (
+    camera: string,
+    patch: Record<string, unknown>,
+    options?: ApplyCameraHardwarePatchOptions
+  ): Promise<CameraHardwareMutationResult> => {
+    const cleanCam = (camera || "").trim();
+    if (!cleanCam) {
+      return { ok: false, status: 0, data: {}, hardware: null };
+    }
+    const fetchFn = resolveFetch(options?.fetchImpl);
+    const res = await fetchFn(
+      `/api/${encodeURIComponent(cleanCam)}/hardware`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify(patch),
+      }
+    );
+    const rawData = await res.json().catch(() => null);
+    const data: Record<string, unknown> =
+      rawData && typeof rawData === "object"
+        ? (rawData as Record<string, unknown>)
+        : {};
+    const ok = Boolean(res.ok && data.success !== false);
+    if (!ok) {
+      return {
+        ok: false,
+        status: res.status,
+        data,
+        hardware: getCachedCameraHardware(cleanCam),
+      };
+    }
+
+    const existing = getCachedCameraHardware(cleanCam);
+    const merged = mergeOptimisticCameraHardwareInfo(
+      existing,
+      patch,
+      data as Partial<CameraHardwareInfoResponse>
+    );
+    if (merged) {
+      setCachedCameraHardware(cleanCam, merged);
+    }
+
+    if (isConfigPersistenceHardwarePatch(patch)) {
+      invalidateCameraHardwareCache(cleanCam);
+      await options?.onConfigPersisted?.();
+      const reprobed = await probeCameraHardwareAndPtz(
+        cleanCam,
+        { force: true },
+        fetchFn
+      );
+      return {
+        ok: true,
+        status: res.status,
+        data,
+        hardware: reprobed.hardware ?? merged,
+      };
+    }
+
+    return {
+      ok: true,
+      status: res.status,
+      data,
+      hardware: getCachedCameraHardware(cleanCam) ?? merged,
+    };
+  };
+
+  const gotoPtzPreset = async (
+    camera: string,
+    preset: string,
+    options?: { fetchImpl?: typeof fetch }
+  ): Promise<CameraPtzMutationResult> => {
+    const cleanCam = (camera || "").trim();
+    const cleanPreset = (preset || "").trim();
+    if (!cleanCam || !cleanPreset) {
+      return {
+        ok: false,
+        status: 0,
+        data: {},
+        ptz: getCachedCameraPtzInfo(cleanCam),
+      };
+    }
+    const fetchFn = resolveFetch(options?.fetchImpl);
+    const res = await fetchFn(
+      `/api/${encodeURIComponent(cleanCam)}/ptz/preset`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ preset: cleanPreset }),
+      }
+    );
+    const rawData = await res.json().catch(() => null);
+    const data: Record<string, unknown> =
+      rawData && typeof rawData === "object"
+        ? (rawData as Record<string, unknown>)
+        : {};
+    const ok = Boolean(res.ok && data.success !== false);
+    if (ok) {
+      const existing = getCachedCameraPtzInfo(cleanCam) || { enabled: true };
+      const nextPtz: CameraPtzInfoResponse = {
+        ...existing,
+        active_preset: cleanPreset,
+      };
+      setCachedCameraPtzInfo(cleanCam, nextPtz);
+      return { ok: true, status: res.status, data, ptz: nextPtz };
+    }
+    return {
+      ok: false,
+      status: res.status,
+      data,
+      ptz: getCachedCameraPtzInfo(cleanCam),
+    };
+  };
+
+  const savePtzPreset = async (
+    camera: string,
+    name: string,
+    token?: string,
+    options?: { fetchImpl?: typeof fetch }
+  ): Promise<CameraPtzMutationResult> => {
+    const cleanCam = (camera || "").trim();
+    const cleanName = (name || "").trim();
+    const cleanToken = token?.trim();
+    if (!cleanCam || !cleanName) {
+      return {
+        ok: false,
+        status: 0,
+        data: {},
+        ptz: getCachedCameraPtzInfo(cleanCam),
+      };
+    }
+    const fetchFn = resolveFetch(options?.fetchImpl);
+    const res = await fetchFn(
+      `/api/${encodeURIComponent(cleanCam)}/ptz/preset/save`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          name: cleanName,
+          ...(cleanToken ? { token: cleanToken } : {}),
+        }),
+      }
+    );
+    const rawData = await res.json().catch(() => null);
+    const data: Record<string, unknown> =
+      rawData && typeof rawData === "object"
+        ? (rawData as Record<string, unknown>)
+        : {};
+    const ok = Boolean(res.ok && data.success !== false);
+    if (ok) {
+      const existing = getCachedCameraPtzInfo(cleanCam) || { enabled: true };
+      const returnedToken =
+        typeof data.token === "string" && data.token.trim()
+          ? data.token.trim()
+          : cleanToken || cleanName;
+      const returnedMode =
+        typeof data.mode === "string" && data.mode.trim()
+          ? data.mode.trim()
+          : undefined;
+      const nextPtz = applySavedPresetToPtzInfo(existing, {
+        name: cleanName,
+        token: returnedToken,
+        mode: returnedMode,
+        presets: Array.isArray(data.presets)
+          ? (data.presets as string[])
+          : undefined,
+        preset_names:
+          data.preset_names &&
+          typeof data.preset_names === "object" &&
+          !Array.isArray(data.preset_names)
+            ? (data.preset_names as Record<string, string>)
+            : undefined,
+      });
+      if (nextPtz) {
+        setCachedCameraPtzInfo(cleanCam, nextPtz);
+      }
+      return {
+        ok: true,
+        status: res.status,
+        data,
+        ptz: nextPtz ?? getCachedCameraPtzInfo(cleanCam),
+      };
+    }
+    return {
+      ok: false,
+      status: res.status,
+      data,
+      ptz: getCachedCameraPtzInfo(cleanCam),
+    };
+  };
+
+  const deletePtzPreset = async (
+    camera: string,
+    tokenOrName: string,
+    options?: { fetchImpl?: typeof fetch }
+  ): Promise<CameraPtzMutationResult> => {
+    const cleanCam = (camera || "").trim();
+    const cleanToken = (tokenOrName || "").trim();
+    if (!cleanCam || !cleanToken) {
+      return {
+        ok: false,
+        status: 0,
+        data: {},
+        ptz: getCachedCameraPtzInfo(cleanCam),
+      };
+    }
+    const fetchFn = resolveFetch(options?.fetchImpl);
+    let res = await fetchFn(
+      `/api/${encodeURIComponent(cleanCam)}/ptz/preset/${encodeURIComponent(
+        cleanToken
+      )}`,
+      {
+        method: "DELETE",
+        credentials: "include",
+      }
+    );
+    if (res.status === 404 || res.status === 405) {
+      res = await fetchFn(
+        `/api/${encodeURIComponent(cleanCam)}/ptz/preset/delete`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ token: cleanToken }),
+        }
+      );
+    }
+    const rawData = await res.json().catch(() => null);
+    const data: Record<string, unknown> =
+      rawData && typeof rawData === "object"
+        ? (rawData as Record<string, unknown>)
+        : {};
+    const ok = Boolean(res.ok && data.success !== false);
+    if (ok) {
+      const existing = getCachedCameraPtzInfo(cleanCam) || { enabled: true };
+      const nextPtz = applyDeletedPresetToPtzInfo(
+        existing,
+        cleanToken,
+        Array.isArray(data.presets) ? (data.presets as string[]) : undefined,
+        data.preset_names &&
+          typeof data.preset_names === "object" &&
+          !Array.isArray(data.preset_names)
+          ? (data.preset_names as Record<string, string>)
+          : undefined
+      );
+      if (nextPtz) {
+        setCachedCameraPtzInfo(cleanCam, nextPtz);
+      }
+      return {
+        ok: true,
+        status: res.status,
+        data,
+        ptz: nextPtz ?? getCachedCameraPtzInfo(cleanCam),
+      };
+    }
+    return {
+      ok: false,
+      status: res.status,
+      data,
+      ptz: getCachedCameraPtzInfo(cleanCam),
+    };
+  };
+
   const getSnapshot = () => {
     const hwObj: Record<string, CameraHardwareInfoResponse> = {};
     for (const [k, v] of hardwareByCam.entries()) {
@@ -1004,10 +1357,20 @@ export function createCameraHardwareCacheController(): CameraHardwareCacheContro
   return {
     getCachedCameraHardware,
     setCachedCameraHardware,
+    getHardware: getCachedCameraHardware,
+    setHardware: setCachedCameraHardware,
     getCachedCameraPtzInfo,
     setCachedCameraPtzInfo,
+    getPtzInfo: getCachedCameraPtzInfo,
+    setPtzInfo: setCachedCameraPtzInfo,
     invalidateCameraHardwareCache,
+    invalidate: invalidateCameraHardwareCache,
     probeCameraHardwareAndPtz,
+    probe: probeCameraHardwareAndPtz,
+    applyHardwarePatch,
+    gotoPtzPreset,
+    savePtzPreset,
+    deletePtzPreset,
     getSnapshot,
     subscribe,
   };
@@ -1028,4 +1391,9 @@ export const invalidateCameraHardwareCache =
   cameraHardwareCache.invalidateCameraHardwareCache;
 export const probeCameraHardwareAndPtz =
   cameraHardwareCache.probeCameraHardwareAndPtz;
+export const applyCameraHardwarePatch =
+  cameraHardwareCache.applyHardwarePatch;
+export const gotoCameraPtzPreset = cameraHardwareCache.gotoPtzPreset;
+export const saveCameraPtzPreset = cameraHardwareCache.savePtzPreset;
+export const deleteCameraPtzPreset = cameraHardwareCache.deletePtzPreset;
 export const subscribeCameraHardwareCache = cameraHardwareCache.subscribe;

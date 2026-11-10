@@ -270,11 +270,12 @@ struct CameraDriverRuntimeInner {
     digest_challenges: Mutex<HashMap<String, String>>,
     siren_cooldown_until: Mutex<HashMap<String, f64>>,
     tapo_streamd_ports: RwLock<HashMap<String, u16>>,
+    active_presets: Arc<tokio::sync::RwLock<HashMap<String, Option<String>>>>,
 }
 
 /// `AppState`-scoped runtime cache for discovered camera ONVIF tokens, protocol families,
-/// and HTTP Digest challenge nonces. Replaces process-global `LazyLock` singletons so each
-/// server instance and test harness has isolated, invalidatable state.
+/// active PTZ presets, and HTTP Digest challenge nonces. Replaces process-global `LazyLock`
+/// singletons so each server instance and test harness has isolated, invalidatable state.
 #[derive(Debug, Clone, Default)]
 pub struct CameraDriverRuntime {
     inner: Arc<CameraDriverRuntimeInner>,
@@ -283,6 +284,64 @@ pub struct CameraDriverRuntime {
 impl CameraDriverRuntime {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_active_presets(
+        active_presets: Arc<tokio::sync::RwLock<HashMap<String, Option<String>>>>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(CameraDriverRuntimeInner {
+                active_presets,
+                ..Default::default()
+            }),
+        }
+    }
+
+    pub fn active_presets(&self) -> &Arc<tokio::sync::RwLock<HashMap<String, Option<String>>>> {
+        &self.inner.active_presets
+    }
+
+    pub async fn get_active_preset(
+        &self,
+        camera: &str,
+        fallback_return_preset: Option<&str>,
+    ) -> Option<String> {
+        self.inner
+            .active_presets
+            .read()
+            .await
+            .get(camera)
+            .cloned()
+            .flatten()
+            .or_else(|| {
+                fallback_return_preset
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+            })
+    }
+
+    pub async fn set_active_preset(&self, camera: &str, preset: Option<String>) {
+        self.inner
+            .active_presets
+            .write()
+            .await
+            .insert(camera.to_string(), preset);
+    }
+
+    pub async fn clear_active_preset_if_matching(&self, camera: &str, candidates: &[&str]) {
+        let mut guard = self.inner.active_presets.write().await;
+        if guard
+            .get(camera)
+            .and_then(|v| v.as_deref())
+            .is_some_and(|active| {
+                candidates
+                    .iter()
+                    .any(|cand| active.eq_ignore_ascii_case(cand))
+            })
+        {
+            guard.insert(camera.to_string(), None);
+        }
     }
 
     pub fn get_profile(&self, camera: &str, endpoint: &str) -> Option<String> {
@@ -461,28 +520,7 @@ impl CameraDriverRuntime {
             _ => {}
         }
 
-        let effective_proto = protocol_id
-            .map(str::to_string)
-            .or_else(|| self.get_protocol(camera));
-        let spec_opt = effective_proto
-            .as_deref()
-            .and_then(find_protocol_spec_by_id_or_alias);
-
-        let mut candidates: Vec<&str> = Vec::with_capacity(6);
-        if let Some(spec) = spec_opt {
-            for &tok in spec.preferred_profile_tokens {
-                if tok != initial_profile && !candidates.contains(&tok) {
-                    candidates.push(tok);
-                }
-            }
-        }
-        for tok in ["Profile000", "profile_1", "Profile_1"] {
-            if tok != initial_profile && !candidates.contains(&tok) {
-                candidates.push(tok);
-            }
-        }
-
-        for candidate in candidates {
+        for candidate in self.candidate_profile_tokens(camera, initial_profile, protocol_id) {
             match send_fn(candidate.to_string()).await {
                 Ok((cand_status, cand_body)) => {
                     if !is_onvif_profile_not_found_response(cand_status, &cand_body) {
@@ -508,6 +546,360 @@ impl CameraDriverRuntime {
         }
     }
 
+    pub fn candidate_profile_tokens(
+        &self,
+        camera: &str,
+        initial_profile: &str,
+        protocol_id: Option<&str>,
+    ) -> Vec<&'static str> {
+        let effective_proto = protocol_id
+            .map(str::to_string)
+            .or_else(|| self.get_protocol(camera));
+        let spec_opt = effective_proto
+            .as_deref()
+            .and_then(find_protocol_spec_by_id_or_alias);
+
+        let mut candidates: Vec<&'static str> = Vec::with_capacity(6);
+        if let Some(spec) = spec_opt {
+            for &tok in spec.preferred_profile_tokens {
+                if tok != initial_profile && !candidates.contains(&tok) {
+                    candidates.push(tok);
+                }
+            }
+        }
+        for tok in ["Profile000", "profile_1", "Profile_1"] {
+            if tok != initial_profile && !candidates.contains(&tok) {
+                candidates.push(tok);
+            }
+        }
+        candidates
+    }
+
+    pub fn candidate_video_source_tokens(
+        &self,
+        camera: &str,
+        initial_vs: &str,
+        protocol_id: Option<&str>,
+        extra_discovered: &[String],
+    ) -> Vec<String> {
+        let effective_proto = protocol_id
+            .map(str::to_string)
+            .or_else(|| self.get_protocol(camera));
+        let spec_opt = effective_proto
+            .as_deref()
+            .and_then(find_protocol_spec_by_id_or_alias);
+
+        let mut candidates: Vec<String> = vec![initial_vs.to_string()];
+        if let Some(spec) = spec_opt {
+            for &tok in spec.preferred_video_source_tokens {
+                if !candidates.iter().any(|c| c == tok) {
+                    candidates.push(tok.to_string());
+                }
+            }
+        }
+        for tok in ["raw_vs1", "VideoSource000", "00000"] {
+            if !candidates.iter().any(|c| c == tok) {
+                candidates.push(tok.to_string());
+            }
+        }
+        for tok in extra_discovered {
+            if !candidates.iter().any(|c| c == tok) {
+                candidates.push(tok.clone());
+            }
+        }
+        candidates
+    }
+
+    /// Probes ONVIF Imaging `GetImagingSettings` across `img_endpoints` and candidate video-source
+    /// tokens over `transport`, caching the working video-source token in `CameraDriverRuntime`.
+    // Grouped ONVIF Imaging probe parameters over CameraWireTransport port
+    #[expect(clippy::too_many_arguments)]
+    pub async fn probe_imaging_settings_with_transport(
+        &self,
+        transport: &dyn CameraWireTransport,
+        camera: &str,
+        img_endpoints: &[String],
+        initial_vs: &str,
+        protocol_id: Option<&str>,
+        extra_discovered_vs: &[String],
+        (user, pass): (Option<&str>, Option<&str>),
+        timeout: Duration,
+    ) -> Option<(String, (Option<f32>, Option<f32>, Option<f32>, Option<f32>))> {
+        let vs_candidates = self.candidate_video_source_tokens(
+            camera,
+            initial_vs,
+            protocol_id,
+            extra_discovered_vs,
+        );
+        for img_ep in img_endpoints {
+            for cand_vs in &vs_candidates {
+                let img_soap = build_onvif_get_imaging_settings_soap(cand_vs, user, pass);
+                match transport
+                    .send_soap(
+                        img_ep,
+                        "http://www.onvif.org/ver20/imaging/wsdl",
+                        "GetImagingSettings",
+                        img_soap,
+                        (user, pass),
+                        timeout,
+                    )
+                    .await
+                {
+                    Ok(img_xml) => {
+                        self.set_video_source(camera, cand_vs);
+                        let tuple = parse_onvif_imaging_settings_xml(&img_xml);
+                        return Some((cand_vs.clone(), tuple));
+                    }
+                    Err((StatusCode::GATEWAY_TIMEOUT, _)) => return None,
+                    Err((_, ref e)) if e.contains("request failed") => return None,
+                    Err(_) => {}
+                }
+            }
+        }
+        None
+    }
+
+    /// Applies ONVIF Imaging `SetImagingSettings` across `img_endpoints` and candidate video-source
+    /// tokens over `transport`, caching the working video-source token in `CameraDriverRuntime`.
+    // Grouped ONVIF Imaging update parameters over CameraWireTransport port
+    #[expect(clippy::too_many_arguments)]
+    pub async fn apply_imaging_settings_with_transport(
+        &self,
+        transport: &dyn CameraWireTransport,
+        camera: &str,
+        img_endpoints: &[String],
+        initial_vs: &str,
+        protocol_id: Option<&str>,
+        settings: (Option<f32>, Option<f32>, Option<f32>, Option<f32>),
+        (user, pass): (Option<&str>, Option<&str>),
+        timeout: Duration,
+    ) -> std::result::Result<String, String> {
+        let (brightness, contrast, saturation, sharpness) = settings;
+        let vs_candidates =
+            self.candidate_video_source_tokens(camera, initial_vs, protocol_id, &[]);
+        let mut last_img_err = String::new();
+        'img_outer: for img_ep in img_endpoints {
+            for cand_vs in &vs_candidates {
+                let set_img_soap = build_onvif_set_imaging_settings_soap(
+                    cand_vs, brightness, contrast, saturation, sharpness, user, pass,
+                );
+                match transport
+                    .send_soap(
+                        img_ep,
+                        "http://www.onvif.org/ver20/imaging/wsdl",
+                        "SetImagingSettings",
+                        set_img_soap,
+                        (user, pass),
+                        timeout,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        self.set_video_source(camera, cand_vs);
+                        return Ok(cand_vs.clone());
+                    }
+                    Err((StatusCode::GATEWAY_TIMEOUT, e)) => {
+                        last_img_err = e;
+                        break 'img_outer;
+                    }
+                    Err((_, e)) if e.contains("request failed") => {
+                        last_img_err = e;
+                        break 'img_outer;
+                    }
+                    Err((_, e)) => {
+                        last_img_err = e;
+                    }
+                }
+            }
+        }
+        Err(last_img_err)
+    }
+
+    /// Executes an ONVIF PTZ SOAP request via `transport` and automatically falls back through
+    /// protocol-preferred and standard ONVIF profile tokens when `allow_discovery` is true and
+    /// the camera returns a profile-not-found fault (`NoProfile`, `InvalidArgVal`, etc.).
+    /// Caches the working profile token via `self.set_profile(camera, endpoint, token)` and returns
+    /// `(resolved_profile_token, response_xml)`.
+    // Grouped ONVIF PTZ profile discovery over CameraWireTransport port
+    #[expect(clippy::too_many_arguments)]
+    pub async fn send_ptz_soap_with_profile_discovery<F>(
+        &self,
+        transport: &dyn CameraWireTransport,
+        camera: &str,
+        endpoint: &str,
+        initial_profile: &str,
+        allow_discovery: bool,
+        protocol_id: Option<&str>,
+        action: &str,
+        credentials: (Option<&str>, Option<&str>),
+        timeout: Duration,
+        mut build_soap: F,
+    ) -> std::result::Result<(String, String), (StatusCode, String)>
+    where
+        F: FnMut(&str) -> String,
+    {
+        let first_soap = build_soap(initial_profile);
+        let first_res = transport
+            .send_soap(
+                endpoint,
+                "http://www.onvif.org/ver20/ptz/wsdl",
+                action,
+                first_soap,
+                credentials,
+                timeout,
+            )
+            .await;
+
+        match first_res {
+            Ok(xml) => {
+                self.set_profile(camera, endpoint, initial_profile);
+                Ok((initial_profile.to_string(), xml))
+            }
+            Err((first_status, first_err)) => {
+                if !allow_discovery
+                    || first_status == StatusCode::GATEWAY_TIMEOUT
+                    || !is_onvif_profile_not_found_error(&first_err)
+                {
+                    return Err((first_status, first_err));
+                }
+                for candidate_prof in
+                    self.candidate_profile_tokens(camera, initial_profile, protocol_id)
+                {
+                    let retry_soap = build_soap(candidate_prof);
+                    match transport
+                        .send_soap(
+                            endpoint,
+                            "http://www.onvif.org/ver20/ptz/wsdl",
+                            action,
+                            retry_soap,
+                            credentials,
+                            timeout,
+                        )
+                        .await
+                    {
+                        Ok(ok_xml) => {
+                            self.set_profile(camera, endpoint, candidate_prof);
+                            return Ok((candidate_prof.to_string(), ok_xml));
+                        }
+                        Err((st, e)) if is_onvif_action_not_supported_error(&e) => {
+                            return Err((st, e));
+                        }
+                        Err((StatusCode::GATEWAY_TIMEOUT, e)) => {
+                            return Err((StatusCode::GATEWAY_TIMEOUT, e));
+                        }
+                        Err(_) => {}
+                    }
+                }
+                Err((first_status, first_err))
+            }
+        }
+    }
+
+    /// Queries ONVIF PTZ `GetStatus` via `transport` with automatic profile-token discovery,
+    /// returning `(resolved_profile_token, parsed_status, raw_xml)`.
+    // Grouped ONVIF PTZ status probe over CameraWireTransport port
+    #[expect(clippy::too_many_arguments)]
+    pub async fn fetch_ptz_status_with_discovery(
+        &self,
+        transport: &dyn CameraWireTransport,
+        camera: &str,
+        endpoint: &str,
+        initial_profile: &str,
+        allow_discovery: bool,
+        protocol_id: Option<&str>,
+        credentials: (Option<&str>, Option<&str>),
+        timeout: Duration,
+    ) -> std::result::Result<(String, OnvifPtzStatus, String), (StatusCode, String)> {
+        let (user, pass) = credentials;
+        let (resolved_prof, xml) = self
+            .send_ptz_soap_with_profile_discovery(
+                transport,
+                camera,
+                endpoint,
+                initial_profile,
+                allow_discovery,
+                protocol_id,
+                "GetStatus",
+                credentials,
+                timeout,
+                |prof| build_onvif_get_status_soap(prof, user, pass),
+            )
+            .await?;
+        let parsed = parse_onvif_status_xml(&xml);
+        Ok((resolved_prof, parsed, xml))
+    }
+
+    /// Discovers ONVIF Media profile tokens and video source tokens across `/onvif/media_service`
+    /// and `/onvif/service` via `transport`.
+    pub async fn discover_onvif_media_tokens_with_transport(
+        &self,
+        transport: &dyn CameraWireTransport,
+        onvif_base: &str,
+        (user, pass): (Option<&str>, Option<&str>),
+        timeout: Duration,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut profiles = Vec::new();
+        let mut video_sources = Vec::new();
+        for suffix in ["media_service", "service"] {
+            let ep = format!("{onvif_base}/onvif/{suffix}");
+            let prof_soap = build_onvif_get_profiles_soap(user, pass);
+            if let Ok(xml) = transport
+                .send_soap(
+                    &ep,
+                    "http://www.onvif.org/ver10/media/wsdl",
+                    "GetProfiles",
+                    prof_soap,
+                    (user, pass),
+                    timeout,
+                )
+                .await
+            {
+                let (p, vs) = parse_onvif_profiles_and_video_sources_xml(&xml);
+                for tok in p {
+                    if !profiles.contains(&tok) {
+                        profiles.push(tok);
+                    }
+                }
+                for tok in vs {
+                    if !video_sources.contains(&tok) {
+                        video_sources.push(tok);
+                    }
+                }
+                if !profiles.is_empty() {
+                    break;
+                }
+            }
+        }
+        if video_sources.is_empty() {
+            for suffix in ["media_service", "service"] {
+                let ep = format!("{onvif_base}/onvif/{suffix}");
+                let vs_soap = build_onvif_get_video_sources_soap(user, pass);
+                if let Ok(xml) = transport
+                    .send_soap(
+                        &ep,
+                        "http://www.onvif.org/ver10/media/wsdl",
+                        "GetVideoSources",
+                        vs_soap,
+                        (user, pass),
+                        timeout,
+                    )
+                    .await
+                {
+                    let (_, vs) = parse_onvif_profiles_and_video_sources_xml(&xml);
+                    for tok in vs {
+                        if !video_sources.contains(&tok) {
+                            video_sources.push(tok);
+                        }
+                    }
+                    if !video_sources.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+        (profiles, video_sources)
+    }
+
     // Direct scalar PTZ pan/tilt/zoom coordinates and step bounds
     #[expect(clippy::too_many_arguments)]
     pub fn compute_soft_preset_delta(
@@ -531,6 +923,68 @@ impl CameraDriverRuntime {
         )
     }
 
+    /// Reboots a camera over `transport` by probing ONVIF `SystemReboot` across both
+    /// `/onvif/device_service` and `/onvif/service`, falling back to HTTP Digest CGI
+    /// (`/cgi-bin/magicBox.cgi?action=reboot`) when `allow_cgi_fallback` is true.
+    pub async fn reboot_camera_at_endpoints(
+        &self,
+        transport: &dyn CameraWireTransport,
+        onvif_base: &str,
+        cgi_base: &str,
+        allow_cgi_fallback: bool,
+        (user, pass): (Option<&str>, Option<&str>),
+        timeout: Duration,
+    ) -> std::result::Result<&'static str, (StatusCode, String)> {
+        let mut last_err: Option<(StatusCode, String)> = None;
+        for suffix in ["device_service", "service"] {
+            let dev_ep = format!("{onvif_base}/onvif/{suffix}");
+            let soap = build_onvif_system_reboot_soap(user, pass);
+            match transport
+                .send_soap(
+                    &dev_ep,
+                    "http://www.onvif.org/ver10/device/wsdl",
+                    "SystemReboot",
+                    soap,
+                    (user, pass),
+                    timeout,
+                )
+                .await
+            {
+                Ok(_) => return Ok("reboot:onvif"),
+                Err((st, err_msg)) => {
+                    if last_err.is_none() {
+                        last_err = Some((st, err_msg));
+                    }
+                }
+            }
+        }
+
+        if allow_cgi_fallback {
+            let cgi_url = format!("{cgi_base}/cgi-bin/magicBox.cgi?action=reboot");
+            if let Ok((st, _)) = transport
+                .send_digest_http(
+                    self,
+                    reqwest::Method::GET,
+                    &cgi_url,
+                    (user, pass),
+                    (None, None),
+                    timeout,
+                )
+                .await
+                && st.is_success()
+            {
+                return Ok("reboot:cgi");
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "Camera reboot failed across ONVIF and CGI endpoints".to_string(),
+            )
+        }))
+    }
+
     /// Reboots a camera via ONVIF `SystemReboot` (`/onvif/device_service` or `/onvif/service`)
     /// with automatic fallback to Dahua/Intelbras HTTP Digest CGI (`/cgi-bin/magicBox.cgi?action=reboot`).
     pub async fn reboot_camera(
@@ -547,55 +1001,63 @@ impl CameraDriverRuntime {
         };
         let timeout = Duration::from_secs(cam_cfg.onvif.timeout_sec.clamp(1, 10));
         let onvif_base = format_camera_http_base(host, target.onvif_port);
-        let user = target.user.as_deref();
-        let pass = target.password.as_deref();
-        let mut last_err = String::new();
+        let cgi_base = format_camera_http_base(host, target.cgi_port);
+        let transport = ReqwestCameraWireTransport::new(client.clone());
+        self.reboot_camera_at_endpoints(
+            &transport,
+            &onvif_base,
+            &cgi_base,
+            !target.is_tapo_hint,
+            (target.user.as_deref(), target.password.as_deref()),
+            timeout,
+        )
+        .await
+        .map(str::to_string)
+        .map_err(|(_, msg)| msg)
+    }
 
-        for suffix in ["device_service", "service"] {
-            let dev_ep = format!("{onvif_base}/onvif/{suffix}");
-            let soap = build_onvif_system_reboot_soap(user, pass);
-            match send_onvif_soap_request_with_ns(
-                client,
-                &dev_ep,
-                ("http://www.onvif.org/ver10/device/wsdl", "SystemReboot"),
-                soap,
-                (user, pass),
-                timeout,
-            )
-            .await
-            {
-                Ok(_) => return Ok("reboot:onvif".to_string()),
-                Err((_, err_msg)) => {
-                    if last_err.is_empty() {
-                        last_err = err_msg;
-                    }
-                }
-            }
-        }
-
-        if !target.is_tapo_hint {
-            let cgi_base = format_camera_http_base(host, target.cgi_port);
-            let cgi_url = format!("{cgi_base}/cgi-bin/magicBox.cgi?action=reboot");
-            if let Ok((st, _)) = send_http_digest_request(
-                client,
-                self,
-                reqwest::Method::GET,
-                &cgi_url,
-                (user, pass),
-                (None, None),
-                timeout,
-            )
-            .await
-                && st.is_success()
-            {
-                return Ok("reboot:cgi".to_string());
-            }
-        }
-
-        Err(if last_err.is_empty() {
-            format!("Camera '{camera}' reboot failed")
+    /// Synthesizes a G.711 A-law siren payload for `duration_sec` and dispatches it to `(host, onvif_port)`
+    /// using the protocol-appropriate transport (`"tapo_streamd"` on TCP `:8800` or `"dahua_cgi"` `postAudio`).
+    // Grouped siren dispatch parameters for resolved host/port and credentials
+    #[expect(clippy::too_many_arguments)]
+    pub async fn trigger_siren_at_host(
+        &self,
+        client: &reqwest::Client,
+        camera: &str,
+        (host, onvif_port): (&str, u16),
+        (user, pass): (Option<&str>, Option<&str>),
+        cloud_password: Option<&str>,
+        is_tapo_proto: bool,
+        duration_sec: f32,
+    ) -> std::result::Result<&'static str, (StatusCode, String)> {
+        let dur_f32 = if duration_sec.is_finite() {
+            duration_sec.clamp(0.2, 15.0)
         } else {
-            last_err
+            3.5
+        };
+        let siren_alaw = generate_siren_alaw_bytes(dur_f32);
+        let siren_timeout =
+            Duration::from_secs((dur_f32.ceil() as u64).saturating_add(6).clamp(5, 25));
+
+        send_camera_talkback_or_siren_alaw(
+            client,
+            self,
+            camera,
+            (host, onvif_port),
+            (user, pass),
+            cloud_password,
+            is_tapo_proto,
+            siren_alaw,
+            true,
+            siren_timeout,
+        )
+        .await
+        .map(|_| {
+            if is_tapo_proto {
+                "tapo_streamd"
+            } else {
+                "dahua_cgi"
+            }
         })
     }
 
@@ -614,37 +1076,18 @@ impl CameraDriverRuntime {
                 "Camera '{camera}' has no reachable ONVIF or HTTP host"
             ));
         };
-        let dur_f32 = if duration_sec.is_finite() {
-            (duration_sec as f32).clamp(0.2, 15.0)
-        } else {
-            3.5
-        };
-        let siren_alaw = generate_siren_alaw_bytes(dur_f32);
         let is_tapo_proto =
             target.protocol == "tapo" || (target.is_tapo_hint && !target.is_dahua_hint);
-        let siren_timeout =
-            Duration::from_secs((dur_f32.ceil() as u64).saturating_add(6).clamp(5, 25));
-
-        send_camera_talkback_or_siren_alaw(
+        self.trigger_siren_at_host(
             client,
-            self,
             camera,
             (host, target.onvif_port),
             (target.user.as_deref(), target.password.as_deref()),
             target.cloud_password.as_deref(),
             is_tapo_proto,
-            siren_alaw,
-            true,
-            siren_timeout,
+            duration_sec as f32,
         )
         .await
-        .map(|_| {
-            if is_tapo_proto {
-                "tapo_streamd"
-            } else {
-                "dahua_cgi"
-            }
-        })
         .map_err(|(_, err_msg)| err_msg)
     }
 }
@@ -4571,5 +5014,151 @@ mod tests {
         assert_eq!(siren_res, "dahua_cgi");
 
         srv.abort();
+    }
+
+    struct FakeCameraWireTransport {
+        soap_calls: Mutex<Vec<(String, String, String)>>,
+        http_calls: Mutex<Vec<String>>,
+    }
+
+    impl FakeCameraWireTransport {
+        fn new() -> Self {
+            Self {
+                soap_calls: Mutex::new(Vec::new()),
+                http_calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CameraWireTransport for FakeCameraWireTransport {
+        fn send_soap<'a>(
+            &'a self,
+            endpoint: &'a str,
+            _wsdl_ns: &'a str,
+            action: &'a str,
+            soap_xml: String,
+            _credentials: (Option<&'a str>, Option<&'a str>),
+            _timeout: Duration,
+        ) -> WireSoapFuture<'a> {
+            self.soap_calls.lock().unwrap().push((
+                endpoint.to_string(),
+                action.to_string(),
+                soap_xml.clone(),
+            ));
+            let ep = endpoint.to_string();
+            let act = action.to_string();
+            Box::pin(async move {
+                if act == "GetStatus" {
+                    if soap_xml.contains("ProfileToken>profile_1<") {
+                        Ok(r#"<s:Envelope><s:Body><tptz:GetStatusResponse><tptz:PTZStatus><tt:Position><tt:PanTilt x="0.35" y="-0.15"/><tt:Zoom x="0.50"/></tt:Position><tt:MoveStatus><tt:PanTilt>IDLE</tt:PanTilt></tt:MoveStatus></tptz:PTZStatus></tptz:GetStatusResponse></s:Body></s:Envelope>"#.to_string())
+                    } else {
+                        Err((
+                            StatusCode::BAD_REQUEST,
+                            "ONVIF SOAP Fault: ter:NoProfile".to_string(),
+                        ))
+                    }
+                } else if act == "GetProfiles" && ep.ends_with("/onvif/service") {
+                    Ok(r#"<s:Envelope><s:Body><trt:GetProfilesResponse><trt:Profiles token="profile_1"><tt:VideoSourceConfiguration><tt:SourceToken>raw_vs1</tt:SourceToken></tt:VideoSourceConfiguration></trt:Profiles></trt:GetProfilesResponse></s:Body></s:Envelope>"#.to_string())
+                } else if act == "SystemReboot" && ep.ends_with("/onvif/service") {
+                    Ok(
+                        "<s:Envelope><s:Body><tds:SystemRebootResponse/></s:Body></s:Envelope>"
+                            .to_string(),
+                    )
+                } else {
+                    Err((
+                        StatusCode::BAD_REQUEST,
+                        "ONVIF SOAP Fault: ActionNotSupported".to_string(),
+                    ))
+                }
+            })
+        }
+
+        fn send_digest_http<'a>(
+            &'a self,
+            _runtime: &'a CameraDriverRuntime,
+            _method: reqwest::Method,
+            url: &'a str,
+            _credentials: (Option<&'a str>, Option<&'a str>),
+            _body: (Option<&'a str>, Option<Vec<u8>>),
+            _timeout: Duration,
+        ) -> WireHttpFuture<'a> {
+            self.http_calls.lock().unwrap().push(url.to_string());
+            Box::pin(async move { Ok((StatusCode::OK, "OK\r\n".to_string())) })
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_wire_transport_exercises_profile_discovery_media_tokens_reboot_and_presets() {
+        let rt = CameraDriverRuntime::new();
+        let fake_transport = FakeCameraWireTransport::new();
+        let endpoint = "http://192.0.2.44:2020/onvif/service";
+
+        // 1. Tapo protocol prefers profile_1 when initial Profile_1 fails with NoProfile
+        let (resolved_prof, status, _raw) = rt
+            .fetch_ptz_status_with_discovery(
+                &fake_transport,
+                "escritorio",
+                endpoint,
+                "Profile_1",
+                true,
+                Some("tapo"),
+                (Some("admin"), Some("secret")),
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("status discovery over FakeCameraWireTransport must succeed");
+        assert_eq!(resolved_prof, "profile_1");
+        assert!((status.pan - 0.35).abs() < 1e-4);
+        assert!((status.tilt - (-0.15)).abs() < 1e-4);
+        assert!((status.zoom - 0.50).abs() < 1e-4);
+        assert_eq!(
+            rt.get_profile("escritorio", endpoint).as_deref(),
+            Some("profile_1")
+        );
+
+        // 2. Discover ONVIF media tokens falls back from /onvif/media_service to /onvif/service
+        let (profs, vs) = rt
+            .discover_onvif_media_tokens_with_transport(
+                &fake_transport,
+                "http://192.0.2.44:2020",
+                (Some("admin"), Some("secret")),
+                Duration::from_secs(2),
+            )
+            .await;
+        assert_eq!(profs, vec!["profile_1".to_string()]);
+        assert_eq!(vs, vec!["raw_vs1".to_string()]);
+
+        // 3. Reboot probes both /onvif/device_service and /onvif/service
+        let reboot_tag = rt
+            .reboot_camera_at_endpoints(
+                &fake_transport,
+                "http://192.0.2.44:2020",
+                "http://192.0.2.44:80",
+                false,
+                (Some("admin"), Some("secret")),
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("reboot should succeed on /onvif/service");
+        assert_eq!(reboot_tag, "reboot:onvif");
+
+        // 4. Active preset tracking inside CameraDriverRuntime
+        assert_eq!(
+            rt.get_active_preset("escritorio", Some("home"))
+                .await
+                .as_deref(),
+            Some("home")
+        );
+        rt.set_active_preset("escritorio", Some("desk_view".to_string()))
+            .await;
+        assert_eq!(
+            rt.get_active_preset("escritorio", Some("home"))
+                .await
+                .as_deref(),
+            Some("desk_view")
+        );
+        rt.clear_active_preset_if_matching("escritorio", &["other", "DESK_VIEW"])
+            .await;
+        assert_eq!(rt.get_active_preset("escritorio", None).await, None);
     }
 }

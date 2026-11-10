@@ -1,7 +1,11 @@
 use std::path::{Component, Path, PathBuf};
 
+use anyhow::Result;
+use ninjanvr_db::{CameraScope, NinjaDatabase};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::share_engine::{ensure_path_within_canon_media_dir, ensure_path_within_media_dir};
 
 /// Normalized, typed view of an event JSON envelope across legacy top-level columns
 /// and nested `data.*` / `data.provenance.*` fallback shapes.
@@ -339,6 +343,438 @@ pub fn cleanup_review_media_artifacts(media_dir: &Path, review_id: &str, thumb_p
     }
 }
 
+/// Resolves a database recording path (which may carry a legacy `/media/ninjanvr/` prefix)
+/// against the active `media_dir`.
+pub fn resolve_recording_disk_path(media_dir: &Path, db_path: &str) -> PathBuf {
+    if let Some(rel) = ninjanvr_db::strip_media_root(db_path) {
+        media_dir.join(rel)
+    } else {
+        PathBuf::from(db_path)
+    }
+}
+
+/// Verifies that `candidate` is a non-symlink file inside `media_dir/recordings` (and, when
+/// `camera` is `Some`, belongs to that camera's directory hierarchy).
+pub fn ensure_recording_segment_path(
+    media_dir: &Path,
+    camera: Option<&str>,
+    candidate: &Path,
+) -> Option<PathBuf> {
+    let recordings_dir = media_dir.join("recordings");
+    let canon_rec_dir = ensure_path_within_media_dir(media_dir, &recordings_dir)?;
+    let safe_path = ensure_path_within_media_dir(&canon_rec_dir, candidate)?;
+    if let Some(cam) = camera
+        && let Ok(rel) = safe_path.strip_prefix(&canon_rec_dir)
+        && let Some(parent) = rel.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.components().any(|c| c.as_os_str() == cam)
+    {
+        return None;
+    }
+    Some(safe_path)
+}
+
+/// Resolves a recording segment `db_path` across both the hot `media_dir/recordings` tier and
+/// the optional `cold_dir` tier, enforcing non-symlink regular-file and camera containment.
+pub fn resolve_contained_recording_segment(
+    media_dir: &Path,
+    cold_dir: Option<&Path>,
+    camera: Option<&str>,
+    db_path: &str,
+) -> Option<PathBuf> {
+    if db_path.is_empty()
+        || Path::new(db_path)
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+    {
+        return None;
+    }
+    let disk_path = resolve_recording_disk_path(media_dir, db_path);
+    if let Some(hot_path) = ensure_recording_segment_path(media_dir, camera, &disk_path)
+        && hot_path.is_file()
+        && hot_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
+    {
+        return Some(hot_path);
+    }
+
+    let cold_root = cold_dir?;
+    if std::fs::symlink_metadata(cold_root).is_ok_and(|m| m.file_type().is_symlink()) {
+        return None;
+    }
+    let canon_cold = std::fs::canonicalize(cold_root).ok()?;
+    let mut cold_candidates = vec![disk_path];
+    if let Some(rel) = ninjanvr_db::strip_media_root(db_path) {
+        let rel_stripped = rel.strip_prefix("recordings/").unwrap_or(rel);
+        cold_candidates.push(cold_root.join(rel_stripped));
+        cold_candidates.push(cold_root.join(rel));
+    }
+    for cand in cold_candidates {
+        let Some(safe_path) = ensure_path_within_canon_media_dir(&canon_cold, &cand) else {
+            continue;
+        };
+        if !safe_path.is_file()
+            || !safe_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
+        {
+            continue;
+        }
+        if let Some(cam) = camera
+            && let Ok(rel) = safe_path.strip_prefix(&canon_cold)
+            && let Some(parent) = rel.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.components().any(|c| c.as_os_str() == cam)
+        {
+            continue;
+        }
+        return Some(safe_path);
+    }
+    None
+}
+
+/// Resolves safe, non-symlink export video and thumbnail paths inside `media_dir/exports`
+/// and `media_dir/clips` respectively, protecting `latest_*` live snapshots.
+pub fn resolve_safe_export_unlink_paths(
+    media_dir: &Path,
+    vpath: &str,
+    tpath: &str,
+) -> (Option<PathBuf>, Option<PathBuf>) {
+    let same_regular_inode = |raw_p: &Path, canon_p: &Path| -> bool {
+        let Ok(lmeta) = std::fs::symlink_metadata(raw_p) else {
+            return false;
+        };
+        if !lmeta.file_type().is_file() {
+            return false;
+        }
+        let Ok(cmeta) = std::fs::symlink_metadata(canon_p) else {
+            return false;
+        };
+        if !cmeta.file_type().is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if lmeta.dev() != cmeta.dev() || lmeta.ino() != cmeta.ino() {
+                return false;
+            }
+        }
+        true
+    };
+    let raw_vpath = resolve_recording_disk_path(media_dir, vpath);
+    let safe_vpath = if std::fs::symlink_metadata(&raw_vpath).is_ok_and(|m| m.file_type().is_file())
+    {
+        ensure_path_within_media_dir(media_dir, &raw_vpath)
+            .filter(|canon_v| {
+                same_regular_inode(&raw_vpath, canon_v)
+                    && std::fs::canonicalize(media_dir.join("exports"))
+                        .ok()
+                        .is_some_and(|exports_canon| {
+                            canon_v.parent() == Some(exports_canon.as_path())
+                        })
+            })
+            .map(|_| raw_vpath)
+    } else {
+        None
+    };
+
+    let raw_tpath = resolve_recording_disk_path(media_dir, tpath);
+    let safe_tpath = if std::fs::symlink_metadata(&raw_tpath).is_ok_and(|m| m.file_type().is_file())
+    {
+        ensure_path_within_media_dir(media_dir, &raw_tpath)
+            .filter(|canon_t| {
+                let not_latest = !canon_t
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("latest_"));
+                not_latest
+                    && same_regular_inode(&raw_tpath, canon_t)
+                    && std::fs::canonicalize(media_dir.join("clips"))
+                        .ok()
+                        .is_some_and(|clips_canon| canon_t.parent() == Some(clips_canon.as_path()))
+            })
+            .map(|_| raw_tpath)
+    } else {
+        None
+    };
+
+    (safe_vpath, safe_tpath)
+}
+
+/// Atomically writes `bytes` to `target_dir.join(filename)` after verifying that `media_dir`,
+/// `target_dir`, and the target file are not symlinks and that `target_dir` resolves inside `media_dir`.
+pub fn write_contained_media_file(
+    media_dir: &Path,
+    target_dir: &Path,
+    filename: &str,
+    bytes: &[u8],
+) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind, Write};
+    if filename.is_empty()
+        || filename.starts_with('.')
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains("..")
+        || filename.contains('\0')
+    {
+        return Err(Error::new(ErrorKind::InvalidInput, "unsafe media filename"));
+    }
+    if std::fs::symlink_metadata(media_dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "refusing to write through symlinked media_dir",
+        ));
+    }
+    std::fs::create_dir_all(media_dir)?;
+    let Ok(rel) = target_dir.strip_prefix(media_dir) else {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "target directory must reside inside media_dir",
+        ));
+    };
+    let mut cur = media_dir.to_path_buf();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(part) => {
+                cur.push(part);
+                if let Ok(meta) = std::fs::symlink_metadata(&cur)
+                    && (meta.file_type().is_symlink() || !meta.file_type().is_dir())
+                {
+                    return Err(Error::new(
+                        ErrorKind::PermissionDenied,
+                        "refusing to traverse symlinked or non-directory media subdirectory",
+                    ));
+                }
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "invalid path component in target media directory",
+                ));
+            }
+        }
+    }
+    std::fs::create_dir_all(target_dir)?;
+    let canon_media = std::fs::canonicalize(media_dir)?;
+    let canon_target = std::fs::canonicalize(target_dir)?;
+    if !canon_target.starts_with(&canon_media) {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "target directory escapes media_dir",
+        ));
+    }
+    let dst_path = target_dir.join(filename);
+    if let Ok(dst_meta) = std::fs::symlink_metadata(&dst_path)
+        && (dst_meta.file_type().is_symlink() || !dst_meta.file_type().is_file())
+    {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "refusing to overwrite symlink or non-regular file in media_dir",
+        ));
+    }
+    let nonce: u64 = rand::random();
+    let tmp_name = format!(".{filename}.{nonce:016x}.tmp");
+    let tmp_path = target_dir.join(tmp_name);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    let mut tmp_file = opts.open(&tmp_path)?;
+    if let Err(err) = tmp_file.write_all(bytes) {
+        drop(tmp_file);
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    drop(tmp_file);
+    if let Ok(dst_meta) = std::fs::symlink_metadata(&dst_path)
+        && (dst_meta.file_type().is_symlink() || !dst_meta.file_type().is_file())
+    {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "refusing to rename over symlink or non-regular file in media_dir",
+        ));
+    }
+    if let Err(err) = std::fs::rename(&tmp_path, &dst_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(dst_path)
+}
+
+/// Async helper that atomically writes `bytes` into `media_dir.join(subdir_name).join(filename)`
+/// on the blocking threadpool while enforcing non-symlink directory and file containment.
+pub async fn atomic_write_within_media_subdir(
+    media_dir: &Path,
+    subdir_name: &str,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    if !is_safe_id(filename) || filename.contains('/') || filename.contains('\\') {
+        anyhow::bail!("Invalid filename '{filename}'");
+    }
+    let media_dir_owned = media_dir.to_path_buf();
+    let subdir_owned = subdir_name.to_string();
+    let filename_owned = filename.to_string();
+    let bytes_owned = bytes.to_vec();
+    tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+        let subdir = media_dir_owned.join(&subdir_owned);
+        let written =
+            write_contained_media_file(&media_dir_owned, &subdir, &filename_owned, &bytes_owned)?;
+        let Some(canon_subdir) = ensure_path_within_media_dir(&media_dir_owned, &subdir) else {
+            let _ = std::fs::remove_file(&written);
+            anyhow::bail!("Target directory '{subdir_owned}' escapes media_dir");
+        };
+        let Some(safe_final) = ensure_path_within_media_dir(&canon_subdir, &written) else {
+            let _ = std::fs::remove_file(&written);
+            anyhow::bail!("Written file escapes '{subdir_owned}' directory");
+        };
+        Ok(safe_final)
+    })
+    .await?
+}
+
+/// Deletes a single event from SQLite and cleans up all associated snapshots, clips,
+/// custom `thumb_path` files, and share-link artifacts under `media_dir`.
+pub fn delete_event_with_artifacts(
+    db: &NinjaDatabase,
+    media_dir: &Path,
+    event_id: &str,
+) -> Result<()> {
+    let existing_env = db
+        .get_event(event_id)
+        .ok()
+        .flatten()
+        .map(|ev| extract_event_envelope(&ev));
+    db.delete_event(event_id)?;
+    let cam_opt = existing_env
+        .as_ref()
+        .map(|e| e.camera.as_str())
+        .filter(|s| !s.is_empty());
+    let thumb_opt = existing_env.as_ref().and_then(|e| e.thumb_path.as_deref());
+    cleanup_event_media_artifacts(media_dir, event_id, cam_opt, thumb_opt);
+    Ok(())
+}
+
+/// Deletes a batch of events scoped to `scope` and cleans up all associated media artifacts.
+pub fn delete_events_bulk_with_artifacts(
+    db: &NinjaDatabase,
+    media_dir: &Path,
+    ids: &[String],
+    scope: &CameraScope,
+) -> Result<std::result::Result<usize, String>> {
+    match db.delete_events_bulk_scoped(ids, scope)? {
+        Ok(deleted_items) => {
+            for (id, cam, thumb_opt) in &deleted_items {
+                cleanup_event_media_artifacts(
+                    media_dir,
+                    id,
+                    Some(cam.as_str()),
+                    thumb_opt.as_deref(),
+                );
+            }
+            for id in ids {
+                if !deleted_items.iter().any(|(d_id, _, _)| d_id == id) {
+                    cleanup_event_media_artifacts(media_dir, id, None, None);
+                }
+            }
+            Ok(Ok(deleted_items.len()))
+        }
+        Err(forbidden_cam) => Ok(Err(forbidden_cam)),
+    }
+}
+
+/// Deletes one or more review segments scoped to `scope` and removes all associated review
+/// thumbnails, custom `thumb_path` files, and share-link artifacts under `media_dir`.
+pub fn delete_reviews_with_artifacts(
+    db: &NinjaDatabase,
+    media_dir: &Path,
+    ids: &[String],
+    scope: &CameraScope,
+) -> Result<std::result::Result<u64, String>> {
+    match db.delete_reviews_scoped(ids, scope)? {
+        Ok((deleted_count, thumbs)) => {
+            for id in ids {
+                cleanup_review_media_artifacts(media_dir, id, None);
+            }
+            for thumb in thumbs.iter().flatten() {
+                cleanup_review_media_artifacts(media_dir, "", Some(thumb.as_str()));
+            }
+            Ok(Ok(deleted_count))
+        }
+        Err(forbidden_cam) => Ok(Err(forbidden_cam)),
+    }
+}
+
+/// Deletes an export row from SQLite and removes its contained MP4, thumbnail, and share-link artifacts.
+pub fn delete_export_with_artifacts(
+    db: &NinjaDatabase,
+    media_dir: &Path,
+    export_id: &str,
+) -> Result<bool> {
+    cleanup_share_clip_artifacts_in_dir(media_dir, "export", export_id);
+    if let Some((vpath, tpath)) = db.delete_export(export_id)? {
+        let (safe_vpath, safe_tpath) = resolve_safe_export_unlink_paths(media_dir, &vpath, &tpath);
+        if let Some(vp) = safe_vpath {
+            let _ = std::fs::remove_file(vp);
+        }
+        if let Some(tp) = safe_tpath {
+            let _ = std::fs::remove_file(tp);
+        }
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Deletes recording segments for `camera` in `[after, before]` across both hot `media_dir/recordings`
+/// and optional `cold_dir`, pruning empty parent directories and returning `(deleted_count, freed_bytes)`.
+pub fn delete_recordings_in_range_with_artifacts(
+    db: &NinjaDatabase,
+    media_dir: &Path,
+    cold_dir: Option<&Path>,
+    camera: &str,
+    after: f64,
+    before: f64,
+) -> Result<(usize, u64)> {
+    let deleted = db.delete_recordings_in_range(camera, after, before)?;
+    let recordings_root = media_dir.join("recordings");
+    let canon_rec_root = std::fs::canonicalize(&recordings_root).ok();
+    let canon_cold_root = cold_dir.and_then(|c| std::fs::canonicalize(c).ok());
+    let mut freed_bytes: u64 = 0;
+    for (_id, db_path, seg_size_mb) in &deleted {
+        if let Some(safe_disk_path) =
+            resolve_contained_recording_segment(media_dir, cold_dir, Some(camera), db_path)
+        {
+            if let Ok(meta) = std::fs::metadata(&safe_disk_path) {
+                freed_bytes += meta.len();
+            } else {
+                freed_bytes += (seg_size_mb * 1024.0 * 1024.0).round() as u64;
+            }
+            let _ = std::fs::remove_file(&safe_disk_path);
+            if let Some(ref canon_root) = canon_rec_root
+                && safe_disk_path.starts_with(canon_root)
+            {
+                ninjanvr_media::prune_empty_parent_dirs(&safe_disk_path, canon_root);
+            } else if let Some(ref canon_cold) = canon_cold_root
+                && safe_disk_path.starts_with(canon_cold)
+            {
+                ninjanvr_media::prune_empty_parent_dirs(&safe_disk_path, canon_cold);
+            }
+        } else {
+            freed_bytes += (seg_size_mb * 1024.0 * 1024.0).round() as u64;
+        }
+    }
+    Ok((deleted.len(), freed_bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,5 +933,177 @@ mod tests {
         assert!(unrelated_file.exists());
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn single_and_bulk_delete_helpers_clean_artifacts_and_resolve_cold_segments() {
+        use ninjanvr_db::{EventDto, ReviewItemDto};
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "ninjanvr_media_vault_test_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let cold_dir = std::env::temp_dir().join(format!(
+            "ninjanvr_media_vault_cold_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let _ = std::fs::remove_dir_all(&cold_dir);
+
+        let clips_dir = tmp_dir.join("clips");
+        let review_clips_dir = clips_dir.join("review");
+        let exports_dir = tmp_dir.join("exports");
+        let hot_cam_dir = tmp_dir.join("recordings").join("front_door");
+        let cold_cam_dir = cold_dir.join("front_door");
+        std::fs::create_dir_all(&review_clips_dir).unwrap();
+        std::fs::create_dir_all(&exports_dir).unwrap();
+        std::fs::create_dir_all(&hot_cam_dir).unwrap();
+        std::fs::create_dir_all(&cold_cam_dir).unwrap();
+
+        let db = NinjaDatabase::open(tmp_dir.join("vault.db")).unwrap();
+
+        // 1. Single event delete cleans up custom thumb_path + share artifacts
+        let ev_dto = EventDto {
+            id: "ev_single_1".to_string(),
+            camera: "front_door".to_string(),
+            label: "person".to_string(),
+            sub_label: None,
+            top_score: Some(0.92),
+            false_positive: Some(false),
+            zones: json!([]),
+            thumbnail: Some("/media/ninjanvr/clips/custom_ev_single_1.webp".to_string()),
+            start_time: 1000.0,
+            end_time: Some(1005.0),
+            has_clip: true,
+            has_snapshot: true,
+            retain_indefinitely: false,
+            plus_id: None,
+            box_coords: None,
+            area: None,
+            ratio: None,
+            score: Some(0.92),
+            stationary: false,
+            data: json!({"thumb_path": "/media/ninjanvr/clips/custom_ev_single_1.webp"}),
+        };
+        db.upsert_event(&ev_dto).unwrap();
+        let custom_ev_thumb = clips_dir.join("custom_ev_single_1.webp");
+        let share_ev_clip = exports_dir.join("share_redacted_ev_single_1.mp4");
+        std::fs::write(&custom_ev_thumb, b"thumb").unwrap();
+        std::fs::write(&share_ev_clip, b"share").unwrap();
+
+        delete_event_with_artifacts(&db, &tmp_dir, "ev_single_1").unwrap();
+        assert!(db.get_event("ev_single_1").unwrap().is_none());
+        assert!(!custom_ev_thumb.exists());
+        assert!(!share_ev_clip.exists());
+
+        // 2. Single review delete via delete_reviews_with_artifacts cleans up review thumbnail
+        let rev_dto = ReviewItemDto {
+            id: "rev_single_1".to_string(),
+            camera: "front_door".to_string(),
+            start_time: 1000.0,
+            end_time: Some(1010.0),
+            severity: "alert".to_string(),
+            thumb_path: "/media/ninjanvr/clips/review/thumb-rev_single_1.webp".to_string(),
+            data: json!({"objects": ["person"]}),
+            has_been_reviewed: false,
+        };
+        db.insert_review_segment(&rev_dto).unwrap();
+        let rev_thumb = review_clips_dir.join("thumb-rev_single_1.webp");
+        std::fs::write(&rev_thumb, b"rev-thumb").unwrap();
+
+        let del_rev = delete_reviews_with_artifacts(
+            &db,
+            &tmp_dir,
+            &["rev_single_1".to_string()],
+            &CameraScope::All,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(del_rev, 1);
+        assert!(!rev_thumb.exists());
+
+        // 3. Hot + cold recording segment resolution and range deletion
+        let hot_seg = hot_cam_dir.join("seg_hot.mp4");
+        let cold_seg = cold_cam_dir.join("seg_cold.mp4");
+        std::fs::write(&hot_seg, b"0123456789").unwrap();
+        std::fs::write(&cold_seg, b"0123456789abcdef").unwrap();
+
+        assert_eq!(
+            resolve_contained_recording_segment(
+                &tmp_dir,
+                Some(&cold_dir),
+                Some("front_door"),
+                "/media/ninjanvr/recordings/front_door/seg_hot.mp4",
+            ),
+            Some(std::fs::canonicalize(&hot_seg).unwrap())
+        );
+        assert_eq!(
+            resolve_contained_recording_segment(
+                &tmp_dir,
+                Some(&cold_dir),
+                Some("front_door"),
+                &cold_seg.to_string_lossy(),
+            ),
+            Some(std::fs::canonicalize(&cold_seg).unwrap())
+        );
+        assert!(
+            resolve_contained_recording_segment(
+                &tmp_dir,
+                Some(&cold_dir),
+                Some("other_cam"),
+                &cold_seg.to_string_lossy(),
+            )
+            .is_none()
+        );
+
+        db.insert_recording(&ninjanvr_db::RecordingRow {
+            id: "rec_hot".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/ninjanvr/recordings/front_door/seg_hot.mp4".to_string(),
+            start_time: 100.0,
+            end_time: 110.0,
+            duration: 10.0,
+            motion: 1,
+            objects: 1,
+            dbfs: -20,
+            segment_size: 0.01,
+            regions: 1,
+            motion_heatmap: None,
+        })
+        .unwrap();
+        db.insert_recording(&ninjanvr_db::RecordingRow {
+            id: "rec_cold".to_string(),
+            camera: "front_door".to_string(),
+            path: cold_seg.to_string_lossy().to_string(),
+            start_time: 110.0,
+            end_time: 120.0,
+            duration: 10.0,
+            motion: 1,
+            objects: 1,
+            dbfs: -20,
+            segment_size: 0.01,
+            regions: 1,
+            motion_heatmap: None,
+        })
+        .unwrap();
+
+        let (deleted_count, freed_bytes) = delete_recordings_in_range_with_artifacts(
+            &db,
+            &tmp_dir,
+            Some(&cold_dir),
+            "front_door",
+            90.0,
+            130.0,
+        )
+        .unwrap();
+        assert_eq!(deleted_count, 2);
+        assert_eq!(freed_bytes, 26);
+        assert!(!hot_seg.exists());
+        assert!(!cold_seg.exists());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let _ = std::fs::remove_dir_all(&cold_dir);
     }
 }

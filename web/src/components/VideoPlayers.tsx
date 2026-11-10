@@ -9,14 +9,13 @@ import { formatRelTime, formatTs, resolveEffectiveTheme } from "../utils/format"
 export { resolveRealCameraSource };
 import { resolveCanvasThemePalette } from "../utils/themeTokens";
 import {
-  captureVideoElementFrame,
-  coalesceArrayBuffers,
-  computeCameraJitterSeed,
-  computeLiveEdgeSeekTarget,
-  computeMseReconnectDelayMs,
-  DualSlotMachine,
-  MSE_HANDSHAKE_TIMEOUT_MS,
-  MSE_STALL_TIMEOUT_MS,
+  getCachedCameraHardware,
+  resolveCameraPushToTalkCapability,
+} from "../utils/cameraCapabilities";
+import {
+  createDomMsePlatformAdapter,
+  createMseDualSlotSessionController,
+  MseDualSlotSessionController,
   prewarmStream,
   resolveLivePosterUrl,
   VideoSlotIndex,
@@ -1187,7 +1186,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   draftColor = "#f59e0b",
   stageOverlay,
   pushToTalkSupported,
-  pushToTalkMode = "webrtc",
+  pushToTalkMode,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const videoRef0 = useRef<HTMLVideoElement | null>(null);
@@ -1195,32 +1194,12 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   const imgRef = useRef<HTMLImageElement | null>(null);
   /** Invisible box over the rendered picture, inside the zoom transform; used to map clicks. */
   const frameAnchorRef = useRef<HTMLDivElement | null>(null);
-  const slotMachineRef = useRef<DualSlotMachine>(new DualSlotMachine());
-  const slotCleanupsRef = useRef<[(() => void) | null, (() => void) | null]>([
-    null,
-    null,
-  ]);
-  const slotTeardownTimersRef = useRef<[number | null, number | null]>([
-    null,
-    null,
-  ]);
-  const clearSlotTeardownTimer = useCallback((slot: VideoSlotIndex) => {
-    const t = slotTeardownTimersRef.current[slot];
-    if (t !== null && typeof window !== "undefined") {
-      window.clearTimeout(t);
-      slotTeardownTimersRef.current[slot] = null;
-    }
-  }, []);
   const [activeSlot, setActiveSlot] = useState<VideoSlotIndex>(0);
   const [outgoingSlot, setOutgoingSlot] = useState<VideoSlotIndex | null>(null);
   const [mseReady, setMseReady] = useState(false);
   const [streamDisconnected, setStreamDisconnected] = useState(false);
   const [headerLastSeenTs, setHeaderLastSeenTs] = useState<number>(0);
   const [posterTick, setPosterTick] = useState(() => Date.now());
-  const mseReadyRef = useRef<boolean>(false);
-  mseReadyRef.current = mseReady;
-  const streamDisconnectedRef = useRef<boolean>(false);
-  streamDisconnectedRef.current = streamDisconnected;
   const lastProbedFrameTsRef = useRef<number>(0);
   const [overlayBox, setOverlayBox] = useState<ContainedBox | null>(null);
   const [pttState, setPttState] = useState<PushToTalkState>("idle");
@@ -1238,68 +1217,41 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   );
   const desiredStreamSrcRef = useRef<string>(desiredStreamSrc);
   desiredStreamSrcRef.current = desiredStreamSrc;
-  const reconnectTimerRef = useRef<number | null>(null);
-  const reconnectAttemptRef = useRef<number>(0);
   const unmountedRef = useRef<boolean>(false);
-  const connectDesiredStreamRef = useRef<
-    (streamSrc: string, isCameraOrModeSwitch?: boolean) => void
-  >(() => {});
+  const updateOverlayGeometryRef = useRef<() => void>(() => {});
   const camStats = useNvrStore(
     (s) => s.stats?.cameras?.[camera] ?? s.stats?.cameras?.[realCamera]
-  );
-
-  const clearReconnectTimer = useCallback(() => {
-    if (reconnectTimerRef.current !== null && typeof window !== "undefined") {
-      window.clearTimeout(reconnectTimerRef.current);
-      reconnectTimerRef.current = null;
-    }
-  }, []);
-
-  const scheduleReconnect = useCallback(
-    (immediate = false) => {
-      if (unmountedRef.current || typeof window === "undefined") return;
-      const jitterMs = computeCameraJitterSeed(realCameraRef.current);
-      if (immediate) {
-        clearReconnectTimer();
-        reconnectAttemptRef.current = 0;
-        reconnectTimerRef.current = window.setTimeout(() => {
-          reconnectTimerRef.current = null;
-          if (unmountedRef.current) return;
-          const target = desiredStreamSrcRef.current;
-          if (slotMachineRef.current.needsReconnect(target)) {
-            connectDesiredStreamRef.current(target, false);
-          }
-        }, jitterMs);
-        return;
-      }
-      if (reconnectTimerRef.current !== null) {
-        return;
-      }
-      const delayMs = computeMseReconnectDelayMs(
-        reconnectAttemptRef.current,
-        jitterMs
-      );
-      reconnectAttemptRef.current += 1;
-      reconnectTimerRef.current = window.setTimeout(() => {
-        reconnectTimerRef.current = null;
-        if (unmountedRef.current) return;
-        const target = desiredStreamSrcRef.current;
-        if (slotMachineRef.current.needsReconnect(target)) {
-          connectDesiredStreamRef.current(target, false);
-        }
-      }, delayMs);
-    },
-    [clearReconnectTimer]
   );
 
   const getSlotVideoEl = useCallback((slot: VideoSlotIndex): HTMLVideoElement | null => {
     return slot === 0 ? videoRef0.current : videoRef1.current;
   }, []);
 
+  const sessionControllerRef = useRef<MseDualSlotSessionController | null>(null);
+  if (!sessionControllerRef.current) {
+    sessionControllerRef.current = createMseDualSlotSessionController({
+      adapter: createDomMsePlatformAdapter({
+        getVideoElement: (slot) =>
+          slot === 0 ? videoRef0.current : videoRef1.current,
+        getCameraName: () => realCameraRef.current,
+        onOverlayGeometryUpdate: () => updateOverlayGeometryRef.current(),
+      }),
+      getCameraName: () => realCameraRef.current,
+      onStateChange: (snap) => {
+        if (unmountedRef.current) return;
+        setActiveSlot(snap.activeSlot);
+        setOutgoingSlot(snap.outgoingSlot);
+        setMseReady(snap.mseReady);
+        setStreamDisconnected(snap.streamDisconnected);
+      },
+    });
+  }
+
   const getActiveVideoEl = useCallback((): HTMLVideoElement | null => {
-    const curSlot = slotMachineRef.current.getState().activeSlot;
+    const curSlot =
+      sessionControllerRef.current?.getSnapshot().activeSlot ?? activeSlot;
     return getSlotVideoEl(curSlot);
-  }, [getSlotVideoEl]);
+  }, [activeSlot, getSlotVideoEl]);
 
   const isOffline =
     streamDisconnected || (camStats !== undefined && camStats.camera_fps === 0 && !mseReady);
@@ -1328,6 +1280,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
       detH;
     setOverlayBox(computeContainedBox(cw, ch, mw, mh));
   }, [detW, detH, getActiveVideoEl]);
+  updateOverlayGeometryRef.current = updateOverlayGeometry;
 
   // The picture's aspect ratio can change once the live stream (or the other MSE slot) takes
   // over from the poster, so re-measure the letterbox whenever the shown media changes.
@@ -1383,475 +1336,36 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
     return () => window.clearInterval(timer);
   }, [realCamera, mseReady]);
 
-  const startSlotSession = useCallback(
-    (slot: VideoSlotIndex, streamSrc: string, sessionId: number) => {
-      const videoEl = getSlotVideoEl(slot);
-      const MediaSourceCtor =
-        typeof window !== "undefined"
-          ? window.MediaSource ||
-            (
-              window as unknown as {
-                ManagedMediaSource?: typeof MediaSource;
-              }
-            ).ManagedMediaSource
-          : undefined;
-      if (!videoEl || !MediaSourceCtor) {
-        slotMachineRef.current.markSlotError(slot, sessionId);
-        return;
-      }
-
-      clearSlotTeardownTimer(slot);
-      setOutgoingSlot((cur) => (cur === slot ? null : cur));
-
-      if (slot === slotMachineRef.current.getState().activeSlot) {
-        captureVideoElementFrame(realCameraRef.current, videoEl);
-      }
-
-      slotCleanupsRef.current[slot]?.();
-      slotCleanupsRef.current[slot] = null;
-
-      let closed = false;
-      let failedOnce = false;
-      let quotaRecoveries = 0;
-      let ws: WebSocket | null = null;
-      let mediaSource: MediaSource | null = null;
-      let sourceBuffer: SourceBuffer | null = null;
-      let watchdogTimer: number | null = null;
-      const queue: ArrayBuffer[] = [];
-
-      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const wsUrl = `${proto}//${window.location.host}/live/mse/api/ws?src=${encodeURIComponent(
-        streamSrc
-      )}`;
-
-      try {
-        videoEl.disableRemotePlayback = true;
-      } catch {
-        // ignore if readonly in synthetic test DOM
-      }
-      mediaSource = new MediaSourceCtor();
-      const objUrl = URL.createObjectURL(mediaSource);
-
-      let initialBurstSeekDone = false;
-      let promotedOnce = false;
-
-      const clearWatchdog = () => {
-        if (watchdogTimer !== null) {
-          window.clearTimeout(watchdogTimer);
-          watchdogTimer = null;
-        }
-      };
-
-      const handleSlotFailure = () => {
-        if (closed || failedOnce) return;
-        failedOnce = true;
-        clearWatchdog();
-        if (slot === slotMachineRef.current.getState().activeSlot) {
-          captureVideoElementFrame(realCameraRef.current, videoEl);
-        }
-        const snap = slotMachineRef.current.markSlotError(slot, sessionId);
-        if (!snap.isAnyReady) {
-          setMseReady(false);
-          setStreamDisconnected(true);
-        }
-        slotCleanupsRef.current[slot]?.();
-        slotCleanupsRef.current[slot] = null;
-        if (slotMachineRef.current.needsReconnect(desiredStreamSrcRef.current)) {
-          scheduleReconnect(false);
-        }
-      };
-
-      const resetWatchdog = (timeoutMs: number) => {
-        clearWatchdog();
-        if (closed) return;
-        watchdogTimer = window.setTimeout(() => {
-          watchdogTimer = null;
-          handleSlotFailure();
-        }, timeoutMs);
-      };
-
-      resetWatchdog(MSE_HANDSHAKE_TIMEOUT_MS);
-
-      const flushQueue = () => {
-        if (
-          closed ||
-          !sourceBuffer ||
-          sourceBuffer.updating ||
-          queue.length === 0 ||
-          !mediaSource ||
-          mediaSource.readyState !== "open"
-        ) {
-          return;
-        }
-        const batch = queue.splice(0, queue.length);
-        const merged = coalesceArrayBuffers(batch);
-        if (!merged) return;
-        try {
-          sourceBuffer.appendBuffer(merged);
-          quotaRecoveries = 0;
-        } catch (err) {
-          const errName = (err as { name?: string } | null)?.name;
-          if (
-            errName === "QuotaExceededError" &&
-            quotaRecoveries < 2 &&
-            !closed &&
-            mediaSource &&
-            mediaSource.readyState === "open" &&
-            !sourceBuffer.updating &&
-            videoEl.buffered.length > 0
-          ) {
-            try {
-              const start = videoEl.buffered.start(0);
-              const end = videoEl.buffered.end(videoEl.buffered.length - 1);
-              if (end > start + 1) {
-                quotaRecoveries += 1;
-                if (queue.length < 256) {
-                  queue.unshift(merged);
-                }
-                sourceBuffer.remove(start, Math.max(start + 0.5, end - 2));
-                return;
-              }
-            } catch {
-              // fall through to failure recovery
-            }
-          }
-          handleSlotFailure();
-        }
-      };
-
-      const onUpdateEnd = () => {
-        if (closed || !sourceBuffer) return;
-        try {
-          if (videoEl.buffered.length > 0) {
-            const end = videoEl.buffered.end(videoEl.buffered.length - 1);
-            const start = videoEl.buffered.start(0);
-            const seekTarget = computeLiveEdgeSeekTarget(
-              start,
-              end,
-              videoEl.currentTime,
-              !initialBurstSeekDone
-            );
-            if (seekTarget !== null) {
-              videoEl.currentTime = seekTarget;
-              initialBurstSeekDone = true;
-            }
-            if (videoEl.paused) {
-              videoEl.play().catch(() => {});
-            }
-            if (videoEl.readyState >= 2) {
-              tryPromoteSlot();
-            }
-            if (
-              end - start > 18 &&
-              !sourceBuffer.updating &&
-              mediaSource &&
-              mediaSource.readyState === "open"
-            ) {
-              try {
-                sourceBuffer.remove(start, end - 10);
-                return;
-              } catch {
-                // ignore buffer trim race
-              }
-            }
-          }
-        } catch {
-          // ignore buffered range error
-        }
-        flushQueue();
-      };
-
-      const onSourceOpen = () => {
-        if (closed) return;
-        ws = new WebSocket(wsUrl);
-        ws.binaryType = "arraybuffer";
-
-        ws.onopen = () => {
-          if (closed) return;
-          resetWatchdog(MSE_HANDSHAKE_TIMEOUT_MS);
-          const codecs = [
-            'video/mp4; codecs="avc1.640029,mp4a.40.2"',
-            'video/mp4; codecs="avc1.64002A,mp4a.40.2"',
-            'video/mp4; codecs="avc1.640028,mp4a.40.2"',
-            'video/mp4; codecs="avc1.4D401F,mp4a.40.2"',
-            'video/mp4; codecs="avc1.4D0029,mp4a.40.2"',
-            'video/mp4; codecs="avc1.42E01E,mp4a.40.2"',
-            'video/mp4; codecs="avc1.640029"',
-          ]
-            .filter((c) => MediaSource.isTypeSupported(c))
-            .map((c) => c.replace('video/mp4; codecs="', "").replace('"', ""))
-            .join(",");
-
-          ws?.send(
-            JSON.stringify({
-              type: "mse",
-              value:
-                codecs ||
-                "avc1.640029,avc1.640028,avc1.4D401F,avc1.4D0029,avc1.42E01E,mp4a.40.2",
-            })
-          );
-        };
-
-        ws.onerror = () => {
-          handleSlotFailure();
-        };
-
-        ws.onclose = () => {
-          handleSlotFailure();
-        };
-
-        ws.onmessage = (ev) => {
-          if (closed) return;
-          if (typeof ev.data === "string") {
-            let msg: { type?: unknown; value?: unknown } | null = null;
-            try {
-              msg = JSON.parse(ev.data);
-            } catch {
-              return;
-            }
-            if (msg && msg.type === "mse" && typeof msg.value === "string" && mediaSource) {
-              if (!sourceBuffer && mediaSource.readyState === "open") {
-                try {
-                  sourceBuffer = mediaSource.addSourceBuffer(msg.value);
-                  sourceBuffer.mode = "segments";
-                  sourceBuffer.addEventListener("updateend", onUpdateEnd);
-                  sourceBuffer.addEventListener("error", handleSlotFailure);
-                  flushQueue();
-                } catch {
-                  handleSlotFailure();
-                }
-              }
-            }
-          } else if (ev.data instanceof ArrayBuffer) {
-            if (promotedOnce) {
-              resetWatchdog(MSE_STALL_TIMEOUT_MS);
-            }
-            if (queue.length < 256) {
-              queue.push(ev.data);
-            }
-            flushQueue();
-          }
-        };
-      };
-
-      mediaSource.addEventListener("sourceopen", onSourceOpen);
-      videoEl.src = objUrl;
-
-      const tryPromoteSlot = () => {
-        if (closed || promotedOnce) return;
-        const machineSnap = slotMachineRef.current.getState();
-        const isStandbyUpgrade =
-          machineSnap.isAnyReady && machineSnap.standbySlot === slot;
-        // When upgrading in standby while another slot is already playing smoothly on screen,
-        // wait until any live-edge seek completes so the promoted slot never stutters on frame 1.
-        if (isStandbyUpgrade && (videoEl.seeking || videoEl.readyState < 2)) {
-          return;
-        }
-        promotedOnce = true;
-        const res = slotMachineRef.current.markSlotReady(slot, sessionId);
-        if (res.promoted) {
-          reconnectAttemptRef.current = 0;
-          if (!slotMachineRef.current.needsReconnect(desiredStreamSrcRef.current)) {
-            clearReconnectTimer();
-          }
-          resetWatchdog(MSE_STALL_TIMEOUT_MS);
-          setActiveSlot(res.activeSlot);
-          setMseReady(true);
-          setStreamDisconnected(false);
-          updateOverlayGeometry();
-          videoEl.play().catch(() => {});
-          if (res.teardownSlot !== null) {
-            const oldSlot = res.teardownSlot;
-            const cleanupToRun = slotCleanupsRef.current[oldSlot];
-            clearSlotTeardownTimer(oldSlot);
-            setOutgoingSlot(oldSlot);
-            slotTeardownTimersRef.current[oldSlot] = window.setTimeout(() => {
-              slotTeardownTimersRef.current[oldSlot] = null;
-              setOutgoingSlot((cur) => (cur === oldSlot ? null : cur));
-              if (
-                cleanupToRun &&
-                slotCleanupsRef.current[oldSlot] === cleanupToRun
-              ) {
-                cleanupToRun();
-                slotCleanupsRef.current[oldSlot] = null;
-              }
-            }, 80);
-          }
-        }
-      };
-
-      const onLoadedData = () => {
-        if (closed) return;
-        if (videoEl.buffered.length > 0 && !initialBurstSeekDone) {
-          const end = videoEl.buffered.end(videoEl.buffered.length - 1);
-          const start = videoEl.buffered.start(0);
-          const seekTarget = computeLiveEdgeSeekTarget(
-            start,
-            end,
-            videoEl.currentTime,
-            true
-          );
-          if (seekTarget !== null) {
-            videoEl.currentTime = seekTarget;
-            initialBurstSeekDone = true;
-          }
-        }
-        videoEl.play().catch(() => {});
-        tryPromoteSlot();
-      };
-
-      const onCanPlayOrSeeked = () => {
-        if (closed) return;
-        tryPromoteSlot();
-      };
-
-      const onVideoError = () => {
-        handleSlotFailure();
-      };
-
-      videoEl.addEventListener("loadeddata", onLoadedData);
-      videoEl.addEventListener("canplay", onCanPlayOrSeeked);
-      videoEl.addEventListener("seeked", onCanPlayOrSeeked);
-      videoEl.addEventListener("playing", onCanPlayOrSeeked);
-      videoEl.addEventListener("error", onVideoError);
-      videoEl.addEventListener("resize", updateOverlayGeometry);
-
-      slotCleanupsRef.current[slot] = () => {
-        closed = true;
-        clearWatchdog();
-        clearSlotTeardownTimer(slot);
-        queue.length = 0;
-        videoEl.removeEventListener("loadeddata", onLoadedData);
-        videoEl.removeEventListener("canplay", onCanPlayOrSeeked);
-        videoEl.removeEventListener("seeked", onCanPlayOrSeeked);
-        videoEl.removeEventListener("playing", onCanPlayOrSeeked);
-        videoEl.removeEventListener("error", onVideoError);
-        videoEl.removeEventListener("resize", updateOverlayGeometry);
-        try {
-          mediaSource?.removeEventListener("sourceopen", onSourceOpen);
-        } catch {
-          // ignore
-        }
-        try {
-          sourceBuffer?.removeEventListener("updateend", onUpdateEnd);
-          sourceBuffer?.removeEventListener("error", handleSlotFailure);
-          if (sourceBuffer && mediaSource && mediaSource.readyState === "open") {
-            sourceBuffer.abort();
-            mediaSource.removeSourceBuffer(sourceBuffer);
-          }
-        } catch {
-          // ignore
-        }
-        if (ws) {
-          ws.onopen = null;
-          ws.onmessage = null;
-          ws.onerror = null;
-          ws.onclose = null;
-          try {
-            ws.close();
-          } catch {
-            // ignore
-          }
-          ws = null;
-        }
-        try {
-          videoEl.pause();
-          videoEl.removeAttribute("src");
-          videoEl.load();
-        } catch {
-          // ignore
-        }
-        URL.revokeObjectURL(objUrl);
-      };
-    },
-    [
-      clearReconnectTimer,
-      clearSlotTeardownTimer,
-      getSlotVideoEl,
-      scheduleReconnect,
-      updateOverlayGeometry,
-    ]
-  );
-
-  const connectDesiredStream = useCallback(
-    (streamSrc: string, isCameraOrModeSwitch = false) => {
-      const transition = slotMachineRef.current.requestStream(streamSrc);
-      if (transition.abortSlot !== null) {
-        slotCleanupsRef.current[transition.abortSlot]?.();
-        slotCleanupsRef.current[transition.abortSlot] = null;
-      }
-      if (transition.action === "noop") {
-        return;
-      }
-      if (transition.action === "start_active" && isCameraOrModeSwitch) {
-        setMseReady(false);
-        setStreamDisconnected(false);
-      }
-      startSlotSession(transition.targetSlot, streamSrc, transition.sessionId);
-    },
-    [startSlotSession]
-  );
-  connectDesiredStreamRef.current = connectDesiredStream;
-
   // Double-buffered ping-pong transition when realCamera or desiredStreamSrc changes
   useEffect(() => {
-    reconnectAttemptRef.current = 0;
-    clearReconnectTimer();
-    connectDesiredStream(desiredStreamSrc, true);
-  }, [desiredStreamSrc, clearReconnectTimer, connectDesiredStream]);
+    sessionControllerRef.current?.connectStream(desiredStreamSrc, {
+      isCameraOrModeSwitch: true,
+    });
+  }, [desiredStreamSrc]);
 
   // Fast-path MSE recovery when global telemetry WebSocket (/ws) or camera FPS comes back online after pod rollout
   useEffect(() => {
     if (!wsOnline && !(camStats && camStats.camera_fps > 0)) return;
-    if (slotMachineRef.current.needsReconnect(desiredStreamSrcRef.current)) {
-      scheduleReconnect(true);
+    const ctrl = sessionControllerRef.current;
+    if (ctrl && ctrl.needsReconnect(desiredStreamSrcRef.current)) {
+      ctrl.scheduleReconnect(true);
     }
-  }, [wsOnline, camStats?.camera_fps, camStats?.last_frame_ts, scheduleReconnect]);
+  }, [wsOnline, camStats?.camera_fps, camStats?.last_frame_ts]);
 
   // Fast-path MSE recovery on browser network restore ("online") or tab wake ("visibilitychange")
   useEffect(() => {
     if (typeof window === "undefined") return;
     const onNetworkOnline = () => {
-      if (slotMachineRef.current.needsReconnect(desiredStreamSrcRef.current)) {
-        scheduleReconnect(true);
+      const ctrl = sessionControllerRef.current;
+      if (ctrl && ctrl.needsReconnect(desiredStreamSrcRef.current)) {
+        ctrl.scheduleReconnect(true);
       }
     };
     const onVisibilityChange = () => {
       if (typeof document !== "undefined" && document.visibilityState !== "visible") {
         return;
       }
-      if (
-        !mseReadyRef.current ||
-        streamDisconnectedRef.current ||
-        slotMachineRef.current.needsReconnect(desiredStreamSrcRef.current)
-      ) {
-        const snap = slotMachineRef.current.getState();
-        slotMachineRef.current.markSlotError(0, snap.slots[0].sessionId);
-        slotMachineRef.current.markSlotError(1, snap.slots[1].sessionId);
-        scheduleReconnect(true);
-        return;
-      }
-      const v = getActiveVideoEl();
-      if (v) {
-        try {
-          if (v.buffered.length > 0) {
-            const end = v.buffered.end(v.buffered.length - 1);
-            const start = v.buffered.start(0);
-            const seekTarget = computeLiveEdgeSeekTarget(
-              start,
-              end,
-              v.currentTime,
-              false
-            );
-            if (seekTarget !== null) {
-              v.currentTime = seekTarget;
-            }
-          }
-        } catch {
-          // ignore
-        }
-        v.play().catch(() => {});
-      }
+      sessionControllerRef.current?.recoverIfStalled(desiredStreamSrcRef.current);
     };
     window.addEventListener("online", onNetworkOnline);
     if (typeof document !== "undefined") {
@@ -1863,22 +1377,16 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         document.removeEventListener("visibilitychange", onVisibilityChange);
       }
     };
-  }, [getActiveVideoEl, scheduleReconnect]);
+  }, []);
 
   // Capture live GPU-decoded frame into LiveFrameBridge and release decoders on unmount
   useEffect(() => {
     unmountedRef.current = false;
     return () => {
       unmountedRef.current = true;
-      clearReconnectTimer();
-      clearSlotTeardownTimer(0);
-      clearSlotTeardownTimer(1);
-      captureVideoElementFrame(realCameraRef.current, getActiveVideoEl());
-      slotCleanupsRef.current[0]?.();
-      slotCleanupsRef.current[1]?.();
-      slotCleanupsRef.current = [null, null];
+      sessionControllerRef.current?.cleanupAll();
     };
-  }, [clearReconnectTimer, clearSlotTeardownTimer, getActiveVideoEl]);
+  }, []);
 
   const masks = extractMaskPolygons(cameraConfig?.motion?.mask);
   const objectMasks = extractMaskPolygons(cameraConfig?.objects?.mask);
@@ -1894,28 +1402,22 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
 
   const posterSrc = resolveLivePosterUrl(realCamera, useMainStream, posterTick);
   const effCfg = cameraConfig ?? configuredCameras?.[realCamera];
-  const effProto = (
-    effCfg?.hardware?.protocol ||
-    effCfg?.onvif?.protocol ||
-    ""
-  )
-    .trim()
-    .toLowerCase();
+  const cachedHw = getCachedCameraHardware(realCamera);
+  const pttCap = resolveCameraPushToTalkCapability(
+    effCfg,
+    cachedHw,
+    go2rtcStreams,
+    realCamera
+  );
   const resolvedPttSupported = Boolean(onPlotPoint)
     ? false
     : pushToTalkSupported !== undefined
     ? pushToTalkSupported
-    : configuredCameras === undefined && cameraConfig === undefined
+    : configuredCameras === undefined && cameraConfig === undefined && !cachedHw && !go2rtcStreams
     ? true
-    : Boolean(
-        effCfg?.onvif?.has_cloud_password ||
-          effCfg?.hardware?.has_cloud_password ||
-          effProto === "dahua_cgi" ||
-          effProto === "intelbras"
-      );
+    : pttCap.supported;
   const resolvedPttMode =
-    pushToTalkMode ??
-    (effProto === "dahua_cgi" || effProto === "intelbras" ? "cgi_alaw" : "webrtc");
+    pushToTalkMode ?? pttCap.mode ?? "webrtc";
 
   return (
     <div

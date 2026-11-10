@@ -13,8 +13,6 @@ import { WorkspaceTab, findMatchingExport, formatDateTime } from "../utils/forma
 import { RecordingCalendarPopover } from "../components/RecordingCalendarPopover";
 import { useCompactViewport } from "../utils/useCompactViewport";
 import { countActiveExploreFilters } from "../utils/liveTileHud";
-import { shouldRunFallbackAutoAnnotate } from "../utils/datasetStudio";
-import { isSafeDatasetSampleId } from "./settings/VisionAndAiPanels";
 import {
   BatchFaceProgress,
   DEFAULT_LPR_FORMAT_REGEX,
@@ -129,82 +127,41 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   const [datasetAddBusy, setDatasetAddBusy] = React.useState(false);
   const [addedDatasetIds, setAddedDatasetIds] = React.useState<Record<string, boolean>>({});
   const isMountedRef = React.useRef(true);
-  const datasetAddSeqRef = React.useRef(0);
-  const fpToggleSeqRef = React.useRef(0);
-  const aiVerifySeqRef = React.useRef(0);
   const selectedEventIdRef = React.useRef<string | null>(selectedEvent?.id ?? null);
   selectedEventIdRef.current = selectedEvent?.id ?? null;
   const debugReplayAbortRef = React.useRef<AbortController | null>(null);
   const debugReplaySeqRef = React.useRef(0);
+  const triageController = React.useMemo(() => {
+    const ctrl = createForensicTriageController();
+    ctrl.setActiveTarget("event", selectedEvent?.id ?? null);
+    return ctrl;
+  }, []);
 
   const handleAddToDataset = async () => {
     if (!selectedEvent || datasetAddBusy) return;
     const targetEvent = selectedEvent;
     const targetId = targetEvent.id;
-    const seq = ++datasetAddSeqRef.current;
+    triageController.setActiveTarget("event", targetId);
     setDatasetAddBusy(true);
+    let isStale = false;
     try {
-      const res = await fetch(
-        `/api/dataset/samples/from-event/${encodeURIComponent(targetId)}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
-          body: JSON.stringify({ auto_annotate: true }),
-        }
-      );
-      const data = await res.json().catch(() => null);
-      if (!isMountedRef.current) return;
-      if (res.ok && data) {
-        const rawSampleId = String(
-          data.id || data.sample?.id || `ds_${targetId}`
-        ).trim();
-        const sampleKind = String(
-          data.sample_kind || data.sample?.sample_kind || ""
-        )
-          .trim()
-          .toLowerCase();
-        let split = data.split || data.sample?.split || "train";
-        const initialAnns = Array.isArray(data.annotations)
-          ? data.annotations
-          : Array.isArray(data.sample?.annotations)
-          ? data.sample.annotations
-          : null;
-        let aiBoxCount: number | null =
-          sampleKind === "ai_annotated" && initialAnns
-            ? initialAnns.length
-            : null;
-        if (
-          isSafeDatasetSampleId(rawSampleId) &&
-          shouldRunFallbackAutoAnnotate(data, true)
-        ) {
-          try {
-            const aiRes = await fetch(
-              `/api/dataset/samples/${encodeURIComponent(rawSampleId)}/auto-annotate`,
-              {
-                method: "POST",
-                credentials: "include",
-              }
-            );
-            const aiData = await aiRes.json().catch(() => null);
-            if (aiRes.ok && aiData) {
-              const anns = aiData.annotations || aiData.sample?.annotations;
-              if (Array.isArray(anns)) {
-                aiBoxCount = anns.length;
-              }
-              if (aiData.split || aiData.sample?.split) {
-                split = aiData.split || aiData.sample?.split;
-              }
-            }
-          } catch {
-            // Keep sample even if AI teacher is offline
-          }
-        }
-        if (!isMountedRef.current) return;
+      const result = await triageController.addEventToDataset({
+        eventId: targetId,
+        camera: targetEvent.camera,
+        label: targetEvent.label,
+        timestamp: targetEvent.start_time,
+        autoAnnotate: true,
+        getActiveTargetId: () => selectedEventIdRef.current,
+        isCancelled: () => !isMountedRef.current,
+      });
+      isStale = result.stale;
+      if (!isMountedRef.current || result.stale) return;
+      if (result.ok) {
+        const split = result.split || "train";
         setAddedDatasetIds((prev) => ({ ...prev, [targetId]: true }));
         notify(
-          aiBoxCount !== null
-            ? `Added event #${targetId.slice(-8)} & AI-annotated ${aiBoxCount} YOLO boxes (split: ${String(
+          result.autoAnnotated
+            ? `Added event #${targetId.slice(-8)} & AI-annotated ${result.annotationCount} YOLO boxes (split: ${String(
                 split
               ).toUpperCase()})`
             : `Added event #${targetId.slice(-8)} clean frame to Active Learning Dataset (split: ${String(
@@ -212,14 +169,18 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
               ).toUpperCase()})`
         );
       } else {
-        notify(data?.message || "Failed to add event snapshot to training dataset");
+        notify(result.error || "Failed to add event snapshot to training dataset");
       }
     } catch {
-      if (isMountedRef.current) {
+      if (isMountedRef.current && selectedEventIdRef.current === targetId) {
         notify("Network error while adding event snapshot to training dataset");
       }
     } finally {
-      if (isMountedRef.current && seq === datasetAddSeqRef.current) {
+      if (
+        isMountedRef.current &&
+        !isStale &&
+        selectedEventIdRef.current === targetId
+      ) {
         setDatasetAddBusy(false);
       }
     }
@@ -229,41 +190,31 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     if (!selectedEvent) return;
     const targetEvent = selectedEvent;
     const targetId = targetEvent.id;
-    const nextFp = !targetEvent.false_positive;
-    const seq = ++fpToggleSeqRef.current;
+    triageController.setActiveTarget("event", targetId);
     try {
-      const res = await fetch(
-        `/api/events/${encodeURIComponent(targetId)}/false_positive`,
+      const result = await triageController.toggleFalsePositive(
+        targetId,
+        Boolean(targetEvent.false_positive),
         {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
-          body: JSON.stringify({ false_positive: nextFp }),
+          getActiveTargetId: () => selectedEventIdRef.current,
+          isCancelled: () => !isMountedRef.current,
         }
       );
-      if (!isMountedRef.current) return;
-      if (res.ok) {
-        if (
-          seq === fpToggleSeqRef.current &&
-          shouldApplyEventMutationResult(
-            selectedEventIdRef.current,
-            targetId,
-            true
-          )
-        ) {
+      if (!isMountedRef.current || result.stale) return;
+      if (result.ok) {
+        if (result.shouldApply) {
           setSelectedEvent({
             ...targetEvent,
-            false_positive: nextFp,
+            false_positive: result.nextFp,
           });
         }
         notify(
-          nextFp
+          result.nextFp
             ? "Marked as False Positive — spatial & dhash64 suppression signature saved"
             : "Cleared False Positive flag & removed suppression signature"
         );
       } else {
-        const data = await res.json().catch(() => null);
-        notify(data?.message || "Failed to update False Positive status");
+        notify(result.message || "Failed to update False Positive status");
       }
     } catch {
       if (isMountedRef.current) {
@@ -276,41 +227,24 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     if (!selectedEvent || aiVerifyBusy) return;
     const targetEvent = selectedEvent;
     const targetId = targetEvent.id;
-    const seq = ++aiVerifySeqRef.current;
+    triageController.setActiveTarget("event", targetId);
     setAiVerifyBusy(true);
+    let isStale = false;
     try {
-      const res = await fetch(
-        `/api/events/${encodeURIComponent(targetId)}/verify-ai`,
-        {
-          method: "POST",
-          credentials: "include",
-        }
-      );
-      const data = await res.json().catch(() => null);
-      if (!isMountedRef.current) return;
-      if (res.ok && data) {
-        const rawConf = Number(data.confidence ?? 0.9);
-        const aiVerdict: AiVerificationResult = data.ai_verification || {
-          is_true_positive: Boolean(data.is_true_positive),
-          confidence: Number.isFinite(rawConf) ? rawConf : 0.9,
-          reason: String(data.reason || "Verified by Vision AI Judge"),
-          provider: data.provider,
-          model: data.model,
-          verified_at: data.verified_at,
-        };
-        if (
-          seq === aiVerifySeqRef.current &&
-          shouldApplyEventMutationResult(
-            selectedEventIdRef.current,
-            targetId,
-            true
-          )
-        ) {
+      const result = await triageController.verifyWithAi(targetId, {
+        getActiveTargetId: () => selectedEventIdRef.current,
+        isCancelled: () => !isMountedRef.current,
+      });
+      isStale = result.stale;
+      if (!isMountedRef.current || result.stale) return;
+      if (result.ok && result.aiVerification) {
+        const aiVerdict: AiVerificationResult = result.aiVerification;
+        if (result.shouldApply) {
           setSelectedEvent({
             ...targetEvent,
             false_positive:
-              data.false_positive !== undefined
-                ? Boolean(data.false_positive)
+              result.falsePositive !== undefined
+                ? result.falsePositive
                 : targetEvent.false_positive,
             data: {
               ...(targetEvent.data || {}),
@@ -322,14 +256,18 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
           `${formatAiVerificationBadge(aiVerdict)} — ${aiVerdict.reason}`
         );
       } else {
-        notify(data?.message || "Vision AI Judge verification failed");
+        notify(result.error || "Vision AI Judge verification failed");
       }
     } catch {
       if (isMountedRef.current) {
         notify("Vision AI Judge request failed");
       }
     } finally {
-      if (isMountedRef.current && seq === aiVerifySeqRef.current) {
+      if (
+        isMountedRef.current &&
+        !isStale &&
+        selectedEventIdRef.current === targetId
+      ) {
         setAiVerifyBusy(false);
       }
     }
@@ -347,11 +285,6 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   const lastDeletedFaceProfile = useNvrStore((s) => s.lastDeletedFaceProfile);
   const subLabelsRefreshTick = useNvrStore((s) => s.subLabelsRefreshTick);
   const bumpSubLabelsRefresh = useNvrStore((s) => s.bumpSubLabelsRefresh);
-  const triageController = React.useMemo(() => {
-    const ctrl = createForensicTriageController();
-    ctrl.setActiveTarget("event", selectedEvent?.id ?? null);
-    return ctrl;
-  }, []);
 
   React.useEffect(() => {
     setEventNoteDraft(selectedEvent?.data?.notes || "");
@@ -370,9 +303,6 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
 
   React.useEffect(() => {
     selectedEventIdRef.current = selectedEvent?.id ?? null;
-    datasetAddSeqRef.current += 1;
-    fpToggleSeqRef.current += 1;
-    aiVerifySeqRef.current += 1;
     triageController.setActiveTarget("event", selectedEvent?.id ?? null);
     setAiVerifyBusy(false);
     setDatasetAddBusy(false);
@@ -389,9 +319,6 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
-      datasetAddSeqRef.current += 1;
-      fpToggleSeqRef.current += 1;
-      aiVerifySeqRef.current += 1;
       triageController.invalidatePendingMutations();
       debugReplaySeqRef.current += 1;
       if (debugReplayAbortRef.current) {
@@ -602,7 +529,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         getActiveTargetId: () => selectedEventIdRef.current,
         isCancelled: () => !isMountedRef.current,
       });
-      if (!isMountedRef.current) return;
+      if (!isMountedRef.current || result.stale) return;
       if (result.ok) {
         const nextPlate = result.normalizedPlate;
         const nextSubLabel =
@@ -649,7 +576,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         getActiveTargetId: () => selectedEventIdRef.current,
         isCancelled: () => !isMountedRef.current,
       });
-      if (!isMountedRef.current) return;
+      if (!isMountedRef.current || result.stale) return;
       if (result.ok) {
         if (result.shouldApply) {
           setSelectedEvent({
