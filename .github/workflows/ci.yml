@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   verify:
-    name: Verify Workspace (Rust + Console v2 + Privacy)
+    name: Verify Workspace (Rust + Web + Privacy)
     if: "!startsWith(github.event.head_commit.message, 'chore(release):')"
     runs-on: ubuntu-26.04
     timeout-minutes: 25
@@ -51,11 +51,11 @@ jobs:
         with:
           bun-version: latest
 
-      - name: Install and verify NinjaNVR Console (web-v2)
+      - name: Install and verify NinjaNVR Console (web)
         run: |
-          bun install --cwd web-v2 --frozen-lockfile
-          bun run --cwd web-v2 typecheck
-          bun run --cwd web-v2 build
+          bun install --cwd web --frozen-lockfile
+          bun run --cwd web typecheck
+          bun run --cwd web build
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

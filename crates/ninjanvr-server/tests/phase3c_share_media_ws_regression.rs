@@ -121,7 +121,7 @@ async fn share_links_and_media_containment_regression() {
     // 3. Trimmed camera names in review/export share links do not trigger false camera mismatch
     let db_path = tmp_dir.join("ninjanvr.db");
     let cfg_path = tmp_dir.join("config.yml");
-    let web_dir = tmp_dir.join("web-v2");
+    let web_dir = tmp_dir.join("web");
     std::fs::create_dir_all(&web_dir).unwrap();
     std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
     std::fs::write(
@@ -199,7 +199,7 @@ async fn cases_exports_and_previews_scoping_regression() {
     let media_dir = tmp_dir.join("media");
     let db_path = tmp_dir.join("ninjanvr.db");
     let cfg_path = tmp_dir.join("config.yml");
-    let web_dir = tmp_dir.join("web-v2");
+    let web_dir = tmp_dir.join("web");
     std::fs::create_dir_all(&web_dir).unwrap();
     std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
 
@@ -521,7 +521,7 @@ async fn onvif_ptz_ssrf_bounds_xml_and_rbac_regression() {
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let db_path = tmp_dir.join("ninjanvr.db");
     let cfg_path = tmp_dir.join("config.yml");
-    let web_dir = tmp_dir.join("web-v2");
+    let web_dir = tmp_dir.join("web");
     std::fs::create_dir_all(&web_dir).unwrap();
     std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
 
@@ -647,7 +647,7 @@ async fn latest_frame_privacy_ws_stats_webrtc_and_vod_regression() {
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let db_path = tmp_dir.join("ninjanvr.db");
     let cfg_path = tmp_dir.join("config.yml");
-    let web_dir = tmp_dir.join("web-v2");
+    let web_dir = tmp_dir.join("web");
     std::fs::create_dir_all(&web_dir).unwrap();
     std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
 
@@ -901,7 +901,7 @@ async fn cycle2_share_export_onvif_ws_cswsh_and_vod_regression() {
 
     let db_path = tmp_dir.join("ninjanvr.db");
     let cfg_path = tmp_dir.join("config.yml");
-    let web_dir = tmp_dir.join("web-v2");
+    let web_dir = tmp_dir.join("web");
     std::fs::create_dir_all(&web_dir).unwrap();
     std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
 
@@ -1374,7 +1374,7 @@ async fn cycle3_share_privacy_cases_onvif_ws_and_vod_regression() {
 
     let db_path = tmp_dir.join("ninjanvr.db");
     let cfg_path = tmp_dir.join("config.yml");
-    let web_dir = tmp_dir.join("web-v2");
+    let web_dir = tmp_dir.join("web");
     std::fs::create_dir_all(&web_dir).unwrap();
     std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
 

@@ -7,7 +7,7 @@ cd -- "$repo_root"
 
 echo "==> Checking repository privacy and hygiene guardrails..."
 
-# 1. Ensure DESIGN.md, CLAUDE.md, and web-v2/dist are never tracked or present in root
+# 1. Ensure DESIGN.md, CLAUDE.md, and web/dist are never tracked or present in root
 for forbidden in DESIGN.md CLAUDE.md; do
   if git ls-files --error-unmatch "$forbidden" >/dev/null 2>&1; then
     echo "ERROR: $forbidden must never be tracked in Git (use AGENTS.md for agent instructions)." >&2
@@ -19,8 +19,8 @@ for forbidden in DESIGN.md CLAUDE.md; do
   fi
 done
 
-if [ -n "$(git ls-files web-v2/dist)" ] || [ -n "$(git ls-files docs/.vitepress/dist docs/.vitepress/cache)" ]; then
-  echo "ERROR: web-v2/dist or docs/.vitepress build artifacts must not be tracked in Git." >&2
+if [ -n "$(git ls-files web/dist)" ] || [ -n "$(git ls-files docs/.vitepress/dist docs/.vitepress/cache)" ]; then
+  echo "ERROR: web/dist or docs/.vitepress build artifacts must not be tracked in Git." >&2
   exit 1
 fi
 

@@ -4,7 +4,7 @@ Validates commit messages against NinjaNVR Conventional Commits and SemVer stand
 - Format: <type>(<scope>)[!]: <description>
 - Allowed types: feat, fix, perf, refactor, docs, ci, chore, test, build, style, revert
 - Scope is mandatory for new commits and must match [a-z0-9][a-z0-9_,-]*
-  (e.g. feat(ui-v2): ..., fix(vision): ..., ci(release): ...)
+  (e.g. feat(web): ..., fix(vision): ..., ci(release): ...)
 - Subject length: 12..120 characters, no trailing period, no WIP/todo/fixup markers.
 """
 
@@ -67,7 +67,7 @@ def validate_message(raw_message: str, source_label: str = "commit") -> list[str
             f"[{source_label}] Invalid header: '{header}'\n"
             "  Expected Conventional Commit with scope: <type>(<scope>): <description>\n"
             f"  Allowed types: {', '.join(ALLOWED_TYPES)}\n"
-            "  Scope format: lowercase alphanumeric, '-', '_', or ',' (e.g. feat(ui-v2): ..., fix(vision): ...)\n"
+            "  Scope format: lowercase alphanumeric, '-', '_', or ',' (e.g. feat(web): ..., fix(vision): ...)\n"
             "  SemVer impact: feat/fix/perf increment the next release version in ./scripts/ci/cut-release."
         )
         return errors

@@ -7,7 +7,7 @@ updates:
     open-pull-requests-limit: 5
 
   - package-ecosystem: "bun"
-    directory: "/web-v2"
+    directory: "/web"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5

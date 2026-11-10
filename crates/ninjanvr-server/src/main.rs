@@ -498,9 +498,7 @@ async fn main() -> Result<()> {
         std::env::var("CONFIG_FILE").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string()),
     );
     let default_web_dir = PathBuf::from(
-        std::env::var("NINJANVR_WEB_V2_DIR")
-            .or_else(|_| std::env::var("NINJANVR_WEB_DIR"))
-            .unwrap_or_else(|_| "/opt/ninjanvr/web-v2".to_string()),
+        std::env::var("NINJANVR_WEB_DIR").unwrap_or_else(|_| "/opt/ninjanvr/web".to_string()),
     );
     let default_media_dir = PathBuf::from(
         std::env::var("NINJANVR_MEDIA_DIR").unwrap_or_else(|_| "/media/ninjanvr".to_string()),
@@ -542,8 +540,8 @@ async fn main() -> Result<()> {
     }
 
     if !web_dir.exists() {
-        let fallback_dist = PathBuf::from("web-v2/dist");
-        let fallback = PathBuf::from("web-v2");
+        let fallback_dist = PathBuf::from("web/dist");
+        let fallback = PathBuf::from("web");
         if fallback_dist.exists() {
             web_dir = fallback_dist;
         } else if fallback.exists() {
@@ -880,7 +878,7 @@ mod tests {
                 "8443".to_string(),
             ],
             PathBuf::from("/config/config.yml"),
-            PathBuf::from("/opt/ninjanvr/web-v2"),
+            PathBuf::from("/opt/ninjanvr/web"),
             PathBuf::from("/media/ninjanvr"),
             5000,
             8971,
@@ -959,7 +957,7 @@ mod tests {
         let cli_missing_val = parse_cli_args(
             vec!["--config".to_string(), "--validate-config".to_string()],
             PathBuf::from("/config/default.yml"),
-            PathBuf::from("/opt/ninjanvr/web-v2"),
+            PathBuf::from("/opt/ninjanvr/web"),
             PathBuf::from("/media/ninjanvr"),
             5000,
             8971,
@@ -982,7 +980,7 @@ mod tests {
                 "--validate-config".to_string(),
             ],
             PathBuf::from("/config/default.yml"),
-            PathBuf::from("/opt/ninjanvr/web-v2"),
+            PathBuf::from("/opt/ninjanvr/web"),
             PathBuf::from("/media/ninjanvr"),
             5000,
             8971,

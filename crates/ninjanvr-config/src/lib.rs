@@ -3698,7 +3698,7 @@ impl NinjaConfig {
         Ok(yaml_str)
     }
 
-    /// Applies a partial or full structured JSON configuration update (from UI v2),
+    /// Applies a partial or full structured JSON configuration update,
     /// automatically preserving any scrubbed RTSP/MQTT credentials and refreshing `raw_yaml`.
     pub fn apply_structured_json(&mut self, patch: &Value) -> Result<()> {
         let Some(obj) = patch.as_object() else {
@@ -7033,7 +7033,7 @@ go2rtc:
         let mut cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/config.yml")).unwrap();
         let mut api_payload = cfg.to_api_config();
 
-        // Simulate UI v2 modifying camera detect FPS, adding a zone, and changing MQTT port
+        // Simulate UI modifying camera detect FPS, adding a zone, and changing MQTT port
         // while sending back the scrubbed URLs from GET /api/config
         api_payload["mqtt"]["port"] = json!(1884);
         api_payload["cameras"]["sala"]["detect"]["fps"] = json!(8);

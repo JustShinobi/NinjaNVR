@@ -5,7 +5,7 @@ export default defineConfig({
   plugins: [react()],
   build: {
     outDir: "dist",
-    assetsDir: "assets-v2",
+    assetsDir: "assets",
     emptyOutDir: true,
     sourcemap: false,
     target: "es2022",

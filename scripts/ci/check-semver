@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Enforces SemVer and release manifest invariants across the workspace:
-1. Cargo.toml ([workspace.package] version), web-v2/package.json (version),
+1. Cargo.toml ([workspace.package] version), web/package.json (version),
    and all ninjanvr* entries in Cargo.lock must use valid SemVer (X.Y.Z or X.Y.Z-rc.N)
    and be 100% synchronized.
 2. Top entry in CHANGELOG.md must be a valid [X.Y.Z] - YYYY-MM-DD header.
@@ -71,20 +71,27 @@ def check_staged_release_edits() -> int:
                         "SemVer versions are calculated and bumped automatically by ./scripts/ci/cut-release."
                     )
 
-    if "web-v2/package.json" in staged_files:
-        diff = subprocess.run(
-            ["git", "diff", "--cached", "-U0", "--", "web-v2/package.json"],
+    if "web/package.json" in staged_files:
+        head_pkg = subprocess.run(
+            ["git", "cat-file", "-e", "HEAD:web/package.json"],
             capture_output=True,
             text=True,
-            check=True,
-        ).stdout
-        for line in diff.splitlines():
-            if line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
-                if re.search(r'"version"\s*:', line):
-                    return fail(
-                        "Manual version bump in web-v2/package.json is blocked. "
-                        "SemVer versions are calculated and bumped automatically by ./scripts/ci/cut-release."
-                    )
+            check=False,
+        )
+        if head_pkg.returncode == 0:
+            diff = subprocess.run(
+                ["git", "diff", "--cached", "-U0", "--", "web/package.json"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            for line in diff.splitlines():
+                if line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
+                    if re.search(r'"version"\s*:', line):
+                        return fail(
+                            "Manual version bump in web/package.json is blocked. "
+                            "SemVer versions are calculated and bumped automatically by ./scripts/ci/cut-release."
+                        )
 
     return 0
 
@@ -112,16 +119,16 @@ def main() -> int:
             f"Cargo.toml workspace version '{cargo_version}' is not valid SemVer (expected X.Y.Z or X.Y.Z-rc.N)."
         )
 
-    pkg_json = json.loads(Path("web-v2/package.json").read_text(encoding="utf-8"))
+    pkg_json = json.loads(Path("web/package.json").read_text(encoding="utf-8"))
     web_version = pkg_json.get("version", "")
     if not SEMVER_RE.match(web_version):
         return fail(
-            f"web-v2/package.json version '{web_version}' is not valid SemVer (expected X.Y.Z or X.Y.Z-rc.N)."
+            f"web/package.json version '{web_version}' is not valid SemVer (expected X.Y.Z or X.Y.Z-rc.N)."
         )
 
     if cargo_version != web_version:
         return fail(
-            f"Version mismatch between Cargo.toml ({cargo_version}) and web-v2/package.json ({web_version})."
+            f"Version mismatch between Cargo.toml ({cargo_version}) and web/package.json ({web_version})."
         )
 
     cargo_lock_path = Path("Cargo.lock")

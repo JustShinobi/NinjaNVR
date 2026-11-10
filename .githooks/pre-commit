@@ -37,7 +37,7 @@ while IFS= read -r file; do
       echo "ERROR [pre-commit]: Forbidden secret, database, or bytecode file staged: $file" >&2
       exit 1
       ;;
-    DESIGN.md|CLAUDE.md|web-v2/dist/*|docs/.vitepress/dist/*|docs/.vitepress/cache/*|*/__pycache__/*|__pycache__/*)
+    DESIGN.md|CLAUDE.md|web/dist/*|docs/.vitepress/dist/*|docs/.vitepress/cache/*|*/__pycache__/*|__pycache__/*)
       echo "ERROR [pre-commit]: Forbidden artifact or untracked file staged: $file" >&2
       exit 1
       ;;
@@ -77,7 +77,7 @@ while IFS= read -r file; do
       ;;
   esac
   case "$file" in
-    web-v2/*)
+    web/*)
       has_web=1
       ;;
   esac
@@ -115,9 +115,9 @@ if [[ "$has_rust" -eq 1 ]]; then
 fi
 
 if [[ "$has_web" -eq 1 ]]; then
-  echo "==> [pre-commit] Verifying web-v2 TypeScript types and unit tests..."
-  bun run --cwd web-v2 typecheck
-  bun run --cwd web-v2 test
+  echo "==> [pre-commit] Verifying web TypeScript types and unit tests..."
+  bun run --cwd web typecheck
+  bun run --cwd web test
 fi
 
 if [[ "$has_docs" -eq 1 ]]; then

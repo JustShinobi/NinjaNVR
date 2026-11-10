@@ -1,6 +1,6 @@
 {
   "exclude": [
-    "web-v2/dist/**",
+    "web/dist/**",
     "target/**"
   ]
 }

@@ -27,8 +27,8 @@ test:
 	cargo test --workspace
 
 build-ui:
-	bun run --cwd web-v2 typecheck
-	bun run --cwd web-v2 build
+	bun run --cwd web typecheck
+	bun run --cwd web build
 
 docs-dev:
 	bun run --cwd docs dev
@@ -44,8 +44,8 @@ image:
 
 fast-ui: build-ui
 	@pod=$$(kubectl -n $(K8S_NAMESPACE) get pod -l app.kubernetes.io/name=$(K8S_DEPLOY) -o jsonpath="{.items[0].metadata.name}") && \
-	kubectl -n $(K8S_NAMESPACE) exec "$$pod" -- rm -rf /opt/ninjanvr/web-v2/assets-v2 && \
-	kubectl -n $(K8S_NAMESPACE) cp web-v2/dist/. "$$pod":/opt/ninjanvr/web-v2
+	kubectl -n $(K8S_NAMESPACE) exec "$$pod" -- rm -rf /opt/ninjanvr/web/assets && \
+	kubectl -n $(K8S_NAMESPACE) cp web/dist/. "$$pod":/opt/ninjanvr/web
 
 logs:
 	kubectl -n $(K8S_NAMESPACE) logs -l app.kubernetes.io/name=$(K8S_DEPLOY) --tail=100

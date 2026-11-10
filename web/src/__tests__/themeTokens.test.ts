@@ -160,7 +160,7 @@ describe("themeTokens colorimetric utilities & cross-monitor invariants (#88)", 
     }
   });
 
-  test("web-v2/src/styles.css :root declarations match canonical DARK_THEME_TOKENS and structural CSS rules", async () => {
+  test("web/src/styles.css :root declarations match canonical DARK_THEME_TOKENS and structural CSS rules", async () => {
     const cssText = await readSrcFile("../styles.css");
     const rootVars = extractRootCssVariables(cssText);
 

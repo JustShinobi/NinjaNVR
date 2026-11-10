@@ -804,7 +804,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
             get(vod_segment_m4s),
         )
         .route("/login", get(serve_login_page))
-        .nest_service("/assets-v2", ServeDir::new(web_dir.join("assets-v2")))
+        .nest_service("/assets", ServeDir::new(web_dir.join("assets")))
         .fallback(get(serve_spa_fallback))
         .layer(CompressionLayer::new())
         // Binary media directories and MP4 share streams are mounted outside CompressionLayer so MP4/WebP files
@@ -14817,9 +14817,9 @@ pub async fn new_app_state(
     } else if !web_dir.join("index.html").exists()
         && web_dir
             .parent()
-            .is_some_and(|p| p.join("web-v2").join("index.html").exists())
+            .is_some_and(|p| p.join("web").join("index.html").exists())
     {
-        web_dir.parent().unwrap().join("web-v2")
+        web_dir.parent().unwrap().join("web")
     } else {
         web_dir
     };
@@ -14981,7 +14981,7 @@ mod tests {
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let db_path = tmp_dir.join("ninjanvr.db");
         let cfg_path = tmp_dir.join("config.yml");
-        let web_dir = tmp_dir.join("web-v2");
+        let web_dir = tmp_dir.join("web");
         std::fs::create_dir_all(&web_dir).unwrap();
         std::fs::write(
             web_dir.join("index.html"),
@@ -16090,7 +16090,7 @@ version: 0.18-0
         std::fs::write(&blocked_media_path, b"not_a_directory").unwrap();
         let degraded_state = new_app_state(
             &ctx.cfg_path,
-            ctx.tmp_dir.join("web-v2"),
+            ctx.tmp_dir.join("web"),
             blocked_media_path.clone(),
             false,
         )
@@ -20444,7 +20444,7 @@ cameras:
         // =========================================================================
         let db_path = tmp_dir.join("ninjanvr.db");
         let cfg_path = tmp_dir.join("config.yml");
-        let web_dir = tmp_dir.join("web-v2");
+        let web_dir = tmp_dir.join("web");
         let media_dir = tmp_dir.join("media");
         std::fs::create_dir_all(&web_dir).unwrap();
         std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
@@ -22126,7 +22126,7 @@ cameras:
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let db_path = tmp_dir.join("ninjanvr.db");
         let cfg_path = tmp_dir.join("config.yml");
-        let web_dir = tmp_dir.join("web-v2");
+        let web_dir = tmp_dir.join("web");
         let media_dir = tmp_dir.join("media");
         std::fs::create_dir_all(&web_dir).unwrap();
         std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
@@ -22960,7 +22960,7 @@ cameras:
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let db_path = tmp_dir.join("ninjanvr.db");
         let cfg_path = tmp_dir.join("config.yml");
-        let web_dir = tmp_dir.join("web-v2");
+        let web_dir = tmp_dir.join("web");
         let media_dir = tmp_dir.join("media");
         std::fs::create_dir_all(&web_dir).unwrap();
         std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
@@ -23638,7 +23638,7 @@ cameras:
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let db_path = tmp_dir.join("ninjanvr.db");
         let cfg_path = tmp_dir.join("config.yml");
-        let web_dir = tmp_dir.join("web-v2");
+        let web_dir = tmp_dir.join("web");
         let media_dir = tmp_dir.join("media");
         std::fs::create_dir_all(&web_dir).unwrap();
         std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
@@ -24197,7 +24197,7 @@ cameras:
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let db_path = tmp_dir.join("ninjanvr.db");
         let cfg_path = tmp_dir.join("config.yml");
-        let web_dir = tmp_dir.join("web-v2");
+        let web_dir = tmp_dir.join("web");
         let media_dir = tmp_dir.join("media");
         std::fs::create_dir_all(&web_dir).unwrap();
         std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
@@ -24955,7 +24955,7 @@ cameras:
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let db_path = tmp_dir.join("ninjanvr.db");
         let cfg_path = tmp_dir.join("config.yml");
-        let web_dir = tmp_dir.join("web-v2");
+        let web_dir = tmp_dir.join("web");
         let media_dir = tmp_dir.join("media");
         std::fs::create_dir_all(&web_dir).unwrap();
         std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
@@ -25611,7 +25611,7 @@ cameras:
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let db_path = tmp_dir.join("ninjanvr.db");
         let cfg_path = tmp_dir.join("config.yml");
-        let web_dir = tmp_dir.join("web-v2");
+        let web_dir = tmp_dir.join("web");
         let media_dir = tmp_dir.join("media");
         std::fs::create_dir_all(&web_dir).unwrap();
         std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
@@ -26089,7 +26089,7 @@ cameras:
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let db_path = tmp_dir.join("ninjanvr.db");
         let cfg_path = tmp_dir.join("config.yml");
-        let web_dir = tmp_dir.join("web-v2");
+        let web_dir = tmp_dir.join("web");
         let media_dir = tmp_dir.join("media");
         std::fs::create_dir_all(&web_dir).unwrap();
         std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
@@ -26954,7 +26954,7 @@ cameras:
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let db_path = tmp_dir.join("ninjanvr.db");
         let cfg_path = tmp_dir.join("config.yml");
-        let web_dir = tmp_dir.join("web-v2");
+        let web_dir = tmp_dir.join("web");
         let media_dir = tmp_dir.join("media");
         std::fs::create_dir_all(&web_dir).unwrap();
         std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
@@ -27600,7 +27600,7 @@ cameras:
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let db_path = tmp_dir.join("ninjanvr.db");
         let cfg_path = tmp_dir.join("config.yml");
-        let web_dir = tmp_dir.join("web-v2");
+        let web_dir = tmp_dir.join("web");
         let media_dir = tmp_dir.join("media");
         std::fs::create_dir_all(&web_dir).unwrap();
         std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
@@ -28711,7 +28711,7 @@ cameras:
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let db_path = tmp_dir.join("ninjanvr.db");
         let cfg_path = tmp_dir.join("config.yml");
-        let web_dir = tmp_dir.join("web-v2");
+        let web_dir = tmp_dir.join("web");
         let media_dir = tmp_dir.join("media");
         std::fs::create_dir_all(&web_dir).unwrap();
         std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
@@ -29608,7 +29608,7 @@ cameras:
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let db_path = tmp_dir.join("ninjanvr.db");
         let cfg_path = tmp_dir.join("config.yml");
-        let web_dir = tmp_dir.join("web-v2");
+        let web_dir = tmp_dir.join("web");
         let media_dir = tmp_dir.join("media");
         std::fs::create_dir_all(&web_dir).unwrap();
         std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
@@ -30438,7 +30438,7 @@ cameras:
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let db_path = tmp_dir.join("ninjanvr.db");
         let cfg_path = tmp_dir.join("config.yml");
-        let web_dir = tmp_dir.join("web-v2");
+        let web_dir = tmp_dir.join("web");
         let media_dir = tmp_dir.join("media");
         std::fs::create_dir_all(&web_dir).unwrap();
         std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();

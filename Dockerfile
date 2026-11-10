@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1.6
 FROM oven/bun:1-slim AS ui-builder
 
-WORKDIR /src/web-v2
-COPY web-v2/package.json web-v2/bun.lock ./
+WORKDIR /src/web
+COPY web/package.json web/bun.lock ./
 RUN bun install --frozen-lockfile
-COPY web-v2 ./
+COPY web ./
 RUN bun run typecheck && bun run build
 
 FROM rust:1-trixie AS builder
@@ -64,11 +64,10 @@ COPY --from=ffmpeg-bin /ffprobe /usr/local/bin/ffprobe
 COPY --from=openvino-assets /openvino-model /openvino-model
 COPY --from=openvino-assets /out/openvino/ /usr/local/lib/ninjanvr/openvino/
 COPY --from=builder /src/target/release/ninjanvr /usr/local/bin/ninjanvr
-COPY --from=ui-builder /src/web-v2/dist /opt/ninjanvr/web-v2
+COPY --from=ui-builder /src/web/dist /opt/ninjanvr/web
 
 ENV CONFIG_FILE=/config/config.yml
-ENV NINJANVR_WEB_DIR=/opt/ninjanvr/web-v2
-ENV NINJANVR_WEB_V2_DIR=/opt/ninjanvr/web-v2
+ENV NINJANVR_WEB_DIR=/opt/ninjanvr/web
 ENV NINJANVR_MEDIA_DIR=/media/ninjanvr
 ENV NINJANVR_OPENVINO_LIB_DIR=/usr/local/lib/ninjanvr/openvino
 ENV LD_LIBRARY_PATH=/usr/local/lib/ninjanvr/openvino

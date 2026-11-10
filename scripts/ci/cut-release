@@ -138,7 +138,7 @@ def update_version_manifests(next_version: str) -> list[str]:
         cargo_lock_path.write_text(cargo_lock_updated, encoding="utf-8")
         modified.append("Cargo.lock")
 
-    for json_file in ["web-v2/package.json"]:
+    for json_file in ["web/package.json"]:
         p = Path(json_file)
         data = json.loads(p.read_text(encoding="utf-8"))
         data["version"] = next_version

@@ -4240,7 +4240,7 @@ mod tests {
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let db_path = tmp_dir.join("ninjanvr.db");
         let cfg_path = tmp_dir.join("config.yml");
-        let web_dir = tmp_dir.join("web-v2");
+        let web_dir = tmp_dir.join("web");
         let media_dir = tmp_dir.join("media");
         std::fs::create_dir_all(&web_dir).unwrap();
         std::fs::create_dir_all(media_dir.join("exports")).unwrap();

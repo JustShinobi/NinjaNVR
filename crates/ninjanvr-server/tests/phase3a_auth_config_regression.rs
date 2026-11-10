@@ -40,7 +40,7 @@ fn mint_test_jwt(secret: &str, sub: &str, role: &str, allowed_cameras: Option<&s
 async fn phase3a_router_rbac_camera_scoping_static_media_and_log_sanitization_work() {
     let tmp_dir =
         std::env::temp_dir().join(format!("ninjanvr-p3a-router-{}", rand::random::<u64>()));
-    let web_dir = tmp_dir.join("web-v2");
+    let web_dir = tmp_dir.join("web");
     let media_dir = tmp_dir.join("media");
     std::fs::create_dir_all(&web_dir).unwrap();
     std::fs::create_dir_all(media_dir.join("clips/review")).unwrap();
@@ -247,7 +247,7 @@ version: 0.18-0
 #[tokio::test]
 async fn phase3a_login_rate_limit_csrf_oidc_hardening_and_trusted_proxy_work() {
     let tmp_dir = std::env::temp_dir().join(format!("ninjanvr-p3a-auth-{}", rand::random::<u64>()));
-    let web_dir = tmp_dir.join("web-v2");
+    let web_dir = tmp_dir.join("web");
     let media_dir = tmp_dir.join("media");
     std::fs::create_dir_all(&web_dir).unwrap();
     std::fs::create_dir_all(&media_dir).unwrap();
@@ -595,7 +595,7 @@ version: 0.18-0
 #[tokio::test]
 async fn phase3a_user_role_atomicity_config_raw_scrubbing_stats_and_prometheus_escaping_work() {
     let tmp_dir = std::env::temp_dir().join(format!("ninjanvr-p3a-cfg-{}", rand::random::<u64>()));
-    let web_dir = tmp_dir.join("web-v2");
+    let web_dir = tmp_dir.join("web");
     let media_dir = tmp_dir.join("media");
     std::fs::create_dir_all(&web_dir).unwrap();
     std::fs::create_dir_all(&media_dir).unwrap();
@@ -857,7 +857,7 @@ version: 0.18-0
 async fn phase3a_mcp_scoping_debug_traversal_federation_and_camera_proxy_hardening_work() {
     let tmp_dir =
         std::env::temp_dir().join(format!("ninjanvr-p3a-mcp-proxy-{}", rand::random::<u64>()));
-    let web_dir = tmp_dir.join("web-v2");
+    let web_dir = tmp_dir.join("web");
     let media_dir = tmp_dir.join("media");
     std::fs::create_dir_all(&web_dir).unwrap();
     std::fs::create_dir_all(&media_dir).unwrap();
@@ -1104,7 +1104,7 @@ version: 0.18-0
 #[tokio::test]
 async fn phase3a_cycle2_oidc_jwks_yaml_block_scrub_ssrf_userinfo_and_proxy_hardening_work() {
     let tmp_dir = std::env::temp_dir().join(format!("ninjanvr-p3a-c2-{}", rand::random::<u64>()));
-    let web_dir = tmp_dir.join("web-v2");
+    let web_dir = tmp_dir.join("web");
     let media_dir = tmp_dir.join("media");
     std::fs::create_dir_all(&web_dir).unwrap();
     std::fs::create_dir_all(&media_dir).unwrap();
@@ -1540,7 +1540,7 @@ version: 0.18-0
 #[tokio::test]
 async fn phase3a_cycle3_oidc_proxy_role_cap_token_prefix_ssrf_and_yaml_scrub_regression_work() {
     let tmp_dir = std::env::temp_dir().join(format!("ninjanvr-p3a-c3-{}", rand::random::<u64>()));
-    let web_dir = tmp_dir.join("web-v2");
+    let web_dir = tmp_dir.join("web");
     let media_dir = tmp_dir.join("media");
     std::fs::create_dir_all(&web_dir).unwrap();
     std::fs::create_dir_all(&media_dir).unwrap();

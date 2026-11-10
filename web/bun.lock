@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "ninjanvr-web-v2",
+      "name": "ninjanvr-web",
       "dependencies": {
         "hls.js": "^1.7.4",
         "lucide-react": "^1.66.0",
