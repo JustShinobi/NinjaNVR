@@ -106,6 +106,20 @@ pub const NINJANVR_VERSION: &str = match option_env!("NINJANVR_RELEASE_VERSION")
     _ => env!("CARGO_PKG_VERSION"),
 };
 
+/// Structured configuration validation error (`thiserror::Error`).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConfigValidationError {
+    #[error("invalid {0}")]
+    InvalidPathField(&'static str),
+    #[error("invalid detector {field} in '{detector}'")]
+    InvalidDetectorPath {
+        detector: String,
+        field: &'static str,
+    },
+    #[error("invalid {0} path")]
+    InvalidTlsPath(&'static str),
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeerNodeConfig {
     #[serde(default = "default_true")]
@@ -4770,33 +4784,41 @@ fn merge_json_values(base: &mut Value, patch: &Value, replace_map_keys: &[&str])
 
 fn validate_config_file_paths(cfg: &NinjaConfig) -> Result<()> {
     if !is_safe_labelmap_path(Path::new(&cfg.model.labelmap_path)) {
-        anyhow::bail!("invalid model.labelmap_path");
+        return Err(ConfigValidationError::InvalidPathField("model.labelmap_path").into());
     }
     if !is_safe_model_path(Path::new(&cfg.model.path)) {
-        anyhow::bail!("invalid model.path");
+        return Err(ConfigValidationError::InvalidPathField("model.path").into());
     }
     for (det_name, det) in &cfg.detectors {
         if let Some(ref m) = det.model {
             if !is_safe_labelmap_path(Path::new(&m.labelmap_path)) {
-                anyhow::bail!("invalid detector model.labelmap_path in '{det_name}'");
+                return Err(ConfigValidationError::InvalidDetectorPath {
+                    detector: det_name.clone(),
+                    field: "model.labelmap_path",
+                }
+                .into());
             }
             if !is_safe_model_path(Path::new(&m.path)) {
-                anyhow::bail!("invalid detector model.path in '{det_name}'");
+                return Err(ConfigValidationError::InvalidDetectorPath {
+                    detector: det_name.clone(),
+                    field: "model.path",
+                }
+                .into());
             }
         }
     }
     if !is_safe_model_path(&cfg.face_recognition.model_path) {
-        anyhow::bail!("invalid face_recognition.model_path");
+        return Err(ConfigValidationError::InvalidPathField("face_recognition.model_path").into());
     }
     if let Some(ref p) = cfg.lpr.detector_model_path
         && !is_safe_model_path(p)
     {
-        anyhow::bail!("invalid lpr.detector_model_path");
+        return Err(ConfigValidationError::InvalidPathField("lpr.detector_model_path").into());
     }
     if let Some(ref p) = cfg.lpr.ocr_model_path
         && !is_safe_model_path(p)
     {
-        anyhow::bail!("invalid lpr.ocr_model_path");
+        return Err(ConfigValidationError::InvalidPathField("lpr.ocr_model_path").into());
     }
     validate_mqtt_tls_paths(&cfg.mqtt)?;
     Ok(())
@@ -4806,17 +4828,17 @@ fn validate_mqtt_tls_paths(mqtt: &MqttConfig) -> Result<()> {
     if let Some(ref p) = mqtt.tls_ca_certs
         && !is_safe_tls_path(p)
     {
-        anyhow::bail!("invalid mqtt.tls_ca_certs path");
+        return Err(ConfigValidationError::InvalidTlsPath("mqtt.tls_ca_certs").into());
     }
     if let Some(ref p) = mqtt.tls_client_cert
         && !is_safe_tls_path(p)
     {
-        anyhow::bail!("invalid mqtt.tls_client_cert path");
+        return Err(ConfigValidationError::InvalidTlsPath("mqtt.tls_client_cert").into());
     }
     if let Some(ref p) = mqtt.tls_client_key
         && !is_safe_tls_path(p)
     {
-        anyhow::bail!("invalid mqtt.tls_client_key path");
+        return Err(ConfigValidationError::InvalidTlsPath("mqtt.tls_client_key").into());
     }
     Ok(())
 }

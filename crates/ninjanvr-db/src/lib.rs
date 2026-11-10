@@ -126,6 +126,33 @@ pub type ScopedReviewDeleteResult = std::result::Result<(u64, Vec<Option<String>
 pub type ScopedEventDeleteResult =
     std::result::Result<Vec<(String, String, Option<String>)>, String>;
 
+/// Typed database validation and invariant error (`thiserror::Error`).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DbValidationError {
+    #[error("Username must be between 1 and 30 characters")]
+    InvalidUsernameLength,
+    #[error("Username may only contain letters, numbers, '_', '.', or '-'")]
+    InvalidUsernameCharacters,
+    #[error("Password cannot be empty")]
+    EmptyPassword,
+    #[error("Role must be 'admin', 'operator', or 'viewer'")]
+    InvalidRole,
+    #[error("User '{0}' already exists")]
+    UserAlreadyExists(String),
+    #[error("Cannot demote the last admin account")]
+    CannotDemoteLastAdmin,
+    #[error("Cannot delete the last admin account")]
+    CannotDeleteLastAdmin,
+    #[error("Token name cannot be empty")]
+    EmptyTokenName,
+    #[error("Token expiration timestamp must be a finite positive number")]
+    InvalidTokenExpiration,
+    #[error("Scope must be 'read_only', 'metrics', or 'full'")]
+    InvalidTokenScope,
+    #[error("An API token with name '{0}' already exists")]
+    TokenAlreadyExists(String),
+}
+
 #[derive(Clone)]
 pub struct NinjaDatabase {
     conn: Arc<Mutex<Connection>>,
@@ -1155,22 +1182,22 @@ impl NinjaDatabase {
     ) -> Result<()> {
         let trimmed = username.trim();
         if trimmed.is_empty() || trimmed.len() > 30 {
-            anyhow::bail!("Username must be between 1 and 30 characters");
+            return Err(DbValidationError::InvalidUsernameLength.into());
         }
         if !trimmed
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
         {
-            anyhow::bail!("Username may only contain letters, numbers, '_', '.', or '-'");
+            return Err(DbValidationError::InvalidUsernameCharacters.into());
         }
         if password.is_empty() {
-            anyhow::bail!("Password cannot be empty");
+            return Err(DbValidationError::EmptyPassword.into());
         }
         let norm_role = match role.trim().to_ascii_lowercase().as_str() {
             "viewer" => "viewer",
             "operator" => "operator",
             "admin" => "admin",
-            _ => anyhow::bail!("Role must be 'admin', 'operator', or 'viewer'"),
+            _ => return Err(DbValidationError::InvalidRole.into()),
         };
         let norm_cams = normalize_allowed_cameras_str(allowed_cameras);
 
@@ -1184,7 +1211,7 @@ impl NinjaDatabase {
                 )
                 .optional()?;
             if exists.is_some() {
-                anyhow::bail!("User '{trimmed}' already exists");
+                return Err(DbValidationError::UserAlreadyExists(trimmed.to_string()).into());
             }
         }
 
@@ -1200,7 +1227,7 @@ impl NinjaDatabase {
             )
             .optional()?;
         if exists.is_some() {
-            anyhow::bail!("User '{trimmed}' already exists");
+            return Err(DbValidationError::UserAlreadyExists(trimmed.to_string()).into());
         }
         tx.execute(
             r#"
@@ -1220,7 +1247,7 @@ impl NinjaDatabase {
         iterations: u32,
     ) -> Result<bool> {
         if password.is_empty() {
-            anyhow::bail!("Password cannot be empty");
+            return Err(DbValidationError::EmptyPassword.into());
         }
         let pw_hash = hash_password(password, None, iterations.max(MIN_PBKDF2_ITERATIONS));
         let now_str = Utc::now().to_rfc3339();
@@ -1290,7 +1317,7 @@ impl NinjaDatabase {
             "viewer" => "viewer",
             "operator" => "operator",
             "admin" => "admin",
-            _ => anyhow::bail!("Role must be 'admin', 'operator', or 'viewer'"),
+            _ => return Err(DbValidationError::InvalidRole.into()),
         };
         let target = username.trim();
         let mut conn = self.lock_conn();
@@ -1312,7 +1339,7 @@ impl NinjaDatabase {
                 |r| r.get(0),
             )?;
             if other_admins == 0 {
-                anyhow::bail!("Cannot demote the last admin account");
+                return Err(DbValidationError::CannotDemoteLastAdmin.into());
             }
         }
         let (updated, effective_cams) = if let Some(cams) = allowed_cameras {
@@ -1376,18 +1403,18 @@ impl NinjaDatabase {
     ) -> Result<(Value, String)> {
         let trimmed_name = name.trim();
         if trimmed_name.is_empty() {
-            anyhow::bail!("Token name cannot be empty");
+            return Err(DbValidationError::EmptyTokenName.into());
         }
         if let Some(exp) = expires_at
             && (!exp.is_finite() || exp <= 0.0)
         {
-            anyhow::bail!("Token expiration timestamp must be a finite positive number");
+            return Err(DbValidationError::InvalidTokenExpiration.into());
         }
         let norm_scope = match scope.trim().to_ascii_lowercase().as_str() {
             "read_only" => "read_only",
             "metrics" => "metrics",
             "full" => "full",
-            _ => anyhow::bail!("Scope must be 'read_only', 'metrics', or 'full'"),
+            _ => return Err(DbValidationError::InvalidTokenScope.into()),
         };
 
         let mut rand_bytes = [0u8; 16];
@@ -1412,7 +1439,7 @@ impl NinjaDatabase {
             |r| r.get(0),
         )?;
         if existing_count > 0 {
-            anyhow::bail!("An API token with name '{trimmed_name}' already exists");
+            return Err(DbValidationError::TokenAlreadyExists(trimmed_name.to_string()).into());
         }
         tx.execute(
             r#"
@@ -1613,7 +1640,7 @@ impl NinjaDatabase {
                 |r| r.get(0),
             )?;
             if other_admins == 0 {
-                anyhow::bail!("Cannot delete the last admin account");
+                return Err(DbValidationError::CannotDeleteLastAdmin.into());
             }
         }
         tx.execute(
