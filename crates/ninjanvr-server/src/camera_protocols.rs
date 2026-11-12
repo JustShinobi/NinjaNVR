@@ -267,7 +267,7 @@ struct CameraDriverRuntimeInner {
     discovered_profiles: RwLock<HashMap<(String, String), String>>,
     discovered_video_sources: RwLock<HashMap<String, String>>,
     discovered_protocols: RwLock<HashMap<String, String>>,
-    digest_challenges: Mutex<HashMap<String, String>>,
+    digest_challenges: Mutex<HashMap<String, (String, u32)>>,
     siren_cooldown_until: Mutex<HashMap<String, f64>>,
     tapo_streamd_ports: RwLock<HashMap<String, u16>>,
     active_presets: Arc<tokio::sync::RwLock<HashMap<String, Option<String>>>>,
@@ -401,7 +401,17 @@ impl CameraDriverRuntime {
             .digest_challenges
             .lock()
             .ok()
-            .and_then(|g| g.get(authority_key).cloned())
+            .and_then(|g| g.get(authority_key).map(|(hdr, _)| hdr.clone()))
+    }
+
+    /// Returns the cached `WWW-Authenticate` header for `authority_key` along with the
+    /// next monotonically incremented RFC 2617 / RFC 7616 nonce-count (`nc >= 2`).
+    pub fn next_digest_challenge(&self, authority_key: &str) -> Option<(String, u32)> {
+        self.inner.digest_challenges.lock().ok().and_then(|mut g| {
+            let entry = g.get_mut(authority_key)?;
+            entry.1 = entry.1.saturating_add(1).max(2);
+            Some((entry.0.clone(), entry.1))
+        })
     }
 
     pub fn set_digest_challenge(&self, authority_key: &str, www_authenticate: &str) {
@@ -409,7 +419,7 @@ impl CameraDriverRuntime {
             if g.len() >= 128 && !g.contains_key(authority_key) {
                 g.clear();
             }
-            g.insert(authority_key.to_string(), www_authenticate.to_string());
+            g.insert(authority_key.to_string(), (www_authenticate.to_string(), 1));
         }
     }
 
@@ -652,6 +662,13 @@ impl CameraDriverRuntime {
                     }
                     Err((StatusCode::GATEWAY_TIMEOUT, _)) => return None,
                     Err((_, ref e)) if e.contains("request failed") => return None,
+                    Err((
+                        StatusCode::NOT_FOUND
+                        | StatusCode::METHOD_NOT_ALLOWED
+                        | StatusCode::UNAUTHORIZED
+                        | StatusCode::FORBIDDEN,
+                        _,
+                    )) => break,
                     Err(_) => {}
                 }
             }
@@ -3163,6 +3180,26 @@ pub fn build_http_digest_auth_header(
     password: &str,
     cnonce: &str,
 ) -> Option<String> {
+    build_http_digest_auth_header_with_nc(
+        www_authenticate,
+        method,
+        uri_path_and_query,
+        user,
+        password,
+        cnonce,
+        1,
+    )
+}
+
+pub fn build_http_digest_auth_header_with_nc(
+    www_authenticate: &str,
+    method: &str,
+    uri_path_and_query: &str,
+    user: &str,
+    password: &str,
+    cnonce: &str,
+    nonce_count: u32,
+) -> Option<String> {
     let trimmed = www_authenticate.trim();
     if trimmed.len() < 7 || !trimmed[..7].eq_ignore_ascii_case("digest ") {
         return None;
@@ -3175,7 +3212,7 @@ pub fn build_http_digest_auth_header(
 
     let ha1 = md5_hex(format!("{user}:{realm}:{password}").as_bytes());
     let ha2 = md5_hex(format!("{method}:{uri_path_and_query}").as_bytes());
-    let nc = "00000001";
+    let nc = format!("{:08x}", nonce_count.max(1));
 
     let use_qop_auth = qop_raw.is_some_and(|q| {
         q.split(',')
@@ -3285,10 +3322,10 @@ pub async fn send_http_digest_request(
     );
 
     let build_req = |auth_header: Option<String>, include_body: bool| {
-        let mut r = client
-            .request(method.clone(), url)
-            .timeout(timeout)
-            .header(header::CONNECTION, "close");
+        let mut r = client.request(method.clone(), url).timeout(timeout);
+        if is_audio_post {
+            r = r.header(header::CONNECTION, "close");
+        }
         if let Some(ct) = content_type {
             r = r.header(header::CONTENT_TYPE, ct);
         }
@@ -3304,11 +3341,19 @@ pub async fn send_http_digest_request(
     let cached_auth_hdr = if let Some(u) = user.map(str::trim).filter(|s| !s.is_empty()) {
         let pw = password.unwrap_or("");
         runtime
-            .get_digest_challenge(&authority_key)
-            .and_then(|www_auth| {
+            .next_digest_challenge(&authority_key)
+            .and_then(|(www_auth, nc)| {
                 let uri_pq = extract_uri_path_and_query(url);
                 let cnonce = format!("{:016x}", rand::random::<u64>());
-                build_http_digest_auth_header(&www_auth, method.as_str(), &uri_pq, u, pw, &cnonce)
+                build_http_digest_auth_header_with_nc(
+                    &www_auth,
+                    method.as_str(),
+                    &uri_pq,
+                    u,
+                    pw,
+                    &cnonce,
+                    nc,
+                )
             })
     } else {
         None

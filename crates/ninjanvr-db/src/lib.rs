@@ -186,6 +186,8 @@ pub enum DbValidationError {
 pub struct NinjaDatabase {
     conn: Arc<Mutex<Connection>>,
     path: PathBuf,
+    recordings_mutation_seq: Arc<std::sync::atomic::AtomicU64>,
+    storage_usage_cache: Arc<Mutex<Option<(std::time::Instant, u64, Value)>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -739,9 +741,16 @@ impl NinjaDatabase {
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
             path,
+            recordings_mutation_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            storage_usage_cache: Arc::new(Mutex::new(None)),
         };
         db.init_schema()?;
         Ok(db)
+    }
+
+    fn bump_recordings_mutation(&self) {
+        self.recordings_mutation_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     pub fn path(&self) -> &Path {
@@ -752,6 +761,7 @@ impl NinjaDatabase {
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
         let conn = self.lock_conn();
         conn.execute_batch(sql)?;
+        self.bump_recordings_mutation();
         Ok(())
     }
 
@@ -877,6 +887,7 @@ impl NinjaDatabase {
             );
             CREATE INDEX IF NOT EXISTS "recordings_camera_start_time_end_time" ON "recordings" ("camera", "start_time" DESC, "end_time" DESC);
             CREATE INDEX IF NOT EXISTS "recordings_camera_end_time" ON "recordings" ("camera", "end_time" ASC);
+            CREATE INDEX IF NOT EXISTS "recordings_camera_storage_agg" ON "recordings" ("camera", "start_time", "segment_size", "duration");
             CREATE UNIQUE INDEX IF NOT EXISTS "recordings_path" ON "recordings" ("path");
             CREATE INDEX IF NOT EXISTS "review_segment_camera" ON "reviewsegment" ("camera");
             CREATE INDEX IF NOT EXISTS "review_segment_start_time_end_time" ON "reviewsegment" ("start_time" DESC, "end_time" DESC);
@@ -992,10 +1003,12 @@ impl NinjaDatabase {
 
     pub fn set_recording_stream_tier(&self, id: &str, tier: &str) -> Result<usize> {
         let conn = self.lock_conn();
-        Ok(conn.execute(
+        let rows = conn.execute(
             "UPDATE recordings SET stream_tier = ?2 WHERE id = ?1",
             params![id, tier],
-        )?)
+        )?;
+        self.bump_recordings_mutation();
+        Ok(rows)
     }
 
     pub fn list_recordings_by_dbfs(
@@ -1079,12 +1092,19 @@ impl NinjaDatabase {
             }
         }
         tx.commit()?;
+        if !paths.is_empty() {
+            self.bump_recordings_mutation();
+        }
         Ok(paths)
     }
 
     pub fn delete_recording_by_id(&self, id: &str) -> Result<usize> {
         let conn = self.lock_conn();
-        Ok(conn.execute("DELETE FROM recordings WHERE id = ?1", params![id])?)
+        let rows = conn.execute("DELETE FROM recordings WHERE id = ?1", params![id])?;
+        if rows > 0 {
+            self.bump_recordings_mutation();
+        }
+        Ok(rows)
     }
 
     pub fn ensure_default_admin(&self, iterations: u32) -> Result<Option<String>> {
@@ -4070,6 +4090,18 @@ impl NinjaDatabase {
     }
 
     pub fn query_recordings_storage_usage(&self) -> Result<Value> {
+        const STORAGE_USAGE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+        let current_seq = self
+            .recordings_mutation_seq
+            .load(std::sync::atomic::Ordering::Acquire);
+        if let Ok(guard) = self.storage_usage_cache.lock()
+            && let Some((cached_at, cached_seq, ref cached_val)) = *guard
+            && cached_seq == current_seq
+            && cached_at.elapsed() < STORAGE_USAGE_CACHE_TTL
+        {
+            return Ok(cached_val.clone());
+        }
+
         let conn = self.lock_conn();
         let cutoff = (Utc::now().timestamp() - 86400) as f64;
         let mut stmt = conn.prepare(
@@ -4139,7 +4171,13 @@ impl NinjaDatabase {
                 }),
             );
         }
-        Ok(Value::Object(out))
+        drop(stmt);
+        drop(conn);
+        let result_val = Value::Object(out);
+        if let Ok(mut guard) = self.storage_usage_cache.lock() {
+            *guard = Some((std::time::Instant::now(), current_seq, result_val.clone()));
+        }
+        Ok(result_val)
     }
 
     pub fn query_motion_activity(
@@ -4388,6 +4426,7 @@ impl NinjaDatabase {
                 hm_str
             ],
         )?;
+        self.bump_recordings_mutation();
         Ok(())
     }
 
@@ -4513,6 +4552,9 @@ impl NinjaDatabase {
             }
         }
         tx.commit()?;
+        if !ids.is_empty() {
+            self.bump_recordings_mutation();
+        }
         Ok(paths)
     }
 
@@ -4597,6 +4639,7 @@ impl NinjaDatabase {
             "UPDATE recordings SET segment_size = ?2, stream_tier = 'compacted' WHERE id = ?1",
             params![id, safe_size],
         )?;
+        self.bump_recordings_mutation();
         Ok(())
     }
 
@@ -4640,6 +4683,9 @@ impl NinjaDatabase {
             }
         }
         tx.commit()?;
+        if !matched.is_empty() {
+            self.bump_recordings_mutation();
+        }
         Ok(matched)
     }
 
@@ -4681,6 +4727,9 @@ impl NinjaDatabase {
             }
         }
         tx.commit()?;
+        if deleted > 0 {
+            self.bump_recordings_mutation();
+        }
         Ok(deleted)
     }
 
@@ -4797,6 +4846,9 @@ impl NinjaDatabase {
             }
         }
         tx.commit()?;
+        if !paths.is_empty() {
+            self.bump_recordings_mutation();
+        }
         Ok(paths)
     }
 
@@ -4864,6 +4916,9 @@ impl NinjaDatabase {
             }
         }
         tx.commit()?;
+        if !paths.is_empty() {
+            self.bump_recordings_mutation();
+        }
         Ok(paths)
     }
 

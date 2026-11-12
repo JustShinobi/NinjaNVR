@@ -214,7 +214,10 @@ jobs:
                       (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)))
                       for m in rc_matches
                   )
-                  rc_entries.append((v.get("created_at", ""), best_rc, vid, tags))
+                  if current_tag.startswith("v2.") and best_rc[0] >= 3:
+                      legacy_sha_ids.append((vid, tags))
+                  else:
+                      rc_entries.append((v.get("created_at", ""), best_rc, vid, tags))
               elif all(LEGACY_SHA_RE.match(t) for t in tags):
                   legacy_sha_ids.append((vid, tags))
 

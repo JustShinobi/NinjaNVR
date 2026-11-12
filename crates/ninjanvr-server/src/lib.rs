@@ -230,6 +230,7 @@ type PidTickEntry = (u64, Instant, f64);
 pub struct ProcCpuTracker {
     prev_ticks: Arc<std::sync::Mutex<HashMap<u32, PidTickEntry>>>,
     prev_infer: Arc<std::sync::Mutex<Option<PidTickEntry>>>,
+    last_storage_probe_ok: Arc<std::sync::Mutex<Option<(PathBuf, Instant)>>>,
 }
 
 impl ProcCpuTracker {
@@ -314,6 +315,37 @@ impl ProcCpuTracker {
             fallback_cpu
         };
         (pct * 10.0).round() / 10.0
+    }
+
+    /// Probes `media_dir` writability with a 15s TTL when healthy and all media subdirectories
+    /// (`recordings/`, `clips/`, `exports/`) exist on disk, avoiding per-request file creation/deletion
+    /// on `/api/stats` and `/api/metrics` while immediately re-probing when degraded or missing.
+    pub fn probe_storage_writable_cached(
+        &self,
+        media_dir: &Path,
+        currently_degraded: bool,
+    ) -> std::result::Result<(), String> {
+        const STORAGE_PROBE_TTL: Duration = Duration::from_secs(15);
+        if !currently_degraded
+            && media_dir.join("recordings").is_dir()
+            && media_dir.join("clips").is_dir()
+            && media_dir.join("exports").is_dir()
+            && let Ok(guard) = self.last_storage_probe_ok.lock()
+            && let Some((ref cached_path, cached_at)) = *guard
+            && cached_path == media_dir
+            && cached_at.elapsed() < STORAGE_PROBE_TTL
+        {
+            return Ok(());
+        }
+        let res = probe_storage_writable(media_dir);
+        if let Ok(mut guard) = self.last_storage_probe_ok.lock() {
+            if res.is_ok() {
+                *guard = Some((media_dir.to_path_buf(), Instant::now()));
+            } else {
+                *guard = None;
+            }
+        }
+        res
     }
 }
 
@@ -4300,27 +4332,32 @@ async fn compute_stats_snapshot(state: &AppState) -> Value {
             obj.insert("min_shm".to_string(), json!(16));
         }
 
-        let (storage_degraded_val, storage_error_val) =
-            match probe_storage_writable(&state.media_dir) {
-                Ok(()) => {
-                    state
-                        .storage_degraded
-                        .store(false, std::sync::atomic::Ordering::SeqCst);
-                    if let Ok(mut g) = state.storage_error.lock() {
-                        *g = None;
-                    }
-                    (false, Value::Null)
+        let currently_degraded = state
+            .storage_degraded
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let (storage_degraded_val, storage_error_val) = match state
+            .cpu_tracker
+            .probe_storage_writable_cached(&state.media_dir, currently_degraded)
+        {
+            Ok(()) => {
+                state
+                    .storage_degraded
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                if let Ok(mut g) = state.storage_error.lock() {
+                    *g = None;
                 }
-                Err(err) => {
-                    state
-                        .storage_degraded
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    if let Ok(mut g) = state.storage_error.lock() {
-                        *g = Some(err.clone());
-                    }
-                    (true, json!(err))
+                (false, Value::Null)
+            }
+            Err(err) => {
+                state
+                    .storage_degraded
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Ok(mut g) = state.storage_error.lock() {
+                    *g = Some(err.clone());
                 }
-            };
+                (true, json!(err))
+            }
+        };
 
         let rec_mount = stat_mount_mb(&rec_dir, "ext4");
         let free_mb = rec_mount["free"].as_f64().unwrap_or(20_000.0).max(1.0);
@@ -7392,6 +7429,12 @@ async fn api_streams_probe(
         "error",
         "-rtsp_transport",
         "tcp",
+        "-analyzeduration",
+        "100000",
+        "-probesize",
+        "32768",
+        "-fpsprobesize",
+        "0",
         "-timeout",
         "5000000",
         "-print_format",
@@ -10789,22 +10832,31 @@ async fn api_camera_hardware_get(
     }
 
     if dahua_cgi_ok {
-        for &table in DAHUA_CGI_PROBE_TABLES {
-            let tbl_url =
-                format!("{cgi_base}/cgi-bin/configManager.cgi?action=getConfig&name={table}");
-            if let Ok((StatusCode::OK, txt)) = send_http_digest_request(
-                &state.http_client,
-                &state.camera_driver_runtime,
-                reqwest::Method::GET,
-                &tbl_url,
-                (user, pass),
-                (None, None),
-                timeout,
-            )
-            .await
-            {
-                let kv = parse_dahua_cgi_kv(&txt);
-                apply_dahua_cgi_table_to_state(table, &kv, &mut state_map);
+        for chunk in DAHUA_CGI_PROBE_TABLES.chunks(4) {
+            let futs = chunk.iter().map(|&table| {
+                let tbl_url =
+                    format!("{cgi_base}/cgi-bin/configManager.cgi?action=getConfig&name={table}");
+                let client = &state.http_client;
+                let rt = &state.camera_driver_runtime;
+                async move {
+                    let res = send_http_digest_request(
+                        client,
+                        rt,
+                        reqwest::Method::GET,
+                        &tbl_url,
+                        (user, pass),
+                        (None, None),
+                        timeout,
+                    )
+                    .await;
+                    (table, res)
+                }
+            });
+            for (table, res) in futures_util::future::join_all(futs).await {
+                if let Ok((StatusCode::OK, txt)) = res {
+                    let kv = parse_dahua_cgi_kv(&txt);
+                    apply_dahua_cgi_table_to_state(table, &kv, &mut state_map);
+                }
             }
         }
     }
@@ -32660,6 +32712,25 @@ cameras:
         assert!(digest_hdr.contains("realm=\"Login to 5C93B8D566124B9A\""));
         assert!(digest_hdr.contains("opaque=\"\""));
         assert!(digest_hdr.contains("qop=auth, nc=00000001, cnonce=\"0a4f113b\""));
+
+        let rt_nc = CameraDriverRuntime::new();
+        rt_nc.set_digest_challenge("http://192.0.2.70:80", www_auth);
+        let (_, nc2) = rt_nc.next_digest_challenge("http://192.0.2.70:80").unwrap();
+        let (_, nc3) = rt_nc.next_digest_challenge("http://192.0.2.70:80").unwrap();
+        assert_eq!(nc2, 2);
+        assert_eq!(nc3, 3);
+        let digest_hdr_nc2 = camera_protocols::build_http_digest_auth_header_with_nc(
+            www_auth,
+            "GET",
+            "/cgi-bin/configManager.cgi?action=getConfig&name=Lighting",
+            "admin",
+            "cam_pass",
+            "0a4f113b",
+            nc2,
+        )
+        .unwrap();
+        assert!(digest_hdr_nc2.contains("qop=auth, nc=00000002, cnonce=\"0a4f113b\""));
+        assert_ne!(digest_hdr, digest_hdr_nc2);
 
         // 3. ITU-T G.711 A-law encoding and WAV stripping (including odd-length RIFF chunk padding)
         assert_eq!(linear_pcm16_to_alaw(0), 0xD5);
