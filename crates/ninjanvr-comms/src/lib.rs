@@ -1407,11 +1407,20 @@ impl LogBufferHub {
         map.insert("ninjanvr".to_string(), VecDeque::new());
         map.insert("go2rtc".to_string(), VecDeque::new());
         map.insert("nginx".to_string(), VecDeque::new());
+        map.insert("cameras".to_string(), VecDeque::new());
         Self {
             buffers: Arc::new(Mutex::new(map)),
             stream_tx,
             max_lines: max_lines.max(1),
         }
+    }
+
+    pub fn push_camera(&self, camera: &str, severity: &str, message: &str) {
+        let (outer_ts, inner_ts, _) = format_utc_timestamps();
+        let sev_pad = format!("{:<7}", severity.to_ascii_uppercase());
+        let sec_pad = format!("{:<30}", format!("camera.{camera}"));
+        let line = format!("{outer_ts}  [{inner_ts}] {sec_pad} {sev_pad} : {message}");
+        self.push_raw("cameras", line);
     }
 
     pub fn push_ninjanvr(&self, severity: &str, section: &str, message: &str) {
@@ -1430,7 +1439,7 @@ impl LogBufferHub {
 
     pub fn push_nginx(&self, method: &str, path: &str, status: u16) {
         let (outer_ts, inner_ts, _) = format_utc_timestamps();
-        let safe_path = redact_share_path(path);
+        let safe_path = sanitize_logged_path(path);
         let line = format!(
             "{outer_ts}  127.0.0.1 - - [{inner_ts} +0000] \"{method} {safe_path} HTTP/1.1\" {status} 0 \"-\" \"NinjaNVR\""
         );
@@ -1441,8 +1450,7 @@ impl LogBufferHub {
         if !is_valid_topic_segment(service) {
             return;
         }
-        let raw_line: String = line
-            .into()
+        let raw_line: String = ninjanvr_config::scrub_rtsp_credentials(&line.into())
             .chars()
             .map(|c| if c.is_control() { ' ' } else { c })
             .collect();
@@ -1484,12 +1492,12 @@ impl LogBufferHub {
             return (0, Vec::new());
         }
         let start_idx = match start {
-            Some(s) if s < 0 => total.saturating_sub(s.unsigned_abs() as usize),
+            Some(s) if s < 0 => total.saturating_sub(s.unsigned_abs().min(total as u64) as usize),
             Some(s) => (s as usize).min(total),
             None => 0,
         };
         let end_idx = match end {
-            Some(e) if e < 0 => total.saturating_sub(e.unsigned_abs() as usize),
+            Some(e) if e < 0 => total.saturating_sub(e.unsigned_abs().min(total as u64) as usize),
             Some(e) => (e as usize).min(total),
             None => total,
         };
@@ -1510,12 +1518,34 @@ impl LogBufferHub {
     }
 }
 
-fn redact_share_path(path: &str) -> String {
-    let clean: String = path
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    let trimmed = clean.trim_start_matches('/');
+fn percent_decode_log_path(raw: &str) -> Option<String> {
+    if !raw.contains('%') {
+        return None;
+    }
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            let decoded = ((hi << 4) | lo) as u8;
+            out.push(if decoded == 0 { b' ' } else { decoded });
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+fn redact_share_candidate(candidate: &str) -> Option<String> {
+    let trimmed = candidate.trim_start_matches('/');
     if trimmed
         .get(..6)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("share/"))
@@ -1526,9 +1556,31 @@ fn redact_share_path(path: &str) -> String {
             None => (rest, ""),
         };
         if let Some((_, suffix)) = token_and_path.split_once('/') {
-            return format!("/share/<redacted>/{suffix}{query_suffix}");
+            return Some(format!("/share/<redacted>/{suffix}{query_suffix}"));
         } else if !token_and_path.is_empty() {
-            return format!("/share/<redacted>{query_suffix}");
+            return Some(format!("/share/<redacted>{query_suffix}"));
+        }
+    }
+    None
+}
+
+/// Sanitizes HTTP request paths for access logging by stripping control characters and
+/// redacting raw or percent-encoded `/share/<token>` segments while preserving suffixes.
+pub fn sanitize_logged_path(path: &str) -> String {
+    let clean: String = path
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if let Some(redacted) = redact_share_candidate(&clean) {
+        return redacted;
+    }
+    if let Some(decoded) = percent_decode_log_path(&clean) {
+        let clean_dec: String = decoded
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        if let Some(redacted) = redact_share_candidate(&clean_dec) {
+            return redacted;
         }
     }
     clean
@@ -1539,6 +1591,24 @@ mod tests {
     use super::*;
     use ninjanvr_config::NinjaConfig;
     use std::path::PathBuf;
+
+    #[test]
+    fn sanitize_logged_path_redacts_percent_encoded_share_token_with_non_utf8_query_bytes() {
+        let redacted = sanitize_logged_path("/share%2Fsuper_secret_tok%2Fvideo.mp4?x=%FF");
+        assert!(
+            redacted.starts_with("/share/<redacted>/video.mp4?x="),
+            "expected redacted share path, got: {redacted}"
+        );
+        assert!(!redacted.contains("super_secret_tok"));
+
+        let redacted_malformed =
+            sanitize_logged_path("/share%2Fanother_secret_tok%2Fvideo.mp4?x=%ZZ&y=%00");
+        assert!(
+            redacted_malformed.starts_with("/share/<redacted>/video.mp4?"),
+            "expected redacted share path on malformed percent suffix, got: {redacted_malformed}"
+        );
+        assert!(!redacted_malformed.contains("another_secret_tok"));
+    }
 
     #[tokio::test]
     async fn comms_hub_broadcasts_topics_and_updates_camera_activity() {

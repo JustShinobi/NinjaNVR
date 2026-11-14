@@ -113,6 +113,101 @@ pub const NINJANVR_VERSION: &str = match option_env!("NINJANVR_RELEASE_VERSION")
     _ => env!("CARGO_PKG_VERSION"),
 };
 
+/// Validates that a `go2rtc` stream identifier is `1..=128` ASCII `[A-Za-z0-9_-]` characters
+/// and does not start with `.` so stream names cannot inject query parameters, URL schemes,
+/// fragments, or path traversal sequences.
+pub fn is_safe_go2rtc_stream_name(stream: &str) -> bool {
+    !stream.is_empty()
+        && stream.len() <= 128
+        && !stream.starts_with('.')
+        && stream
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Logical stream variant within `go2rtc` for a camera (`{cam}`, `{cam}_sub`, `{cam}_talk`, `{cam}_sub_talk`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Go2RtcStreamVariant {
+    Main,
+    Sub,
+    Talkback,
+    SubTalkback,
+}
+
+/// Canonical owner-camera route parsed from a `go2rtc` stream identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Go2RtcStreamRoute {
+    pub stream: String,
+    pub camera: String,
+    pub variant: Go2RtcStreamVariant,
+}
+
+/// Parses a `go2rtc` stream identifier into its owner camera and [`Go2RtcStreamVariant`].
+///
+/// When `known_cameras` is provided, exact configured camera keys match first, followed by
+/// shortest-suffix matches (`_talk`, `_sub`, `_sub_talk`) against `known_cameras` so the
+/// longest configured camera key wins (e.g. `"lobby_sub_talk"` resolves to `"lobby_sub"` when
+/// both `"lobby"` and `"lobby_sub"` exist), before falling back to longest-suffix stripping
+/// (`_sub_talk`, `_talk`, `_sub`) for unconfigured stream names.
+pub fn parse_go2rtc_stream_route(
+    stream: &str,
+    known_cameras: Option<&std::collections::BTreeSet<String>>,
+) -> Option<Go2RtcStreamRoute> {
+    let trimmed = stream.trim();
+    if !is_safe_go2rtc_stream_name(trimmed) {
+        return None;
+    }
+    let known_suffix_table = [
+        ("_talk", Go2RtcStreamVariant::Talkback),
+        ("_sub", Go2RtcStreamVariant::Sub),
+        ("_sub_talk", Go2RtcStreamVariant::SubTalkback),
+    ];
+    let fallback_suffix_table = [
+        ("_sub_talk", Go2RtcStreamVariant::SubTalkback),
+        ("_talk", Go2RtcStreamVariant::Talkback),
+        ("_sub", Go2RtcStreamVariant::Sub),
+    ];
+    if let Some(known) = known_cameras {
+        if known.contains(trimmed) {
+            return Some(Go2RtcStreamRoute {
+                stream: trimmed.to_string(),
+                camera: trimmed.to_string(),
+                variant: Go2RtcStreamVariant::Main,
+            });
+        }
+        for (sfx, variant) in known_suffix_table {
+            if let Some(base) = trimmed.strip_suffix(sfx)
+                && !base.is_empty()
+                && is_safe_go2rtc_stream_name(base)
+                && known.contains(base)
+            {
+                return Some(Go2RtcStreamRoute {
+                    stream: trimmed.to_string(),
+                    camera: base.to_string(),
+                    variant,
+                });
+            }
+        }
+    }
+    for (sfx, variant) in fallback_suffix_table {
+        if let Some(base) = trimmed.strip_suffix(sfx) {
+            if base.is_empty() || !is_safe_go2rtc_stream_name(base) {
+                return None;
+            }
+            return Some(Go2RtcStreamRoute {
+                stream: trimmed.to_string(),
+                camera: base.to_string(),
+                variant,
+            });
+        }
+    }
+    Some(Go2RtcStreamRoute {
+        stream: trimmed.to_string(),
+        camera: trimmed.to_string(),
+        variant: Go2RtcStreamVariant::Main,
+    })
+}
+
 /// Structured configuration validation error (`thiserror::Error`).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigValidationError {
@@ -954,7 +1049,7 @@ impl Default for StationaryConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DetectorEntryConfig {
     #[serde(rename = "type", default = "default_detector_type")]
     pub detector_type: String,
@@ -993,7 +1088,7 @@ impl DetectorEntryConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelConfig {
     #[serde(default = "default_model_width")]
     pub width: u32,
@@ -2369,6 +2464,37 @@ impl NinjaConfig {
             }
         }
         None
+    }
+
+    /// Resolves the owner camera identifier for a `go2rtc` stream (`{cam}`, `{cam}_sub`,
+    /// `{cam}_talk`, or `{cam}_sub_talk`), checking exact configured camera keys first so
+    /// cameras whose names contain underscores or end in `_sub` / `_talk` never misparse.
+    pub fn resolve_stream_owner_camera<'a>(&'a self, stream: &'a str) -> Option<&'a str> {
+        let trimmed = stream.trim();
+        if !is_safe_go2rtc_stream_name(trimmed) {
+            return None;
+        }
+        if let Some((k, _)) = self.cameras.get_key_value(trimmed) {
+            return Some(k.as_str());
+        }
+        for sfx in ["_talk", "_sub", "_sub_talk"] {
+            if let Some(base) = trimmed.strip_suffix(sfx)
+                && !base.is_empty()
+                && is_safe_go2rtc_stream_name(base)
+                && let Some((k, _)) = self.cameras.get_key_value(base)
+            {
+                return Some(k.as_str());
+            }
+        }
+        for sfx in ["_sub_talk", "_talk", "_sub"] {
+            if let Some(base) = trimmed.strip_suffix(sfx) {
+                if base.is_empty() || !is_safe_go2rtc_stream_name(base) {
+                    return None;
+                }
+                return Some(base);
+            }
+        }
+        Some(trimmed)
     }
 
     /// Resolves a requested MSE/go2rtc stream name (`{cam}_sub`) to its canonical primary
@@ -4514,7 +4640,9 @@ fn build_own_stream_originals(prev: &NinjaConfig, stream_key: &str) -> Vec<Strin
     if let Some(prev_val) = prev.go2rtc.streams.get(stream_key) {
         collect_urls_from_json_val(prev_val, &mut out);
     }
-    let base_cam = stream_key.strip_suffix("_sub").unwrap_or(stream_key);
+    let base_cam = prev
+        .resolve_stream_owner_camera(stream_key)
+        .unwrap_or_else(|| stream_key.strip_suffix("_sub").unwrap_or(stream_key));
     if let Some(prev_cam) = prev.cameras.get(base_cam) {
         collect_camera_urls(prev_cam, &mut out);
     }
@@ -11026,5 +11154,144 @@ cameras:
             NinjaConfig::from_yaml_str(bool_yaml, PathBuf::from("/tmp/config.yml")).unwrap();
         assert_eq!(bool_cfg.record.preview.quality, "off");
         assert!(is_preview_disabled(&bool_cfg.record.preview.quality));
+    }
+
+    #[test]
+    fn go2rtc_stream_route_resolves_main_sub_talk_sub_talk_and_exact_underscore_cameras() {
+        let yaml = r#"
+cameras:
+  front_door:
+    enabled: true
+  lobby_sub:
+    enabled: true
+  gate_talk:
+    enabled: true
+"#;
+        let cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        let known: std::collections::BTreeSet<String> = cfg.cameras.keys().cloned().collect();
+
+        for (stream, expected_cam, expected_variant) in [
+            ("front_door", "front_door", Go2RtcStreamVariant::Main),
+            ("front_door_sub", "front_door", Go2RtcStreamVariant::Sub),
+            (
+                "front_door_talk",
+                "front_door",
+                Go2RtcStreamVariant::Talkback,
+            ),
+            (
+                "front_door_sub_talk",
+                "front_door",
+                Go2RtcStreamVariant::SubTalkback,
+            ),
+            ("lobby_sub", "lobby_sub", Go2RtcStreamVariant::Main),
+            ("lobby_sub_sub", "lobby_sub", Go2RtcStreamVariant::Sub),
+            ("lobby_sub_talk", "lobby_sub", Go2RtcStreamVariant::Talkback),
+            (
+                "lobby_sub_sub_talk",
+                "lobby_sub",
+                Go2RtcStreamVariant::SubTalkback,
+            ),
+            ("gate_talk", "gate_talk", Go2RtcStreamVariant::Main),
+            ("gate_talk_talk", "gate_talk", Go2RtcStreamVariant::Talkback),
+            (
+                "unconfigured_sub_talk",
+                "unconfigured",
+                Go2RtcStreamVariant::SubTalkback,
+            ),
+        ] {
+            let route = parse_go2rtc_stream_route(stream, Some(&known))
+                .unwrap_or_else(|| panic!("expected valid route for {stream}"));
+            assert_eq!(route.camera, expected_cam, "stream={stream}");
+            assert_eq!(route.variant, expected_variant, "stream={stream}");
+            assert_eq!(cfg.resolve_stream_owner_camera(stream), Some(expected_cam));
+        }
+
+        // Fallback mode without known_cameras strips _sub_talk, _talk, _sub cleanly
+        assert_eq!(
+            parse_go2rtc_stream_route("yard_sub_talk", None),
+            Some(Go2RtcStreamRoute {
+                stream: "yard_sub_talk".to_string(),
+                camera: "yard".to_string(),
+                variant: Go2RtcStreamVariant::SubTalkback,
+            })
+        );
+        assert_eq!(
+            parse_go2rtc_stream_route("yard_talk", None),
+            Some(Go2RtcStreamRoute {
+                stream: "yard_talk".to_string(),
+                camera: "yard".to_string(),
+                variant: Go2RtcStreamVariant::Talkback,
+            })
+        );
+
+        // Bare suffixes and unsafe identifiers are rejected
+        for invalid in [
+            "",
+            "_sub",
+            "_talk",
+            "_sub_talk",
+            ".hidden",
+            "exec:id",
+            "../etc/passwd",
+            "cam?dst=x",
+        ] {
+            assert_eq!(
+                parse_go2rtc_stream_route(invalid, Some(&known)),
+                None,
+                "invalid={invalid}"
+            );
+            assert_eq!(
+                cfg.resolve_stream_owner_camera(invalid),
+                None,
+                "invalid={invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn go2rtc_stream_route_longest_camera_key_wins_when_prefix_camera_also_exists() {
+        let yaml = r#"
+cameras:
+  lobby:
+    enabled: true
+  lobby_sub:
+    enabled: true
+"#;
+        let cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        let known: std::collections::BTreeSet<String> = cfg.cameras.keys().cloned().collect();
+
+        assert_eq!(
+            parse_go2rtc_stream_route("lobby_sub_talk", Some(&known)),
+            Some(Go2RtcStreamRoute {
+                stream: "lobby_sub_talk".to_string(),
+                camera: "lobby_sub".to_string(),
+                variant: Go2RtcStreamVariant::Talkback,
+            })
+        );
+        assert_eq!(
+            cfg.resolve_stream_owner_camera("lobby_sub_talk"),
+            Some("lobby_sub")
+        );
+        assert_eq!(
+            parse_go2rtc_stream_route("lobby_sub", Some(&known)),
+            Some(Go2RtcStreamRoute {
+                stream: "lobby_sub".to_string(),
+                camera: "lobby_sub".to_string(),
+                variant: Go2RtcStreamVariant::Main,
+            })
+        );
+        assert_eq!(
+            cfg.resolve_stream_owner_camera("lobby_sub"),
+            Some("lobby_sub")
+        );
+        assert_eq!(
+            parse_go2rtc_stream_route("lobby_talk", Some(&known)),
+            Some(Go2RtcStreamRoute {
+                stream: "lobby_talk".to_string(),
+                camera: "lobby".to_string(),
+                variant: Go2RtcStreamVariant::Talkback,
+            })
+        );
+        assert_eq!(cfg.resolve_stream_owner_camera("lobby_talk"), Some("lobby"));
     }
 }
