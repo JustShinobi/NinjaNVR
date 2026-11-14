@@ -5,14 +5,34 @@
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
+use std::sync::Arc;
 
 use anyhow::Result;
 pub use image::RgbImage;
 use image::{ImageFormat, Rgb};
 use ninjanvr_config::{MotionConfig, StateRoiConfig};
-use ninjanvr_media::YuvFrame;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+pub mod privacy_mask;
+pub use privacy_mask::*;
+
+/// Represents a decoded YUV420p (I420) frame in memory, shared zero-copy via `Arc<YuvFrame>`.
+#[derive(Debug, Clone)]
+pub struct YuvFrame {
+    pub camera: Arc<str>,
+    pub timestamp: f64,
+    pub width: u32,
+    pub height: u32,
+    pub data: Arc<Vec<u8>>,
+}
+
+impl YuvFrame {
+    pub fn y_plane(&self) -> &[u8] {
+        let y_len = (self.width as usize) * (self.height as usize);
+        &self.data[..y_len.min(self.data.len())]
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoundingBox {
@@ -285,6 +305,18 @@ impl PolygonMask {
 
     pub fn is_empty(&self) -> bool {
         self.polygons.is_empty()
+    }
+
+    pub(crate) fn from_pixel_polygons(polygons: Vec<Vec<(f32, f32)>>) -> Self {
+        let valid = polygons
+            .into_iter()
+            .filter(|pts| {
+                pts.len() >= 3
+                    && pts.iter().all(|&(x, y)| x.is_finite() && y.is_finite())
+                    && polygon_signed_area2(pts).abs() > 1e-5
+            })
+            .collect();
+        Self { polygons: valid }
     }
 
     pub fn contains_point(&self, x: f32, y: f32) -> bool {
@@ -1459,14 +1491,6 @@ pub fn apply_privacy_mask_pixelated_rgb(img: &mut RgbImage, mask: &PolygonMask, 
     }
 }
 
-fn is_pixelate_value(v: &Value) -> bool {
-    v.get("mode")
-        .or_else(|| v.get("style"))
-        .and_then(|m| m.as_str())
-        .is_some_and(|m| m.eq_ignore_ascii_case("pixelate") || m.eq_ignore_ascii_case("pixelated"))
-        || v.get("pixelate").and_then(|p| p.as_bool()) == Some(true)
-}
-
 /// Parses normalized or pixel `privacy_mask` polygon coordinates against `(img.width(), img.height())`
 /// and redacts all interior pixels to `[12, 14, 18]` (or 8x8 block pixelation when `mode: "pixelate"` is set).
 pub fn apply_privacy_masks_from_value(img: &mut RgbImage, mask_val: &Value) {
@@ -1475,15 +1499,14 @@ pub fn apply_privacy_masks_from_value(img: &mut RgbImage, mask_val: &Value) {
     }
     let w = img.width();
     let h = img.height();
-    let mask = PolygonMask::from_config_value(mask_val, w, h);
-    if is_pixelate_value(mask_val) {
-        let block_size = mask_val
-            .get("block_size")
-            .and_then(|b| b.as_u64())
-            .unwrap_or(8) as u32;
-        apply_privacy_mask_pixelated_rgb(img, &mask, block_size);
-    } else {
-        apply_privacy_mask_rgb(img, &mask);
+    let policy = PrivacyMaskPolicy::from_value(mask_val, w, h);
+    if !policy.is_configured() {
+        return;
+    }
+    if policy.is_invalid() || !policy.redact_rgb(img) {
+        for px in img.pixels_mut() {
+            *px = Rgb([12, 14, 18]);
+        }
     }
 }
 
@@ -2110,7 +2133,6 @@ pub fn decode_or_extract_rgb_grid_16x16(data: &[u8]) -> Option<[[f32; 3]; 256]> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     #[test]
     fn jpeg_quality_controls_size_and_output_is_valid_jpeg() {
@@ -2381,6 +2403,19 @@ mod tests {
         // Exterior checkerboard pixels (2, 2) and (3, 2) remain distinct (200 vs 40)
         assert_eq!(*pix_img.get_pixel(2, 2), Rgb([200, 200, 200]));
         assert_eq!(*pix_img.get_pixel(3, 2), Rgb([40, 40, 40]));
+
+        // Invalid / malformed privacy_mask fails closed by filling the entire frame with [12, 14, 18]
+        for malformed in [
+            serde_json::json!(["not_a_polygon"]),
+            serde_json::json!(true),
+            serde_json::json!("10,10,20,20,30,30"),
+        ] {
+            let mut fc_img = RgbImage::from_pixel(32, 32, Rgb([250, 250, 250]));
+            apply_privacy_masks_from_value(&mut fc_img, &malformed);
+            assert_eq!(*fc_img.get_pixel(0, 0), Rgb([12, 14, 18]));
+            assert_eq!(*fc_img.get_pixel(16, 16), Rgb([12, 14, 18]));
+            assert_eq!(*fc_img.get_pixel(31, 31), Rgb([12, 14, 18]));
+        }
     }
 
     #[test]

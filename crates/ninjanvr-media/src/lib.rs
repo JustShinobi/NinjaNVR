@@ -89,22 +89,7 @@ pub fn resolve_ffmpeg_bin() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("ffmpeg"))
 }
 
-/// Represents a decoded YUV420p (I420) frame in memory, shared zero-copy via `Arc<YuvFrame>`.
-#[derive(Debug, Clone)]
-pub struct YuvFrame {
-    pub camera: Arc<str>,
-    pub timestamp: f64,
-    pub width: u32,
-    pub height: u32,
-    pub data: Arc<Vec<u8>>,
-}
-
-impl YuvFrame {
-    pub fn y_plane(&self) -> &[u8] {
-        let y_len = (self.width as usize) * (self.height as usize);
-        &self.data[..y_len.min(self.data.len())]
-    }
-}
+pub use ninjanvr_vision::YuvFrame;
 
 /// Per-second activity sample stored in an in-memory ring buffer per camera
 /// so closed recording segments know their exact motion & object counts immediately
@@ -3430,14 +3415,7 @@ pub fn build_mp4_export_ffmpeg_args_with_privacy(
 
 /// Returns `true` when `mask` contains a non-empty privacy mask configuration.
 pub fn privacy_mask_is_configured(mask: Option<&serde_json::Value>) -> bool {
-    match mask {
-        None | Some(serde_json::Value::Null) => false,
-        Some(serde_json::Value::Array(arr)) => !arr.is_empty(),
-        Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
-        Some(serde_json::Value::Object(map)) => !map.is_empty(),
-        Some(serde_json::Value::Bool(b)) => *b,
-        Some(serde_json::Value::Number(_)) => true,
-    }
+    ninjanvr_vision::PrivacyMaskPolicy::from_optional_value(mask, 0, 0).is_configured()
 }
 
 /// Converts a `privacy_mask` config value (normalized or pixel polygon strings, coordinate-pair
@@ -3445,206 +3423,10 @@ pub fn privacy_mask_is_configured(mask: Option<&serde_json::Value>) -> bool {
 /// (`drawbox=x=iw*0.2:y=ih*0.2:w=iw*0.6:h=ih*0.6:color=#0c0e12@1.0:t=fill`)
 /// for redacting privacy regions during MP4 export transcoding.
 pub fn build_privacy_drawbox_filter(mask: Option<&serde_json::Value>) -> Option<String> {
-    let privacy_mask = mask?;
-    const MAX_PRIVACY_MASK_POLYGONS: usize = 64;
-    const MAX_PRIVACY_POLYGON_COORDS: usize = 512;
-
-    fn collect_polygons(
-        val: &serde_json::Value,
-        out: &mut Vec<Vec<f32>>,
-        invalid: &mut bool,
-        depth: usize,
-    ) {
-        if depth > 16 || out.len() >= MAX_PRIVACY_MASK_POLYGONS {
-            *invalid = true;
-            return;
-        }
-        match val {
-            serde_json::Value::String(s) => {
-                let trimmed = s.trim();
-                if trimmed.is_empty() {
-                    return;
-                }
-                let mut nums = Vec::new();
-                for part in trimmed.split(',') {
-                    if nums.len() >= MAX_PRIVACY_POLYGON_COORDS {
-                        *invalid = true;
-                        return;
-                    }
-                    if let Ok(n) = part.trim().parse::<f32>()
-                        && n.is_finite()
-                    {
-                        nums.push(n);
-                    } else {
-                        *invalid = true;
-                        return;
-                    }
-                }
-                if nums.len() >= 4
-                    && nums.len() <= MAX_PRIVACY_POLYGON_COORDS
-                    && nums.len().is_multiple_of(2)
-                {
-                    out.push(nums);
-                } else {
-                    *invalid = true;
-                }
-            }
-            serde_json::Value::Array(arr) => {
-                if arr.is_empty() {
-                    return;
-                }
-                if arr.iter().all(|v| v.is_number()) {
-                    if arr.len() > MAX_PRIVACY_POLYGON_COORDS {
-                        *invalid = true;
-                        return;
-                    }
-                    let nums: Vec<f32> = arr
-                        .iter()
-                        .filter_map(|v| v.as_f64().map(|n| n as f32))
-                        .filter(|n| n.is_finite())
-                        .collect();
-                    if nums.len() == arr.len() && nums.len() >= 4 && nums.len().is_multiple_of(2) {
-                        out.push(nums);
-                    } else {
-                        *invalid = true;
-                    }
-                } else if arr.iter().all(|v| {
-                    v.as_array()
-                        .is_some_and(|p| p.len() == 2 && p[0].is_number() && p[1].is_number())
-                }) {
-                    if arr.len() * 2 > MAX_PRIVACY_POLYGON_COORDS {
-                        *invalid = true;
-                        return;
-                    }
-                    let mut nums = Vec::with_capacity(arr.len() * 2);
-                    for pair in arr.iter().filter_map(|v| v.as_array()) {
-                        if let (Some(x), Some(y)) = (pair[0].as_f64(), pair[1].as_f64()) {
-                            let xf = x as f32;
-                            let yf = y as f32;
-                            if xf.is_finite() && yf.is_finite() {
-                                nums.push(xf);
-                                nums.push(yf);
-                            } else {
-                                *invalid = true;
-                                return;
-                            }
-                        } else {
-                            *invalid = true;
-                            return;
-                        }
-                    }
-                    if nums.len() >= 4 && nums.len().is_multiple_of(2) {
-                        out.push(nums);
-                    } else {
-                        *invalid = true;
-                    }
-                } else {
-                    if arr.len() > MAX_PRIVACY_MASK_POLYGONS {
-                        *invalid = true;
-                        return;
-                    }
-                    for item in arr {
-                        let before = out.len();
-                        collect_polygons(item, out, invalid, depth + 1);
-                        if out.len() == before {
-                            *invalid = true;
-                        }
-                    }
-                }
-            }
-            serde_json::Value::Object(map) => {
-                if map.is_empty() {
-                    return;
-                }
-                let mut matched_known = false;
-                for key in ["coordinates", "points", "zones"] {
-                    if let Some(coords) = map.get(key) {
-                        let before = out.len();
-                        collect_polygons(coords, out, invalid, depth + 1);
-                        if out.len() == before {
-                            *invalid = true;
-                        }
-                        matched_known = true;
-                    }
-                }
-                if !matched_known {
-                    for nested in map.values() {
-                        let before = out.len();
-                        collect_polygons(nested, out, invalid, depth + 1);
-                        if out.len() == before {
-                            *invalid = true;
-                        }
-                    }
-                }
-            }
-            serde_json::Value::Null => {}
-            _ => {
-                *invalid = true;
-            }
-        }
-    }
-
-    let mut polys: Vec<Vec<f32>> = Vec::new();
-    let mut invalid = false;
-    collect_polygons(privacy_mask, &mut polys, &mut invalid, 0);
-    if invalid || polys.is_empty() {
-        return None;
-    }
-
-    let mut filters = Vec::with_capacity(polys.len());
-    for nums in polys {
-        if nums.len() < 4 || !nums.len().is_multiple_of(2) || nums.iter().any(|n| !n.is_finite()) {
-            return None;
-        }
-        let mut raw_x_min = f32::MAX;
-        let mut raw_y_min = f32::MAX;
-        let mut raw_x_max = f32::MIN;
-        let mut raw_y_max = f32::MIN;
-        for &[px, py] in nums.as_chunks::<2>().0 {
-            raw_x_min = raw_x_min.min(px);
-            raw_y_min = raw_y_min.min(py);
-            raw_x_max = raw_x_max.max(px);
-            raw_y_max = raw_y_max.max(py);
-        }
-        if raw_x_max <= raw_x_min || raw_y_max <= raw_y_min {
-            return None;
-        }
-        if raw_x_min >= -1.0 && raw_y_min >= -1.0 && raw_x_max <= 2.0 && raw_y_max <= 2.0 {
-            let x_min = raw_x_min.clamp(0.0, 1.0);
-            let y_min = raw_y_min.clamp(0.0, 1.0);
-            let x_max = raw_x_max.clamp(0.0, 1.0);
-            let y_max = raw_y_max.clamp(0.0, 1.0);
-            let w = x_max - x_min;
-            let h = y_max - y_min;
-            if w < 0.001 || h < 0.001 {
-                return None;
-            }
-            filters.push(format!(
-                "drawbox=x=iw*{x_min:.3}:y=ih*{y_min:.3}:w=iw*{w:.3}:h=ih*{h:.3}:color=#0c0e12@1.0:t=fill"
-            ));
-        } else {
-            if raw_x_max <= 2.0 || raw_y_max <= 2.0 {
-                return None;
-            }
-            let x_min = raw_x_min.clamp(0.0, 65535.0).floor() as u32;
-            let y_min = raw_y_min.clamp(0.0, 65535.0).floor() as u32;
-            let x_max = raw_x_max.clamp(0.0, 65535.0).ceil() as u32;
-            let y_max = raw_y_max.clamp(0.0, 65535.0).ceil() as u32;
-            if x_max <= x_min + 1 || y_max <= y_min + 1 {
-                return None;
-            }
-            filters.push(format!(
-                "drawbox=x={x_min}:y={y_min}:w={}:h={}:color=#0c0e12@1.0:t=fill",
-                x_max - x_min,
-                y_max - y_min
-            ));
-        }
-    }
-    if filters.is_empty() {
-        None
-    } else {
-        Some(filters.join(","))
-    }
+    ninjanvr_vision::PrivacyMaskPolicy::from_optional_value(mask, 0, 0)
+        .ffmpeg_drawbox_filter()
+        .ok()
+        .flatten()
 }
 
 /// Concatenates recording segments in `[start, end]` into a single MP4 export file.
