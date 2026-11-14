@@ -220,6 +220,47 @@ pub struct RecordingRow {
     pub motion_heatmap: Option<Value>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PostHocReviewPruneOutcome {
+    /// `(before_dto, after_dto)` pairs for persisted review segments whose detections or severity changed.
+    pub updated_reviews: Vec<(ReviewItemDto, ReviewItemDto)>,
+    /// `(before_dto, thumb_path)` pairs for persisted review segments deleted because zero valid detections remain.
+    pub deleted_reviews: Vec<(ReviewItemDto, String)>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SurvivingReviewDetectionsSummary {
+    pub fp_ids: Vec<String>,
+    pub labels: Vec<String>,
+    pub sub_labels: Vec<String>,
+    pub max_sub_score: Option<f32>,
+    pub detected_attributes: Vec<Value>,
+    pub zones: Vec<String>,
+    pub any_alert: bool,
+}
+
+struct ReviewDetectionEventRow {
+    label: String,
+    sub_label: Option<String>,
+    sub_label_score: Option<f64>,
+    raw_zones: Option<String>,
+    raw_data: Option<String>,
+    false_positive: i32,
+}
+
+struct RestorableEventRow {
+    camera: String,
+    label: String,
+    start_time: f64,
+    end_time: Option<f64>,
+    sub_label: Option<String>,
+    sub_label_score: Option<f64>,
+    raw_zones: Option<String>,
+    raw_data: Option<String>,
+    false_positive: i32,
+    has_snapshot: i32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewItemDto {
     pub id: String,
@@ -3082,6 +3123,527 @@ impl NinjaDatabase {
         Ok(updated)
     }
 
+    /// Summarizes SQLite `false_positive` state and surviving event metadata for `det_ids`
+    /// so `VisionPipeline` can prune post-hoc false positives before flushing an `ActiveReviewState`.
+    pub fn summarize_review_detections_fp_state(
+        &self,
+        det_ids: &[String],
+    ) -> Result<SurvivingReviewDetectionsSummary> {
+        let mut summary = SurvivingReviewDetectionsSummary::default();
+        if det_ids.is_empty() {
+            return Ok(summary);
+        }
+        let conn = self.lock_conn();
+        for det_id in det_ids {
+            let ev_meta: Option<ReviewDetectionEventRow> = conn
+                .query_row(
+                    "SELECT label, sub_label, sub_label_score, zones, data, COALESCE(false_positive, 0) FROM event WHERE id = ?1",
+                    params![det_id],
+                    |r| {
+                        Ok(ReviewDetectionEventRow {
+                            label: r.get(0)?,
+                            sub_label: r.get(1).ok().flatten(),
+                            sub_label_score: r.get(2).ok().flatten(),
+                            raw_zones: r.get(3).ok().flatten(),
+                            raw_data: r.get(4).ok().flatten(),
+                            false_positive: r.get(5)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(ev_row) = ev_meta {
+                if ev_row.false_positive != 0 {
+                    if !summary.fp_ids.contains(det_id) {
+                        summary.fp_ids.push(det_id.clone());
+                    }
+                    continue;
+                }
+                if !ev_row.label.is_empty() && !summary.labels.contains(&ev_row.label) {
+                    summary.labels.push(ev_row.label);
+                }
+                let ev_d = parse_json_or(ev_row.raw_data, json!({}));
+                if ev_d["max_severity"].as_str() == Some("alert") {
+                    summary.any_alert = true;
+                }
+                if let Some(sl) = ev_row
+                    .sub_label
+                    .as_deref()
+                    .or_else(|| ev_d["sub_label"].as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    && !summary.sub_labels.iter().any(|x| x == sl)
+                {
+                    summary.sub_labels.push(sl.to_string());
+                }
+                if let Some(sc) = ev_row
+                    .sub_label_score
+                    .or_else(|| ev_d["sub_label_score"].as_f64())
+                    .filter(|v| v.is_finite())
+                {
+                    let sc32 = sc as f32;
+                    summary.max_sub_score =
+                        Some(summary.max_sub_score.map_or(sc32, |prev| prev.max(sc32)));
+                }
+                if let Some(attr_arr) = ev_d["detected_attributes"].as_array() {
+                    for attr in attr_arr {
+                        let attr_lbl = attr.get("label").and_then(Value::as_str).unwrap_or("");
+                        if !attr_lbl.is_empty()
+                            && !summary
+                                .detected_attributes
+                                .iter()
+                                .any(|a| a.get("label").and_then(Value::as_str) == Some(attr_lbl))
+                        {
+                            summary.detected_attributes.push(attr.clone());
+                        }
+                    }
+                }
+                let z_val = parse_json_or(ev_row.raw_zones, json!([]));
+                if let Some(z_arr) = z_val.as_array() {
+                    for z in z_arr
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        if !summary.zones.iter().any(|x| x == z) {
+                            summary.zones.push(z.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(summary)
+    }
+
+    /// Reconciles persisted `reviewsegment` rows referencing `event_id` after `false_positive`
+    /// is toggled (`true` prunes the detection, recomputes `objects` + `sub_labels` +
+    /// `recognized_license_plates` + `detected_attributes` + `zones` + `severity`, or deletes
+    /// empty review segments; `false` restores a previously pruned detection or reconstructs
+    /// a single-detection review segment when none remains).
+    pub fn reconcile_reviews_for_event_false_positive(
+        &self,
+        event_id: &str,
+        fp: bool,
+    ) -> Result<PostHocReviewPruneOutcome> {
+        let clean_id = event_id.trim();
+        if clean_id.is_empty() || clean_id.contains('"') {
+            return Ok(PostHocReviewPruneOutcome::default());
+        }
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+
+        let like_pattern = format!("%\"{}\"%", escape_sql_like(clean_id));
+        let mut stmt = tx.prepare(
+            r#"
+            SELECT r.id, r.camera, r.start_time, r.end_time, r.severity, r.thumb_path, r.data,
+                   EXISTS(SELECT 1 FROM userreviewstatus u WHERE u.review_segment_id = r.id AND u.has_been_reviewed = 1)
+            FROM reviewsegment r
+            WHERE r.id = ?1 OR r.data LIKE ?2 ESCAPE '\'
+            "#,
+        )?;
+        let rows: Vec<ReviewItemDto> = stmt
+            .query_map(params![clean_id, like_pattern], |r| {
+                Ok(ReviewItemDto {
+                    id: r.get(0)?,
+                    camera: r.get(1)?,
+                    start_time: r.get(2)?,
+                    end_time: r.get(3).ok(),
+                    severity: r
+                        .get::<_, Option<String>>(4)?
+                        .unwrap_or_else(|| "detection".to_string()),
+                    thumb_path: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    data: parse_json_or(r.get::<_, Option<String>>(6).ok().flatten(), json!({})),
+                    has_been_reviewed: r.get::<_, bool>(7).unwrap_or(false),
+                })
+            })?
+            .flatten()
+            .collect();
+        drop(stmt);
+
+        let mut outcome = PostHocReviewPruneOutcome::default();
+        let mut matched_existing_review = false;
+        for row in rows {
+            let mut next_data = row.data.clone();
+            let Some(obj) = next_data.as_object_mut() else {
+                continue;
+            };
+            let mut det_ids: Vec<String> = obj
+                .get("detections")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut pruned_ids: Vec<String> = obj
+                .get("pruned_fp_detections")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let matches = row.id == clean_id
+                || det_ids.iter().any(|d| d == clean_id)
+                || pruned_ids.iter().any(|d| d == clean_id)
+                || obj
+                    .get("event_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|eid| eid == clean_id);
+            if !matches {
+                continue;
+            }
+            matched_existing_review = true;
+
+            if fp {
+                det_ids.retain(|d| d != clean_id);
+                if !pruned_ids.iter().any(|d| d == clean_id) {
+                    pruned_ids.push(clean_id.to_string());
+                }
+            } else {
+                let was_pruned = pruned_ids.iter().any(|d| d == clean_id);
+                if !was_pruned && !det_ids.iter().any(|d| d == clean_id) {
+                    continue;
+                }
+                pruned_ids.retain(|d| d != clean_id);
+                if !det_ids.iter().any(|d| d == clean_id) {
+                    det_ids.push(clean_id.to_string());
+                }
+            }
+
+            let mut surviving_det_ids: Vec<String> = Vec::new();
+            let mut labels: Vec<String> = Vec::new();
+            let mut sub_labels: Vec<String> = Vec::new();
+            let mut max_sub_score: Option<f64> = None;
+            let mut plates: Vec<String> = Vec::new();
+            let mut detected_attrs: Vec<Value> = Vec::new();
+            let mut zones: Vec<String> = Vec::new();
+            let mut any_alert = false;
+
+            for det_id in &det_ids {
+                let ev_meta: Option<ReviewDetectionEventRow> = tx
+                    .query_row(
+                        "SELECT label, sub_label, sub_label_score, zones, data, COALESCE(false_positive, 0) FROM event WHERE id = ?1",
+                        params![det_id],
+                        |r| {
+                            Ok(ReviewDetectionEventRow {
+                                label: r.get(0)?,
+                                sub_label: r.get(1).ok().flatten(),
+                                sub_label_score: r.get(2).ok().flatten(),
+                                raw_zones: r.get(3).ok().flatten(),
+                                raw_data: r.get(4).ok().flatten(),
+                                false_positive: r.get(5)?,
+                            })
+                        },
+                    )
+                    .optional()?;
+                if let Some(ev_row) = ev_meta {
+                    if ev_row.false_positive == 0 {
+                        surviving_det_ids.push(det_id.clone());
+                        if !ev_row.label.is_empty() && !labels.contains(&ev_row.label) {
+                            labels.push(ev_row.label);
+                        }
+                        let ev_d = parse_json_or(ev_row.raw_data, json!({}));
+                        if ev_d["max_severity"].as_str() == Some("alert") {
+                            any_alert = true;
+                        }
+                        if let Some(sl) = ev_row
+                            .sub_label
+                            .as_deref()
+                            .or_else(|| ev_d["sub_label"].as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            && !sub_labels.iter().any(|x| x == sl)
+                        {
+                            sub_labels.push(sl.to_string());
+                        }
+                        if let Some(sc) = ev_row
+                            .sub_label_score
+                            .or_else(|| ev_d["sub_label_score"].as_f64())
+                            .filter(|v| v.is_finite())
+                        {
+                            max_sub_score = Some(max_sub_score.map_or(sc, |prev| prev.max(sc)));
+                        }
+                        if let Some(p) = ev_d["recognized_license_plate"]
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            && !plates.iter().any(|x| x == p)
+                        {
+                            plates.push(p.to_string());
+                        }
+                        if let Some(attr_arr) = ev_d["detected_attributes"].as_array() {
+                            for attr in attr_arr {
+                                let attr_lbl =
+                                    attr.get("label").and_then(Value::as_str).unwrap_or("");
+                                if !attr_lbl.is_empty()
+                                    && !detected_attrs.iter().any(|a| {
+                                        a.get("label").and_then(Value::as_str) == Some(attr_lbl)
+                                    })
+                                {
+                                    detected_attrs.push(attr.clone());
+                                }
+                            }
+                        }
+                        let z_val = parse_json_or(ev_row.raw_zones, json!([]));
+                        if let Some(z_arr) = z_val.as_array() {
+                            for z in z_arr
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                            {
+                                if !zones.iter().any(|x| x == z) {
+                                    zones.push(z.to_string());
+                                }
+                            }
+                        }
+                    } else if !pruned_ids.iter().any(|d| d == det_id) {
+                        pruned_ids.push(det_id.clone());
+                    }
+                }
+            }
+
+            if surviving_det_ids.is_empty() {
+                tx.execute("DELETE FROM reviewsegment WHERE id = ?1", params![row.id])?;
+                tx.execute(
+                    "DELETE FROM userreviewstatus WHERE review_segment_id = ?1",
+                    params![row.id],
+                )?;
+                let thumb = row.thumb_path.clone();
+                outcome.deleted_reviews.push((row, thumb));
+                continue;
+            }
+
+            obj.insert("detections".to_string(), json!(surviving_det_ids));
+            if pruned_ids.is_empty() {
+                obj.remove("pruned_fp_detections");
+            } else {
+                obj.insert("pruned_fp_detections".to_string(), json!(pruned_ids));
+            }
+            obj.insert("objects".to_string(), json!(labels));
+            obj.insert("sub_labels".to_string(), json!(sub_labels));
+            obj.insert("sub_label_score".to_string(), json!(max_sub_score));
+            obj.insert("recognized_license_plates".to_string(), json!(plates));
+            obj.insert("detected_attributes".to_string(), json!(detected_attrs));
+            obj.insert("zones".to_string(), json!(zones));
+
+            let has_audio = obj
+                .get("audio")
+                .and_then(Value::as_array)
+                .is_some_and(|a| !a.is_empty());
+            let next_severity = if any_alert {
+                "alert".to_string()
+            } else if !has_audio {
+                "detection".to_string()
+            } else {
+                row.severity.clone()
+            };
+
+            let next_data_str = serde_json::to_string(&next_data)?;
+            tx.execute(
+                "UPDATE reviewsegment SET severity = ?1, data = ?2 WHERE id = ?3",
+                params![next_severity, next_data_str, row.id],
+            )?;
+            let mut after = row.clone();
+            after.severity = next_severity;
+            after.data = next_data;
+            outcome.updated_reviews.push((row, after));
+        }
+
+        if !fp && !matched_existing_review {
+            let ev_row: Option<RestorableEventRow> = tx
+                .query_row(
+                    r#"
+                    SELECT camera, label, start_time, end_time, sub_label, sub_label_score,
+                           zones, data, COALESCE(false_positive, 0), COALESCE(has_snapshot, 0)
+                    FROM event WHERE id = ?1
+                    "#,
+                    params![clean_id],
+                    |r| {
+                        Ok(RestorableEventRow {
+                            camera: r.get(0)?,
+                            label: r.get(1)?,
+                            start_time: r.get(2)?,
+                            end_time: r.get(3).ok().flatten(),
+                            sub_label: r.get(4).ok().flatten(),
+                            sub_label_score: r.get(5).ok().flatten(),
+                            raw_zones: r.get(6).ok().flatten(),
+                            raw_data: r.get(7).ok().flatten(),
+                            false_positive: r.get(8)?,
+                            has_snapshot: r.get(9)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(ev) = ev_row
+                && ev.false_positive == 0
+                && !ev.camera.trim().is_empty()
+            {
+                let camera = ev.camera;
+                let safe_start = if ev.start_time.is_finite() {
+                    ev.start_time
+                } else {
+                    0.0
+                };
+                let safe_end = ev.end_time.filter(|v| v.is_finite());
+                let ev_d = parse_json_or(ev.raw_data, json!({}));
+                let severity = if ev_d["max_severity"].as_str() == Some("alert") {
+                    "alert".to_string()
+                } else {
+                    "detection".to_string()
+                };
+                let mut sub_labels = Vec::new();
+                if let Some(sl) = ev
+                    .sub_label
+                    .as_deref()
+                    .or_else(|| ev_d["sub_label"].as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    sub_labels.push(sl.to_string());
+                }
+                let sub_label_score = ev
+                    .sub_label_score
+                    .or_else(|| ev_d["sub_label_score"].as_f64())
+                    .filter(|v| v.is_finite());
+                let mut plates = Vec::new();
+                if let Some(p) = ev_d["recognized_license_plate"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    plates.push(p.to_string());
+                }
+                let detected_attrs: Vec<Value> = ev_d["detected_attributes"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let z_val = parse_json_or(ev.raw_zones, json!([]));
+                let zones: Vec<String> = z_val
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let objects = if ev.label.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    vec![ev.label]
+                };
+                let has_snapshot = ev.has_snapshot;
+                let thumb_path = ev_d["thumb_path"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map_or_else(
+                        || {
+                            if has_snapshot != 0 {
+                                format!("/media/ninjanvr/clips/{camera}-{clean_id}.webp")
+                            } else {
+                                String::new()
+                            }
+                        },
+                        str::to_string,
+                    );
+                let restored_id = format!("rev-restored-{clean_id}");
+                let restored_data = json!({
+                    "detections": [clean_id],
+                    "objects": objects,
+                    "verified_objects": [],
+                    "sub_labels": sub_labels,
+                    "sub_label_score": sub_label_score,
+                    "recognized_license_plates": plates,
+                    "detected_attributes": detected_attrs,
+                    "zones": zones,
+                    "audio": [],
+                    "thumb_time": safe_start,
+                    "provenance": ev_d.get("provenance").cloned().unwrap_or(Value::Null),
+                    "metadata": null
+                });
+                let restored_data_str = serde_json::to_string(&restored_data)?;
+                tx.execute(
+                    r#"
+                    INSERT INTO reviewsegment (id, camera, start_time, end_time, severity, thumb_path, data)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    ON CONFLICT(id) DO UPDATE SET
+                        end_time = excluded.end_time,
+                        severity = excluded.severity,
+                        thumb_path = excluded.thumb_path,
+                        data = excluded.data
+                    "#,
+                    params![
+                        restored_id,
+                        camera,
+                        safe_start,
+                        safe_end,
+                        severity,
+                        thumb_path,
+                        restored_data_str
+                    ],
+                )?;
+                let restored = ReviewItemDto {
+                    id: restored_id,
+                    camera,
+                    start_time: safe_start,
+                    end_time: safe_end,
+                    severity,
+                    thumb_path,
+                    data: restored_data,
+                    has_been_reviewed: false,
+                };
+                outcome.updated_reviews.push((restored.clone(), restored));
+            }
+        }
+
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    /// Queries persisted `ReviewItemDto` rows referencing `event_id` (for live WebSocket broadcast).
+    pub fn get_reviews_referencing_event(&self, event_id: &str) -> Result<Vec<ReviewItemDto>> {
+        let clean_id = event_id.trim();
+        if clean_id.is_empty() || clean_id.contains('"') {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock_conn();
+        let like_pattern = format!("%\"{}\"%", escape_sql_like(clean_id));
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT r.id, r.camera, r.start_time, r.end_time, r.severity, r.thumb_path, r.data,
+                   EXISTS(SELECT 1 FROM userreviewstatus u WHERE u.review_segment_id = r.id AND u.has_been_reviewed = 1)
+            FROM reviewsegment r
+            WHERE r.id = ?1 OR r.data LIKE ?2 ESCAPE '\'
+            "#,
+        )?;
+        let rows: Vec<ReviewItemDto> = stmt
+            .query_map(params![clean_id, like_pattern], |r| {
+                Ok(ReviewItemDto {
+                    id: r.get(0)?,
+                    camera: r.get(1)?,
+                    start_time: r.get(2)?,
+                    end_time: r.get(3).ok(),
+                    severity: r
+                        .get::<_, Option<String>>(4)?
+                        .unwrap_or_else(|| "detection".to_string()),
+                    thumb_path: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    data: parse_json_or(r.get::<_, Option<String>>(6).ok().flatten(), json!({})),
+                    has_been_reviewed: r.get::<_, bool>(7).unwrap_or(false),
+                })
+            })?
+            .flatten()
+            .collect();
+        Ok(rows)
+    }
+
     pub fn set_event_ai_verification(&self, id: &str, verification: &Value) -> Result<usize> {
         let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
@@ -3733,6 +4295,81 @@ impl NinjaDatabase {
             "UPDATE event SET data = ?1 WHERE id = ?2",
             params![data_str, id],
         )?;
+
+        let clean_id = id.trim();
+        if updated > 0 && !clean_id.is_empty() && !clean_id.contains('"') {
+            let like_pattern = format!("%\"{}\"%", escape_sql_like(clean_id));
+            let mut stmt = tx.prepare(
+                "SELECT id, data FROM reviewsegment WHERE id = ?1 OR data LIKE ?2 ESCAPE '\\'",
+            )?;
+            let rev_rows: Vec<(String, String)> = stmt
+                .query_map(params![clean_id, like_pattern], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    ))
+                })?
+                .flatten()
+                .collect();
+            drop(stmt);
+
+            for (rev_id, raw_rev_data) in rev_rows {
+                let mut rev_val = parse_json_or(Some(raw_rev_data), json!({}));
+                let Some(obj) = rev_val.as_object_mut() else {
+                    continue;
+                };
+                let det_ids: Vec<String> = obj
+                    .get("detections")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let matches_event = rev_id == clean_id
+                    || det_ids.iter().any(|d| d == clean_id)
+                    || obj
+                        .get("event_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|eid| eid == clean_id);
+                if !matches_event {
+                    continue;
+                }
+                let mut plates: Vec<String> = Vec::new();
+                let check_ids = if det_ids.is_empty() {
+                    vec![clean_id.to_string()]
+                } else {
+                    det_ids
+                };
+                for det_id in &check_ids {
+                    if let Some(ev_d_raw) = tx
+                        .query_row(
+                            "SELECT data FROM event WHERE id = ?1",
+                            params![det_id],
+                            |r| r.get::<_, Option<String>>(0),
+                        )
+                        .optional()?
+                        .flatten()
+                        && let Ok(ev_d) = serde_json::from_str::<Value>(&ev_d_raw)
+                        && let Some(p) = ev_d["recognized_license_plate"]
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        && !plates.iter().any(|x| x == p)
+                    {
+                        plates.push(p.to_string());
+                    }
+                }
+                obj.insert("recognized_license_plates".to_string(), json!(plates));
+                let next_rev_str = serde_json::to_string(&rev_val)?;
+                tx.execute(
+                    "UPDATE reviewsegment SET data = ?1 WHERE id = ?2",
+                    params![next_rev_str, rev_id],
+                )?;
+            }
+        }
+
         tx.commit()?;
         Ok(updated)
     }
@@ -11989,6 +12626,150 @@ mod tests {
         assert!(files.contains(&expected_share));
         assert!(!files.iter().any(|p| p.starts_with("/media/ninjanvr/")
             && (p.contains("ev_by_1") || p.contains("rev_by_1"))));
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn reconcile_reviews_recomputes_metadata_deletes_all_fp_and_restores_single_event_undo() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr_db_fp_undo_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let db = NinjaDatabase::open(tmp_dir.join("test.db")).unwrap();
+
+        db.upsert_event(&EventDto {
+            id: "ev_car_fp".to_string(),
+            camera: "driveway".to_string(),
+            label: "car".to_string(),
+            zones: json!(["street"]),
+            start_time: 1000.0,
+            end_time: Some(1008.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: Some("GhostCar".to_string()),
+            top_score: Some(0.92),
+            false_positive: Some(false),
+            box_coords: Some(json!([0.1, 0.1, 0.4, 0.4])),
+            data: json!({
+                "max_severity": "alert",
+                "sub_label": "GhostCar",
+                "sub_label_score": 0.91,
+                "recognized_license_plate": "FAKE999",
+                "detected_attributes": [{"label": "license_plate", "score": 0.89}]
+            }),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.92),
+            stationary: false,
+        })
+        .unwrap();
+
+        db.upsert_event(&EventDto {
+            id: "ev_person_ok".to_string(),
+            camera: "driveway".to_string(),
+            label: "person".to_string(),
+            zones: json!(["porch"]),
+            start_time: 1001.0,
+            end_time: Some(1009.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: Some("Alice".to_string()),
+            top_score: Some(0.95),
+            false_positive: Some(false),
+            box_coords: Some(json!([0.2, 0.2, 0.3, 0.6])),
+            data: json!({
+                "max_severity": "detection",
+                "sub_label": "Alice",
+                "sub_label_score": 0.88,
+                "detected_attributes": [{"label": "face", "score": 0.93}]
+            }),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.95),
+            stationary: false,
+        })
+        .unwrap();
+
+        db.insert_review_segment(&ReviewItemDto {
+            id: "rev_multi_1".to_string(),
+            camera: "driveway".to_string(),
+            start_time: 1000.0,
+            end_time: Some(1009.0),
+            severity: "alert".to_string(),
+            thumb_path: "/media/ninjanvr/clips/review/thumb-driveway-rev_multi_1.webp".to_string(),
+            data: json!({
+                "detections": ["ev_car_fp", "ev_person_ok"],
+                "objects": ["car", "person"],
+                "sub_labels": ["GhostCar", "Alice"],
+                "recognized_license_plates": ["FAKE999"],
+                "detected_attributes": [
+                    {"label": "license_plate", "score": 0.89},
+                    {"label": "face", "score": 0.93}
+                ],
+                "zones": ["street", "porch"],
+                "audio": []
+            }),
+            has_been_reviewed: false,
+        })
+        .unwrap();
+
+        // 1. Mark ev_car_fp as FP: sub_labels, plates, attributes, zones, objects, and severity recompute from ev_person_ok
+        db.set_event_false_positive("ev_car_fp", true).unwrap();
+        let out1 = db
+            .reconcile_reviews_for_event_false_positive("ev_car_fp", true)
+            .unwrap();
+        assert_eq!(out1.updated_reviews.len(), 1);
+        assert!(out1.deleted_reviews.is_empty());
+        let after1 = &out1.updated_reviews[0].1;
+        assert_eq!(after1.severity, "detection");
+        assert_eq!(after1.data["objects"], json!(["person"]));
+        assert_eq!(after1.data["sub_labels"], json!(["Alice"]));
+        assert_eq!(after1.data["recognized_license_plates"], json!([]));
+        assert_eq!(after1.data["zones"], json!(["porch"]));
+        assert_eq!(
+            after1.data["detected_attributes"],
+            json!([{"label": "face", "score": 0.93}])
+        );
+
+        // 2. Mark ev_person_ok as FP too -> zero ev_fp == 0 events remain -> reviewsegment deleted!
+        db.set_event_false_positive("ev_person_ok", true).unwrap();
+        let out2 = db
+            .reconcile_reviews_for_event_false_positive("ev_person_ok", true)
+            .unwrap();
+        assert_eq!(out2.deleted_reviews.len(), 1);
+        assert!(db.get_review_by_id("rev_multi_1").unwrap().is_none());
+
+        // 3. Undo FP on ev_car_fp (fp == false) when no reviewsegment remains -> reconstructs rev-restored-ev_car_fp
+        db.set_event_false_positive("ev_car_fp", false).unwrap();
+        let out3 = db
+            .reconcile_reviews_for_event_false_positive("ev_car_fp", false)
+            .unwrap();
+        assert_eq!(out3.updated_reviews.len(), 1);
+        let restored = db
+            .get_review_by_id("rev-restored-ev_car_fp")
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.camera, "driveway");
+        assert_eq!(restored.severity, "alert");
+        assert_eq!(restored.data["detections"], json!(["ev_car_fp"]));
+        assert_eq!(restored.data["objects"], json!(["car"]));
+        assert_eq!(restored.data["sub_labels"], json!(["GhostCar"]));
+        assert_eq!(
+            restored.data["recognized_license_plates"],
+            json!(["FAKE999"])
+        );
+        assert_eq!(restored.data["zones"], json!(["street"]));
+        assert_eq!(
+            restored.thumb_path,
+            "/media/ninjanvr/clips/driveway-ev_car_fp.webp"
+        );
 
         drop(db);
         let _ = std::fs::remove_dir_all(&tmp_dir);

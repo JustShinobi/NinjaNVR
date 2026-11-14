@@ -500,6 +500,39 @@ fn read_bounded_labelmap_file(path: &Path) -> Result<String> {
     Ok(String::from_utf8(buf)?)
 }
 
+/// Parses newline-delimited labelmap text while bounding entry count (`<= 256`),
+/// line length (`<= 128`), and filtering out credential-like or URL lines.
+pub fn parse_safe_labelmap_lines(content: &str) -> BTreeMap<i32, String> {
+    let mut labelmap = BTreeMap::new();
+    for (idx, line) in content.lines().enumerate() {
+        if labelmap.len() >= 256 {
+            break;
+        }
+        let trimmed = line.trim();
+        let trimmed_lc = trimmed.to_ascii_lowercase();
+        if !trimmed.is_empty()
+            && trimmed.len() <= 128
+            && !trimmed.contains("://")
+            && !trimmed_lc.starts_with("password:")
+            && !trimmed_lc.starts_with("api_key:")
+            && !trimmed_lc.starts_with("secret:")
+            && !trimmed_lc.starts_with("client_secret:")
+            && !trimmed_lc.starts_with("token:")
+            && !trimmed_lc.starts_with("-----begin")
+            && let Ok(id) = i32::try_from(idx)
+        {
+            labelmap.insert(id, trimmed.to_string());
+        }
+    }
+    labelmap
+}
+
+/// Pre-compiled primary detector candidate produced during staged atomic model deployment.
+pub struct CompiledCandidateDetector {
+    state: DetectorRuntimeState,
+    pub loaded: bool,
+}
+
 /// Standard 80-class COCO index to label mapping used by YOLOv5/v8/v11/YOLOX models when
 /// a 91-class SSD labelmap (with `__background__` at 0) is loaded.
 const YOLO_COCO_80: [&str; 80] = [
@@ -630,6 +663,88 @@ impl AiDetectorEngine {
         *lock_unpoisoned(&self.pool) = pool_map;
     }
 
+    /// Incrementally reloads only the primary or named detectors whose configuration changed
+    /// between `prev_cfg` and `next_cfg`, preserving compiled sessions and rolling latency samples
+    /// for unchanged detectors.
+    pub fn reload_if_changed(&self, prev_cfg: &NinjaConfig, next_cfg: &NinjaConfig) {
+        let prev_primary_entry = prev_cfg.detectors.values().next();
+        let next_primary_entry = next_cfg.detectors.values().next();
+        let primary_changed =
+            prev_cfg.model != next_cfg.model || prev_primary_entry != next_primary_entry;
+        if primary_changed {
+            let next_state = Self::build_runtime_state(next_cfg, None);
+            *lock_unpoisoned(&self.inner) = next_state;
+            *lock_unpoisoned(&self.last_inference_ms) = 0.0;
+            self.inference_samples.store(0, Ordering::Relaxed);
+        }
+
+        if prev_cfg.detectors != next_cfg.detectors || prev_cfg.model != next_cfg.model {
+            let existing_pool = lock_unpoisoned(&self.pool).clone();
+            let mut next_pool = BTreeMap::new();
+            for (name, entry) in &next_cfg.detectors {
+                let entry_unchanged = prev_cfg.detectors.get(name) == Some(entry)
+                    && (entry.model.is_some() || prev_cfg.model == next_cfg.model);
+                if entry_unchanged && let Some(existing) = existing_pool.get(name) {
+                    next_pool.insert(name.clone(), existing.clone());
+                } else {
+                    next_pool.insert(name.clone(), Arc::new(Self::new_for_entry(next_cfg, entry)));
+                }
+            }
+            *lock_unpoisoned(&self.pool) = next_pool;
+        }
+    }
+
+    /// Compiles a staged primary detector candidate without mutating `self` or resetting
+    /// live inference telemetry.
+    pub fn compile_candidate_primary(
+        candidate_cfg: &NinjaConfig,
+        labelmap_override: Option<BTreeMap<i32, String>>,
+    ) -> CompiledCandidateDetector {
+        let mut state = Self::build_runtime_state(candidate_cfg, None);
+        if let Some(lm) = labelmap_override
+            && !lm.is_empty()
+        {
+            state.labelmap = lm;
+        }
+        let loaded = state.backend.is_some();
+        CompiledCandidateDetector { state, loaded }
+    }
+
+    /// Atomically swaps a pre-compiled candidate state into `self`, updating its canonical
+    /// `active_model_path`, resetting rolling latency telemetry, and rebuilding any named
+    /// detector pool entries that inherit the default `updated_cfg.model` (`entry.model.is_none()`).
+    pub fn activate_compiled_primary(
+        &self,
+        mut compiled: CompiledCandidateDetector,
+        final_model_path: String,
+        updated_cfg: &NinjaConfig,
+    ) {
+        let new_labelmap = compiled.state.labelmap.clone();
+        compiled.state.active_model_path = final_model_path;
+        *lock_unpoisoned(&self.inner) = compiled.state;
+        *lock_unpoisoned(&self.last_inference_ms) = 0.0;
+        self.inference_samples.store(0, Ordering::Relaxed);
+
+        let existing_pool = lock_unpoisoned(&self.pool).clone();
+        if !updated_cfg.detectors.is_empty() || !existing_pool.is_empty() {
+            let mut next_pool = BTreeMap::new();
+            for (name, entry) in &updated_cfg.detectors {
+                if entry.model.is_some()
+                    && let Some(existing) = existing_pool.get(name)
+                {
+                    next_pool.insert(name.clone(), existing.clone());
+                } else {
+                    let rebuilt = Self::new_for_entry(updated_cfg, entry);
+                    if entry.model.is_none() && !new_labelmap.is_empty() {
+                        rebuilt.set_labelmap(new_labelmap.clone());
+                    }
+                    next_pool.insert(name.clone(), Arc::new(rebuilt));
+                }
+            }
+            *lock_unpoisoned(&self.pool) = next_pool;
+        }
+    }
+
     /// Resolves a named detector from the pool if present, or returns `None` (caller uses `self`).
     pub fn named_detector(&self, name: Option<&str>) -> Option<Arc<AiDetectorEngine>> {
         let n = name?;
@@ -720,26 +835,7 @@ impl AiDetectorEngine {
         if !effective_model.labelmap_path.is_empty()
             && let Ok(content) = read_bounded_labelmap_file(labelmap_candidate)
         {
-            for (idx, line) in content.lines().enumerate() {
-                if labelmap.len() >= 256 {
-                    break;
-                }
-                let trimmed = line.trim();
-                let trimmed_lc = trimmed.to_ascii_lowercase();
-                if !trimmed.is_empty()
-                    && trimmed.len() <= 128
-                    && !trimmed.contains("://")
-                    && !trimmed_lc.starts_with("password:")
-                    && !trimmed_lc.starts_with("api_key:")
-                    && !trimmed_lc.starts_with("secret:")
-                    && !trimmed_lc.starts_with("client_secret:")
-                    && !trimmed_lc.starts_with("token:")
-                    && !trimmed_lc.starts_with("-----begin")
-                    && let Ok(id) = i32::try_from(idx)
-                {
-                    labelmap.insert(id, trimmed.to_string());
-                }
-            }
+            labelmap = parse_safe_labelmap_lines(&content);
         }
         if labelmap.is_empty() {
             let raw_labels = config.load_labelmap();
@@ -1054,6 +1150,12 @@ impl AiDetectorEngine {
             if let Ok(entries) = std::fs::read_dir(d) {
                 for entry in entries.flatten().take(256) {
                     let p = entry.path();
+                    let Some(fname) = p.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    if fname.starts_with("staged_") || fname.starts_with('.') {
+                        continue;
+                    }
                     if ninjanvr_config::is_safe_model_path(&p)
                         && p.is_file()
                         && let Some(ext) = p.extension().and_then(|e| e.to_str())
@@ -5748,6 +5850,75 @@ detectors:
         assert!(!tmp.join("Erik").exists());
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn activate_compiled_primary_rebuilds_default_model_pool_entries_and_preserves_explicit_ones() {
+        let yaml_init = r#"
+model:
+  path: /tmp/primary_v1.onnx
+  width: 320
+  height: 320
+detectors:
+  inherited_cpu:
+    type: openvino
+    device: CPU
+  custom_gpu:
+    type: openvino
+    device: GPU
+    model:
+      path: /tmp/custom_fixed.onnx
+      width: 512
+      height: 512
+"#;
+        let cfg_v1 = NinjaConfig::from_yaml_str(yaml_init, PathBuf::new()).unwrap();
+        let engine = AiDetectorEngine::new(&cfg_v1);
+        let inherited_before = engine.named_detector(Some("inherited_cpu")).unwrap();
+        let custom_before = engine.named_detector(Some("custom_gpu")).unwrap();
+        assert_eq!(
+            (
+                inherited_before.model_dimensions().0,
+                inherited_before.model_dimensions().1
+            ),
+            (320, 320)
+        );
+        assert_eq!(
+            (
+                custom_before.model_dimensions().0,
+                custom_before.model_dimensions().1
+            ),
+            (512, 512)
+        );
+
+        let mut cfg_v2 = cfg_v1;
+        cfg_v2.model.path = "/tmp/primary_v2.onnx".to_string();
+        cfg_v2.model.width = 640;
+        cfg_v2.model.height = 640;
+
+        let mut lm = BTreeMap::new();
+        lm.insert(0, "forklift".to_string());
+        let compiled = AiDetectorEngine::compile_candidate_primary(&cfg_v2, Some(lm));
+        engine.activate_compiled_primary(compiled, "/tmp/primary_v2.onnx".to_string(), &cfg_v2);
+
+        assert_eq!(
+            (engine.model_dimensions().0, engine.model_dimensions().1),
+            (640, 640)
+        );
+        let inherited_after = engine.named_detector(Some("inherited_cpu")).unwrap();
+        let custom_after = engine.named_detector(Some("custom_gpu")).unwrap();
+        assert_eq!(
+            (
+                inherited_after.model_dimensions().0,
+                inherited_after.model_dimensions().1
+            ),
+            (640, 640),
+            "named detector with entry.model == None must inherit newly deployed primary model"
+        );
+        assert_eq!(inherited_after.active_model_path(), "/tmp/primary_v2.onnx");
+        assert!(
+            Arc::ptr_eq(&custom_before, &custom_after),
+            "named detector with explicit entry.model must be preserved untouched"
+        );
     }
 
     #[test]
