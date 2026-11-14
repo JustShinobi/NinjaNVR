@@ -13,6 +13,12 @@ import { WorkspaceTab, findMatchingExport, formatDateTime } from "../utils/forma
 import { RecordingCalendarPopover } from "../components/RecordingCalendarPopover";
 import { useCompactViewport } from "../utils/useCompactViewport";
 import { countActiveExploreFilters } from "../utils/liveTileHud";
+import { resolveSafeMediaUrl } from "../utils/mediaUrlPolicy";
+import {
+  EventMutationPatch,
+  reconcileDeletedFaceProfile,
+  reconcileEventMutation,
+} from "../utils/operationalFeed";
 import {
   BatchFaceProgress,
   DEFAULT_LPR_FORMAT_REGEX,
@@ -92,6 +98,10 @@ interface ExploreWorkspaceProps {
   setSyncMasterTs: (ts: number) => void;
   switchTab: (tab: WorkspaceTab) => void;
   notify: (msg: string) => void;
+  onReconcileEvents?: (
+    eventIds: string | ReadonlyArray<string>,
+    patch: EventMutationPatch
+  ) => void;
 }
 
 export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
@@ -119,6 +129,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   setSyncMasterTs,
   switchTab,
   notify,
+  onReconcileEvents,
 }) => {
   const { t } = useI18n();
   const [showForensic, setShowForensic] = React.useState(false);
@@ -127,6 +138,8 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   const [datasetAddBusy, setDatasetAddBusy] = React.useState(false);
   const [addedDatasetIds, setAddedDatasetIds] = React.useState<Record<string, boolean>>({});
   const isMountedRef = React.useRef(true);
+  const eventClipVideoRef = React.useRef<HTMLVideoElement | null>(null);
+  const pendingClipSeekSecRef = React.useRef<number | null>(null);
   const selectedEventIdRef = React.useRef<string | null>(selectedEvent?.id ?? null);
   selectedEventIdRef.current = selectedEvent?.id ?? null;
   const debugReplayAbortRef = React.useRef<AbortController | null>(null);
@@ -202,11 +215,14 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
       );
       if (!isMountedRef.current || result.stale) return;
       if (result.ok) {
-        if (result.shouldApply) {
-          setSelectedEvent({
-            ...targetEvent,
-            false_positive: result.nextFp,
-          });
+        onReconcileEvents?.(targetId, { falsePositive: result.nextFp });
+        if (result.shouldApply && !onReconcileEvents) {
+          const reconciled = reconcileEventMutation(
+            { events: [], selectedEvent: targetEvent },
+            targetId,
+            { falsePositive: result.nextFp }
+          );
+          setSelectedEvent(reconciled.selectedEvent);
         }
         notify(
           result.nextFp
@@ -239,18 +255,20 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
       if (!isMountedRef.current || result.stale) return;
       if (result.ok && result.aiVerification) {
         const aiVerdict: AiVerificationResult = result.aiVerification;
-        if (result.shouldApply) {
-          setSelectedEvent({
-            ...targetEvent,
-            false_positive:
-              result.falsePositive !== undefined
-                ? result.falsePositive
-                : targetEvent.false_positive,
-            data: {
-              ...(targetEvent.data || {}),
-              ai_verification: aiVerdict,
-            },
-          });
+        const patch: EventMutationPatch = {
+          aiVerification: aiVerdict,
+          ...(result.falsePositive !== undefined
+            ? { falsePositive: result.falsePositive }
+            : {}),
+        };
+        onReconcileEvents?.(targetId, patch);
+        if (result.shouldApply && !onReconcileEvents) {
+          const reconciled = reconcileEventMutation(
+            { events: [], selectedEvent: targetEvent },
+            targetId,
+            patch
+          );
+          setSelectedEvent(reconciled.selectedEvent);
         }
         notify(
           `${formatAiVerificationBadge(aiVerdict)} — ${aiVerdict.reason}`
@@ -303,6 +321,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
 
   React.useEffect(() => {
     selectedEventIdRef.current = selectedEvent?.id ?? null;
+    pendingClipSeekSecRef.current = null;
     triageController.setActiveTarget("event", selectedEvent?.id ?? null);
     setAiVerifyBusy(false);
     setDatasetAddBusy(false);
@@ -314,6 +333,22 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     setDebugBusy(false);
     setDebugTrace(null);
   }, [selectedEvent?.id, triageController]);
+
+  React.useEffect(() => {
+    if (
+      eventViewMode === "clip" &&
+      pendingClipSeekSecRef.current !== null &&
+      eventClipVideoRef.current &&
+      eventClipVideoRef.current.readyState >= 1
+    ) {
+      try {
+        eventClipVideoRef.current.currentTime = pendingClipSeekSecRef.current;
+        pendingClipSeekSecRef.current = null;
+      } catch {
+        // Applied on loadedmetadata
+      }
+    }
+  }, [eventViewMode, selectedEvent?.id]);
 
   React.useEffect(() => {
     isMountedRef.current = true;
@@ -349,22 +384,27 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
 
   React.useEffect(() => {
     if (!lastDeletedFaceProfile?.name) return;
-    const deletedLower = lastDeletedFaceProfile.name.trim().toLowerCase();
     setEnrolledFaces((prev) =>
-      prev.filter((p) => p.name.trim().toLowerCase() !== deletedLower)
+      reconcileDeletedFaceProfile(
+        { enrolledFaces: prev },
+        lastDeletedFaceProfile.name
+      ).enrolledFaces
     );
-    if (
-      selectedEvent &&
-      (selectedEvent.sub_label || selectedEvent.data?.sub_label || "")
-        .trim()
-        .toLowerCase() === deletedLower
-    ) {
-      const [cleared] = clearFaceProfileFromEvents(
-        [selectedEvent],
+    setLocalEventSubLabels((prev) =>
+      reconcileDeletedFaceProfile(
+        { localSubLabels: prev },
+        lastDeletedFaceProfile.name
+      ).localSubLabels
+    );
+    if (selectedEvent) {
+      const scrubbed = reconcileDeletedFaceProfile(
+        { selectedEvent },
         lastDeletedFaceProfile.name
       );
-      setSelectedEvent(cleared);
-      setFaceNameDraft("");
+      if (scrubbed.clearedSelectedEvent) {
+        setSelectedEvent(scrubbed.selectedEvent);
+        setFaceNameDraft("");
+      }
     }
   }, [lastDeletedFaceProfile, selectedEvent, setSelectedEvent]);
 
@@ -390,16 +430,17 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         isCancelled: () => !isMountedRef.current,
         onItemSuccess: (eid) => {
           setLocalEventSubLabels((prev) => ({ ...prev, [eid]: null }));
+          onReconcileEvents?.(eid, { subLabel: null, subLabelScore: null });
         },
       });
       if (!isMountedRef.current) return;
-      if (selectedEvent && targetIds.includes(selectedEvent.id)) {
-        const [updated] = applyEventSubLabelUpdate(
-          [selectedEvent],
+      if (!onReconcileEvents && selectedEvent && targetIds.includes(selectedEvent.id)) {
+        const reconciled = reconcileEventMutation(
+          { events: [], selectedEvent },
           selectedEvent.id,
-          null
+          { subLabel: null, subLabelScore: null }
         );
-        setSelectedEvent(updated);
+        setSelectedEvent(reconciled.selectedEvent);
       }
       setSelectedBatchEventIds([]);
       bumpSubLabelsRefresh();
@@ -425,14 +466,18 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
           ...prev,
           [targetId]: result.cleanName,
         }));
-        if (result.shouldApply) {
-          const [updated] = applyEventSubLabelUpdate(
-            [targetEvent],
+        const patch: EventMutationPatch = {
+          subLabel: result.cleanName,
+          subLabelScore: result.cleanName ? 1.0 : null,
+        };
+        onReconcileEvents?.(targetId, patch);
+        if (result.shouldApply && !onReconcileEvents) {
+          const reconciled = reconcileEventMutation(
+            { events: [], selectedEvent: targetEvent },
             targetId,
-            result.cleanName,
-            result.cleanName ? 1.0 : null
+            patch
           );
-          setSelectedEvent(updated);
+          setSelectedEvent(reconciled.selectedEvent);
         }
         bumpSubLabelsRefresh();
         notify(
@@ -486,14 +531,19 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         onProgress: (progress) => setBatchFaceProgress(progress),
         onItemSuccess: (eid, assignedName) => {
           setLocalEventSubLabels((prev) => ({ ...prev, [eid]: assignedName }));
-          if (selectedEvent && selectedEvent.id === eid) {
-            const [updated] = applyEventSubLabelUpdate(
-              [selectedEvent],
+          const patch: EventMutationPatch = {
+            subLabel: assignedName,
+            subLabelScore: assignedName ? 1.0 : null,
+          };
+          if (onReconcileEvents) {
+            onReconcileEvents(eid, patch);
+          } else if (selectedEvent && selectedEvent.id === eid) {
+            const reconciled = reconcileEventMutation(
+              { events: [], selectedEvent },
               eid,
-              assignedName,
-              assignedName ? 1.0 : null
+              patch
             );
-            setSelectedEvent(updated);
+            setSelectedEvent(reconciled.selectedEvent);
           }
         },
       });
@@ -536,15 +586,20 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
           result.subLabel !== undefined
             ? result.subLabel
             : targetEvent.sub_label;
+        const patch: EventMutationPatch = {
+          recognizedLicensePlate: nextPlate,
+          ...(result.subLabel !== undefined ? { subLabel: nextSubLabel } : {}),
+        };
+        onReconcileEvents?.(targetId, patch);
         if (result.shouldApply) {
-          setSelectedEvent({
-            ...targetEvent,
-            sub_label: nextSubLabel,
-            data: {
-              ...(targetEvent.data || {}),
-              recognized_license_plate: nextPlate,
-            },
-          });
+          if (!onReconcileEvents) {
+            const reconciled = reconcileEventMutation(
+              { events: [], selectedEvent: targetEvent },
+              targetId,
+              patch
+            );
+            setSelectedEvent(reconciled.selectedEvent);
+          }
           setEventPlateDraft(nextPlate || "");
         }
         notify(
@@ -578,11 +633,14 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
       });
       if (!isMountedRef.current || result.stale) return;
       if (result.ok) {
-        if (result.shouldApply) {
-          setSelectedEvent({
-            ...targetEvent,
-            data: { ...(targetEvent.data || {}), notes: result.notes },
-          });
+        onReconcileEvents?.(targetId, { notes: result.notes });
+        if (result.shouldApply && !onReconcileEvents) {
+          const reconciled = reconcileEventMutation(
+            { events: [], selectedEvent: targetEvent },
+            targetId,
+            { notes: result.notes }
+          );
+          setSelectedEvent(reconciled.selectedEvent);
         }
         notify("Saved forensic note on event");
       } else {
@@ -1655,8 +1713,25 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                           className="nvr-btn mono"
                           style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
                           onClick={() => {
+                            const safeEventStart =
+                              typeof selectedEvent.start_time === "number" &&
+                              Number.isFinite(selectedEvent.start_time)
+                                ? selectedEvent.start_time
+                                : triggerTs;
+                            const targetOffset = Math.max(
+                              0,
+                              triggerTs - safeEventStart
+                            );
+                            pendingClipSeekSecRef.current = targetOffset;
                             setEventViewMode("clip");
-                            setSyncMasterTs(Math.floor(triggerTs));
+                            if (eventClipVideoRef.current) {
+                              try {
+                                eventClipVideoRef.current.currentTime = targetOffset;
+                                pendingClipSeekSecRef.current = null;
+                              } catch {
+                                // Applied on loadedmetadata once media element is ready
+                              }
+                            }
                           }}
                         >
                           Jump to Trigger Frame
@@ -1817,14 +1892,31 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                       !/[/\\%\u0000-\u001f\u007f]/.test(rawMock)
                         ? rawMock
                         : "";
+                    const clipSrc = resolveSafeMediaUrl(
+                      safeMock
+                        ? `/clips/mocks/${encodeURIComponent(safeMock)}`
+                        : null,
+                      {
+                        kind: "event_clip",
+                        eventId: selectedEvent.id,
+                      }
+                    );
                     return (
                       <video
                         key={selectedEvent.id}
-                        src={
-                          safeMock
-                            ? `/clips/mocks/${encodeURIComponent(safeMock)}`
-                            : `/api/events/${encodeURIComponent(selectedEvent.id)}/clip.mp4`
-                        }
+                        ref={eventClipVideoRef}
+                        src={clipSrc}
+                        onLoadedMetadata={(e) => {
+                          if (pendingClipSeekSecRef.current !== null) {
+                            try {
+                              e.currentTarget.currentTime =
+                                pendingClipSeekSecRef.current;
+                              pendingClipSeekSecRef.current = null;
+                            } catch {
+                              // ignore seek error on empty media
+                            }
+                          }
+                        }}
                         controls
                         autoPlay
                         muted

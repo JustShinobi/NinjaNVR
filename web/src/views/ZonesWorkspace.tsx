@@ -14,11 +14,13 @@ import {
 } from "lucide-react";
 import { useI18n } from "../i18n";
 import { FfprobeItem, NinjaConfigResponse } from "../types/nvr";
-import { buildCleanYamlFromDraft } from "../utils/configYaml";
 import {
-  applyStructuredDraftMutation,
-  synthesizeDraftYamlIfNeeded,
-} from "../utils/scopedConfigDraft";
+  type ConfigWorkbenchSession,
+  createConfigWorkbenchSession,
+  createFetchConfigTransport,
+  useConfigWorkbenchSession,
+  useConfigWorkbenchSnapshot,
+} from "../utils/configWorkbench";
 import { TacticalCameraPicker } from "../components/TacticalCameraPicker";
 import { useNvrStore } from "../store/useNvrStore";
 import { countChangedSections, formatUnsavedLabel } from "../utils/settingsUx";
@@ -27,7 +29,7 @@ import {
   ConsoleUiSection,
 } from "./settings/ConsoleAndStreamsPanels";
 import { AiDetectionObjectsSection } from "./settings/VisionAndAiPanels";
-import { ZonesStudio, type SaveOutcome } from "./settings/ZonesStudio";
+import { ZonesStudio } from "./settings/ZonesStudio";
 import { DatasetStudioSection } from "./settings/DatasetStudio";
 import { mergeDeployedModel } from "../utils/datasetStudio";
 import {
@@ -88,6 +90,7 @@ interface ZonesWorkspaceProps {
   ffprobeInfo: FfprobeItem[] | null;
   handleSaveConfig: (saveOption: "saveonly" | "restart") => Promise<void>;
   notify: (msg: string) => void;
+  workbenchSession?: ConfigWorkbenchSession;
 }
 
 export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
@@ -105,6 +108,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   ffprobeInfo,
   handleSaveConfig,
   notify,
+  workbenchSession,
 }) => {
   const { t, locale } = useI18n();
   const isPt = locale === "pt";
@@ -112,19 +116,38 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
     zonesSubTab === "yaml" ? "yaml" : "vision"
   );
   const [scope, setScope] = useState<"global" | string>("camera");
-  const [draftConfig, setDraftConfig] = useState<NinjaConfigResponse | null>(() =>
-    config ? JSON.parse(JSON.stringify(config)) : null
-  );
-  const [baselineYaml, setBaselineYaml] = useState<string>(() => rawYaml || "");
-  const [isDirty, setIsDirty] = useState(false);
-  const [isSaving, setIsSaving] = useState(false);
   const [visionReviewOpen, setVisionReviewOpen] = useState(false);
-  const [saveOutcome, setSaveOutcome] = useState<SaveOutcome | null>(null);
-  const draftRevisionRef = useRef<number>(0);
-  const sanitizedDraftRef = useRef<NinjaConfigResponse | null>(null);
-  const latestDraftRef = useRef<NinjaConfigResponse | null>(draftConfig);
-  latestDraftRef.current = sanitizedDraftRef.current ?? draftConfig;
-  const yamlStaleRef = useRef<boolean>(false);
+
+  const contextSession = useConfigWorkbenchSession();
+  const sharedSession = workbenchSession ?? contextSession;
+  const fallbackSessionRef = useRef<ConfigWorkbenchSession | null>(null);
+  if (!sharedSession && !fallbackSessionRef.current) {
+    fallbackSessionRef.current = createConfigWorkbenchSession(
+      createFetchConfigTransport(),
+      {
+        initialConfig: config,
+        initialRawYaml: rawYaml || "",
+        onServerCommitted: (nextCfg, nextYaml) => {
+          if (nextCfg) setConfig(nextCfg);
+          if (nextYaml) setRawYaml(nextYaml);
+        },
+      }
+    );
+  }
+  const session = sharedSession ?? fallbackSessionRef.current!;
+  const {
+    baselineConfig,
+    draftConfig,
+    rawYaml: sessionRawYaml,
+    yamlStale,
+    isDirty,
+    isSaving,
+    saveOutcome,
+  } = useConfigWorkbenchSnapshot(session);
+  const effectiveRawYaml = sharedSession
+    ? sessionRawYaml
+    : sessionRawYaml || rawYaml;
+
   const prevZonesSubTabRef = useRef<"visual" | "yaml">(zonesSubTab);
   const isMountedRef = useRef<boolean>(true);
   const showYamlKeys = useNvrStore((s) => s.showYamlKeys);
@@ -138,20 +161,25 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   }, []);
 
   useEffect(() => {
+    if (!sharedSession && config) {
+      session.hydrateFromServer(config);
+    }
+  }, [sharedSession, session, config]);
+
+  useEffect(() => {
+    if (!sharedSession && rawYaml && !isDirty && !isSaving) {
+      session.hydrateRawYamlFromServer(rawYaml);
+    }
+  }, [sharedSession, session, rawYaml, isDirty, isSaving]);
+
+  useEffect(() => {
     const subTabChanged = prevZonesSubTabRef.current !== zonesSubTab;
     prevZonesSubTabRef.current = zonesSubTab;
     if (subTabChanged) {
       if (zonesSubTab === "yaml" && activeCategory !== "yaml") {
-        const currentDraft = latestDraftRef.current;
-        if (yamlStaleRef.current && currentDraft) {
-          const synced = synthesizeDraftYamlIfNeeded(
-            currentDraft,
-            baselineYaml,
-            rawYaml,
-            yamlStaleRef.current
-          );
-          yamlStaleRef.current = synced.yamlStale;
-          setRawYaml(synced.rawYaml);
+        const syncedYaml = session.ensureDraftYamlSynced();
+        if (!sharedSession && syncedYaml) {
+          setRawYaml(syncedYaml);
         }
         setActiveCategory("yaml");
       } else if (zonesSubTab === "visual" && activeCategory === "yaml") {
@@ -159,33 +187,20 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
       }
       return;
     }
-    if (activeCategory === "yaml" && yamlStaleRef.current && latestDraftRef.current) {
-      const synced = synthesizeDraftYamlIfNeeded(
-        latestDraftRef.current,
-        baselineYaml,
-        rawYaml,
-        yamlStaleRef.current
-      );
-      yamlStaleRef.current = synced.yamlStale;
-      setRawYaml(synced.rawYaml);
+    if (activeCategory === "yaml" && yamlStale) {
+      const syncedYaml = session.ensureDraftYamlSynced();
+      if (!sharedSession && syncedYaml) {
+        setRawYaml(syncedYaml);
+      }
     }
-  }, [zonesSubTab, activeCategory, draftConfig, baselineYaml, rawYaml, setRawYaml]);
-
-  // Sync incoming config into draftConfig when no local unsaved changes exist
-  useEffect(() => {
-    if (config && !isDirty && !isSaving) {
-      const cloned = JSON.parse(JSON.stringify(config)) as NinjaConfigResponse;
-      sanitizedDraftRef.current = null;
-      latestDraftRef.current = cloned;
-      setDraftConfig(cloned);
-    }
-  }, [config, isDirty, isSaving]);
-
-  useEffect(() => {
-    if (rawYaml && !isDirty && !isSaving && baselineYaml !== rawYaml) {
-      setBaselineYaml(rawYaml);
-    }
-  }, [rawYaml, baselineYaml, isDirty, isSaving]);
+  }, [
+    zonesSubTab,
+    activeCategory,
+    yamlStale,
+    session,
+    sharedSession,
+    setRawYaml,
+  ]);
 
   const allCamKeys = Object.keys(draftConfig?.cameras || {});
   const displayCams = allCamKeys.length > 0 ? allCamKeys : cameraNames;
@@ -227,14 +242,10 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   );
 
   const updateDraft = (updater: (next: NinjaConfigResponse) => void) => {
-    const baseDraft = latestDraftRef.current;
-    if (!baseDraft) return;
     const syncYamlImmediately =
       activeCategory === "yaml" || zonesSubTab === "yaml";
-    const mutation = applyStructuredDraftMutation(baseDraft, updater, {
-      syncYamlImmediately,
-      baselineYaml: baselineYaml || rawYaml,
-    });
+    const mutation = session.mutateDraft(updater, { syncYamlImmediately });
+    if (!mutation) return;
     if (mutation.rejectedGeometryCount > 0) {
       notify(
         isPt
@@ -242,31 +253,20 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
           : "Rejected degenerate (collinear / zero-area) polygon or line to protect backend masks"
       );
     }
-    sanitizedDraftRef.current = mutation.draft;
-    latestDraftRef.current = mutation.draft;
-    draftRevisionRef.current += 1;
-    setDraftConfig(mutation.draft);
-    yamlStaleRef.current = mutation.yamlStale;
-    if (mutation.rawYaml !== null) {
+    if (!sharedSession && mutation.rawYaml !== null) {
       setRawYaml(mutation.rawYaml);
     }
-    setIsDirty(true);
   };
 
   const handleDiscardDraft = () => {
-    draftRevisionRef.current += 1;
-    sanitizedDraftRef.current = null;
-    yamlStaleRef.current = false;
-    if (config) {
-      const cloned = JSON.parse(JSON.stringify(config)) as NinjaConfigResponse;
-      latestDraftRef.current = cloned;
-      setDraftConfig(cloned);
-    }
-    if (baselineYaml) {
-      setRawYaml(baselineYaml);
+    session.discardDraft();
+    if (!sharedSession) {
+      const snap = session.getSnapshot();
+      if (snap.rawYaml) {
+        setRawYaml(snap.rawYaml);
+      }
     }
     setDraftPoints([]);
-    setIsDirty(false);
     notify(
       isPt
         ? "Alterações descartadas e restauradas ao estado salvo"
@@ -275,178 +275,52 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   };
 
   const handleSaveStructured = async (restartAfter = false) => {
-    const activeDraft = latestDraftRef.current;
-    if (!activeDraft || isSaving) return;
-    const report = (ok: boolean, message: string) => {
-      notify(message);
-      setSaveOutcome({ ok, message, at: Date.now() });
-    };
-    setSaveOutcome(null);
-    const saveRev = draftRevisionRef.current;
-    const { cleaned: payloadConfig, rejectedCount } =
-      sanitizedDraftRef.current === activeDraft
-        ? { cleaned: activeDraft, rejectedCount: 0 }
-        : sanitizeConfigGeometryDraft(activeDraft);
-    sanitizedDraftRef.current = payloadConfig;
-    latestDraftRef.current = payloadConfig;
-    if (rejectedCount > 0) {
+    if (isSaving) return;
+    const outcome = await session.commitStructured({
+      restart: restartAfter,
+      savedMessage: isPt
+        ? "Configuração salva em config.yml"
+        : "Structured configuration saved to config.yml",
+      restartedMessage: isPt
+        ? "Configuração salva e pipeline reiniciado"
+        : "Structured configuration saved and pipeline restart triggered",
+      failedMessage: isPt
+        ? "Falha ao salvar a configuração"
+        : "Failed to save configuration",
+      networkErrorMessage: isPt
+        ? "Erro de rede ao salvar. Nada foi gravado."
+        : "Network error while saving. Nothing was written.",
+    });
+    if (!isMountedRef.current) return;
+    if (outcome.rejectedGeometryCount > 0) {
       notify(
         isPt
           ? "Polígono degenerado removido antes de salvar"
           : "Stripped degenerate polygon before saving configuration"
       );
     }
-    setIsSaving(true);
-    try {
-      const res = await fetch("/api/config/structured", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify(payloadConfig),
-      });
-
-      if (res.status === 404) {
-        // Fallback for pods running an older backend binary without /api/config/structured
-        const generatedYaml = buildCleanYamlFromDraft(
-          payloadConfig,
-          baselineYaml || rawYaml
-        );
-        const saveRes = await fetch(
-          `/api/config/save?save_option=${restartAfter ? "restart" : "saveonly"}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "text/plain" },
-            credentials: "include",
-            body: generatedYaml,
-          }
-        );
-        const saveData = await saveRes.json().catch(() => ({}));
-        if (!isMountedRef.current) return;
-        if (saveRes.ok && saveData.success !== false) {
-          setConfig(JSON.parse(JSON.stringify(payloadConfig)));
-          setBaselineYaml(generatedYaml);
-          if (draftRevisionRef.current === saveRev) {
-            yamlStaleRef.current = false;
-            setRawYaml(generatedYaml);
-            setIsDirty(false);
-          }
-          if (restartAfter) {
-            await fetch("/api/restart", { method: "POST", credentials: "include" });
-            if (!isMountedRef.current) return;
-          }
-          report(
-            true,
-            restartAfter
-              ? isPt
-                ? "Configuração salva e NVR reiniciado"
-                : "Configuration saved and NVR restart triggered"
-              : isPt
-              ? "Configuração salva em config.yml"
-              : "Configuration saved to config.yml"
-          );
-        } else {
-          report(false, saveData.message || (isPt ? "Falha ao salvar a configuração" : "Failed to save configuration"));
-        }
-        return;
-      }
-
-      const data = await res.json().catch(() => ({}));
-      if (!isMountedRef.current) return;
-      if (res.ok && data.success !== false) {
-        const nextSavedConfig: NinjaConfigResponse =
-          data.config || payloadConfig;
-        setConfig(JSON.parse(JSON.stringify(nextSavedConfig)));
-        if (draftRevisionRef.current === saveRev) {
-          const clonedSaved = JSON.parse(
-            JSON.stringify(nextSavedConfig)
-          ) as NinjaConfigResponse;
-          sanitizedDraftRef.current = clonedSaved;
-          latestDraftRef.current = clonedSaved;
-          setDraftConfig(clonedSaved);
-        }
-        const nextSavedYaml =
-          typeof data.raw_yaml === "string" && data.raw_yaml.trim()
-            ? data.raw_yaml
-            : buildCleanYamlFromDraft(
-                nextSavedConfig,
-                baselineYaml || rawYaml
-              );
-        setBaselineYaml(nextSavedYaml);
-        if (draftRevisionRef.current === saveRev) {
-          yamlStaleRef.current = false;
-          setRawYaml(nextSavedYaml);
-          setIsDirty(false);
-        }
-        if (restartAfter) {
-          await fetch("/api/restart", { method: "POST", credentials: "include" });
-          if (!isMountedRef.current) return;
-          report(
-            true,
-            isPt
-              ? "Configuração salva e pipeline reiniciado"
-              : "Structured configuration saved and pipeline restart triggered"
-          );
-        } else {
-          report(
-            true,
-            isPt
-              ? "Configuração salva em config.yml"
-              : "Structured configuration saved to config.yml"
-          );
-        }
-      } else {
-        report(
-          false,
-          data.message ||
-            (isPt
-              ? `Falha ao salvar (HTTP ${res.status})`
-              : `Failed to save structured configuration (HTTP ${res.status})`)
-        );
-      }
-    } catch {
-      if (isMountedRef.current) {
-        report(
-          false,
-          isPt
-            ? "Erro de rede ao salvar. Nada foi gravado."
-            : "Network error while saving. Nothing was written."
-        );
-      }
-    } finally {
-      if (isMountedRef.current) {
-        setIsSaving(false);
+    if (outcome.ok && outcome.config) {
+      setConfig(outcome.config);
+      if (!sharedSession && outcome.rawYaml) {
+        setRawYaml(outcome.rawYaml);
       }
     }
+    notify(outcome.message);
   };
 
   const handleSaveRawYaml = async (saveOption: "saveonly" | "restart") => {
     if (isSaving) return;
-    const saveRev = draftRevisionRef.current;
-    let savedYamlSnapshot = rawYaml;
-    if (yamlStaleRef.current && latestDraftRef.current) {
-      const synced = synthesizeDraftYamlIfNeeded(
-        latestDraftRef.current,
-        baselineYaml,
-        rawYaml,
-        yamlStaleRef.current
-      );
-      yamlStaleRef.current = synced.yamlStale;
-      savedYamlSnapshot = synced.rawYaml;
-      setRawYaml(synced.rawYaml);
+    const syncedYaml = session.ensureDraftYamlSynced();
+    if (!sharedSession && syncedYaml) {
+      setRawYaml(syncedYaml);
     }
-    setIsSaving(true);
-    try {
+    if (sharedSession) {
       await handleSaveConfig(saveOption);
-      if (!isMountedRef.current) return;
-      setBaselineYaml(savedYamlSnapshot);
-      if (draftRevisionRef.current === saveRev) {
-        setIsDirty(false);
-      }
-    } finally {
-      if (isMountedRef.current) {
-        setIsSaving(false);
-      }
+      return;
     }
+    await handleSaveConfig(saveOption);
+    if (!isMountedRef.current) return;
+    session.hydrateRawYamlFromServer(syncedYaml);
   };
 
   const switchInspectorCamera = (cam: string) => {
@@ -455,16 +329,11 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   };
 
   const selectCategory = (cat: SettingsCategory) => {
-    const currentDraft = latestDraftRef.current;
-    if (cat === "yaml" && yamlStaleRef.current && currentDraft) {
-      const synced = synthesizeDraftYamlIfNeeded(
-        currentDraft,
-        baselineYaml,
-        rawYaml,
-        yamlStaleRef.current
-      );
-      yamlStaleRef.current = synced.yamlStale;
-      setRawYaml(synced.rawYaml);
+    if (cat === "yaml") {
+      const syncedYaml = session.ensureDraftYamlSynced();
+      if (!sharedSession && syncedYaml) {
+        setRawYaml(syncedYaml);
+      }
     }
     const nextSubTab = cat === "yaml" ? "yaml" : "visual";
     prevZonesSubTabRef.current = nextSubTab;
@@ -474,9 +343,13 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
     setDraftPoints([]);
   };
 
+  const effectiveSavedConfig = baselineConfig ?? config;
   const unsavedCount = useMemo(
-    () => (isDirty && config && draftConfig ? countChangedSections(config, draftConfig) : 0),
-    [isDirty, config, draftConfig]
+    () =>
+      isDirty && effectiveSavedConfig && draftConfig
+        ? countChangedSections(effectiveSavedConfig, draftConfig)
+        : 0,
+    [isDirty, effectiveSavedConfig, draftConfig]
   );
   const unsavedLabel = isDirty
     ? activeCategory === "yaml" || unsavedCount === 0
@@ -725,7 +598,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                   type="button"
                   className="nvr-btn"
                   onClick={() => {
-                    navigator.clipboard?.writeText(rawYaml);
+                    navigator.clipboard?.writeText(effectiveRawYaml);
                     notify("Copied config.yml to clipboard");
                   }}
                 >
@@ -838,12 +711,12 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
           <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
             <textarea
               className="nvr-code-editor"
-              value={rawYaml}
+              value={effectiveRawYaml}
               onChange={(e) => {
-                draftRevisionRef.current += 1;
-                yamlStaleRef.current = false;
-                setRawYaml(e.target.value);
-                setIsDirty(true);
+                session.setRawYamlDraft(e.target.value);
+                if (!sharedSession) {
+                  setRawYaml(e.target.value);
+                }
               }}
               spellCheck={false}
               aria-label="config.yml editor"
@@ -852,7 +725,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
         ) : activeCategory === "vision" && draftConfig ? (
           <ZonesStudio
             draftConfig={draftConfig}
-            savedConfig={config}
+            savedConfig={effectiveSavedConfig}
             updateDraft={updateDraft}
             inspectorCam={effectiveInspectorCam}
             draftPoints={draftPoints}
@@ -879,6 +752,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                 setInspectorCam={switchInspectorCamera}
                 ffprobeInfo={ffprobeInfo}
                 notify={notify}
+                workbenchSession={session}
               />
             )}
 
@@ -890,6 +764,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                 inspectorCam={effectiveInspectorCam}
                 notify={notify}
                 onOpenVectorStudio={() => selectCategory("vision")}
+                workbenchSession={session}
               />
             )}
 
@@ -899,18 +774,21 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                 updateDraft={updateDraft}
                 notify={notify}
                 onModelDeployed={(model) => {
-                  // The server already wrote config.yml; mirror it in the saved config and the
-                  // draft so a later "Save Config" does not send the previous model back.
-                  const patch = (cfg: NinjaConfigResponse | null): NinjaConfigResponse | null =>
-                    cfg && cfg.model ? { ...cfg, model: mergeDeployedModel(cfg.model, model) } : cfg;
-                  if (config) setConfig(patch(config));
-                  setDraftConfig((prev) => {
-                    const next = patch(prev);
-                    sanitizedDraftRef.current = next;
-                    latestDraftRef.current = next;
-                    return next;
-                  });
-                  yamlStaleRef.current = true;
+                  // The server already wrote config.yml; rebase it into both baselineConfig and
+                  // draftConfig via ConfigWorkbenchSession so a later "Save Only" preserves it.
+                  const baseModel =
+                    session.getSnapshot().baselineConfig?.model ??
+                    draftConfig?.model ??
+                    config?.model;
+                  if (!baseModel) return;
+                  const nextModel = mergeDeployedModel(baseModel, model);
+                  void session.applyOutOfBandPatch(
+                    { model: nextModel },
+                    {
+                      persistViaTransport: false,
+                      syncYamlImmediately: zonesSubTab === "yaml",
+                    }
+                  );
                 }}
               />
             )}

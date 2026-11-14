@@ -13,6 +13,10 @@ import {
 } from "../types/nvr";
 import { resolveCameraPushToTalkCapability } from "../utils/cameraCapabilities";
 import {
+  type ConfigWorkbenchSession,
+  useConfigWorkbenchSession,
+} from "../utils/configWorkbench";
+import {
   DEFAULT_FLOORPLAN_HEIGHT_M,
   DEFAULT_FLOORPLAN_WIDTH_M,
   DEFAULT_ROOM_LABELS,
@@ -70,6 +74,7 @@ export interface FloorplanStudioCanvasProps {
   hardwareInfoByCam: Record<string, CameraHardwareInfoResponse>;
   showVectors: boolean;
   mapTheme: CanvasThemePalette;
+  workbenchSession?: ConfigWorkbenchSession;
 }
 
 function resolveInitialMapPlacements(
@@ -114,7 +119,10 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
   hardwareInfoByCam,
   showVectors,
   mapTheme,
+  workbenchSession,
 }) => {
+  const contextWorkbench = useConfigWorkbenchSession();
+  const activeWorkbench = workbenchSession ?? contextWorkbench;
   const [mapEditMode, setMapEditMode] = useState(false);
   const [mapTool, setMapTool] = useState<FloorplanStudioTool>("select");
   const [draggingCam, setDraggingCam] = useState<string | null>(null);
@@ -372,6 +380,56 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
   const handleSaveMapPlacements = async () => {
     const mySaveSeq = ++mapSaveSeqRef.current;
     try {
+      if (activeWorkbench) {
+        const currentCfg =
+          (await activeWorkbench.transport
+            .fetchStructuredConfig()
+            .catch(() => null)) ??
+          activeWorkbench.getSnapshot().baselineConfig ??
+          config;
+        if (
+          !currentCfg ||
+          !currentCfg.cameras ||
+          !isMountedRef.current ||
+          mySaveSeq !== mapSaveSeqRef.current
+        ) {
+          return;
+        }
+        const latestDraft = latestFloorplanDraftRef.current;
+        const payload = buildFloorplanSavePayload({
+          existingCameras: currentCfg.cameras,
+          mapPlacements: latestDraft.mapPlacements,
+          existingUi: currentCfg.ui as unknown as Record<string, unknown>,
+          floorplanUrl: latestDraft.mapFloorplanUrl,
+          floorplanOpacity: latestDraft.floorplanOpacity,
+          floorplanWidthM: latestDraft.floorplanWidthM,
+          floorplanHeightM: latestDraft.floorplanHeightM,
+          floorplanRooms: latestDraft.floorplanRooms,
+          floorplanWalls: latestDraft.floorplanWalls,
+        });
+        const commitRes = await activeWorkbench.applyOutOfBandPatch(payload);
+        if (
+          commitRes.ok &&
+          isMountedRef.current &&
+          mySaveSeq === mapSaveSeqRef.current
+        ) {
+          if (commitRes.config && onConfigSaved) {
+            onConfigSaved(commitRes.config);
+          }
+          setMapSaveStatus("Saved to config.yml");
+          if (mapSaveTimerRef.current !== null) {
+            window.clearTimeout(mapSaveTimerRef.current);
+          }
+          mapSaveTimerRef.current = window.setTimeout(() => {
+            mapSaveTimerRef.current = null;
+            if (isMountedRef.current) {
+              setMapSaveStatus(null);
+            }
+          }, 2500);
+        }
+        return;
+      }
+
       const cfgRes = await fetch("/api/config", { credentials: "include" });
       if (
         !cfgRes.ok ||

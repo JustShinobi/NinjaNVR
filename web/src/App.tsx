@@ -41,14 +41,34 @@ import { formatMeasured, parseMeasured, resolvePrimaryInferenceMs } from "./util
 import { LiveWorkspace } from "./views/LiveWorkspace";
 import { SyncWorkspace } from "./views/SyncWorkspace";
 import { ReviewWorkspace } from "./views/ReviewWorkspace";
-import {
-  ExploreWorkspace,
-  clearFaceProfileFromEvents,
-  clearFaceProfileFromReviews,
-} from "./views/ExploreWorkspace";
+import { ExploreWorkspace } from "./views/ExploreWorkspace";
 import { ExportsWorkspace } from "./views/ExportsWorkspace";
 import { ZonesWorkspace } from "./views/ZonesWorkspace";
 import { SystemWorkspace } from "./views/SystemWorkspace";
+import {
+  type ConfigWorkbenchSession,
+  ConfigWorkbenchProvider,
+  createConfigWorkbenchSession,
+  createFetchConfigTransport,
+  useConfigWorkbenchSnapshot,
+} from "./utils/configWorkbench";
+import {
+  type ArchiveMetadataCache,
+  ArchiveMetadataCacheProvider,
+  createArchiveMetadataCache,
+} from "./utils/archivePlayback";
+import { resolveSafeMediaUrl } from "./utils/mediaUrlPolicy";
+import {
+  type EventMutationPatch,
+  type ReviewMutationPatch,
+  buildEventsFeedUrl,
+  buildReviewFeedUrl,
+  matchesOperationalDateBounds,
+  parseOperationalDateBoundsSec,
+  reconcileDeletedFaceProfile,
+  reconcileEventMutation,
+  reconcileReviewMutation,
+} from "./utils/operationalFeed";
 
 export const MAX_LIVE_EVENTS = 250;
 export const MAX_LIVE_REVIEWS = 300;
@@ -118,56 +138,14 @@ export function sanitizeExportVideoUrl(
   startSec: number,
   endSec: number
 ): string {
-  const rawCam = (fallbackCamera || "camera").trim();
-  const cleanCam =
-    !rawCam || rawCam === "." || rawCam === ".." || rawCam.includes("..")
-      ? "camera"
-      : rawCam;
-  const safeCam = encodeURIComponent(cleanCam);
-  const s = Number.isFinite(startSec) ? Math.floor(startSec) : 0;
-  const e = Number.isFinite(endSec) ? Math.ceil(Math.max(endSec, s + 5)) : s + 5;
-  const fallbackPath = `/exports/${safeCam}_${s}_${e}.mp4`;
-
-  const candidate = (rawUrl || "").trim();
-  if (!candidate || /[\u0000-\u0020\u007f\\?#]/.test(candidate)) {
-    return fallbackPath;
-  }
-  if (
-    candidate.startsWith("//") ||
-    candidate.includes("..") ||
-    /%2e/i.test(candidate) ||
-    /%2f/i.test(candidate) ||
-    /%5c/i.test(candidate) ||
-    /%00/i.test(candidate)
-  ) {
-    return fallbackPath;
-  }
-  let decoded = candidate;
-  try {
-    decoded = decodeURIComponent(candidate);
-  } catch {
-    return fallbackPath;
-  }
-  const segments = decoded.split("/");
-  if (
-    decoded.startsWith("//") ||
-    decoded.includes("..") ||
-    decoded.includes("%") ||
-    segments.some((seg) => seg === "." || seg === "..") ||
-    /[\u0000-\u0020\u007f\\?#]/.test(decoded) ||
-    /^\/api\/(?:auth|logout|users|tokens|config|restart)\b/i.test(decoded)
-  ) {
-    return fallbackPath;
-  }
-  if (
-    candidate.startsWith("/exports/") ||
-    candidate.startsWith("/api/") ||
-    candidate.startsWith("/vod/") ||
-    candidate.startsWith("/clips/")
-  ) {
-    return candidate;
-  }
-  return fallbackPath;
+  return resolveSafeMediaUrl(rawUrl, {
+    kind: "export_video",
+    fallbackCamera,
+    startSec,
+    endSec,
+    allowedPrefixes: ["/exports/", "/api/", "/vod/", "/clips/"],
+    rejectSpaces: true,
+  });
 }
 
 export function playTacticalAlertChime(): void {
@@ -298,9 +276,44 @@ export const App: React.FC = () => {
   // Zones & Config Studio state
   const [zonesSubTab, setZonesSubTab] = useState<"visual" | "yaml">("visual");
   const [inspectorCam, setInspectorCam] = useState<string>("escritorio");
-  const [rawYaml, setRawYaml] = useState<string>("");
+  const workbenchSessionRef = useRef<ConfigWorkbenchSession | null>(null);
+  if (!workbenchSessionRef.current) {
+    workbenchSessionRef.current = createConfigWorkbenchSession(
+      createFetchConfigTransport(),
+      {
+        initialConfig: config,
+        onServerCommitted: (nextCfg) => {
+          if (nextCfg) {
+            setConfig(nextCfg);
+          }
+        },
+      }
+    );
+  }
+  const workbenchSession = workbenchSessionRef.current;
+  const archiveMetadataCacheRef = useRef<ArchiveMetadataCache | null>(null);
+  if (!archiveMetadataCacheRef.current) {
+    archiveMetadataCacheRef.current = createArchiveMetadataCache({
+      getConfiguredCameras: () => useNvrStore.getState().config?.cameras,
+    });
+  }
+  const archiveMetadataCache = archiveMetadataCacheRef.current;
+  const workbenchSnap = useConfigWorkbenchSnapshot(workbenchSession);
+  const rawYaml = workbenchSnap.rawYaml;
+  const setRawYaml = useCallback(
+    (nextYaml: string) => {
+      workbenchSession.setRawYamlDraft(nextYaml);
+    },
+    [workbenchSession]
+  );
   const [draftPoints, setDraftPoints] = useState<Array<[number, number]>>([]);
   const [ffprobeInfo, setFfprobeInfo] = useState<FfprobeItem[] | null>(null);
+
+  useEffect(() => {
+    if (config) {
+      workbenchSession.hydrateFromServer(config);
+    }
+  }, [config, workbenchSession]);
 
   // System & Logs state
   const [logService, setLogService] = useState<"ninjanvr" | "go2rtc" | "nginx" | "cameras">("ninjanvr");
@@ -395,19 +408,7 @@ export const App: React.FC = () => {
   const fetchCoreData = useCallback(async () => {
     const mySeq = ++coreFetchSeqRef.current;
     try {
-      let revUrl = "/api/review?limit=200";
-      if (reviewDateFilter) {
-        const parts = reviewDateFilter.split("-").map(Number);
-        if (parts.length === 3 && parts.every((n) => Number.isFinite(n))) {
-          const dayStart = Math.floor(
-            new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0).getTime() / 1000
-          );
-          if (Number.isFinite(dayStart)) {
-            const dayEnd = dayStart + 86400;
-            revUrl = `/api/review?after=${dayStart}&before=${dayEnd}&limit=300`;
-          }
-        }
-      }
+      const revUrl = buildReviewFeedUrl(reviewDateFilter);
       const [cfgRes, statsRes, histRes, revRes, expRes, profRes] = await Promise.all([
         fetch("/api/config", { credentials: "include" }),
         fetch("/api/stats", { credentials: "include" }),
@@ -439,6 +440,7 @@ export const App: React.FC = () => {
           return;
         }
         setConfig(cfgJson);
+        workbenchSession.hydrateFromServer(cfgJson);
         const allCams = Object.keys(cfgJson.cameras || {});
         const enabledCams = allCams.filter(
           (k) => cfgJson.cameras?.[k]?.enabled !== false
@@ -759,19 +761,20 @@ export const App: React.FC = () => {
     if (!authChecked || authNeeded || !timelineCam) return;
     let cancelled = false;
     const now = Math.floor(Date.now() / 1000);
-    fetch(
-      `/api/${encodeURIComponent(timelineCam)}/recordings?after=${now - 86400}&before=${now + 10}`,
-      { credentials: "include" }
-    )
-      .then((r) => (r.ok ? r.json() : []))
+    const afterBucket = Math.floor((now - 86400) / 15) * 15;
+    const beforeBucket = Math.ceil((now + 75) / 15) * 15;
+    archiveMetadataCache
+      .getRecordings(
+        timelineCam,
+        { after: afterBucket, before: beforeBucket },
+        { configuredCameras: config?.cameras }
+      )
       .then((segs) => {
         if (!cancelled && Array.isArray(segs)) setFocusSegments(segs);
       })
       .catch(() => {});
-    fetch(`/api/${encodeURIComponent(timelineCam)}/recordings/summary`, {
-      credentials: "include",
-    })
-      .then((r) => (r.ok ? r.json() : []))
+    archiveMetadataCache
+      .getSummary(timelineCam, { configuredCameras: config?.cameras })
       .then((days) => {
         if (!cancelled && Array.isArray(days)) setGlobalDaysSummary(days);
       })
@@ -779,35 +782,45 @@ export const App: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [authChecked, authNeeded, timelineCam, stats?.service?.last_updated]);
+  }, [
+    authChecked,
+    authNeeded,
+    timelineCam,
+    config?.cameras,
+    archiveMetadataCache,
+    stats?.service?.last_updated,
+  ]);
+
+  // Fetch review feed on tab / date filter / auth / sub-label transitions
+  // (5s refresh is already handled by fetchCoreData without duplicating on stats.service.last_updated)
+  useEffect(() => {
+    if (!authChecked || authNeeded || activeTab !== "review") return;
+    let cancelled = false;
+    fetch(buildReviewFeedUrl(reviewDateFilter), { credentials: "include" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((revJson: ReviewItem[] | null) => {
+        if (!cancelled && Array.isArray(revJson)) {
+          setReviews(revJson.slice(0, MAX_LIVE_REVIEWS));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    authChecked,
+    authNeeded,
+    activeTab,
+    reviewDateFilter,
+    subLabelsRefreshTick,
+  ]);
 
   // Tab-specific data loaders
   useEffect(() => {
-    if (!authChecked || authNeeded) return;
+    if (!authChecked || authNeeded || activeTab === "review") return;
     let cancelled = false;
-    if (activeTab === "review") {
-      fetch("/api/review?limit=80", { credentials: "include" })
-        .then((r) => (r.ok ? r.json() : null))
-        .then((revJson: ReviewItem[] | null) => {
-          if (!cancelled && Array.isArray(revJson)) {
-            setReviews(revJson.slice(0, MAX_LIVE_REVIEWS));
-          }
-        })
-        .catch(() => {});
-    } else if (activeTab === "explore") {
-      let evUrl = "/api/events?limit=120";
-      if (reviewDateFilter) {
-        const parts = reviewDateFilter.split("-").map(Number);
-        if (parts.length === 3 && parts.every((n) => Number.isFinite(n))) {
-          const dayStart = Math.floor(
-            new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0).getTime() / 1000
-          );
-          if (Number.isFinite(dayStart)) {
-            const dayEnd = dayStart + 86400;
-            evUrl = `/api/events?after=${dayStart}&before=${dayEnd}&limit=250`;
-          }
-        }
-      }
+    if (activeTab === "explore") {
+      const evUrl = buildEventsFeedUrl(reviewDateFilter);
       fetch(evUrl, { credentials: "include" })
         .then((r) => (r.ok ? r.json() : []))
         .then((arr: EventItem[]) => {
@@ -842,7 +855,7 @@ export const App: React.FC = () => {
         })
         .then((txt) => {
           if (!cancelled && txt) {
-            setRawYaml((curr) => curr || txt);
+            workbenchSession.hydrateRawYamlFromServer(txt);
           }
         })
         .catch(() => {});
@@ -883,15 +896,31 @@ export const App: React.FC = () => {
   useEffect(() => {
     if (!lastDeletedFaceProfile?.name) return;
     let cancelled = false;
-    setEvents((prev) => clearFaceProfileFromEvents(prev, lastDeletedFaceProfile.name));
-    setSelectedEvent((curr) =>
-      curr ? clearFaceProfileFromEvents([curr], lastDeletedFaceProfile.name)[0] : null
+    setEvents(
+      (prev) =>
+        reconcileDeletedFaceProfile({ events: prev }, lastDeletedFaceProfile.name)
+          .events
     );
-    setReviews((prev) => clearFaceProfileFromReviews(prev, lastDeletedFaceProfile.name));
-    setActiveReview((curr) =>
-      curr ? clearFaceProfileFromReviews([curr], lastDeletedFaceProfile.name)[0] : null
+    setSelectedEvent(
+      (curr) =>
+        reconcileDeletedFaceProfile(
+          { selectedEvent: curr },
+          lastDeletedFaceProfile.name
+        ).selectedEvent
     );
-    fetch("/api/events?limit=120", { credentials: "include" })
+    setReviews(
+      (prev) =>
+        reconcileDeletedFaceProfile({ reviews: prev }, lastDeletedFaceProfile.name)
+          .reviews
+    );
+    setActiveReview(
+      (curr) =>
+        reconcileDeletedFaceProfile(
+          { activeReview: curr },
+          lastDeletedFaceProfile.name
+        ).activeReview
+    );
+    fetch(buildEventsFeedUrl(reviewDateFilter), { credentials: "include" })
       .then((r) => (r.ok ? r.json() : null))
       .then((arr: EventItem[] | null) => {
         if (!cancelled && Array.isArray(arr)) {
@@ -902,7 +931,7 @@ export const App: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [lastDeletedFaceProfile]);
+  }, [lastDeletedFaceProfile, reviewDateFilter]);
 
   // Actions
   const handleLogin = async (e: React.FormEvent) => {
@@ -932,6 +961,38 @@ export const App: React.FC = () => {
     }
   };
 
+  const handleReconcileReviews = useCallback(
+    (reviewIds: string | ReadonlyArray<string>, patch: ReviewMutationPatch) => {
+      setReviews(
+        (prev) =>
+          reconcileReviewMutation({ reviews: prev, activeReview: null }, reviewIds, patch)
+            .reviews
+      );
+      setActiveReview(
+        (curr) =>
+          reconcileReviewMutation({ reviews: [], activeReview: curr }, reviewIds, patch)
+            .activeReview
+      );
+    },
+    []
+  );
+
+  const handleReconcileEvents = useCallback(
+    (eventIds: string | ReadonlyArray<string>, patch: EventMutationPatch) => {
+      setEvents(
+        (prev) =>
+          reconcileEventMutation({ events: prev, selectedEvent: null }, eventIds, patch)
+            .events
+      );
+      setSelectedEvent(
+        (curr) =>
+          reconcileEventMutation({ events: [], selectedEvent: curr }, eventIds, patch)
+            .selectedEvent
+      );
+    },
+    []
+  );
+
   const handleMarkReviews = useCallback(
     async (ids: string[], reviewed = true) => {
       if (ids.length === 0) return;
@@ -942,18 +1003,13 @@ export const App: React.FC = () => {
           credentials: "include",
           body: JSON.stringify({ ids, reviewed }),
         });
-        setReviews((prev) =>
-          prev.map((r) => (ids.includes(r.id) ? { ...r, has_been_reviewed: reviewed } : r))
-        );
-        setActiveReview((curr) =>
-          curr && ids.includes(curr.id) ? { ...curr, has_been_reviewed: reviewed } : curr
-        );
+        handleReconcileReviews(ids, { hasBeenReviewed: reviewed });
         notify(`Marked ${ids.length} review item(s) as reviewed`);
       } catch {
         notify("Network error while marking review items");
       }
     },
-    [notify]
+    [notify, handleReconcileReviews]
   );
 
   const handleDeleteReviews = useCallback(
@@ -984,17 +1040,22 @@ export const App: React.FC = () => {
       label?: string,
       includeAudio: boolean = true
     ): Promise<{ exportId?: string; videoUrl?: string } | void> => {
+      const realCam = resolveRealCameraSource(
+        camera,
+        useNvrStore.getState().config?.cameras
+      );
       const nowFallback = Math.floor(Date.now() / 1000);
       const s =
         typeof startSec === "number" && Number.isFinite(startSec) && startSec > 0
           ? Math.floor(startSec)
           : nowFallback - 60;
-      const e =
+      const rawEnd =
         typeof endSec === "number" && Number.isFinite(endSec)
           ? Math.ceil(Math.max(endSec, s + 5))
           : s + 30;
+      const e = s < nowFallback ? Math.max(s + 1, Math.min(nowFallback, rawEnd)) : rawEnd;
       try {
-        const res = await fetch(`/api/export/${encodeURIComponent(camera)}/start/${s}/end/${e}`, {
+        const res = await fetch(`/api/export/${encodeURIComponent(realCam)}/start/${s}/end/${e}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           credentials: "include",
@@ -1021,7 +1082,7 @@ export const App: React.FC = () => {
           }
           return {
             exportId: data.export_id,
-            videoUrl: sanitizeExportVideoUrl(data.video_url, camera, s, e),
+            videoUrl: sanitizeExportVideoUrl(data.video_url, realCam, s, e),
           };
         } else {
           notify(data.message || `Export failed (${res.status})`);
@@ -1040,12 +1101,7 @@ export const App: React.FC = () => {
         method: next ? "POST" : "DELETE",
         credentials: "include",
       });
-      setEvents((prev) =>
-        prev.map((x) => (x.id === ev.id ? { ...x, retain_indefinitely: next } : x))
-      );
-      setSelectedEvent((curr) =>
-        curr && curr.id === ev.id ? { ...curr, retain_indefinitely: next } : curr
-      );
+      handleReconcileEvents(ev.id, { retainIndefinitely: next });
       notify(next ? "Event retained indefinitely" : "Event retention lock removed");
     } catch {
       notify("Network error while updating event retention");
@@ -1067,40 +1123,22 @@ export const App: React.FC = () => {
   };
 
   const handleSaveConfig = async (saveOption: "saveonly" | "restart") => {
-    try {
-      const res = await fetch(
-        `/api/config/save?save_option=${encodeURIComponent(saveOption)}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "text/plain" },
-          credentials: "include",
-          body: rawYaml,
-        }
-      );
-      const data = await res.json().catch(() => ({}));
-      if (res.ok && data.success !== false) {
-        if (saveOption === "restart") {
-          await fetch("/api/restart", { method: "POST", credentials: "include" }).catch(
-            () => null
-          );
-        }
-        notify(
-          saveOption === "restart"
-            ? "Configuration saved and NinjaNVR restarted"
-            : "Configuration saved to disk"
-        );
-        await fetchCoreData();
-      } else {
-        notify(data.message || "Failed to validate/save YAML configuration");
-      }
-    } catch {
-      notify("Network error while saving YAML configuration");
+    const res = await workbenchSession.commitRaw({
+      restart: saveOption === "restart",
+    });
+    notify(res.message);
+    if (res.ok) {
+      await fetchCoreData();
     }
   };
 
   // Filtered Review items (virtualized window of 40 items)
   const filteredReviews = useMemo(() => {
+    const dateBounds = reviewDateFilter
+      ? parseOperationalDateBoundsSec(reviewDateFilter)
+      : null;
     return reviews.filter((r) => {
+      if (!matchesOperationalDateBounds(r, dateBounds)) return false;
       if (reviewCameraFilter !== "all" && r.camera !== reviewCameraFilter) return false;
       if (reviewSeverityFilter !== "all") {
         if (reviewSeverityFilter === "audio") {
@@ -1124,6 +1162,7 @@ export const App: React.FC = () => {
     });
   }, [
     reviews,
+    reviewDateFilter,
     reviewCameraFilter,
     reviewSeverityFilter,
     reviewObjectFilter,
@@ -1132,8 +1171,12 @@ export const App: React.FC = () => {
 
   // Filtered Explore items
   const filteredEvents = useMemo(() => {
+    const dateBounds = reviewDateFilter
+      ? parseOperationalDateBoundsSec(reviewDateFilter)
+      : null;
     const q = exploreQuery.trim().toLowerCase();
     return events.filter((ev) => {
+      if (!matchesOperationalDateBounds(ev, dateBounds)) return false;
       if (exploreCamera !== "all" && ev.camera !== exploreCamera) return false;
       if (exploreLabel !== "all" && ev.label !== exploreLabel) return false;
       if (exploreRetainedOnly && !ev.retain_indefinitely) return false;
@@ -1147,7 +1190,14 @@ export const App: React.FC = () => {
       }
       return true;
     });
-  }, [events, exploreCamera, exploreLabel, exploreRetainedOnly, exploreQuery]);
+  }, [
+    events,
+    reviewDateFilter,
+    exploreCamera,
+    exploreLabel,
+    exploreRetainedOnly,
+    exploreQuery,
+  ]);
 
   // Global keyboard shortcuts (1-7 tabs, J/K/R/E in Review)
   useEffect(() => {
@@ -1384,9 +1434,10 @@ export const App: React.FC = () => {
           setCameraActivity({});
           setFocusSegments([]);
           setGlobalDaysSummary([]);
+          archiveMetadataCache.clear();
           setFfprobeInfo(null);
           setDraftPoints([]);
-          setRawYaml("");
+          workbenchSession.hydrateFromServer(null, "");
           setEvents([]);
           setReviews([]);
           setExportsList([]);
@@ -1720,7 +1771,9 @@ export const App: React.FC = () => {
         </div>
       )}
 
-      <main className="nvr-main">
+      <ConfigWorkbenchProvider session={workbenchSession}>
+        <ArchiveMetadataCacheProvider cache={archiveMetadataCache}>
+        <main className="nvr-main">
         {activeTab === "live" && (
           <LiveWorkspace
             cameraNames={cameraNames}
@@ -1774,6 +1827,7 @@ export const App: React.FC = () => {
             handleQuickExport={handleQuickExport}
             setSyncMasterTs={setSyncMasterTs}
             switchTab={switchTab}
+            onReconcileReviews={handleReconcileReviews}
           />
         )}
 
@@ -1806,6 +1860,7 @@ export const App: React.FC = () => {
             setSyncMasterTs={setSyncMasterTs}
             switchTab={switchTab}
             notify={notify}
+            onReconcileEvents={handleReconcileEvents}
           />
         )}
 
@@ -1848,6 +1903,7 @@ export const App: React.FC = () => {
             ffprobeInfo={ffprobeInfo}
             handleSaveConfig={handleSaveConfig}
             notify={notify}
+            workbenchSession={workbenchSession}
           />
         )}
 
@@ -1864,7 +1920,9 @@ export const App: React.FC = () => {
             notify={notify}
           />
         )}
-      </main>
+        </main>
+        </ArchiveMetadataCacheProvider>
+      </ConfigWorkbenchProvider>
 
       {isCompact && (
         <nav className="nvr-tabbar" aria-label="Primary Workspace Navigation (mobile)">

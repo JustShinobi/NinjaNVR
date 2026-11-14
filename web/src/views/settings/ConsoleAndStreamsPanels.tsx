@@ -24,6 +24,15 @@ import {
   probeCameraHardwareAndPtz,
   setCachedCameraHardware,
 } from "../../utils/cameraCapabilities";
+import {
+  type CloudPasswordSecretPatch,
+  type PasswordSecretPatch,
+  buildSecretFieldPatch,
+} from "../../utils/configYaml";
+import {
+  type ConfigWorkbenchSession,
+  useConfigWorkbenchSession,
+} from "../../utils/configWorkbench";
 
 const RESERVED_OBJECT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -42,58 +51,26 @@ export function buildOnvifPasswordPatch(
   rawInput: string,
   hasExistingPassword?: boolean,
   clearRequested?: boolean
-): { password: string; has_password: boolean; clear_password: boolean } {
-  if (clearRequested) {
-    return {
-      password: "",
-      has_password: false,
-      clear_password: true,
-    };
-  }
-  const isMaskSentinel = rawInput === "***" || rawInput === "*";
-  if (rawInput.length > 0 && !isMaskSentinel) {
-    return {
-      password: rawInput,
-      has_password: Boolean(hasExistingPassword),
-      clear_password: false,
-    };
-  }
-  return {
-    password: hasExistingPassword ? "***" : "",
-    has_password: Boolean(hasExistingPassword),
-    clear_password: false,
-  };
+): PasswordSecretPatch {
+  return buildSecretFieldPatch(
+    "password",
+    rawInput,
+    hasExistingPassword,
+    clearRequested
+  );
 }
 
 export function buildCloudPasswordPatch(
   rawInput: string,
   hasExistingPassword?: boolean,
   clearRequested?: boolean
-): {
-  cloud_password: string;
-  has_cloud_password: boolean;
-  clear_cloud_password: boolean;
-} {
-  if (clearRequested) {
-    return {
-      cloud_password: "",
-      has_cloud_password: false,
-      clear_cloud_password: true,
-    };
-  }
-  const isMaskSentinel = rawInput === "***" || rawInput === "*";
-  if (rawInput.length > 0 && !isMaskSentinel) {
-    return {
-      cloud_password: rawInput,
-      has_cloud_password: Boolean(hasExistingPassword),
-      clear_cloud_password: false,
-    };
-  }
-  return {
-    cloud_password: hasExistingPassword ? "***" : "",
-    has_cloud_password: Boolean(hasExistingPassword),
-    clear_cloud_password: false,
-  };
+): CloudPasswordSecretPatch {
+  return buildSecretFieldPatch(
+    "cloud_password",
+    rawInput,
+    hasExistingPassword,
+    clearRequested
+  );
 }
 
 export const ToggleSwitch: React.FC<{
@@ -682,6 +659,7 @@ export const ChannelsStreamsSection: React.FC<{
   setInspectorCam: (cam: string) => void;
   ffprobeInfo: FfprobeItem[] | null;
   notify: (msg: string) => void;
+  workbenchSession?: ConfigWorkbenchSession;
 }> = ({
   draftConfig,
   updateDraft,
@@ -689,9 +667,12 @@ export const ChannelsStreamsSection: React.FC<{
   setInspectorCam,
   ffprobeInfo,
   notify,
+  workbenchSession,
 }) => {
   const { locale } = useI18n();
   const isPt = locale === "pt";
+  const contextWorkbench = useConfigWorkbenchSession();
+  const activeWorkbench = workbenchSession ?? contextWorkbench;
   const [newCamName, setNewCamName] = useState("");
   const [newCamMainUrl, setNewCamMainUrl] = useState("");
   const [newCamSubUrl, setNewCamSubUrl] = useState("");
@@ -878,6 +859,45 @@ export const ChannelsStreamsSection: React.FC<{
       }
       const res = await applyCameraHardwarePatch(targetCam, patch, {
         onConfigPersisted: async () => {
+          if (activeWorkbench) {
+            try {
+              const [freshCfg, freshYaml] = await Promise.all([
+                activeWorkbench.transport.fetchStructuredConfig().catch(() => null),
+                activeWorkbench.transport.fetchRawYaml().catch(() => ""),
+              ]);
+              if (freshCfg) {
+                const freshCam = freshCfg.cameras?.[targetCam];
+                const camSubPatch: Record<string, unknown> = {};
+                if (freshCam?.hardware) {
+                  camSubPatch.hardware = freshCam.hardware;
+                }
+                if (freshCam?.onvif) {
+                  camSubPatch.onvif = freshCam.onvif;
+                }
+                if (patch.apply_suggested_substream && freshCam?.ffmpeg) {
+                  camSubPatch.ffmpeg = freshCam.ffmpeg;
+                }
+                const persistedPatch: Record<string, unknown> = {
+                  ...(Object.keys(camSubPatch).length > 0
+                    ? { cameras: { [targetCam]: camSubPatch } }
+                    : {}),
+                  ...((patch.apply_suggested_substream ||
+                    typeof patch.cloud_password === "string") &&
+                  freshCfg.go2rtc
+                    ? { go2rtc: freshCfg.go2rtc }
+                    : {}),
+                };
+                activeWorkbench.applyExternalPatch(persistedPatch, {
+                  serverConfig: freshCfg,
+                  serverRawYaml: freshYaml || undefined,
+                });
+                useNvrStore.getState().setConfig(freshCfg);
+              }
+            } catch {
+              // ignore
+            }
+            return;
+          }
           try {
             const cfgRes = await fetch("/api/config", { credentials: "include" });
             if (cfgRes.ok) {

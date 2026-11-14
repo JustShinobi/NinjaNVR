@@ -7,6 +7,7 @@ import { formatDateTime, formatTs } from "../utils/format";
 import { VodHlsPlayer } from "../components/VideoPlayers";
 import { TimelineScrubber } from "../components/TimelineScrubber";
 import { useCompactViewport } from "../utils/useCompactViewport";
+import { resolveSafeMediaUrl } from "../utils/mediaUrlPolicy";
 
 export const MAX_SYNC_QUAD_SLOTS = 4;
 export const SYNC_SEEK_DEBOUNCE_MS = 120;
@@ -50,46 +51,10 @@ export function resolveSafeSyncThumbSrc(
   thumbPath: string | null | undefined,
   camera: string
 ): string {
-  const rawCam = (camera || "").trim();
-  const cleanCam =
-    !rawCam || rawCam === "." || rawCam === ".." || rawCam.includes("..")
-      ? "camera"
-      : rawCam;
-  const encodedCam = encodeURIComponent(cleanCam);
-  const fallback = `/api/${encodedCam}/latest.webp`;
-  if (typeof thumbPath !== "string") return fallback;
-  const trimmed = thumbPath.trim();
-  if (!trimmed || /[\u0000-\u001F\u007F\\?#]/.test(trimmed)) return fallback;
-  const stripped = trimmed.replace(/^\/media\/[^/]+/, "").trim();
-  if (
-    !stripped ||
-    !stripped.startsWith("/") ||
-    stripped.startsWith("//") ||
-    /^\/%2f/i.test(stripped) ||
-    stripped.includes("..") ||
-    /%2e%2e|%5c|%252e|%255c|%00/i.test(stripped)
-  ) {
-    return fallback;
-  }
-  try {
-    const decoded = decodeURIComponent(stripped);
-    const segments = decoded.split("/");
-    if (
-      !decoded.startsWith("/") ||
-      decoded.startsWith("//") ||
-      decoded.includes("\\") ||
-      decoded.includes("..") ||
-      decoded.includes("%") ||
-      segments.some((seg) => seg === "." || seg === "..") ||
-      /[\u0000-\u001F\u007F?#]/.test(decoded) ||
-      /^\/api\/(?:auth|logout|users|tokens|config|restart)\b/i.test(decoded)
-    ) {
-      return fallback;
-    }
-  } catch {
-    return fallback;
-  }
-  return stripped;
+  return resolveSafeMediaUrl(thumbPath, {
+    kind: "thumbnail",
+    fallbackCamera: camera,
+  });
 }
 
 export function resolveSyncQuadCameras(
@@ -266,10 +231,21 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
     };
   }, [safeMasterTs, committedVodTs]);
 
-  const vodWindow = useMemo(
-    () => computeSyncVodWindow(committedVodTs, 120),
-    [committedVodTs]
+  const [vodWindow, setVodWindow] = useState<{ startTime: number; endTime: number }>(
+    () => computeSyncVodWindow(committedVodTs, 120)
   );
+
+  useEffect(() => {
+    setVodWindow((prev) => {
+      if (
+        committedVodTs >= prev.startTime &&
+        committedVodTs <= prev.endTime - 2
+      ) {
+        return prev;
+      }
+      return computeSyncVodWindow(committedVodTs, 120);
+    });
+  }, [committedVodTs]);
 
   const activeQuadCameras = useMemo(
     () => resolveSyncQuadCameras(cameraNames, syncQuadCameras),
@@ -455,12 +431,17 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
               cam,
               config?.cameras || cameraNames
             );
+            const isFocusedTile =
+              cam === selectedCamera ||
+              (!activeQuadCameras.includes(selectedCamera) && slotIdx === 0);
             return (
               <div key={`${cam}-${slotIdx}`} className="nvr-cam-tile">
                 <VodHlsPlayer
                   camera={realCam}
                   startTime={vodWindow.startTime}
                   endTime={vodWindow.endTime}
+                  playheadTs={committedVodTs}
+                  enableKeyboardStep={isFocusedTile}
                   playbackRate={safeSyncSpeed}
                   controls={false}
                 />

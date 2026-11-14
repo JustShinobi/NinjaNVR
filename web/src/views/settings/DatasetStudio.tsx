@@ -42,6 +42,9 @@ import {
   type ReadinessCheck,
 } from "../../utils/datasetStudio";
 import {
+  createSampleMutationEpochTracker,
+} from "../../utils/operationalFeed";
+import {
   applySecurity15ClassPreset,
   buildLocalFinetuneCliCommand,
   buildModelUploadPayload,
@@ -129,6 +132,11 @@ export const DatasetStudioSection: React.FC<{
   const loadSeqRef = useRef(0);
   const isMountedRef = useRef(true);
   const tabInitializedRef = useRef(false);
+  const sampleMutationEpochRef = useRef<Record<string, number>>({});
+  const sampleEpochTracker = useMemo(
+    () => createSampleMutationEpochTracker(sampleMutationEpochRef.current),
+    []
+  );
 
   const modelCfg = draftConfig?.model || {
     path: "/openvino-model/ssdlite_mobilenet_v2.xml",
@@ -282,6 +290,7 @@ export const DatasetStudioSection: React.FC<{
     }
   ): Promise<boolean> => {
     if (!isSafeDatasetSampleId(sample?.id)) return false;
+    const myEpoch = sampleEpochTracker.begin(sample.id);
     const optimistic: DatasetSampleItem = {
       ...sample,
       ...(patch.annotations !== undefined ? { annotations: patch.annotations } : {}),
@@ -300,7 +309,9 @@ export const DatasetStudioSection: React.FC<{
         body: JSON.stringify(patch),
       });
       const data = await res.json().catch(() => null);
-      if (!isMountedRef.current) return false;
+      if (!isMountedRef.current || !sampleEpochTracker.isCurrent(sample.id, myEpoch)) {
+        return false;
+      }
       if (res.ok && data) {
         setSamples((prev) => upsertDatasetSampleInList(prev, data.sample || data));
         void refreshDatasetSummary();
@@ -309,7 +320,7 @@ export const DatasetStudioSection: React.FC<{
       setSamples((prev) => upsertDatasetSampleInList(prev, sample));
       notify(data?.message || t("Falha ao atualizar a amostra", "Failed to update the sample"));
     } catch {
-      if (isMountedRef.current) {
+      if (isMountedRef.current && sampleEpochTracker.isCurrent(sample.id, myEpoch)) {
         setSamples((prev) => upsertDatasetSampleInList(prev, sample));
         notify(t("Erro de rede ao atualizar a amostra", "Network error updating the sample"));
       }
@@ -319,6 +330,7 @@ export const DatasetStudioSection: React.FC<{
 
   const runAutoAnnotate = async (sampleId: string) => {
     if (!isSafeDatasetSampleId(sampleId)) return;
+    const myEpoch = sampleEpochTracker.begin(sampleId);
     setBusyAction(`auto-${sampleId}`);
     try {
       const res = await fetch(`/api/dataset/samples/${encodeURIComponent(sampleId)}/auto-annotate`, {
@@ -326,7 +338,7 @@ export const DatasetStudioSection: React.FC<{
         credentials: "include",
       });
       const data = await res.json().catch(() => null);
-      if (!isMountedRef.current) return;
+      if (!isMountedRef.current || !sampleEpochTracker.isCurrent(sampleId, myEpoch)) return;
       if (res.ok && data) {
         const item: DatasetSampleItem = data.sample || data;
         setSamples((prev) => upsertDatasetSampleInList(prev, item));
@@ -341,9 +353,13 @@ export const DatasetStudioSection: React.FC<{
         notify(data?.message || t("A anotação por IA falhou", "AI annotation failed"));
       }
     } catch {
-      if (isMountedRef.current) notify(t("Erro de rede na anotação por IA", "Network error during AI annotation"));
+      if (isMountedRef.current && sampleEpochTracker.isCurrent(sampleId, myEpoch)) {
+        notify(t("Erro de rede na anotação por IA", "Network error during AI annotation"));
+      }
     } finally {
-      if (isMountedRef.current) setBusyAction(null);
+      if (isMountedRef.current) {
+        setBusyAction((curr) => (curr === `auto-${sampleId}` ? null : curr));
+      }
     }
   };
 
@@ -417,6 +433,7 @@ export const DatasetStudioSection: React.FC<{
           completed += 1;
           continue;
         }
+        const itemEpoch = sampleEpochTracker.begin(cand.id);
         setBatchProgress(snapshot(true, cand));
         try {
           const itemController = typeof AbortController !== "undefined" ? new AbortController() : null;
@@ -434,7 +451,9 @@ export const DatasetStudioSection: React.FC<{
             const item: DatasetSampleItem = data.sample || data;
             boxesGenerated += Array.isArray(item.annotations) ? item.annotations.length : 0;
             succeeded += 1;
-            if (isMountedRef.current) replaceSample(item);
+            if (isMountedRef.current && sampleEpochTracker.isCurrent(cand.id, itemEpoch)) {
+              replaceSample(item);
+            }
           } else {
             failed += 1;
           }
@@ -468,13 +487,19 @@ export const DatasetStudioSection: React.FC<{
     } finally {
       batchRunningRef.current = false;
       batchAbortRef.current = null;
-      if (isMountedRef.current) setBusyAction(null);
+      if (isMountedRef.current) {
+        setBusyAction((curr) => (curr === "batch-auto" ? null : curr));
+      }
     }
   };
 
   const confirmManual = async (sample: DatasetSampleItem) => {
     const next = neighbourAfter(sample.id);
-    const ok = await patchSample(sample, { verified: true, verified_by: "manual" });
+    const ok = await patchSample(sample, {
+      annotations: sample.annotations,
+      verified: true,
+      verified_by: "manual",
+    });
     if (ok && filter.tab !== "manual" && filter.tab !== "all") setSelectedId(next);
     else if (ok) setSelectedId(stepQueue(1));
   };
@@ -493,6 +518,7 @@ export const DatasetStudioSection: React.FC<{
   const discardSample = async (sample: DatasetSampleItem) => {
     if (!isSafeDatasetSampleId(sample?.id)) return;
     if (!window.confirm(t("Descartar esta amostra do dataset?", "Discard this sample from the dataset?"))) return;
+    const myEpoch = sampleEpochTracker.begin(sample.id);
     const next = neighbourAfter(sample.id);
     setSamples((prev) => removeDatasetSampleFromList(prev, sample.id));
     setSelectedId(next);
@@ -501,7 +527,7 @@ export const DatasetStudioSection: React.FC<{
         method: "DELETE",
         credentials: "include",
       });
-      if (!isMountedRef.current) return;
+      if (!isMountedRef.current || !sampleEpochTracker.isCurrent(sample.id, myEpoch)) return;
       if (res.ok) {
         void refreshDatasetSummary();
       } else {
@@ -511,7 +537,7 @@ export const DatasetStudioSection: React.FC<{
         notify(err?.message || t("Falha ao descartar a amostra", "Failed to discard the sample"));
       }
     } catch {
-      if (isMountedRef.current) {
+      if (isMountedRef.current && sampleEpochTracker.isCurrent(sample.id, myEpoch)) {
         setSamples((prev) => upsertDatasetSampleInList(prev, sample));
         setSelectedId(sample.id);
         notify(t("Erro de rede ao descartar", "Network error while discarding"));
@@ -572,51 +598,54 @@ export const DatasetStudioSection: React.FC<{
     }
   };
 
-  // Keyboard shortcuts for the annotate workbench.
-  useEffect(() => {
+  // Keyboard shortcuts for the annotate workbench (registered once via ref).
+  const keydownHandlerRef = useRef<(e: KeyboardEvent) => void>(() => {});
+  keydownHandlerRef.current = (e: KeyboardEvent) => {
     if (step !== "annotate") return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey || isTypingTarget(e.target)) return;
-      const key = e.key.toLowerCase();
-      if (key === "escape") {
-        setDraft(null);
-        setSelectedBox(null);
-        return;
-      }
-      const quick = Number(e.key);
-      if (Number.isInteger(quick) && quick >= 1 && quick <= QUICK_CLASS_IDS.length) {
-        e.preventDefault();
-        setActiveClassId(QUICK_CLASS_IDS[quick - 1]);
-        return;
-      }
-      if (key === "j" || key === "arrowdown") {
-        e.preventDefault();
-        setSelectedId(stepQueue(1));
-        return;
-      }
-      if (key === "k" || key === "arrowup") {
-        e.preventDefault();
-        setSelectedId(stepQueue(-1));
-        return;
-      }
-      if (!selected || busyAction) return;
-      if (key === "v") {
-        e.preventDefault();
-        if (canConfirmSample(selected)) void confirmManual(selected);
-      } else if (key === "a") {
-        e.preventDefault();
-        void runAutoAnnotate(selected.id);
-      } else if (key === "n") {
-        e.preventDefault();
-        void markBackground(selected);
-      } else if ((key === "delete" || key === "backspace") && selectedBox !== null) {
-        e.preventDefault();
-        removeBox(selected, selectedBox);
-      }
-    };
+    if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey || isTypingTarget(e.target)) return;
+    const key = e.key.toLowerCase();
+    if (key === "escape") {
+      setDraft(null);
+      setSelectedBox(null);
+      return;
+    }
+    const quick = Number(e.key);
+    if (Number.isInteger(quick) && quick >= 1 && quick <= QUICK_CLASS_IDS.length) {
+      e.preventDefault();
+      setActiveClassId(QUICK_CLASS_IDS[quick - 1]);
+      return;
+    }
+    if (key === "j" || key === "arrowdown") {
+      e.preventDefault();
+      setSelectedId(stepQueue(1));
+      return;
+    }
+    if (key === "k" || key === "arrowup") {
+      e.preventDefault();
+      setSelectedId(stepQueue(-1));
+      return;
+    }
+    if (!selected || busyAction) return;
+    if (key === "v") {
+      e.preventDefault();
+      if (canConfirmSample(selected)) void confirmManual(selected);
+    } else if (key === "a") {
+      e.preventDefault();
+      void runAutoAnnotate(selected.id);
+    } else if (key === "n") {
+      e.preventDefault();
+      void markBackground(selected);
+    } else if ((key === "delete" || key === "backspace") && selectedBox !== null) {
+      e.preventDefault();
+      removeBox(selected, selectedBox);
+    }
+  };
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => keydownHandlerRef.current(e);
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  });
+  }, []);
 
   // ---- drawing -----------------------------------------------------------
   const pointFromEvent = (e: React.PointerEvent<HTMLDivElement>): Point => {
@@ -787,7 +816,9 @@ export const DatasetStudioSection: React.FC<{
       setDeployOutcome(failed);
       notify(failed.message);
     } finally {
-      if (isMountedRef.current) setBusyAction(null);
+      if (isMountedRef.current) {
+        setBusyAction((curr) => (curr === "upload-model" ? null : curr));
+      }
     }
   };
 

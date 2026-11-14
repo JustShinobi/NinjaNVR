@@ -35,6 +35,7 @@ import {
   StateRoiConfig,
 } from "../../types/nvr";
 import {
+  buildGenAiApiKeyPatch,
   buildGenAiProviderChangePatch,
   DEFAULT_LPR_FORMAT_REGEX,
   normalizeDiscoveredGenAiModels,
@@ -42,6 +43,10 @@ import {
   resolveKnownPlateLabel,
   validateLicensePlateFormat,
 } from "../../utils/configYaml";
+import {
+  type ConfigWorkbenchSession,
+  useConfigWorkbenchSession,
+} from "../../utils/configWorkbench";
 import { formatDateTime } from "../../utils/format";
 import {
   createForensicTriageController,
@@ -948,6 +953,7 @@ export const AiDetectionObjectsSection: React.FC<{
   initialSubSection?: AiSettingsSubSectionId;
   /** Operational data cards (FP memory, enrolled faces, known plates) start collapsed. */
   initialDataCardsOpen?: boolean;
+  workbenchSession?: ConfigWorkbenchSession;
 }> = ({
   draftConfig,
   updateDraft,
@@ -957,9 +963,12 @@ export const AiDetectionObjectsSection: React.FC<{
   onOpenVectorStudio,
   initialSubSection = DEFAULT_AI_SUBSECTION,
   initialDataCardsOpen = false,
+  workbenchSession,
 }) => {
   const { locale } = useI18n();
   const isPt = locale === "pt";
+  const contextWorkbench = useConfigWorkbenchSession();
+  const activeWorkbench = workbenchSession ?? contextWorkbench;
   const stats = useNvrStore((s) => s.stats);
   const [activeSubSection, setActiveSubSection] =
     useState<AiSettingsSubSectionId>(initialSubSection);
@@ -1269,6 +1278,18 @@ export const AiDetectionObjectsSection: React.FC<{
       known_plates: { ...(draftConfig.lpr?.known_plates || {}) },
       ...patch,
     };
+    if (persistImmediately && activeWorkbench) {
+      const seq = ++lprPersistSeqRef.current;
+      void activeWorkbench
+        .applyOutOfBandPatch({ lpr: mergedLpr })
+        .then((res) => {
+          if (seq === lprPersistSeqRef.current && res.ok && res.config) {
+            useNvrStore.getState().setConfig(res.config);
+          }
+        })
+        .catch(() => {});
+      return;
+    }
     updateDraft((next) => {
       next.lpr = mergedLpr;
     });
@@ -3005,8 +3026,11 @@ export const AiDetectionObjectsSection: React.FC<{
                       genaiValidateSeqRef.current += 1;
                       setGenaiValidating(false);
                       updateGenAi({
-                        api_key: val || (genaiCfg.has_api_key ? "***" : null),
-                        clear_api_key: false,
+                        ...buildGenAiApiKeyPatch(
+                          val,
+                          genaiCfg.has_api_key,
+                          false
+                        ),
                         model: "",
                       });
                       setGenaiModels([]);
@@ -3029,9 +3053,7 @@ export const AiDetectionObjectsSection: React.FC<{
                         genaiValidateSeqRef.current += 1;
                         setGenaiValidating(false);
                         updateGenAi({
-                          api_key: null,
-                          has_api_key: false,
-                          clear_api_key: true,
+                          ...buildGenAiApiKeyPatch("", false, true),
                           model: "",
                         });
                         setGenaiModels([]);

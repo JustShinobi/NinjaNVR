@@ -13,10 +13,10 @@ import {
   UserAccountItem,
 } from "../../types/nvr";
 import {
-  buildOnvifPasswordPatch,
   sanitizeConfigEntrySlug,
   ToggleSwitch,
 } from "./ConsoleAndStreamsPanels";
+import { buildMqttPasswordPatch } from "../../utils/configYaml";
 import {
   createScopedConfigLens,
   resolveEffectiveRecordConfig,
@@ -1668,7 +1668,7 @@ export const CommsAuthUsersSection: React.FC<{
                   }
                   onChange={(e) =>
                     mutateMqtt(
-                      buildOnvifPasswordPatch(
+                      buildMqttPasswordPatch(
                         e.target.value,
                         mqttCfg.has_password,
                         false
@@ -1685,7 +1685,7 @@ export const CommsAuthUsersSection: React.FC<{
                     title="Clear saved MQTT password"
                     aria-label="Clear MQTT Password"
                     onClick={() =>
-                      mutateMqtt(buildOnvifPasswordPatch("", false, true))
+                      mutateMqtt(buildMqttPasswordPatch("", false, true))
                     }
                   >
                     ×

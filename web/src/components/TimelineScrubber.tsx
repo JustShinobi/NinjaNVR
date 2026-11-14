@@ -21,8 +21,13 @@ import { RecordingCalendarPopover } from "./RecordingCalendarPopover";
 import { TacticalCameraPicker } from "./TacticalCameraPicker";
 import { formatDuration, resolveEffectiveTheme } from "../utils/format";
 import { resolveCanvasThemePalette } from "../utils/themeTokens";
-import { useNvrStore } from "../store/useNvrStore";
+import { resolveRealCameraSource, useNvrStore } from "../store/useNvrStore";
 import { useI18n } from "../i18n";
+import {
+  createArchiveMetadataCache,
+  useArchiveMetadataCache,
+} from "../utils/archivePlayback";
+import { resolveSafeMediaUrl } from "../utils/mediaUrlPolicy";
 
 export type TimelineZoomMinutes = 5 | 15 | 60 | 360 | 1440;
 
@@ -244,55 +249,12 @@ export function sanitizeTimelineThumbUrl(
   rawThumbPath: string | undefined | null,
   fallbackCamera: string
 ): string {
-  const rawCam = (fallbackCamera || "camera").trim();
-  const cleanCam =
-    !rawCam || rawCam === "." || rawCam === ".." || rawCam.includes("..")
-      ? "camera"
-      : rawCam;
-  const safeCam = encodeURIComponent(cleanCam);
-  const fallbackUrl = `/api/${safeCam}/latest.webp`;
-  if (!rawThumbPath || typeof rawThumbPath !== "string") {
-    return fallbackUrl;
-  }
-  const stripped = rawThumbPath.trim().replace(/^\/media\/[^/]+/, "");
-  if (
-    !stripped ||
-    /[\u0000-\u0020\u007f\\?#]/.test(stripped) ||
-    stripped.startsWith("//") ||
-    stripped.includes("..") ||
-    /%2e/i.test(stripped) ||
-    /%2f/i.test(stripped) ||
-    /%5c/i.test(stripped) ||
-    /%00/i.test(stripped)
-  ) {
-    return fallbackUrl;
-  }
-  let decoded = stripped;
-  try {
-    decoded = decodeURIComponent(stripped);
-  } catch {
-    return fallbackUrl;
-  }
-  const segments = decoded.split("/");
-  if (
-    decoded.startsWith("//") ||
-    decoded.includes("..") ||
-    decoded.includes("%") ||
-    segments.some((seg) => seg === "." || seg === "..") ||
-    /[\u0000-\u0020\u007f\\?#]/.test(decoded) ||
-    /^\/api\/(?:auth|logout|users|tokens|config|restart)\b/i.test(decoded)
-  ) {
-    return fallbackUrl;
-  }
-  if (
-    stripped.startsWith("/clips/") ||
-    stripped.startsWith("/api/") ||
-    stripped.startsWith("/thumbs/") ||
-    stripped.startsWith("/previews/")
-  ) {
-    return stripped;
-  }
-  return fallbackUrl;
+  return resolveSafeMediaUrl(rawThumbPath, {
+    kind: "thumbnail",
+    fallbackCamera,
+    allowedPrefixes: ["/clips/", "/api/", "/thumbs/", "/previews/"],
+    rejectSpaces: true,
+  });
 }
 
 function formatDayShort(dayStr: string): string {
@@ -394,6 +356,14 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const themeMode = useNvrStore((s) => s.themeMode);
   const highContrast = useNvrStore((s) => s.highContrast);
+  const configuredCameras = useNvrStore((s) => s.config?.cameras);
+  const realCamera = useMemo(
+    () => resolveRealCameraSource(camera, configuredCameras),
+    [camera, configuredCameras]
+  );
+  const contextMetadataCache = useArchiveMetadataCache();
+  const localMetadataCache = useMemo(() => createArchiveMetadataCache(), []);
+  const archiveMetadataCache = contextMetadataCache ?? localMetadataCache;
   const effectiveTheme = resolveEffectiveTheme(themeMode);
   const [trackWidth, setTrackWidth] = useState<number>(800);
   const [zoomMin, setZoomMin] = useState<TimelineZoomMinutes>(60);
@@ -584,13 +554,11 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
   // Fetch 30-day recording summary for the active camera
   useEffect(() => {
-    if (!camera) return;
+    if (!realCamera) return;
     let cancelled = false;
-    fetch(`/api/${encodeURIComponent(camera)}/recordings/summary`, {
-      credentials: "include",
-    })
-      .then((r) => (r.ok ? r.json() : []))
-      .then((arr: RecordingDaySummary[]) => {
+    archiveMetadataCache
+      .getSummary(realCamera, { configuredCameras })
+      .then((arr) => {
         if (!cancelled && Array.isArray(arr)) {
           setDaysSummary(arr);
         }
@@ -599,21 +567,22 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [camera]);
+  }, [realCamera, archiveMetadataCache, configuredCameras]);
 
   // Fetch exact recording segments and review items covering `[fetchBucketStart, fetchBucketEnd]`
   useEffect(() => {
-    if (!camera) return;
+    if (!realCamera) return;
     let cancelled = false;
 
     Promise.all([
-      fetch(
-        `/api/${encodeURIComponent(camera)}/recordings?after=${fetchBucketStart}&before=${fetchBucketEnd}`,
-        { credentials: "include" }
-      ).then((r) => (r.ok ? r.json() : [])),
+      archiveMetadataCache.getRecordings(
+        realCamera,
+        { after: fetchBucketStart, before: fetchBucketEnd },
+        { configuredCameras }
+      ),
       fetch(
         `/api/review?cameras=${encodeURIComponent(
-          camera
+          realCamera
         )}&after=${fetchBucketStart}&before=${fetchBucketEnd}&limit=250`,
         { credentials: "include" }
       ).then((r) => (r.ok ? r.json() : [])),
@@ -628,7 +597,13 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [camera, fetchBucketStart, fetchBucketEnd]);
+  }, [
+    realCamera,
+    fetchBucketStart,
+    fetchBucketEnd,
+    archiveMetadataCache,
+    configuredCameras,
+  ]);
 
   const clientXToTs = useCallback(
     (clientX: number): number => {
@@ -1054,11 +1029,11 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
   const visibleReviews = useMemo(() => {
     return windowReviews.filter(
       (r) =>
-        (r.camera === camera || camera === "all") &&
+        (r.camera === camera || r.camera === realCamera || camera === "all") &&
         (r.end_time || r.start_time + 15) >= winStart &&
         r.start_time <= winEnd
     );
-  }, [windowReviews, camera, winStart, winEnd]);
+  }, [windowReviews, camera, realCamera, winStart, winEnd]);
 
   // Nearest review to hoverTs for thumbnail preview tooltip on the timeline
   const hoveredReviewOnTrack = useMemo(() => {
@@ -1354,38 +1329,19 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           /:/g,
           ""
         )}`;
-      const res = await onExportRange(camera, rangeStart, rangeEnd, label);
+      const res = await onExportRange(realCamera, rangeStart, rangeEnd, label);
       if (res && (res.exportId || res.videoUrl)) {
         setExportSaved(true);
       }
       if (res && res.videoUrl) {
-        const candidate = res.videoUrl.trim();
-        let decoded = candidate;
-        let decodable = true;
-        try {
-          decoded = decodeURIComponent(candidate);
-        } catch {
-          decodable = false;
-        }
-        if (
-          candidate &&
-          decodable &&
-          !/[\u0000-\u0020\u007f\\?#]/.test(candidate) &&
-          !candidate.startsWith("//") &&
-          !candidate.includes("..") &&
-          !decoded.includes("..") &&
-          !decoded.includes("%") &&
-          !/^\/api\/(?:auth|logout|users|tokens|config|restart)\b/i.test(decoded) &&
-          !/%2e/i.test(candidate) &&
-          !/%2f/i.test(candidate) &&
-          !/%5c/i.test(candidate) &&
-          !/%00/i.test(candidate) &&
-          (candidate.startsWith("/exports/") ||
-            candidate.startsWith("/api/") ||
-            candidate.startsWith("/vod/") ||
-            candidate.startsWith("/clips/"))
-        ) {
-          setReadyDownloadUrl(candidate);
+        const safeDownloadUrl = resolveSafeMediaUrl(res.videoUrl, {
+          kind: "export_video",
+          fallbackUrl: "",
+          allowedPrefixes: ["/exports/", "/api/", "/vod/", "/clips/"],
+          rejectSpaces: true,
+        });
+        if (safeDownloadUrl) {
+          setReadyDownloadUrl(safeDownloadUrl);
         }
       }
     } finally {

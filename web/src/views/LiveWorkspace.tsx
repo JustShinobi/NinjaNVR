@@ -42,6 +42,8 @@ import {
   StateRoiConfig,
 } from "../types/nvr";
 import { FloorplanStudioCanvas } from "../components/FloorplanStudioCanvas";
+import { resolveSafeMediaUrl } from "../utils/mediaUrlPolicy";
+import { LoadedVodWindow, resolveVodSeekAction } from "../utils/archivePlayback";
 export {
   DEFAULT_FLOORPLAN_HEIGHT_M,
   DEFAULT_FLOORPLAN_WIDTH_M,
@@ -359,46 +361,10 @@ export function resolveSafeAlertThumbSrc(
   thumbPath: string | null | undefined,
   camera: string
 ): string {
-  const rawCam = (camera || "").trim();
-  const cleanCam =
-    !rawCam || rawCam === "." || rawCam === ".." || rawCam.includes("..")
-      ? "camera"
-      : rawCam;
-  const encodedCam = encodeURIComponent(cleanCam);
-  const fallback = `/api/${encodedCam}/latest.webp`;
-  if (typeof thumbPath !== "string") return fallback;
-  const trimmed = thumbPath.trim();
-  if (!trimmed || /[\u0000-\u001F\u007F\\?#]/.test(trimmed)) return fallback;
-  const stripped = trimmed.replace(/^\/media\/[^/]+/, "").trim();
-  if (
-    !stripped ||
-    !stripped.startsWith("/") ||
-    stripped.startsWith("//") ||
-    /^\/%2f/i.test(stripped) ||
-    stripped.includes("..") ||
-    /%2e%2e|%5c|%252e|%255c|%00/i.test(stripped)
-  ) {
-    return fallback;
-  }
-  try {
-    const decoded = decodeURIComponent(stripped);
-    const segments = decoded.split("/");
-    if (
-      !decoded.startsWith("/") ||
-      decoded.startsWith("//") ||
-      decoded.includes("\\") ||
-      decoded.includes("..") ||
-      decoded.includes("%") ||
-      segments.some((seg) => seg === "." || seg === "..") ||
-      /[\u0000-\u001F\u007F?#]/.test(decoded) ||
-      /^\/api\/(?:auth|logout|users|tokens|config|restart)\b/i.test(decoded)
-    ) {
-      return fallback;
-    }
-  } catch {
-    return fallback;
-  }
-  return stripped;
+  return resolveSafeMediaUrl(thumbPath, {
+    kind: "thumbnail",
+    fallbackCamera: camera,
+  });
 }
 
 export function sanitizeTimeShiftSeek(
@@ -1242,6 +1208,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   >(() => cameraHardwareCache.getSnapshot().hardwareByCam);
   const [pttResetEpoch, setPttResetEpoch] = useState<number>(0);
   const activePttCamerasRef = useRef<Set<string>>(new Set());
+  const vodWindowsRef = useRef<Record<string, LoadedVodWindow>>({});
   const isMountedRef = useRef<boolean>(true);
 
   useEffect(() => {
@@ -1567,6 +1534,12 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
     timeShiftTs,
     lockedHeroCam: groupLockedSpotlightCam || liveSpotlightHeroCam,
   });
+
+  useEffect(() => {
+    if (timeShiftTs === null) {
+      vodWindowsRef.current = {};
+    }
+  }, [timeShiftTs]);
 
   useEffect(() => {
     if (liveLayout !== "spotlight") return;
@@ -2315,12 +2288,26 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 )}
 
                 {descriptor.renderMode === "vod" && timeShiftTs !== null ? (
-                  <VodHlsPlayer
-                    camera={realCam}
-                    startTime={timeShiftTs}
-                    endTime={timeShiftTs + 180}
-                    playbackRate={playbackSpeed}
-                  />
+                  (() => {
+                    const prevWin = vodWindowsRef.current[realCam] ?? null;
+                    const seekAction = resolveVodSeekAction(prevWin, {
+                      camera: realCam,
+                      targetTs: timeShiftTs,
+                      windowSpanSec: 180,
+                      configuredCameras: config?.cameras,
+                    });
+                    vodWindowsRef.current[realCam] = seekAction.window;
+                    return (
+                      <VodHlsPlayer
+                        camera={realCam}
+                        startTime={seekAction.window.startSec}
+                        endTime={seekAction.window.endSec}
+                        playheadTs={timeShiftTs}
+                        playbackRate={playbackSpeed}
+                        enableKeyboardStep={descriptor.isTimelineSelected}
+                      />
+                    );
+                  })()
                 ) : descriptor.renderMode === "snapshot" ? (
                   <img
                     className="nvr-cam-poster"

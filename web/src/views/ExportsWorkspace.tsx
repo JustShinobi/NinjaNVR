@@ -9,11 +9,18 @@ import {
   ShareLinkItem,
 } from "../types/nvr";
 import { formatDateTime } from "../utils/format";
+import { resolveRealCameraSource } from "../store/useNvrStore";
+import {
+  LoadedVodWindow,
+  MAX_ARCHIVE_EXPORT_SPAN_SEC,
+  resolveVodSeekAction,
+  validateArchiveExportRange,
+} from "../utils/archivePlayback";
+import { resolveSafeMediaUrl } from "../utils/mediaUrlPolicy";
 import {
   ShareLinkStatus,
-  buildSharePublicUrl,
-  computeShareLinkRotationParams,
   computeShareLinkStatus,
+  createShareLinkSessionController,
   filterActiveAndRecentShareLinks,
   formatShareLinkRemainingTtl,
   formatShareLinkViews,
@@ -21,7 +28,7 @@ import {
 import { LiveMsePlayer, VodHlsPlayer } from "../components/VideoPlayers";
 import { TimelineScrubber } from "../components/TimelineScrubber";
 
-export const MAX_EXPORT_WINDOW_SEC = 86400;
+export const MAX_EXPORT_WINDOW_SEC = MAX_ARCHIVE_EXPORT_SPAN_SEC;
 
 export interface ExportTimeWindowValidation {
   valid: boolean;
@@ -36,108 +43,18 @@ export function validateExportTimeWindow(
   endSec: number,
   maxWindowSec: number = MAX_EXPORT_WINDOW_SEC
 ): ExportTimeWindowValidation {
-  if (
-    typeof startSec !== "number" ||
-    typeof endSec !== "number" ||
-    !Number.isFinite(startSec) ||
-    !Number.isFinite(endSec) ||
-    startSec < 0
-  ) {
-    return {
-      valid: false,
-      startSec: 0,
-      endSec: 0,
-      durationSec: 0,
-      error: "Invalid export time window: start and end timestamps must be finite",
-    };
-  }
-  const normalizedStart = Math.floor(startSec);
-  const normalizedEnd = Math.ceil(endSec);
-  const durationSec = normalizedEnd - normalizedStart;
-  if (durationSec <= 0) {
-    return {
-      valid: false,
-      startSec: normalizedStart,
-      endSec: normalizedEnd,
-      durationSec: 0,
-      error: "Invalid export time window: end time must be greater than start time",
-    };
-  }
-  const safeMax =
-    typeof maxWindowSec === "number" &&
-    Number.isFinite(maxWindowSec) &&
-    maxWindowSec > 0
-      ? maxWindowSec
-      : MAX_EXPORT_WINDOW_SEC;
-  if (durationSec > safeMax) {
-    return {
-      valid: false,
-      startSec: normalizedStart,
-      endSec: normalizedEnd,
-      durationSec,
-      error: `Export time window exceeds maximum allowed duration (${Math.round(
-        safeMax / 3600
-      )}h)`,
-    };
-  }
-  return {
-    valid: true,
-    startSec: normalizedStart,
-    endSec: normalizedEnd,
-    durationSec,
-  };
+  return validateArchiveExportRange(startSec, endSec, maxWindowSec);
 }
 
 export function resolveSafeExportVideoUrl(
   videoPath: string | null | undefined,
   exportId?: string
 ): string {
-  const cleanId = (exportId || "").trim();
-  let decodedId = cleanId;
-  let idDecodable = true;
-  try {
-    decodedId = decodeURIComponent(cleanId);
-  } catch {
-    idDecodable = false;
-  }
-  const fallback =
-    cleanId &&
-    idDecodable &&
-    cleanId !== "." &&
-    decodedId !== "." &&
-    !cleanId.includes("..") &&
-    !decodedId.includes("..") &&
-    !decodedId.includes("%") &&
-    !/[/\\?#\u0000-\u001f\u007f]/.test(cleanId) &&
-    !/[/\\?#\u0000-\u001f\u007f]/.test(decodedId)
-      ? `/exports/${encodeURIComponent(cleanId)}.mp4`
-      : "";
-  const raw = (videoPath || "").trim();
-  if (!raw || /[\u0000-\u001f\u007f\\?#]/.test(raw)) {
-    return fallback;
-  }
-  const stripped = raw.replace(/^\/media\/[^/]+/, "");
-  let decoded = stripped;
-  try {
-    decoded = decodeURIComponent(stripped);
-  } catch {
-    return fallback;
-  }
-  const segments = decoded.split("/");
-  if (
-    !stripped.startsWith("/") ||
-    stripped.startsWith("//") ||
-    stripped.includes("..") ||
-    decoded.startsWith("//") ||
-    decoded.includes("..") ||
-    decoded.includes("%") ||
-    segments.some((seg) => seg === "." || seg === "..") ||
-    /[\u0000-\u001f\u007f\\?#]/.test(decoded) ||
-    !/^\/(?:exports|clips)\//.test(decoded)
-  ) {
-    return fallback;
-  }
-  return stripped;
+  return resolveSafeMediaUrl(videoPath, {
+    kind: "export_video",
+    exportId: exportId ?? "",
+    allowedPrefixes: ["/exports/", "/clips/"],
+  });
 }
 
 interface ExportsWorkspaceProps {
@@ -206,160 +123,22 @@ export async function executeCopyExistingShareLink(
   ) {
     return;
   }
-  setCreatingShareId?.(link.target_id);
-  try {
-    const latestLinks = await fetchShareLinks();
-    const currentLink =
-      latestLinks !== null
-        ? latestLinks.find((l) => l.id === link.id)
-        : link;
-    const oldUrl =
-      shareUrlMap[link.id] ||
-      (currentLink?.url
-        ? buildSharePublicUrl(origin, currentLink.url)
-        : currentLink?.token
-          ? buildSharePublicUrl(origin, currentLink.token)
-          : link.url
-            ? buildSharePublicUrl(origin, link.url)
-            : link.token
-              ? buildSharePublicUrl(origin, link.token)
-              : "");
-    if (!currentLink || computeShareLinkStatus(currentLink) !== "active") {
-      let evictedUrl = oldUrl;
-      setShareUrlMap((prev) => {
-        if (prev[link.id]) {
-          evictedUrl = prev[link.id];
-        }
-        if (!(link.id in prev)) return prev;
-        const next = { ...prev };
-        delete next[link.id];
-        return next;
-      });
-      if (evictedUrl) {
-        setGeneratedShareUrl((prev) => (prev === evictedUrl ? "" : prev));
-      }
-      notify("Share link is no longer active");
-      return;
-    }
-    const knownUrl =
-      (shareUrlMap[currentLink.id]
-        ? buildSharePublicUrl(origin, shareUrlMap[currentLink.id])
-        : "") ||
-      (currentLink.url
-        ? buildSharePublicUrl(origin, currentLink.url)
-        : currentLink.token
-          ? buildSharePublicUrl(origin, currentLink.token)
-          : link.url
-            ? buildSharePublicUrl(origin, link.url)
-            : link.token
-              ? buildSharePublicUrl(origin, link.token)
-              : "");
-    if (knownUrl) {
-      await copyUrlToClipboard(knownUrl);
-      return;
-    }
-    const rotation = computeShareLinkRotationParams(currentLink);
-    if (!rotation) {
-      let evictedUrl = oldUrl;
-      setShareUrlMap((prev) => {
-        if (prev[link.id]) {
-          evictedUrl = prev[link.id];
-        }
-        if (!(link.id in prev)) return prev;
-        const next = { ...prev };
-        delete next[link.id];
-        return next;
-      });
-      if (evictedUrl) {
-        setGeneratedShareUrl((prev) => (prev === evictedUrl ? "" : prev));
-      }
-      notify("Share link is no longer active");
-      return;
-    }
-    let delRes: Response;
-    try {
-      delRes = await fetchImpl(
-        `/api/share/${encodeURIComponent(rotation.revokeOldId)}`,
-        {
-          method: "DELETE",
-          credentials: "include",
-        }
-      );
-    } catch {
-      notify("Failed to revoke previous share link");
-      return;
-    }
-    if (!delRes.ok && delRes.status !== 404) {
-      notify("Failed to revoke previous share link");
-      return;
-    }
-    let revokedOldUrl = shareUrlMap[rotation.revokeOldId] || oldUrl;
-    setShareUrlMap((prev) => {
-      if (prev[rotation.revokeOldId]) {
-        revokedOldUrl = prev[rotation.revokeOldId];
-      }
-      if (!(rotation.revokeOldId in prev)) return prev;
-      const next = { ...prev };
-      delete next[rotation.revokeOldId];
-      return next;
-    });
-    if (revokedOldUrl) {
-      setGeneratedShareUrl((prev) => (prev === revokedOldUrl ? "" : prev));
-    }
-    const payload: Record<string, unknown> = {
-      kind: currentLink.kind || "export",
-      target_id: currentLink.target_id,
-      expires_in_sec: rotation.expiresInSec,
-    };
-    if (
-      typeof rotation.remainingMaxViews === "number" &&
-      Number.isFinite(rotation.remainingMaxViews) &&
-      rotation.remainingMaxViews > 0
-    ) {
-      payload.max_views = rotation.remainingMaxViews;
-    }
-    const res = await fetchImpl("/api/share", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify(payload),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok && (data.url || data.token)) {
-      const fullUrl = buildSharePublicUrl(origin, data.url || data.token);
-      if (!fullUrl) {
-        await fetchShareLinks();
-        notify("Failed to generate share link");
-        return;
-      }
-      setShareUrlMap((prev) => {
-        const next = { ...prev };
-        delete next[rotation.revokeOldId];
-        if (data.id) {
-          next[String(data.id)] = fullUrl;
-        }
-        return next;
-      });
-      await fetchShareLinks();
-      await copyUrlToClipboard(
-        fullUrl,
-        formatShareLinkRemainingTtl(
-          Math.floor(Date.now() / 1000) + rotation.expiresInSec
-        )
-      );
-    } else {
-      await fetchShareLinks();
-      notify(
-        (typeof data?.message === "string" && data.message) ||
-          "Failed to generate share link"
-      );
-    }
-  } catch {
-    await fetchShareLinks();
-    notify("Failed to generate share link");
-  } finally {
-    setCreatingShareId?.(null);
-  }
+  const controller = createShareLinkSessionController({
+    fetchImpl,
+    listShareLinks: fetchShareLinks,
+    origin,
+    copyUrlToClipboard,
+    notify,
+    onCreatingShareIdChange: (id) => setCreatingShareId?.(id),
+    onShareUrlMapChange: (updater) => setShareUrlMap(updater),
+    onGeneratedShareUrlChange: (updater) => setGeneratedShareUrl(updater),
+  });
+  controller.seedState({
+    shareUrlMap,
+    creatingShareId: creatingShareId ?? null,
+    revokingShareId: revokingShareId ?? null,
+  });
+  await controller.copyOrRotate(link);
 }
 
 export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
@@ -386,28 +165,51 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
   const [includeAudio, setIncludeAudio] = React.useState(true);
   const [shareTtlSec, setShareTtlSec] = React.useState(86400);
   const [shareMaxViews, setShareMaxViews] = React.useState<number>(0);
-  const [shareLinks, setShareLinks] = React.useState<ShareLinkItem[]>([]);
   const [showInactiveLinks, setShowInactiveLinks] = React.useState(false);
-  const [generatedShareUrl, setGeneratedShareUrl] = React.useState<string>("");
-  const [shareUrlMap, setShareUrlMap] = React.useState<Record<string, string>>({});
-  const [creatingShareId, setCreatingShareId] = React.useState<string | null>(null);
-  const [revokingShareId, setRevokingShareId] = React.useState<string | null>(null);
   const [deletingExportId, setDeletingExportId] = React.useState<string | null>(null);
   const isMountedRef = React.useRef(true);
-  const shareFetchSeqRef = React.useRef(0);
-  const shareFetchAbortRef = React.useRef<AbortController | null>(null);
+  const exportVodWindowRef = React.useRef<LoadedVodWindow | null>(null);
+  const notifyRef = React.useRef(notify);
+  notifyRef.current = notify;
+
+  const shareControllerRef = React.useRef<ReturnType<
+    typeof createShareLinkSessionController
+  > | null>(null);
+  if (!shareControllerRef.current) {
+    shareControllerRef.current = createShareLinkSessionController({
+      notify: (msg) => notifyRef.current(msg),
+    });
+  }
+  const shareController = shareControllerRef.current;
+
+  const [shareSessionState, setShareSessionState] = React.useState(() =>
+    shareController.getState()
+  );
+  const shareLinks = shareSessionState.links;
+  const generatedShareUrl = shareSessionState.generatedShareUrl;
+  const creatingShareId = shareSessionState.creatingShareId;
+  const revokingShareId = shareSessionState.revokingShareId;
 
   React.useEffect(() => {
     isMountedRef.current = true;
+    const unsub = shareController.subscribe((snap) => {
+      if (isMountedRef.current) {
+        setShareSessionState(snap);
+      }
+    });
+    void shareController.refresh();
     return () => {
       isMountedRef.current = false;
-      shareFetchSeqRef.current += 1;
-      if (shareFetchAbortRef.current) {
-        shareFetchAbortRef.current.abort();
-        shareFetchAbortRef.current = null;
-      }
+      unsub();
+      shareController.dispose();
     };
-  }, []);
+  }, [shareController]);
+
+  React.useEffect(() => {
+    if (timeShiftTs === null || !Number.isFinite(timeShiftTs)) {
+      exportVodWindowRef.current = null;
+    }
+  }, [timeShiftTs]);
 
   React.useEffect(() => {
     if (
@@ -418,40 +220,8 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
     }
   }, [exportsList, activeExportPreview, setActiveExportPreview]);
 
-  const fetchShareLinks = React.useCallback(
-    async (): Promise<ShareLinkItem[] | null> => {
-      const seq = ++shareFetchSeqRef.current;
-      const controller = new AbortController();
-      shareFetchAbortRef.current = controller;
-      try {
-        const res = await fetch("/api/share", {
-          credentials: "include",
-          signal: controller.signal,
-        });
-        if (!res.ok) return null;
-        const data = await res.json().catch(() => null);
-        if (Array.isArray(data)) {
-          const parsed = data as ShareLinkItem[];
-          if (isMountedRef.current && seq === shareFetchSeqRef.current) {
-            setShareLinks(parsed);
-          }
-          return parsed;
-        }
-        return null;
-      } catch {
-        // Preserve last known share links state on transient network error
-        return null;
-      }
-    },
-    []
-  );
-
-  React.useEffect(() => {
-    void fetchShareLinks();
-  }, [fetchShareLinks]);
-
   const copyUrlToClipboard = async (fullUrl: string, ttlHoursLabel?: string) => {
-    setGeneratedShareUrl(fullUrl);
+    shareController.seedState({ generatedShareUrl: fullUrl });
     let copied = false;
     if (
       typeof navigator !== "undefined" &&
@@ -482,137 +252,23 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
     overrideTtlSec?: number,
     overrideMaxViews?: number | null
   ) => {
-    if (creatingShareId !== null || revokingShareId !== null) return;
-    setCreatingShareId(targetId);
-    try {
-      const ttlToUse = overrideTtlSec ?? shareTtlSec;
-      const viewsToUse =
-        overrideMaxViews !== undefined ? overrideMaxViews : shareMaxViews;
-      const payload: Record<string, unknown> = {
-        kind,
-        target_id: targetId,
-        expires_in_sec: ttlToUse,
-      };
-      if (
-        typeof viewsToUse === "number" &&
-        Number.isFinite(viewsToUse) &&
-        viewsToUse > 0
-      ) {
-        payload.max_views = viewsToUse;
-      }
-      const res = await fetch("/api/share", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!isMountedRef.current) return;
-      if (res.ok && (data.url || data.token)) {
-        const fullUrl = buildSharePublicUrl(
-          window.location.origin,
-          data.url || data.token
-        );
-        if (!fullUrl) {
-          await fetchShareLinks();
-          if (isMountedRef.current) {
-            notify("Failed to generate share link");
-          }
-          return;
-        }
-        if (data.id && isMountedRef.current) {
-          setShareUrlMap((prev) => ({
-            ...prev,
-            [String(data.id)]: fullUrl,
-          }));
-        }
-        await fetchShareLinks();
-        if (isMountedRef.current) {
-          await copyUrlToClipboard(
-            fullUrl,
-            formatShareLinkRemainingTtl(Math.floor(Date.now() / 1000) + ttlToUse)
-          );
-        }
-      } else {
-        notify(
-          (typeof data?.message === "string" && data.message) ||
-            "Failed to generate share link"
-        );
-      }
-    } catch {
-      if (isMountedRef.current) {
-        notify("Failed to generate share link");
-      }
-    } finally {
-      if (isMountedRef.current) {
-        setCreatingShareId(null);
-      }
-    }
-  };
-
-  const handleCopyExistingShareLink = async (link: ShareLinkItem) => {
-    await executeCopyExistingShareLink(link, {
-      creatingShareId,
-      revokingShareId,
-      setCreatingShareId,
-      fetchShareLinks,
-      shareUrlMap,
-      setShareUrlMap,
-      setGeneratedShareUrl,
-      copyUrlToClipboard,
-      notify,
+    const ttlToUse = overrideTtlSec ?? shareTtlSec;
+    const viewsToUse =
+      overrideMaxViews !== undefined ? overrideMaxViews : shareMaxViews;
+    await shareController.createAndCopy({
+      targetId,
+      kind,
+      expiresInSec: ttlToUse,
+      maxViews: viewsToUse,
     });
   };
 
+  const handleCopyExistingShareLink = async (link: ShareLinkItem) => {
+    await shareController.copyOrRotate(link);
+  };
+
   const handleRevokeShareLink = async (id: string) => {
-    if (creatingShareId !== null || revokingShareId !== null) return;
-    setRevokingShareId(id);
-    try {
-      const res = await fetch(`/api/share/${encodeURIComponent(id)}`, {
-        method: "DELETE",
-        credentials: "include",
-      });
-      if (!isMountedRef.current) return;
-      if (res.ok) {
-        const revokedLink = shareLinks.find((l) => l.id === id);
-        const revokedUrl =
-          shareUrlMap[id] ||
-          (revokedLink?.url
-            ? buildSharePublicUrl(window.location.origin, revokedLink.url)
-            : revokedLink?.token
-              ? buildSharePublicUrl(window.location.origin, revokedLink.token)
-              : "");
-        setShareUrlMap((prev) => {
-          if (!(id in prev)) return prev;
-          const next = { ...prev };
-          delete next[id];
-          return next;
-        });
-        if (revokedUrl) {
-          setGeneratedShareUrl((prev) => (prev === revokedUrl ? "" : prev));
-        }
-        await fetchShareLinks();
-        if (isMountedRef.current) {
-          notify(`Revoked share link ${id}`);
-        }
-      } else {
-        const data = await res.json().catch(() => ({}));
-        if (isMountedRef.current) {
-          notify(
-            (typeof data?.message === "string" && data.message) ||
-              "Failed to revoke share link"
-          );
-        }
-      }
-    } catch {
-      if (isMountedRef.current) {
-        notify("Failed to revoke share link");
-      }
-    } finally {
-      if (isMountedRef.current) {
-        setRevokingShareId(null);
-      }
-    }
+    await shareController.revoke(id);
   };
 
   const visibleShareLinks = React.useMemo(
@@ -704,8 +360,12 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                 notify(win.error || "Invalid export time window");
                 return;
               }
-              await handleQuickExport(
+              const realExportCam = resolveRealCameraSource(
                 cleanCam,
+                config?.cameras
+              );
+              await handleQuickExport(
+                realExportCam,
                 win.startSec,
                 win.endSec,
                 exportLabel || `${cleanCam}_${exportPresetMin}m`,
@@ -920,58 +580,8 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                           if (activeExportPreview?.id === ex.id) {
                             setActiveExportPreview(null);
                           }
-                          const matchingLinks = shareLinks.filter(
-                            (l) => l.target_id === ex.id
-                          );
-                          const matchingIds = new Set(
-                            matchingLinks.map((l) => l.id)
-                          );
-                          const matchingUrls = new Set<string>();
-                          for (const l of matchingLinks) {
-                            if (shareUrlMap[l.id]) {
-                              matchingUrls.add(shareUrlMap[l.id]);
-                            }
-                            if (l.url) {
-                              matchingUrls.add(
-                                buildSharePublicUrl(
-                                  window.location.origin,
-                                  l.url
-                                )
-                              );
-                            }
-                            if (l.token) {
-                              matchingUrls.add(
-                                buildSharePublicUrl(
-                                  window.location.origin,
-                                  l.token
-                                )
-                              );
-                            }
-                          }
-                          if (shareUrlMap[ex.id]) {
-                            matchingUrls.add(shareUrlMap[ex.id]);
-                          }
-                          setShareUrlMap((prev) => {
-                            let changed = false;
-                            const next = { ...prev };
-                            for (const id of matchingIds) {
-                              if (id in next) {
-                                delete next[id];
-                                changed = true;
-                              }
-                            }
-                            if (ex.id in next) {
-                              delete next[ex.id];
-                              changed = true;
-                            }
-                            return changed ? next : prev;
-                          });
-                          if (matchingUrls.size > 0) {
-                            setGeneratedShareUrl((prev) =>
-                              matchingUrls.has(prev) ? "" : prev
-                            );
-                          }
-                          void fetchShareLinks();
+                          shareController.evictTarget(ex.id, shareLinks);
+                          void shareController.refresh();
                           notify("Export deleted");
                         } else {
                           const data = await res.json().catch(() => ({}));
@@ -1205,17 +815,47 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                 style={{ width: "100%", height: "100%", objectFit: "contain" }}
               />
             ) : timeShiftTs === null || !Number.isFinite(timeShiftTs) ? (
-              <LiveMsePlayer
-                camera={exportCam}
-                useMainStream={true}
-                cameraConfig={config?.cameras?.[exportCam]}
-              />
+              (() => {
+                const realExportCam = resolveRealCameraSource(
+                  exportCam,
+                  config?.cameras
+                );
+                return (
+                  <LiveMsePlayer
+                    camera={exportCam}
+                    useMainStream={true}
+                    cameraConfig={
+                      config?.cameras?.[exportCam] ??
+                      config?.cameras?.[realExportCam]
+                    }
+                  />
+                );
+              })()
             ) : (
-              <VodHlsPlayer
-                camera={exportCam}
-                startTime={timeShiftTs}
-                endTime={timeShiftTs + 180}
-              />
+              (() => {
+                const realExportCam = resolveRealCameraSource(
+                  exportCam,
+                  config?.cameras
+                );
+                const seekAction = resolveVodSeekAction(
+                  exportVodWindowRef.current,
+                  {
+                    camera: realExportCam,
+                    targetTs: timeShiftTs,
+                    windowSpanSec: 180,
+                    configuredCameras: config?.cameras,
+                  }
+                );
+                exportVodWindowRef.current = seekAction.window;
+                return (
+                  <VodHlsPlayer
+                    camera={realExportCam}
+                    startTime={seekAction.window.startSec}
+                    endTime={seekAction.window.endSec}
+                    playheadTs={timeShiftTs}
+                  />
+                );
+              })()
             )}
           </div>
 
@@ -1241,8 +881,12 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                 notify(win.error || "Invalid export time window");
                 return;
               }
-              return handleQuickExport(
+              const realTargetCam = resolveRealCameraSource(
                 cleanCam,
+                config?.cameras
+              );
+              return handleQuickExport(
+                realTargetCam,
                 win.startSec,
                 win.endSec,
                 label,

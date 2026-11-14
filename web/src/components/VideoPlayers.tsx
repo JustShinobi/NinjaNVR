@@ -20,6 +20,7 @@ import {
   resolveLivePosterUrl,
   VideoSlotIndex,
 } from "../utils/msePlayerEngine";
+import { resolveVodSeekAction } from "../utils/archivePlayback";
 
 export interface PushToTalkTrackLike {
   stop: () => void;
@@ -1757,10 +1758,12 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   );
 };
 
-interface VodHlsPlayerProps {
+export interface VodHlsPlayerProps {
   camera: string;
   startTime: number;
   endTime: number;
+  playheadTs?: number | null;
+  enableKeyboardStep?: boolean;
   fallbackPreviewId?: string;
   playbackRate?: number;
   autoPlay?: boolean;
@@ -1795,6 +1798,8 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
   camera,
   startTime,
   endTime,
+  playheadTs = null,
+  enableKeyboardStep = true,
   fallbackPreviewId,
   playbackRate = 1,
   autoPlay = true,
@@ -1805,6 +1810,8 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const endedFiredRef = useRef(false);
+  const playheadTsRef = useRef<number | null | undefined>(playheadTs);
+  playheadTsRef.current = playheadTs;
   const configuredCameras = useNvrStore((s) => s.config?.cameras);
   const realCamera = resolveRealCameraSource(camera, configuredCameras);
   const rawVodRotateDeg = useNvrStore(
@@ -1870,7 +1877,22 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
       };
     }
 
+    const applyInitialPlayheadOffset = () => {
+      const ph = playheadTsRef.current;
+      if (typeof ph === "number" && Number.isFinite(ph) && ph >= safeStart && ph <= safeEnd) {
+        const offset = Math.max(0, ph - safeStart);
+        if (offset > 0) {
+          try {
+            videoEl.currentTime = offset;
+          } catch {
+            // ignore before media seekable
+          }
+        }
+      }
+    };
+
     let hls: Hls | null = null;
+    let onNativeLoadedMetadata: (() => void) | null = null;
     if (Hls.isSupported()) {
       hls = new Hls({
         enableWorker: true,
@@ -1881,6 +1903,7 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         videoEl.playbackRate = safePlaybackRate;
         videoEl.muted = userMuted;
+        applyInitialPlayheadOffset();
         if (autoPlay) {
           videoEl.play().catch(() => {
             videoEl.muted = true;
@@ -1913,6 +1936,10 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
         }
       });
     } else if (videoEl.canPlayType("application/vnd.apple.mpegurl")) {
+      onNativeLoadedMetadata = () => {
+        applyInitialPlayheadOffset();
+      };
+      videoEl.addEventListener("loadedmetadata", onNativeLoadedMetadata);
       videoEl.src = hlsUrl;
       videoEl.playbackRate = safePlaybackRate;
       if (autoPlay) {
@@ -1921,6 +1948,9 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
     }
 
     return () => {
+      if (onNativeLoadedMetadata) {
+        videoEl.removeEventListener("loadedmetadata", onNativeLoadedMetadata);
+      }
       if (hls) {
         try {
           hls.stopLoad();
@@ -1941,6 +1971,26 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
   }, [hlsUrl, useFallbackMp4, fallbackPreviewId, autoPlay]);
 
   useEffect(() => {
+    if (typeof playheadTs !== "number" || !Number.isFinite(playheadTs)) {
+      return;
+    }
+    const vid = videoRef.current;
+    if (!vid || useFallbackMp4) return;
+    const action = resolveVodSeekAction(
+      { camera: realCamera, startSec: safeStart, endSec: safeEnd },
+      { camera: realCamera, targetTs: playheadTs, edgeMarginSec: 2 }
+    );
+    if (action.kind === "seek_in_window") {
+      endedFiredRef.current = false;
+      try {
+        vid.currentTime = Math.max(0, action.offsetSec);
+      } catch {
+        // ignore if media element has not initialized seek range yet
+      }
+    }
+  }, [playheadTs, realCamera, safeStart, safeEnd, useFallbackMp4]);
+
+  useEffect(() => {
     if (videoRef.current) {
       videoRef.current.playbackRate = safePlaybackRate;
     }
@@ -1954,8 +2004,11 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
     const cur = Number.isFinite(vid.currentTime) ? vid.currentTime : 0;
     vid.currentTime = Math.max(0, cur + dir * frameDur);
   };
+  const stepVodFrameRef = useRef(stepVodFrame);
+  stepVodFrameRef.current = stepVodFrame;
 
   useEffect(() => {
+    if (!enableKeyboardStep) return;
     const onKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
       const tag = target?.tagName?.toLowerCase();
@@ -1965,15 +2018,15 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       if (e.key === ",") {
         e.preventDefault();
-        stepVodFrame(-1);
+        stepVodFrameRef.current(-1);
       } else if (e.key === ".") {
         e.preventDefault();
-        stepVodFrame(1);
+        stepVodFrameRef.current(1);
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [enableKeyboardStep]);
 
   const handleCaptureVodStill = () => {
     const vid = videoRef.current;

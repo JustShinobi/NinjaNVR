@@ -1,9 +1,18 @@
 import React from "react";
 import { Check, Trash2 } from "lucide-react";
 import { useI18n } from "../i18n";
-import { useNvrStore } from "../store/useNvrStore";
+import { resolveRealCameraSource, useNvrStore } from "../store/useNvrStore";
 import { useCompactViewport } from "../utils/useCompactViewport";
 import { countActiveReviewFilters } from "../utils/liveTileHud";
+import {
+  LoadedVodWindow,
+  resolveReviewArchivePlayback,
+} from "../utils/archivePlayback";
+import {
+  ReviewMutationPatch,
+  reconcileDeletedFaceProfile,
+  reconcileReviewMutation,
+} from "../utils/operationalFeed";
 import {
   EnrolledFaceProfileItem,
   ExportItem,
@@ -95,6 +104,10 @@ interface ReviewWorkspaceProps {
   ) => Promise<{ exportId?: string; videoUrl?: string } | void>;
   setSyncMasterTs: (ts: number) => void;
   switchTab: (tab: WorkspaceTab) => void;
+  onReconcileReviews?: (
+    reviewIds: string | ReadonlyArray<string>,
+    patch: ReviewMutationPatch
+  ) => void;
 }
 
 export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
@@ -122,10 +135,24 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   handleQuickExport,
   setSyncMasterTs,
   switchTab,
+  onReconcileReviews,
 }) => {
   const { t } = useI18n();
   const playbackSpeed = useNvrStore((s) => s.playbackSpeed);
   const setPlaybackSpeed = useNvrStore((s) => s.setPlaybackSpeed);
+  const configuredCameras = useNvrStore((s) => s.config?.cameras);
+  const [reviewPlayhead, setReviewPlayhead] = React.useState<{
+    reviewId: string;
+    ts: number;
+  } | null>(null);
+  const loadedVodWindowRef = React.useRef<{
+    reviewId: string;
+    window: LoadedVodWindow;
+  } | null>(null);
+  const reviewPlayheadTs =
+    activeReview && reviewPlayhead?.reviewId === activeReview.id
+      ? reviewPlayhead.ts
+      : null;
   const [showForensic, setShowForensic] = React.useState(false);
   const [excludeObjectFilter, setExcludeObjectFilter] = React.useState("none");
   const [zoneFilter, setZoneFilter] = React.useState("all");
@@ -198,6 +225,12 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     const nextId = activeReview?.id ?? null;
     activeReviewIdRef.current = nextId;
     triageController.setActiveTarget("review", nextId);
+    setReviewPlayhead((curr) =>
+      curr && curr.reviewId === nextId ? curr : null
+    );
+    if (loadedVodWindowRef.current?.reviewId !== nextId) {
+      loadedVodWindowRef.current = null;
+    }
     wasInReviewsRef.current = Boolean(
       nextId &&
         (reviews.some((r) => r.id === nextId) ||
@@ -259,18 +292,20 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   }, [triageController]);
 
   React.useEffect(() => {
-    if (!lastDeletedFaceProfile?.name || !activeReview) return;
-    const deletedLower = lastDeletedFaceProfile.name.trim().toLowerCase();
-    if (
-      (activeReview.data?.sub_labels || []).some(
-        (s) => s.trim().toLowerCase() === deletedLower
-      )
-    ) {
-      const [cleared] = clearFaceProfileFromReviews(
-        [activeReview],
+    if (!lastDeletedFaceProfile?.name) return;
+    setLocalReviewSubLabels((prev) =>
+      reconcileDeletedFaceProfile(
+        { localSubLabels: prev },
         lastDeletedFaceProfile.name
-      );
-      setActiveReview(cleared);
+      ).localSubLabels
+    );
+    if (!activeReview) return;
+    const scrubbed = reconcileDeletedFaceProfile(
+      { activeReview },
+      lastDeletedFaceProfile.name
+    );
+    if (scrubbed.clearedActiveReview && scrubbed.activeReview) {
+      setActiveReview(scrubbed.activeReview);
       setReviewFaceDraft("");
     }
   }, [lastDeletedFaceProfile, activeReview, setActiveReview]);
@@ -324,16 +359,17 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
         isCancelled: () => !isMountedRef.current,
         onItemSuccess: (rid) => {
           setLocalReviewSubLabels((prev) => ({ ...prev, [rid]: null }));
+          onReconcileReviews?.(rid, { subLabel: null });
         },
       });
       if (!isMountedRef.current) return;
-      if (activeReview && targetRevIds.includes(activeReview.id)) {
-        const [updated] = applyReviewSubLabelUpdate(
-          [activeReview],
+      if (!onReconcileReviews && activeReview && targetRevIds.includes(activeReview.id)) {
+        const reconciled = reconcileReviewMutation(
+          { reviews: [], activeReview },
           activeReview.id,
-          null
+          { subLabel: null }
         );
-        setActiveReview(updated);
+        setActiveReview(reconciled.activeReview);
       }
       setSelectedBatchReviewIds([]);
       bumpSubLabelsRefresh();
@@ -363,14 +399,17 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
           ...prev,
           [targetId]: result.cleanName,
         }));
+        onReconcileReviews?.(targetId, { subLabel: result.cleanName });
       }
       if (result.shouldApply) {
-        const [updated] = applyReviewSubLabelUpdate(
-          [targetReview],
-          targetId,
-          result.cleanName
-        );
-        setActiveReview(updated);
+        if (!onReconcileReviews) {
+          const reconciled = reconcileReviewMutation(
+            { reviews: [], activeReview: targetReview },
+            targetId,
+            { subLabel: result.cleanName }
+          );
+          setActiveReview(reconciled.activeReview);
+        }
         bumpSubLabelsRefresh();
       }
     } catch {
@@ -410,13 +449,15 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
             ...prev,
             [rid]: assignedName,
           }));
-          if (activeReview && activeReview.id === rid) {
-            const [updated] = applyReviewSubLabelUpdate(
-              [activeReview],
+          if (onReconcileReviews) {
+            onReconcileReviews(rid, { subLabel: assignedName });
+          } else if (activeReview && activeReview.id === rid) {
+            const reconciled = reconcileReviewMutation(
+              { reviews: [], activeReview },
               rid,
-              assignedName
+              { subLabel: assignedName }
             );
-            setActiveReview(updated);
+            setActiveReview(reconciled.activeReview);
           }
         },
       });
@@ -445,16 +486,20 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
         getActiveTargetId: () => activeReviewIdRef.current,
         isCancelled: () => !isMountedRef.current,
       });
-      if (result.shouldApply) {
+      if (result.ok && isMountedRef.current) {
         const norm = result.normalizedPlate || "";
-        setActiveReview({
-          ...targetReview,
-          data: {
-            ...targetReview.data,
-            recognized_license_plates: norm ? [norm] : [],
-          },
-        });
-        setReviewPlateDraft(norm);
+        onReconcileReviews?.(targetId, { recognizedLicensePlate: norm });
+        if (result.shouldApply) {
+          if (!onReconcileReviews) {
+            const reconciled = reconcileReviewMutation(
+              { reviews: [], activeReview: targetReview },
+              targetId,
+              { recognizedLicensePlate: norm }
+            );
+            setActiveReview(reconciled.activeReview);
+          }
+          setReviewPlateDraft(norm);
+        }
       }
     } catch {
       // Preserve current review state on transient network failure
@@ -475,11 +520,16 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
         getActiveTargetId: () => activeReviewIdRef.current,
         isCancelled: () => !isMountedRef.current,
       });
-      if (result.shouldApply) {
-        setActiveReview({
-          ...targetReview,
-          data: { ...targetReview.data, notes: result.notes },
-        });
+      if (result.ok && isMountedRef.current) {
+        onReconcileReviews?.(targetId, { notes: result.notes });
+        if (result.shouldApply && !onReconcileReviews) {
+          const reconciled = reconcileReviewMutation(
+            { reviews: [], activeReview: targetReview },
+            targetId,
+            { notes: result.notes }
+          );
+          setActiveReview(reconciled.activeReview);
+        }
       }
     } catch {
       // Preserve current review state on transient network failure
@@ -1415,8 +1465,12 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                         win.endSec
                       );
                       if (!checked.valid) return;
-                      void handleQuickExport(
+                      const realReviewCam = resolveRealCameraSource(
                         activeReview.camera,
+                        configuredCameras
+                      );
+                      void handleQuickExport(
+                        realReviewCam,
                         checked.startSec,
                         checked.endSec,
                         `${activeReview.camera}_${activeReview.id}`
@@ -1613,10 +1667,9 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                           className="nvr-btn mono"
                           style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
                           onClick={() =>
-                            setActiveReview({
-                              ...activeReview,
-                              start_time: triggerTs,
-                              end_time: triggerTs + 25,
+                            setReviewPlayhead({
+                              reviewId: activeReview.id,
+                              ts: triggerTs,
                             })
                           }
                         >
@@ -1731,19 +1784,29 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                       />
                     );
                   }
-                  const vodWin = computeReviewPlaybackWindow(
-                    activeReview.start_time,
-                    activeReview.end_time,
-                    4,
-                    6,
-                    20
+                  const currentVodWindow =
+                    loadedVodWindowRef.current?.reviewId === activeReview.id
+                      ? loadedVodWindowRef.current.window
+                      : null;
+                  const reviewPlayback = resolveReviewArchivePlayback(
+                    activeReview,
+                    reviewPlayheadTs,
+                    {
+                      currentWindow: currentVodWindow,
+                      configuredCameras,
+                    }
                   );
+                  loadedVodWindowRef.current = {
+                    reviewId: activeReview.id,
+                    window: reviewPlayback.vodWindow,
+                  };
                   return (
                     <VodHlsPlayer
                       key={activeReview.id}
-                      camera={activeReview.camera}
-                      startTime={vodWin.startSec}
-                      endTime={vodWin.endSec}
+                      camera={reviewPlayback.realCamera}
+                      startTime={reviewPlayback.vodWindow.startSec}
+                      endTime={reviewPlayback.vodWindow.endSec}
+                      playheadTs={reviewPlayheadTs}
                       fallbackPreviewId={activeReview.id}
                       playbackRate={briefingActive ? briefingSpeed : playbackSpeed}
                       onEnded={briefingActive ? handleAdvanceBriefing : undefined}
@@ -1874,19 +1937,19 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                 segments={focusSegments}
                 reviews={reviews}
                 currentTs={
-                  typeof activeReview.start_time === "number" &&
-                  Number.isFinite(activeReview.start_time) &&
-                  activeReview.start_time > 0
+                  reviewPlayheadTs !== null && Number.isFinite(reviewPlayheadTs)
+                    ? Math.floor(reviewPlayheadTs)
+                    : typeof activeReview.start_time === "number" &&
+                      Number.isFinite(activeReview.start_time) &&
+                      activeReview.start_time > 0
                     ? Math.floor(activeReview.start_time)
                     : Math.floor(Date.now() / 1000) - 20
                 }
                 onSeek={(ts) => {
                   if (ts !== null && Number.isFinite(ts)) {
-                    setActiveReview({
-                      ...activeReview,
-                      start_time: ts,
-                      end_time: ts + 30,
-                    });
+                    setReviewPlayhead({ reviewId: activeReview.id, ts });
+                  } else {
+                    setReviewPlayhead(null);
                   }
                 }}
                 onOpenExports={() => useNvrStore.getState().setActiveTab("exports")}
@@ -1895,8 +1958,12 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                   if (!cleanCam) return;
                   const win = validateExportTimeWindow(start, end);
                   if (!win.valid) return;
-                  return handleQuickExport(
+                  const realRangeCam = resolveRealCameraSource(
                     cleanCam,
+                    configuredCameras
+                  );
+                  return handleQuickExport(
+                    realRangeCam,
                     win.startSec,
                     win.endSec,
                     label
