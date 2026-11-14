@@ -243,6 +243,17 @@ impl MseGopCache {
             self.gop_bytes = bytes.len();
             self.gop_fragments.push_back(bytes.clone());
             self.updated_at = Instant::now();
+            if let Some(ref cur_init) = self.init_segment
+                && ninjanvr_vod::fmp4_init_has_placeholder_video_dimensions(cur_init)
+                && let Some((w, h)) = ninjanvr_vod::extract_fmp4_fragment_h264_dimensions(&bytes)
+                && (w, h) != (128, 96)
+                && let Some(patched_vec) =
+                    ninjanvr_vod::patch_fmp4_init_video_dimensions(cur_init, w, h)
+            {
+                let patched = Bytes::from(patched_vec);
+                self.init_segment = Some(patched.clone());
+                return (true, Some(MseLivePacket::Init(patched)));
+            }
             return (true, Some(MseLivePacket::Fragment { seq, bytes }));
         }
         // Delta (P/B or audio) fragment: append if we already have an IDR keyframe anchor in gop_fragments
@@ -1347,5 +1358,86 @@ mod tests {
             .expect("post-cancellation recv_or_resync must deliver the GOP keyframe burst");
         assert!(!burst.gop_fragments.is_empty());
         assert_eq!(burst.last_seq, 302);
+    }
+
+    #[test]
+    fn mse_gop_cache_repairs_go2rtc_placeholder_128x96_init_from_first_keyframe_sps() {
+        let mut cache = MseGopCache::new();
+        assert!(cache.ingest_text(r#"{"type":"mse","value":"video/mp4; codecs=\"avc1.640029\""}"#));
+
+        let ftyp = make_box(b"ftyp", b"isom\x00\x00\x02\x00isomiso6dashmp41");
+        let mvhd = make_full_box(b"mvhd", 0, 0, &[0u8; 96]);
+        let mut tkhd_body = vec![0u8; 80];
+        tkhd_body[8..12].copy_from_slice(&1u32.to_be_bytes());
+        tkhd_body[72..76].copy_from_slice(&(128u32 << 16).to_be_bytes());
+        tkhd_body[76..80].copy_from_slice(&(96u32 << 16).to_be_bytes());
+        let tkhd = make_full_box(b"tkhd", 0, 3, &tkhd_body);
+        let mut hdlr_body = vec![0u8; 20];
+        hdlr_body[4..8].copy_from_slice(b"vide");
+        let hdlr = make_full_box(b"hdlr", 0, 0, &hdlr_body);
+        let mut avcc_body = vec![1u8, 0x42, 0x00, 0x0a, 0xff, 0xe1];
+        avcc_body.extend_from_slice(
+            &(ninjanvr_vod::GO2RTC_PLACEHOLDER_H264_SPS.len() as u16).to_be_bytes(),
+        );
+        avcc_body.extend_from_slice(&ninjanvr_vod::GO2RTC_PLACEHOLDER_H264_SPS);
+        avcc_body.extend_from_slice(&[1, 0, 4, 0x68, 0xce, 0x38, 0x80]);
+        let avcc = make_box(b"avcC", &avcc_body);
+        let mut avc1_body = vec![0u8; 78];
+        avc1_body[6..8].copy_from_slice(&1u16.to_be_bytes());
+        avc1_body[24..26].copy_from_slice(&128u16.to_be_bytes());
+        avc1_body[26..28].copy_from_slice(&96u16.to_be_bytes());
+        avc1_body.extend_from_slice(&avcc);
+        let avc1 = make_box(b"avc1", &avc1_body);
+        let mut stsd_body = Vec::new();
+        stsd_body.extend_from_slice(&1u32.to_be_bytes());
+        stsd_body.extend_from_slice(&avc1);
+        let stsd = make_full_box(b"stsd", 0, 0, &stsd_body);
+        let minf = make_box(b"minf", &make_box(b"stbl", &stsd));
+        let mut mdia_c = Vec::new();
+        mdia_c.extend_from_slice(&hdlr);
+        mdia_c.extend_from_slice(&minf);
+        let mut trak_c = Vec::new();
+        trak_c.extend_from_slice(&tkhd);
+        trak_c.extend_from_slice(&make_box(b"mdia", &mdia_c));
+        let mut moov_c = Vec::new();
+        moov_c.extend_from_slice(&mvhd);
+        moov_c.extend_from_slice(&make_box(b"trak", &trak_c));
+        let mut init_vec = Vec::new();
+        init_vec.extend_from_slice(&ftyp);
+        init_vec.extend_from_slice(&make_box(b"moov", &moov_c));
+        let placeholder_init = Bytes::from(init_vec);
+
+        cache.ingest_binary(placeholder_init);
+        assert!(ninjanvr_vod::fmp4_init_has_placeholder_video_dimensions(
+            cache.init_segment.as_ref().unwrap()
+        ));
+
+        // Ingest 1920x1080 IDR keyframe fragment (Tapo C200 High L4.0 SPS)
+        let tapo_1080p_sps: [u8; 23] = [
+            0x67, 0x64, 0x00, 0x28, 0xac, 0x3b, 0x50, 0x3c, 0x01, 0x13, 0xf2, 0xc2, 0x00, 0x00,
+            0x03, 0x00, 0x02, 0x00, 0x00, 0x03, 0x00, 0x3d, 0x08,
+        ];
+        let mut mdat_payload = Vec::new();
+        mdat_payload.extend_from_slice(&(tapo_1080p_sps.len() as u32).to_be_bytes());
+        mdat_payload.extend_from_slice(&tapo_1080p_sps);
+        mdat_payload.extend_from_slice(&4u32.to_be_bytes());
+        mdat_payload.extend_from_slice(&[0x65, 0x88, 0x84, 0x00]);
+
+        let (is_sync, pkt) = cache.ingest_binary_with_seq(build_test_fragment(true, &mdat_payload));
+        assert!(is_sync);
+        assert!(
+            matches!(pkt, Some(MseLivePacket::Init(_))),
+            "repairing placeholder init segment on first keyframe must broadcast updated Init"
+        );
+        let repaired_init = cache.init_segment.as_ref().unwrap();
+        assert!(!ninjanvr_vod::fmp4_init_has_placeholder_video_dimensions(
+            repaired_init
+        ));
+
+        // Subsequent keyframes use normal Fragment delivery without redundant Init rewrites
+        let (is_sync2, pkt2) =
+            cache.ingest_binary_with_seq(build_test_fragment(true, &mdat_payload));
+        assert!(is_sync2);
+        assert!(matches!(pkt2, Some(MseLivePacket::Fragment { .. })));
     }
 }

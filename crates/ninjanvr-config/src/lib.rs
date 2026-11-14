@@ -2440,6 +2440,57 @@ impl NinjaConfig {
         false
     }
 
+    /// Builds the `tapo://<encoded_cloud_password>@<host>` backchannel URL when `camera` has a
+    /// non-masked `hardware.cloud_password` and an upstream Tapo RTSP endpoint.
+    pub fn tapo_talk_stream_url(&self, camera: &str) -> Option<String> {
+        let cam_trimmed = camera.trim();
+        if cam_trimmed.is_empty() {
+            return None;
+        }
+        let cam_cfg = self.cameras.get(cam_trimmed)?;
+        let cloud_pw = cam_cfg
+            .hardware
+            .cloud_password
+            .as_deref()
+            .filter(|p| !p.is_empty() && p.trim() != "***" && p.trim() != "*")?;
+        let upstream = self.infer_camera_upstream(cam_trimmed)?;
+        if !upstream.is_tapo_rtsp {
+            return None;
+        }
+        let encoded_pw = percent_encode_userinfo_component(cloud_pw);
+        Some(format!("tapo://{encoded_pw}@{}", upstream.host))
+    }
+
+    /// Returns `true` when `camera` has a dedicated `{camera}_talk` two-way audio backchannel
+    /// stream in `go2rtc` (either explicitly configured, synthesized from `cloud_password`, or
+    /// split out from a mixed `[rtsp://..., tapo://...]` producer array).
+    pub fn has_dedicated_talk_stream(&self, camera: &str) -> bool {
+        let cam_trimmed = camera.trim();
+        if cam_trimmed.is_empty() || cam_trimmed.ends_with("_talk") {
+            return false;
+        }
+        let talk_key = format!("{cam_trimmed}_talk");
+        if self.go2rtc.streams.contains_key(&talk_key) {
+            return true;
+        }
+        if self.tapo_talk_stream_url(cam_trimmed).is_some() {
+            return true;
+        }
+        matches!(
+            self.go2rtc.streams.get(cam_trimmed),
+            Some(Value::Array(arr))
+                if arr.iter().any(|v| {
+                    v.as_str()
+                        .is_some_and(|s| s.trim().to_ascii_lowercase().starts_with("tapo://"))
+                }) && arr.iter().any(|v| {
+                    v.as_str().is_some_and(|s| {
+                        let lc = s.trim().to_ascii_lowercase();
+                        !lc.is_empty() && !lc.starts_with("tapo://")
+                    })
+                })
+        )
+    }
+
     /// Writes `/dev/shm/go2rtc.yaml` compatible with go2rtc.
     pub fn write_go2rtc_config(&self, target_path: impl AsRef<Path>) -> Result<()> {
         let target_path = target_path.as_ref();
@@ -2496,44 +2547,56 @@ impl NinjaConfig {
                 streams_map.entry(sk.clone()).or_insert_with(|| sv.clone());
             }
         }
-        for (cam_name, cam_cfg) in &self.cameras {
-            let Some(cloud_pw) = cam_cfg
-                .hardware
-                .cloud_password
-                .as_deref()
-                .filter(|p| !p.is_empty() && p.trim() != "***" && p.trim() != "*")
-            else {
-                continue;
-            };
-            let Some(upstream) = self.infer_camera_upstream(cam_name) else {
-                continue;
-            };
-            if !upstream.is_tapo_rtsp {
+        // Isolate any mixed `[rtsp://..., tapo://...]` producer arrays into a dedicated `{stream}_talk`
+        // backchannel stream so go2rtc never fails over live MSE video onto `tapo://` (which lacks SDP
+        // `sprop-parameter-sets`, injects a 128x96 4:3 placeholder `tkhd`, and duplicates 1080p streams).
+        let existing_keys: Vec<String> = streams_map.keys().cloned().collect();
+        for key in existing_keys {
+            if key.ends_with("_talk") {
                 continue;
             }
-            let encoded_pw = percent_encode_userinfo_component(cloud_pw);
-            let tapo_url = format!("tapo://{encoded_pw}@{}", upstream.host);
-            if let Some(stream_val) = streams_map.get_mut(cam_name) {
-                match stream_val {
-                    Value::String(s) => {
-                        if !s.trim().starts_with("tapo://") {
-                            let prev = s.clone();
-                            *stream_val =
-                                Value::Array(vec![Value::String(prev), Value::String(tapo_url)]);
+            let extracted_tapo = if let Some(Value::Array(arr)) = streams_map.get_mut(&key) {
+                let has_non_tapo = arr.iter().any(|v| {
+                    v.as_str().is_some_and(|s| {
+                        let lc = s.trim().to_ascii_lowercase();
+                        !lc.is_empty() && !lc.starts_with("tapo://")
+                    })
+                });
+                if has_non_tapo {
+                    let mut tapo_items = Vec::new();
+                    arr.retain(|v| {
+                        let is_tapo = v
+                            .as_str()
+                            .is_some_and(|s| s.trim().to_ascii_lowercase().starts_with("tapo://"));
+                        if is_tapo {
+                            tapo_items.push(v.clone());
+                            false
+                        } else {
+                            true
                         }
-                    }
-                    Value::Array(arr) => {
-                        let already_has_tapo = arr.iter().any(|item| {
-                            item.as_str().is_some_and(|s| {
-                                s.trim().to_ascii_lowercase().starts_with("tapo://")
-                            })
-                        });
-                        if !already_has_tapo {
-                            arr.push(Value::String(tapo_url));
-                        }
-                    }
-                    _ => {}
+                    });
+                    (!tapo_items.is_empty()).then_some(tapo_items)
+                } else {
+                    None
                 }
+            } else {
+                None
+            };
+            if let Some(tapo_items) = extracted_tapo {
+                streams_map
+                    .entry(format!("{key}_talk"))
+                    .or_insert_with(|| Value::Array(tapo_items));
+            }
+        }
+
+        for cam_name in self.cameras.keys() {
+            let Some(tapo_url) = self.tapo_talk_stream_url(cam_name) else {
+                continue;
+            };
+            if streams_map.contains_key(cam_name) {
+                streams_map
+                    .entry(format!("{cam_name}_talk"))
+                    .or_insert_with(|| Value::Array(vec![Value::String(tapo_url)]));
             }
         }
 
@@ -5328,14 +5391,10 @@ fn has_forbidden_tls_path_components_or_prefix(path: &Path) -> bool {
             return true;
         }
     }
-    if (lc == "/etc" || lc.starts_with("/etc/") || path.starts_with("/etc"))
+    (lc == "/etc" || lc.starts_with("/etc/") || path.starts_with("/etc"))
         && !lc.starts_with("/etc/ssl/")
         && !lc.starts_with("/etc/pki/")
         && !lc.starts_with("/etc/ca-certificates/")
-    {
-        return true;
-    }
-    false
 }
 
 fn validate_existing_or_ancestor_canonical_path(
@@ -10818,16 +10877,50 @@ cameras:
         api["cameras"]["quarto"]["hardware"]["cloud_password"] = json!("tapo_cloud_secret!@#");
         cfg.apply_structured_json(&api).unwrap();
 
-        // 4. write_go2rtc_config automatically appends tapo:// producer with percent-encoded cloud_password
+        // 4. write_go2rtc_config isolates tapo:// producer into dedicated `<camera>_talk` backchannel stream
+        //    so main `streams.<camera>` stays pure RTSP and never fails over MSE video to tapo:// (128x96 4:3 tkhd)
+        assert!(cfg.has_dedicated_talk_stream("quarto"));
         let g2_out = tmp_dir.join("go2rtc.yaml");
         cfg.write_go2rtc_config(&g2_out).unwrap();
         let g2_yaml: Value =
             serde_yaml::from_str(&std::fs::read_to_string(&g2_out).unwrap()).unwrap();
         let quarto_producers = g2_yaml["streams"]["quarto"].as_array().unwrap();
-        assert_eq!(quarto_producers.len(), 2);
+        assert_eq!(quarto_producers.len(), 1);
+        assert!(quarto_producers[0].as_str().unwrap().starts_with("rtsp://"));
+        let quarto_talk_producers = g2_yaml["streams"]["quarto_talk"].as_array().unwrap();
+        assert_eq!(quarto_talk_producers.len(), 1);
         assert_eq!(
-            quarto_producers[1].as_str(),
+            quarto_talk_producers[0].as_str(),
             Some("tapo://tapo_cloud_secret%21%40%23@192.0.2.65")
+        );
+
+        // Legacy mixed `[rtsp://..., tapo://...]` arrays also split `tapo://` out into `<camera>_talk`
+        let mut legacy_mixed = cfg.clone();
+        legacy_mixed
+            .cameras
+            .get_mut("quarto")
+            .unwrap()
+            .hardware
+            .cloud_password = None;
+        legacy_mixed.go2rtc.streams.insert(
+            "quarto".to_string(),
+            json!([
+                "rtsp://admin:pass@192.0.2.65:554/stream1",
+                "tapo://legacy_pw@192.0.2.65"
+            ]),
+        );
+        assert!(legacy_mixed.has_dedicated_talk_stream("quarto"));
+        let g2_mixed_out = tmp_dir.join("go2rtc_mixed.yaml");
+        legacy_mixed.write_go2rtc_config(&g2_mixed_out).unwrap();
+        let g2_mixed_yaml: Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&g2_mixed_out).unwrap()).unwrap();
+        assert_eq!(
+            g2_mixed_yaml["streams"]["quarto"].as_array().unwrap(),
+            &vec![json!("rtsp://admin:pass@192.0.2.65:554/stream1")]
+        );
+        assert_eq!(
+            g2_mixed_yaml["streams"]["quarto_talk"].as_array().unwrap(),
+            &vec![json!("tapo://legacy_pw@192.0.2.65")]
         );
 
         // Clear cloud_password via onvif.clear_cloud_password

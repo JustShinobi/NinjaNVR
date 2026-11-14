@@ -321,7 +321,7 @@ describe("WebRTC Push-to-Talk (AU-05) session helpers and deterministic mic rele
       )
     ).toEqual({ supported: false, mode: null });
 
-    // Tapo camera with cloud_password or tapo:// stream resolves to supported: true (webrtc)
+    // Tapo camera with cloud_password or tapo:// stream (inline or isolated `<camera>_talk`) resolves to supported: true (webrtc)
     expect(
       resolveCameraPushToTalkCapability(
         undefined,
@@ -331,6 +331,17 @@ describe("WebRTC Push-to-Talk (AU-05) session helpers and deterministic mic rele
             "rtsp://user:pw@192.0.2.65:554/stream1",
             "tapo://secret@192.0.2.65",
           ],
+        },
+        "quarto"
+      )
+    ).toEqual({ supported: true, mode: "webrtc" });
+    expect(
+      resolveCameraPushToTalkCapability(
+        undefined,
+        null,
+        {
+          quarto: ["rtsp://user:pw@192.0.2.65:554/stream1"],
+          quarto_talk: ["tapo://secret@192.0.2.65"],
         },
         "quarto"
       )

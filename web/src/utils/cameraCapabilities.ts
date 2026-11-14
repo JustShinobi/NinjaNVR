@@ -296,16 +296,20 @@ export function resolveCameraPushToTalkCapability(
       ) || lc.includes("#backchannel=1")
     );
   };
-  if (camName && go2rtcStreams && go2rtcStreams[camName] !== undefined) {
-    const entry = go2rtcStreams[camName];
-    if (typeof entry === "string" && hasTwoWayProducer(entry)) {
-      return { supported: true, mode: "webrtc" };
-    }
-    if (
-      Array.isArray(entry) &&
-      entry.some((item) => typeof item === "string" && hasTwoWayProducer(item))
-    ) {
-      return { supported: true, mode: "webrtc" };
+  if (camName && go2rtcStreams) {
+    for (const key of [camName, `${camName}_talk`]) {
+      const entry = go2rtcStreams[key];
+      if (typeof entry === "string" && hasTwoWayProducer(entry)) {
+        return { supported: true, mode: "webrtc" };
+      }
+      if (
+        Array.isArray(entry) &&
+        entry.some(
+          (item) => typeof item === "string" && hasTwoWayProducer(item)
+        )
+      ) {
+        return { supported: true, mode: "webrtc" };
+      }
     }
   }
   if (hwInfo && hwInfo.capabilities) {

@@ -886,7 +886,11 @@ pub fn validate_go2rtc_query_streams(
             if !is_safe_go2rtc_stream_name(&v) {
                 return Err("Invalid stream identifier");
             }
-            let base_cam = v.strip_suffix("_sub").unwrap_or(&v).trim();
+            let base_cam = v
+                .strip_suffix("_sub")
+                .or_else(|| v.strip_suffix("_talk"))
+                .unwrap_or(&v)
+                .trim();
             if base_cam.is_empty() {
                 return Err("Invalid stream identifier");
             }

@@ -1186,6 +1186,475 @@ pub fn is_fmp4_sync_fragment(buf: &[u8]) -> bool {
     false
 }
 
+/// Hardcoded dummy H.264 Baseline `128x96` SPS emitted by `go2rtc`'s `mp4.Muxer` when an upstream
+/// producer (such as `tapo://` HTTP `Streamd` or raw MPEG-TS) starts without SDP `sprop-parameter-sets`.
+pub const GO2RTC_PLACEHOLDER_H264_SPS: [u8; 7] = [0x67, 0x42, 0x00, 0x0a, 0xf8, 0x41, 0xa2];
+
+struct RbspBitReader<'a> {
+    data: &'a [u8],
+    bit_pos: usize,
+}
+
+impl<'a> RbspBitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit_pos: 0 }
+    }
+
+    fn read_bit(&mut self) -> Option<u32> {
+        let byte_idx = self.bit_pos / 8;
+        if byte_idx >= self.data.len() {
+            return None;
+        }
+        let shift = 7 - (self.bit_pos % 8);
+        self.bit_pos += 1;
+        Some(u32::from((self.data[byte_idx] >> shift) & 1))
+    }
+
+    fn read_bits(&mut self, count: usize) -> Option<u32> {
+        if count > 32 {
+            return None;
+        }
+        let mut val = 0u32;
+        for _ in 0..count {
+            val = (val << 1) | self.read_bit()?;
+        }
+        Some(val)
+    }
+
+    fn read_ue(&mut self) -> Option<u32> {
+        let mut leading_zeros = 0usize;
+        while self.read_bit()? == 0 {
+            leading_zeros += 1;
+            if leading_zeros > 31 {
+                return None;
+            }
+        }
+        if leading_zeros == 0 {
+            return Some(0);
+        }
+        let suffix = self.read_bits(leading_zeros)?;
+        ((1u32 << leading_zeros) - 1).checked_add(suffix)
+    }
+
+    fn read_se(&mut self) -> Option<i32> {
+        let code_num = self.read_ue()?;
+        let mag = i32::try_from(code_num.div_ceil(2)).ok()?;
+        if (code_num & 1) == 1 {
+            Some(mag)
+        } else {
+            Some(-mag)
+        }
+    }
+}
+
+fn strip_h264_emulation_prevention(nal_body: &[u8], max_bytes: usize) -> Vec<u8> {
+    let cap = nal_body.len().min(max_bytes);
+    let mut rbsp = Vec::with_capacity(cap);
+    let mut i = 0usize;
+    while i < cap {
+        if i + 2 < cap && nal_body[i] == 0x00 && nal_body[i + 1] == 0x00 && nal_body[i + 2] == 0x03
+        {
+            rbsp.push(0x00);
+            rbsp.push(0x00);
+            i += 3;
+        } else {
+            rbsp.push(nal_body[i]);
+            i += 1;
+        }
+    }
+    rbsp
+}
+
+fn skip_h264_scaling_list(br: &mut RbspBitReader<'_>, size: usize) -> Option<()> {
+    let mut last_scale = 8i32;
+    let mut next_scale = 8i32;
+    for _ in 0..size {
+        if next_scale != 0 {
+            let delta = br.read_se()?;
+            next_scale = (last_scale.wrapping_add(delta).wrapping_add(256)).rem_euclid(256);
+        }
+        last_scale = if next_scale == 0 {
+            last_scale
+        } else {
+            next_scale
+        };
+    }
+    Some(())
+}
+
+/// Decodes the cropped display `(width, height)` from a raw H.264 SPS NAL unit (`nal_unit_type == 7`,
+/// without Annex-B start code or AVCC length prefix) per ITU-T H.264 §7.3.2.1.1.
+pub fn parse_h264_sps_dimensions(sps_nal: &[u8]) -> Option<(u32, u32)> {
+    if sps_nal.len() < 4 || (sps_nal[0] & 0x1F) != 7 {
+        return None;
+    }
+    let rbsp = strip_h264_emulation_prevention(&sps_nal[1..], 1024);
+    let mut br = RbspBitReader::new(&rbsp);
+
+    let profile_idc = br.read_bits(8)?;
+    let _constraint_flags = br.read_bits(8)?;
+    let _level_idc = br.read_bits(8)?;
+    let _sps_id = br.read_ue()?;
+
+    let mut chroma_format_idc = 1u32;
+    let mut separate_colour_plane = false;
+    if matches!(
+        profile_idc,
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+    ) {
+        chroma_format_idc = br.read_ue()?;
+        if chroma_format_idc > 3 {
+            return None;
+        }
+        if chroma_format_idc == 3 {
+            separate_colour_plane = br.read_bit()? == 1;
+        }
+        let _bit_depth_luma_minus8 = br.read_ue()?;
+        let _bit_depth_chroma_minus8 = br.read_ue()?;
+        let _qpprime_y_zero_transform_bypass = br.read_bit()?;
+        let seq_scaling_matrix_present = br.read_bit()? == 1;
+        if seq_scaling_matrix_present {
+            let list_count = if chroma_format_idc != 3 {
+                8usize
+            } else {
+                12usize
+            };
+            for idx in 0..list_count {
+                if br.read_bit()? == 1 {
+                    skip_h264_scaling_list(&mut br, if idx < 6 { 16 } else { 64 })?;
+                }
+            }
+        }
+    }
+
+    let _log2_max_frame_num_minus4 = br.read_ue()?;
+    let pic_order_cnt_type = br.read_ue()?;
+    if pic_order_cnt_type == 0 {
+        let _log2_max_pic_order_cnt_lsb_minus4 = br.read_ue()?;
+    } else if pic_order_cnt_type == 1 {
+        let _delta_pic_order_always_zero = br.read_bit()?;
+        let _offset_for_non_ref_pic = br.read_se()?;
+        let _offset_for_top_to_bottom_field = br.read_se()?;
+        let num_ref_frames_in_cycle = br.read_ue()?;
+        if num_ref_frames_in_cycle > 255 {
+            return None;
+        }
+        for _ in 0..num_ref_frames_in_cycle {
+            let _ = br.read_se()?;
+        }
+    } else if pic_order_cnt_type > 2 {
+        return None;
+    }
+
+    let _max_num_ref_frames = br.read_ue()?;
+    let _gaps_in_frame_num_allowed = br.read_bit()?;
+    let pic_width_in_mbs_minus1 = br.read_ue()?;
+    let pic_height_in_map_units_minus1 = br.read_ue()?;
+    let frame_mbs_only_flag = br.read_bit()?;
+    if frame_mbs_only_flag == 0 {
+        let _mb_adaptive_frame_field = br.read_bit()?;
+    }
+    let _direct_8x8_inference = br.read_bit()?;
+
+    let mut crop_left = 0u32;
+    let mut crop_right = 0u32;
+    let mut crop_top = 0u32;
+    let mut crop_bottom = 0u32;
+    if br.read_bit()? == 1 {
+        crop_left = br.read_ue()?;
+        crop_right = br.read_ue()?;
+        crop_top = br.read_ue()?;
+        crop_bottom = br.read_ue()?;
+    }
+
+    let chroma_array_type = if separate_colour_plane {
+        0
+    } else {
+        chroma_format_idc
+    };
+    let frame_mbs_factor = 2u32.checked_sub(frame_mbs_only_flag)?;
+    let (crop_unit_x, crop_unit_y) = match chroma_array_type {
+        0 => (1u32, frame_mbs_factor),
+        1 => (2u32, 2u32.checked_mul(frame_mbs_factor)?),
+        2 => (2u32, frame_mbs_factor),
+        3 => (1u32, frame_mbs_factor),
+        _ => return None,
+    };
+
+    let raw_width = pic_width_in_mbs_minus1.checked_add(1)?.checked_mul(16)?;
+    let raw_height = pic_height_in_map_units_minus1
+        .checked_add(1)?
+        .checked_mul(16)?
+        .checked_mul(frame_mbs_factor)?;
+    let width = raw_width.checked_sub(
+        crop_left
+            .checked_add(crop_right)?
+            .checked_mul(crop_unit_x)?,
+    )?;
+    let height = raw_height.checked_sub(
+        crop_top
+            .checked_add(crop_bottom)?
+            .checked_mul(crop_unit_y)?,
+    )?;
+
+    if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
+        return None;
+    }
+    Some((width, height))
+}
+
+/// Scans an ISO-BMFF fMP4 media fragment (`moof` + `mdat`) containing 4-byte length-prefixed AVCC
+/// NAL units and returns the `(width, height)` from the first in-band H.264 SPS (`nal_unit_type == 7`).
+pub fn extract_fmp4_fragment_h264_dimensions(fragment: &[u8]) -> Option<(u32, u32)> {
+    let top_boxes = iter_boxes(fragment);
+    let mdat = find_box(&top_boxes, b"mdat")?;
+    let mut pos = 0usize;
+    let mut nals_seen = 0usize;
+    while pos.checked_add(5).is_some_and(|end| end <= mdat.len()) && nals_seen < 64 {
+        nals_seen += 1;
+        let nal_len =
+            u32::from_be_bytes([mdat[pos], mdat[pos + 1], mdat[pos + 2], mdat[pos + 3]]) as usize;
+        pos += 4;
+        let Some(nal_end) = pos.checked_add(nal_len) else {
+            break;
+        };
+        if nal_len == 0 || nal_end > mdat.len() {
+            break;
+        }
+        let nal = &mdat[pos..nal_end];
+        if (nal[0] & 0x1F) == 7
+            && let Some(dims) = parse_h264_sps_dimensions(nal)
+        {
+            return Some(dims);
+        }
+        pos = nal_end;
+    }
+    None
+}
+
+/// Returns `true` if `init` is an ISO-BMFF fMP4 initialization segment whose `moov` carries
+/// `go2rtc`'s hardcoded `128x96` placeholder H.264 SPS (`GO2RTC_PLACEHOLDER_H264_SPS`) and still
+/// has `128x96` in its `vide` `tkhd` track header.
+pub fn fmp4_init_has_placeholder_video_dimensions(init: &[u8]) -> bool {
+    let top_boxes = iter_boxes(init);
+    let Some(moov) = find_box(&top_boxes, b"moov") else {
+        return false;
+    };
+    if !moov
+        .windows(GO2RTC_PLACEHOLDER_H264_SPS.len())
+        .any(|w| w == GO2RTC_PLACEHOLDER_H264_SPS)
+    {
+        return false;
+    }
+    for b in iter_boxes(moov) {
+        if &b.box_type != b"trak" {
+            continue;
+        }
+        let trak_boxes = iter_boxes(b.payload);
+        let Some(tkhd) = find_box(&trak_boxes, b"tkhd") else {
+            continue;
+        };
+        let Some(mdia) = find_box(&trak_boxes, b"mdia") else {
+            continue;
+        };
+        let mdia_boxes = iter_boxes(mdia);
+        let Some(hdlr) = find_box(&mdia_boxes, b"hdlr") else {
+            continue;
+        };
+        let min_tkhd_len = match tkhd.first().copied() {
+            Some(0) => 84usize,
+            Some(1) => 96usize,
+            _ => continue,
+        };
+        if hdlr.len() >= 12 && &hdlr[8..12] == b"vide" && tkhd.len() >= min_tkhd_len {
+            let w = u32::from_be_bytes([
+                tkhd[min_tkhd_len - 8],
+                tkhd[min_tkhd_len - 7],
+                tkhd[min_tkhd_len - 6],
+                tkhd[min_tkhd_len - 5],
+            ]) >> 16;
+            let h = u32::from_be_bytes([
+                tkhd[min_tkhd_len - 4],
+                tkhd[min_tkhd_len - 3],
+                tkhd[min_tkhd_len - 2],
+                tkhd[min_tkhd_len - 1],
+            ]) >> 16;
+            if (w, h) == (128, 96) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn next_box_range(buf: &[u8], pos: usize) -> Option<([u8; 4], usize, usize, usize)> {
+    if pos.checked_add(8)? > buf.len() {
+        return None;
+    }
+    let size32 = u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
+    let btype = [buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]];
+    let (box_size, hdr_len) = if size32 == 1 {
+        if pos.checked_add(16)? > buf.len() {
+            return None;
+        }
+        let mut ext = [0u8; 8];
+        ext.copy_from_slice(&buf[pos + 8..pos + 16]);
+        let size64 = usize::try_from(u64::from_be_bytes(ext)).ok()?;
+        (size64, 16usize)
+    } else if size32 == 0 {
+        (buf.len() - pos, 8usize)
+    } else {
+        (size32, 8usize)
+    };
+    let end = pos.checked_add(box_size)?;
+    if box_size < hdr_len || end > buf.len() {
+        return None;
+    }
+    Some((btype, pos + hdr_len, end, end))
+}
+
+fn patch_stsd_visual_sample_entries(stsd_payload: &mut [u8], w16: [u8; 2], h16: [u8; 2]) -> bool {
+    if stsd_payload.len() < 8 {
+        return false;
+    }
+    let mut changed = false;
+    let entries_buf = &mut stsd_payload[8..];
+    let mut pos = 0usize;
+    let mut seen = 0usize;
+    while let Some((btype, p_start, p_end, next_pos)) = next_box_range(entries_buf, pos) {
+        seen += 1;
+        if seen > MAX_BOXES_PER_LEVEL {
+            break;
+        }
+        if matches!(&btype, b"avc1" | b"avc3" | b"hev1" | b"hvc1") {
+            let entry = &mut entries_buf[p_start..p_end];
+            if entry.len() >= 28 && (entry[24..26] != w16 || entry[26..28] != h16) {
+                entry[24..26].copy_from_slice(&w16);
+                entry[26..28].copy_from_slice(&h16);
+                changed = true;
+            }
+        }
+        pos = next_pos;
+    }
+    changed
+}
+
+/// Rewrites `vide` `tkhd` (16.16 fixed-point) and `avc1` (`u16`) dimensions in-place inside an
+/// ISO-BMFF fMP4 initialization segment without altering box byte lengths.
+/// Returns `Some(patched_bytes)` when at least one video dimension field was updated.
+pub fn patch_fmp4_init_video_dimensions(init: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
+        return None;
+    }
+    let w_fixed = (width << 16).to_be_bytes();
+    let h_fixed = (height << 16).to_be_bytes();
+    let w16 = u16::try_from(width).ok()?.to_be_bytes();
+    let h16 = u16::try_from(height).ok()?.to_be_bytes();
+
+    let mut out = init.to_vec();
+    let mut changed = false;
+    let mut top_pos = 0usize;
+    let mut top_seen = 0usize;
+    while let Some((top_type, moov_start, moov_end, next_top)) = next_box_range(&out, top_pos) {
+        top_seen += 1;
+        if top_seen > MAX_BOXES_PER_LEVEL {
+            break;
+        }
+        if &top_type == b"moov" {
+            let moov_slice = &mut out[moov_start..moov_end];
+            let mut m_pos = 0usize;
+            let mut m_seen = 0usize;
+            while let Some((m_type, trak_start, trak_end, next_m)) =
+                next_box_range(moov_slice, m_pos)
+            {
+                m_seen += 1;
+                if m_seen > MAX_BOXES_PER_LEVEL {
+                    break;
+                }
+                if &m_type == b"trak" {
+                    let is_video_trak = {
+                        let trak_boxes = iter_boxes(&moov_slice[trak_start..trak_end]);
+                        find_box(&trak_boxes, b"mdia").is_some_and(|mdia| {
+                            let mb = iter_boxes(mdia);
+                            find_box(&mb, b"hdlr")
+                                .is_some_and(|hdlr| hdlr.len() >= 12 && &hdlr[8..12] == b"vide")
+                        })
+                    };
+                    if is_video_trak {
+                        let trak_slice = &mut moov_slice[trak_start..trak_end];
+                        let mut t_pos = 0usize;
+                        let mut t_seen = 0usize;
+                        while let Some((t_type, t_start, t_end, next_t)) =
+                            next_box_range(trak_slice, t_pos)
+                        {
+                            t_seen += 1;
+                            if t_seen > MAX_BOXES_PER_LEVEL {
+                                break;
+                            }
+                            if &t_type == b"tkhd" {
+                                let tkhd = &mut trak_slice[t_start..t_end];
+                                let min_len = match tkhd.first().copied() {
+                                    Some(0) => Some(84usize),
+                                    Some(1) => Some(96usize),
+                                    _ => None,
+                                };
+                                if let Some(ml) = min_len
+                                    && tkhd.len() >= ml
+                                    && (tkhd[ml - 8..ml - 4] != w_fixed
+                                        || tkhd[ml - 4..ml] != h_fixed)
+                                {
+                                    tkhd[ml - 8..ml - 4].copy_from_slice(&w_fixed);
+                                    tkhd[ml - 4..ml].copy_from_slice(&h_fixed);
+                                    changed = true;
+                                }
+                            } else if &t_type == b"mdia" {
+                                let mdia = &mut trak_slice[t_start..t_end];
+                                let mut d_pos = 0usize;
+                                while let Some((d_type, d_start, d_end, next_d)) =
+                                    next_box_range(mdia, d_pos)
+                                {
+                                    if &d_type == b"minf" {
+                                        let minf = &mut mdia[d_start..d_end];
+                                        let mut i_pos = 0usize;
+                                        while let Some((i_type, i_start, i_end, next_i)) =
+                                            next_box_range(minf, i_pos)
+                                        {
+                                            if &i_type == b"stbl" {
+                                                let stbl = &mut minf[i_start..i_end];
+                                                let mut s_pos = 0usize;
+                                                while let Some((s_type, s_start, s_end, next_s)) =
+                                                    next_box_range(stbl, s_pos)
+                                                {
+                                                    if &s_type == b"stsd"
+                                                        && patch_stsd_visual_sample_entries(
+                                                            &mut stbl[s_start..s_end],
+                                                            w16,
+                                                            h16,
+                                                        )
+                                                    {
+                                                        changed = true;
+                                                    }
+                                                    s_pos = next_s;
+                                                }
+                                            }
+                                            i_pos = next_i;
+                                        }
+                                    }
+                                    d_pos = next_d;
+                                }
+                            }
+                            t_pos = next_t;
+                        }
+                    }
+                }
+                m_pos = next_m;
+            }
+        }
+        top_pos = next_top;
+    }
+    changed.then_some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2267,5 +2736,110 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&tmp_soun_first);
+    }
+
+    #[test]
+    fn go2rtc_placeholder_sps_dimensions_and_fmp4_init_patch_roundtrip() {
+        assert_eq!(
+            parse_h264_sps_dimensions(&GO2RTC_PLACEHOLDER_H264_SPS),
+            Some((128, 96))
+        );
+
+        // Tapo C200 High L4.0 1920x1080 (with frame_crop_bottom_offset = 4 -> 1088 - 8 = 1080)
+        let tapo_1080p_sps: [u8; 23] = [
+            0x67, 0x64, 0x00, 0x28, 0xac, 0x3b, 0x50, 0x3c, 0x01, 0x13, 0xf2, 0xc2, 0x00, 0x00,
+            0x03, 0x00, 0x02, 0x00, 0x00, 0x03, 0x00, 0x3d, 0x08,
+        ];
+        assert_eq!(
+            parse_h264_sps_dimensions(&tapo_1080p_sps),
+            Some((1920, 1080))
+        );
+
+        // Tapo C200 High L3.1 1280x720
+        let tapo_720p_sps: [u8; 22] = [
+            0x67, 0x64, 0x00, 0x1f, 0xac, 0x3b, 0x50, 0x28, 0x02, 0xdd, 0x08, 0x00, 0x00, 0x03,
+            0x00, 0x08, 0x00, 0x00, 0x03, 0x01, 0x94, 0x20,
+        ];
+        assert_eq!(parse_h264_sps_dimensions(&tapo_720p_sps), Some((1280, 720)));
+
+        // Build AVCC sync fragment (moof + mdat) containing SPS + PPS + IDR slice
+        let mut mdat_payload = Vec::new();
+        mdat_payload.extend_from_slice(&(tapo_1080p_sps.len() as u32).to_be_bytes());
+        mdat_payload.extend_from_slice(&tapo_1080p_sps);
+        let pps = [0x68u8, 0xee, 0x3c, 0xe1];
+        mdat_payload.extend_from_slice(&(pps.len() as u32).to_be_bytes());
+        mdat_payload.extend_from_slice(&pps);
+        let idr = [0x65u8, 0x88, 0x84, 0x00];
+        mdat_payload.extend_from_slice(&(idr.len() as u32).to_be_bytes());
+        mdat_payload.extend_from_slice(&idr);
+        let mut fragment = make_box(b"moof", &[0u8; 8]);
+        fragment.extend_from_slice(&make_box(b"mdat", &mdat_payload));
+        assert_eq!(
+            extract_fmp4_fragment_h264_dimensions(&fragment),
+            Some((1920, 1080))
+        );
+
+        // Build fMP4 init segment with go2rtc's 128x96 placeholder SPS in avcC + 128x96 tkhd/avc1
+        let ftyp = make_box(b"ftyp", b"isom\x00\x00\x02\x00isomiso6");
+        let mvhd = make_full_box(b"mvhd", 0, 0, &[0u8; 96]);
+        let mut tkhd_body = vec![0u8; 80];
+        tkhd_body[8..12].copy_from_slice(&1u32.to_be_bytes());
+        tkhd_body[72..76].copy_from_slice(&(128u32 << 16).to_be_bytes());
+        tkhd_body[76..80].copy_from_slice(&(96u32 << 16).to_be_bytes());
+        let tkhd = make_full_box(b"tkhd", 0, 3, &tkhd_body);
+
+        let mut hdlr_body = vec![0u8; 20];
+        hdlr_body[4..8].copy_from_slice(b"vide");
+        let hdlr = make_full_box(b"hdlr", 0, 0, &hdlr_body);
+
+        let mut avcc_body = vec![1u8, 0x42, 0x00, 0x0a, 0xff, 0xe1];
+        avcc_body.extend_from_slice(&(GO2RTC_PLACEHOLDER_H264_SPS.len() as u16).to_be_bytes());
+        avcc_body.extend_from_slice(&GO2RTC_PLACEHOLDER_H264_SPS);
+        avcc_body.push(1);
+        avcc_body.extend_from_slice(&4u16.to_be_bytes());
+        avcc_body.extend_from_slice(&[0x68, 0xce, 0x38, 0x80]);
+        let avcc = make_box(b"avcC", &avcc_body);
+
+        let mut avc1_body = vec![0u8; 78];
+        avc1_body[6..8].copy_from_slice(&1u16.to_be_bytes());
+        avc1_body[24..26].copy_from_slice(&128u16.to_be_bytes());
+        avc1_body[26..28].copy_from_slice(&96u16.to_be_bytes());
+        avc1_body.extend_from_slice(&avcc);
+        let avc1 = make_box(b"avc1", &avc1_body);
+
+        let mut stsd_body = Vec::new();
+        stsd_body.extend_from_slice(&1u32.to_be_bytes());
+        stsd_body.extend_from_slice(&avc1);
+        let stsd = make_full_box(b"stsd", 0, 0, &stsd_body);
+        let stbl = make_box(b"stbl", &stsd);
+        let minf = make_box(b"minf", &stbl);
+        let mut mdia_c = Vec::new();
+        mdia_c.extend_from_slice(&hdlr);
+        mdia_c.extend_from_slice(&minf);
+        let mdia = make_box(b"mdia", &mdia_c);
+        let mut trak_c = Vec::new();
+        trak_c.extend_from_slice(&tkhd);
+        trak_c.extend_from_slice(&mdia);
+        let trak = make_box(b"trak", &trak_c);
+        let mut moov_c = Vec::new();
+        moov_c.extend_from_slice(&mvhd);
+        moov_c.extend_from_slice(&trak);
+        let moov = make_box(b"moov", &moov_c);
+
+        let mut init_seg = Vec::new();
+        init_seg.extend_from_slice(&ftyp);
+        init_seg.extend_from_slice(&moov);
+
+        assert!(fmp4_init_has_placeholder_video_dimensions(&init_seg));
+        let patched = patch_fmp4_init_video_dimensions(&init_seg, 1920, 1080)
+            .expect("placeholder 128x96 dimensions should be patched");
+        assert_eq!(patched.len(), init_seg.len());
+        assert!(!fmp4_init_has_placeholder_video_dimensions(&patched));
+        assert_eq!(patch_fmp4_init_video_dimensions(&patched, 1920, 1080), None);
+
+        let probe_tmp = std::env::temp_dir().join("ninjanvr-vod-patched-init-probe.mp4");
+        std::fs::write(&probe_tmp, &patched).unwrap();
+        assert_eq!(probe_mp4_resolution(&probe_tmp), Some((1920, 1080)));
+        let _ = std::fs::remove_file(&probe_tmp);
     }
 }

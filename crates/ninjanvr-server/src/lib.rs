@@ -10426,15 +10426,20 @@ fn go2rtc_stream_has_native_backchannel(
             || lc.starts_with("doorbird://")
             || lc.contains("#backchannel=1")
     };
-    if let Some(val) = cfg.go2rtc.streams.get(camera) {
-        match val {
-            Value::String(s) if check_url(s) => {
-                return true;
+    let talk_key = format!("{camera}_talk");
+    for stream_key in [camera, talk_key.as_str()] {
+        if let Some(val) = cfg.go2rtc.streams.get(stream_key) {
+            match val {
+                Value::String(s) if check_url(s) => {
+                    return true;
+                }
+                Value::Array(arr)
+                    if arr.iter().any(|item| item.as_str().is_some_and(check_url)) =>
+                {
+                    return true;
+                }
+                _ => {}
             }
-            Value::Array(arr) if arr.iter().any(|item| item.as_str().is_some_and(check_url)) => {
-                return true;
-            }
-            _ => {}
         }
     }
     false
@@ -12568,6 +12573,50 @@ fn query_has_disallowed_go2rtc_dst(query: &str) -> bool {
         })
 }
 
+fn is_webrtc_audio_talkback_offer(sdp_bytes: &[u8]) -> bool {
+    let Ok(sdp) = std::str::from_utf8(sdp_bytes) else {
+        return false;
+    };
+    let mut has_audio = false;
+    let mut audio_recv_or_inactive_only = false;
+    let mut in_audio_section = false;
+    for raw_line in sdp.lines() {
+        let line = raw_line.trim();
+        if let Some(media_rest) = line.strip_prefix("m=") {
+            if media_rest.starts_with("video ") || media_rest == "video" {
+                return false;
+            }
+            in_audio_section = media_rest.starts_with("audio ") || media_rest == "audio";
+            if in_audio_section {
+                has_audio = true;
+            }
+            continue;
+        }
+        if in_audio_section && (line == "a=recvonly" || line == "a=inactive") {
+            audio_recv_or_inactive_only = true;
+        }
+    }
+    has_audio && !audio_recv_or_inactive_only
+}
+
+fn rewrite_query_src_param(query: &str, new_src: &str) -> String {
+    let mut parts = Vec::new();
+    let mut replaced = false;
+    for kv in query.split('&') {
+        if kv.is_empty() {
+            continue;
+        }
+        let (raw_k, _) = kv.split_once('=').unwrap_or((kv, ""));
+        if !replaced && raw_k.eq_ignore_ascii_case("src") {
+            parts.push(format!("src={new_src}"));
+            replaced = true;
+        } else {
+            parts.push(kv.to_string());
+        }
+    }
+    parts.join("&")
+}
+
 async fn api_go2rtc_webrtc(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -12605,9 +12654,10 @@ async fn api_go2rtc_webrtc(
         return (status, Json(json!({ "success": false, "message": msg }))).into_response();
     }
     let query = uri.query().unwrap_or("");
-    if query_has_disallowed_go2rtc_dst(query)
-        || mse_hub::extract_stream_src_from_query(query).is_none()
-    {
+    let Some(raw_src) = (!query_has_disallowed_go2rtc_dst(query))
+        .then(|| mse_hub::extract_stream_src_from_query(query))
+        .flatten()
+    else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -12616,11 +12666,23 @@ async fn api_go2rtc_webrtc(
             })),
         )
             .into_response();
-    }
-    let url = if query.is_empty() {
+    };
+    let upstream_query = if !raw_src.ends_with("_talk")
+        && is_webrtc_audio_talkback_offer(&body)
+        && state
+            .config
+            .read()
+            .await
+            .has_dedicated_talk_stream(&raw_src)
+    {
+        rewrite_query_src_param(query, &format!("{raw_src}_talk"))
+    } else {
+        query.to_string()
+    };
+    let url = if upstream_query.is_empty() {
         format!("{}/api/webrtc", state.go2rtc_http_base)
     } else {
-        format!("{}/api/webrtc?{query}", state.go2rtc_http_base)
+        format!("{}/api/webrtc?{upstream_query}", state.go2rtc_http_base)
     };
     let mut req = state
         .http_client
@@ -16800,6 +16862,41 @@ version: 0.18-0
             assert_eq!(recorded[1].0, "src=front_door&status=201");
             assert_eq!(recorded[1].1, "application/sdp");
             assert_eq!(recorded[1].2, sdp_offer);
+        }
+
+        // 2b. When a camera has a dedicated `<camera>_talk` backchannel stream (e.g. Tapo `tapo://`),
+        //     audio-only talkback SDP offers (`a=sendonly` or `a=sendrecv`) route to `src=<camera>_talk`,
+        //     while video SDP offers stay on `src=<camera>`.
+        {
+            let mut cfg_w = t.state.config.write().await;
+            cfg_w.go2rtc.streams.insert(
+                "front_door_talk".to_string(),
+                json!(["tapo://cloud_secret@192.0.2.65"]),
+            );
+        }
+        let sdp_sendrecv_audio = "v=0\r\no=- 43 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=sendrecv\r\n";
+        let sdp_with_video = "v=0\r\no=- 44 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=recvonly\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=sendrecv\r\n";
+        for offer_body in [sdp_offer, sdp_sendrecv_audio, sdp_with_video] {
+            let r = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/go2rtc/webrtc?src=front_door&status=201")
+                        .header(header::CONTENT_TYPE, "application/sdp")
+                        .body(Body::from(offer_body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::CREATED);
+        }
+        {
+            let recorded = captured_requests.read().await;
+            assert_eq!(recorded.len(), 5);
+            assert_eq!(recorded[2].0, "src=front_door_talk&status=201");
+            assert_eq!(recorded[3].0, "src=front_door_talk&status=201");
+            assert_eq!(recorded[4].0, "src=front_door&status=201");
         }
 
         // 3. Shut down mock go2rtc server and verify 502 Bad Gateway on upstream error
