@@ -7,21 +7,36 @@ pub mod auth_gate;
 pub mod camera_protocols;
 pub mod config_coordinator;
 pub mod dataset_catalog;
+pub mod detector_manager;
 pub mod face_gallery;
+pub mod live_gateway;
 pub mod media_lifecycle;
+pub mod media_redaction;
 pub mod mse_hub;
 pub mod pipeline;
 pub mod preview_frames;
 pub mod share_engine;
 pub mod snapshot_capture;
+pub mod telemetry;
 pub mod track_lifecycle;
 
 pub use auth_gate::*;
 pub use camera_protocols::*;
 pub use config_coordinator::{ConfigCoordinator, persist_config_yaml_atomically};
 pub use dataset_catalog::*;
+pub use detector_manager::{DetectorModelManager, StagedModelUploadBundle};
 pub use face_gallery::*;
+pub use live_gateway::{
+    Go2RtcUpstreamPort, InMemoryGo2RtcUpstream, LiveStreamGateway, ReqwestGo2RtcUpstream,
+};
+pub use media_redaction::MediaDeliveryGate;
+pub use ninjanvr_comms::{LogBufferHub, sanitize_logged_path};
 pub use share_engine::*;
+pub use telemetry::{
+    HostMetricsProbe, LinuxHostMetricsProbe, ProcCpuTracker, ProcessResourceSample,
+    RawPidProcReading, escape_prom_label_value, filter_stats_snapshot_for_allowed_cameras,
+    is_camera_stream_online, render_detector_inference_metrics, render_prometheus_exposition,
+};
 pub use track_lifecycle::*;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -40,7 +55,7 @@ use axum::routing::{delete, get, patch, post, put};
 use axum_extra::extract::cookie::CookieJar;
 use base64::Engine;
 use chrono::Local;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 pub use mse_hub::{MseGopCache, MseStreamHub};
 use ninjanvr_comms::{CommsHub, SharedCommsHub};
 use ninjanvr_config::{
@@ -56,298 +71,12 @@ use pipeline::{SharedCameraMetrics, SharedLatestYuvFrames, VisionPipeline};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{RwLock, broadcast};
-use tokio_tungstenite::tungstenite::protocol::Message as TungMsg;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tracing::{error, info, warn};
 
-const MAX_LOG_LINES: usize = 500;
 const MAX_STATS_HISTORY: usize = 60;
-
-#[derive(Clone)]
-pub struct LogBufferHub {
-    buffers: Arc<std::sync::Mutex<HashMap<String, VecDeque<String>>>>,
-    stream_tx: broadcast::Sender<(String, String)>,
-}
-
-impl Default for LogBufferHub {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub fn sanitize_logged_path(path: &str) -> String {
-    let clean: String = path
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    let redact_share = |candidate: &str| -> Option<String> {
-        let trimmed = candidate.trim_start_matches('/');
-        if trimmed
-            .get(..6)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("share/"))
-        {
-            let rest = &trimmed[6..];
-            if let Some((_, suffix)) = rest.split_once('/') {
-                return Some(format!("/share/<redacted>/{suffix}"));
-            } else if !rest.is_empty() {
-                return Some("/share/<redacted>".to_string());
-            }
-        }
-        None
-    };
-    if let Some(redacted) = redact_share(&clean) {
-        return redacted;
-    }
-    if let Some(decoded) = percent_decode_path(&clean) {
-        let clean_dec: String = decoded
-            .chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .collect();
-        if let Some(redacted) = redact_share(&clean_dec) {
-            return redacted;
-        }
-    }
-    clean
-}
-
-impl LogBufferHub {
-    pub fn new() -> Self {
-        let (stream_tx, _) = broadcast::channel(256);
-        let mut map = HashMap::new();
-        map.insert("ninjanvr".to_string(), VecDeque::new());
-        map.insert("go2rtc".to_string(), VecDeque::new());
-        map.insert("nginx".to_string(), VecDeque::new());
-        map.insert("cameras".to_string(), VecDeque::new());
-        Self {
-            buffers: Arc::new(std::sync::Mutex::new(map)),
-            stream_tx,
-        }
-    }
-
-    pub fn push_camera(&self, camera: &str, severity: &str, message: &str) {
-        let now = Local::now();
-        let outer_ts = now.format("%Y-%m-%d %H:%M:%S%.9f");
-        let inner_ts = now.format("%Y-%m-%d %H:%M:%S");
-        let sev_pad = format!("{:<7}", severity.to_ascii_uppercase());
-        let sec_pad = format!("{:<30}", format!("camera.{camera}"));
-        let line = format!("{outer_ts}  [{inner_ts}] {sec_pad} {sev_pad} : {message}");
-        self.push_raw("cameras", line);
-    }
-
-    pub fn push_ninjanvr(&self, severity: &str, section: &str, message: &str) {
-        let now = Local::now();
-        let outer_ts = now.format("%Y-%m-%d %H:%M:%S%.9f");
-        let inner_ts = now.format("%Y-%m-%d %H:%M:%S");
-        let sev_pad = format!("{:<7}", severity.to_ascii_uppercase());
-        let sec_pad = format!("{:<30}", section);
-        let line = format!("{outer_ts}  [{inner_ts}] {sec_pad} {sev_pad} : {message}");
-        self.push_raw("ninjanvr", line);
-    }
-
-    pub fn push_go2rtc(&self, level: &str, section: &str, message: &str) {
-        let now = Local::now();
-        let outer_ts = now.format("%Y-%m-%d %H:%M:%S%.9f");
-        let inner_ts = now.format("%H:%M:%S%.3f");
-        let line = format!("{outer_ts}  {inner_ts} {level} [{section}] {message}");
-        self.push_raw("go2rtc", line);
-    }
-
-    pub fn push_nginx(&self, method: &str, path: &str, status: u16) {
-        let now = Local::now();
-        let outer_ts = now.format("%Y-%m-%d %H:%M:%S%.9f");
-        let clf_ts = now.format("%d/%b/%Y:%H:%M:%S %z");
-        let safe_path = sanitize_logged_path(path);
-        let line = format!(
-            "{outer_ts}  127.0.0.1 - - [{clf_ts}] \"{method} {safe_path} HTTP/1.1\" {status} 0 \"-\" \"NinjaNVR\""
-        );
-        self.push_raw("nginx", line);
-    }
-
-    pub fn push_raw(&self, service: &str, line: String) {
-        let safe_line: String = scrub_rtsp_credentials(&line)
-            .chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .collect();
-        {
-            let mut guard = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-            if guard.len() >= 16 && !guard.contains_key(service) {
-                return;
-            }
-            let q = guard.entry(service.to_string()).or_default();
-            q.push_back(safe_line.clone());
-            while q.len() > MAX_LOG_LINES {
-                q.pop_front();
-            }
-        }
-        let _ = self.stream_tx.send((service.to_string(), safe_line));
-    }
-
-    pub fn query_lines(
-        &self,
-        service: &str,
-        start: Option<i64>,
-        end: Option<i64>,
-    ) -> (usize, Vec<String>) {
-        let guard = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(q) = guard.get(service) else {
-            return (0, Vec::new());
-        };
-        let total = q.len();
-        if total == 0 {
-            return (0, Vec::new());
-        }
-        let start_idx = match start {
-            Some(s) if s < 0 => total.saturating_sub(s.unsigned_abs().min(total as u64) as usize),
-            Some(s) => (s as usize).min(total),
-            None => 0,
-        };
-        let end_idx = match end {
-            Some(e) if e >= 0 => (e as usize).min(total),
-            _ => total,
-        };
-        if start_idx >= end_idx {
-            return (total, Vec::new());
-        }
-        let slice = q
-            .iter()
-            .skip(start_idx)
-            .take(end_idx - start_idx)
-            .cloned()
-            .collect();
-        (total, slice)
-    }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<(String, String)> {
-        self.stream_tx.subscribe()
-    }
-}
-
-type PidTickEntry = (u64, Instant, f64);
-
-#[derive(Clone, Default)]
-pub struct ProcCpuTracker {
-    prev_ticks: Arc<std::sync::Mutex<HashMap<u32, PidTickEntry>>>,
-    prev_infer: Arc<std::sync::Mutex<Option<PidTickEntry>>>,
-    last_storage_probe_ok: Arc<std::sync::Mutex<Option<(PathBuf, Instant)>>>,
-}
-
-impl ProcCpuTracker {
-    /// Returns `(cpu_percent, mem_percent)` for `pid` by reading `/proc/{pid}/stat`,
-    /// normalizing CPU across the container's CPU limit (`2.0` cores) with EMA smoothing,
-    /// and normalizing memory against `/sys/fs/cgroup/memory.max`.
-    pub fn sample_pid(&self, pid: u32, fallback_cpu: f64, fallback_mem: f64) -> (f64, f64) {
-        if pid == 0 {
-            return (fallback_cpu, fallback_mem);
-        }
-        let Ok(stat_str) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return (fallback_cpu, fallback_mem);
-        };
-        let Some(rparen) = stat_str.rfind(')') else {
-            return (fallback_cpu, fallback_mem);
-        };
-        let fields: Vec<&str> = stat_str[rparen + 1..].split_whitespace().collect();
-        if fields.len() < 22 {
-            return (fallback_cpu, fallback_mem);
-        }
-        let utime: u64 = fields[11].parse().unwrap_or(0);
-        let stime: u64 = fields[12].parse().unwrap_or(0);
-        let rss_pages: u64 = fields[21].parse().unwrap_or(0);
-        let total_ticks = utime + stime;
-        let rss_bytes = rss_pages * 4096;
-
-        let mem_limit = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(805_306_368)
-            .max(67_108_864);
-        let mem_pct = (((rss_bytes as f64) / (mem_limit as f64)) * 100.0).clamp(0.5, 95.0);
-
-        let now = Instant::now();
-        let mut guard = self.prev_ticks.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.len() >= 256 && !guard.contains_key(&pid) {
-            guard.retain(|_, (_, inst, _)| now.duration_since(*inst).as_secs() < 600);
-            if guard.len() >= 256 {
-                guard.clear();
-            }
-        }
-        let cpu_pct = if let Some((prev_t, prev_inst, prev_ema)) = guard.get(&pid).copied() {
-            let dt = now.duration_since(prev_inst).as_secs_f64();
-            if dt >= 2.0 && total_ticks >= prev_t {
-                let delta_sec = (total_ticks - prev_t) as f64 / 100.0;
-                // Normalize against 2-core container limit (200% max raw -> 100% normalized)
-                let raw_pct = ((delta_sec / dt) * 50.0).clamp(0.4, 95.0);
-                let ema = prev_ema * 0.6 + raw_pct * 0.4;
-                guard.insert(pid, (total_ticks, now, ema));
-                ema
-            } else {
-                prev_ema
-            }
-        } else {
-            guard.insert(pid, (total_ticks, now, fallback_cpu));
-            fallback_cpu
-        };
-
-        (
-            (cpu_pct * 10.0).round() / 10.0,
-            (mem_pct * 10.0).round() / 10.0,
-        )
-    }
-
-    /// Computes exact CPU% spent inside OpenVINO inference (`cumulative_infer_us` delta).
-    pub fn sample_infer_cpu(&self, cumulative_us: u64, fallback_cpu: f64) -> f64 {
-        let now = Instant::now();
-        let mut guard = self.prev_infer.lock().unwrap_or_else(|e| e.into_inner());
-        let pct = if let Some((prev_us, prev_inst, prev_ema)) = *guard {
-            let dt_us = now.duration_since(prev_inst).as_micros() as f64;
-            if dt_us >= 2_000_000.0 && cumulative_us >= prev_us {
-                let delta_us = (cumulative_us - prev_us) as f64;
-                let raw_pct = ((delta_us / dt_us) * 100.0).clamp(0.8, 95.0);
-                let ema = prev_ema * 0.6 + raw_pct * 0.4;
-                *guard = Some((cumulative_us, now, ema));
-                ema
-            } else {
-                prev_ema
-            }
-        } else {
-            *guard = Some((cumulative_us, now, fallback_cpu));
-            fallback_cpu
-        };
-        (pct * 10.0).round() / 10.0
-    }
-
-    /// Probes `media_dir` writability with a 15s TTL when healthy and all media subdirectories
-    /// (`recordings/`, `clips/`, `exports/`) exist on disk, avoiding per-request file creation/deletion
-    /// on `/api/stats` and `/api/metrics` while immediately re-probing when degraded or missing.
-    pub fn probe_storage_writable_cached(
-        &self,
-        media_dir: &Path,
-        currently_degraded: bool,
-    ) -> std::result::Result<(), String> {
-        const STORAGE_PROBE_TTL: Duration = Duration::from_secs(15);
-        if !currently_degraded
-            && media_dir.join("recordings").is_dir()
-            && media_dir.join("clips").is_dir()
-            && media_dir.join("exports").is_dir()
-            && let Ok(guard) = self.last_storage_probe_ok.lock()
-            && let Some((ref cached_path, cached_at)) = *guard
-            && cached_path == media_dir
-            && cached_at.elapsed() < STORAGE_PROBE_TTL
-        {
-            return Ok(());
-        }
-        let res = probe_storage_writable(media_dir);
-        if let Ok(mut guard) = self.last_storage_probe_ok.lock() {
-            if res.is_ok() {
-                *guard = Some((media_dir.to_path_buf(), Instant::now()));
-            } else {
-                *guard = None;
-            }
-        }
-        res
-    }
-}
 
 pub type LazySnapshotCacheKey = (String, u32, bool, String);
 pub type LazySnapshotCacheValue = (Instant, Bytes, u64);
@@ -385,6 +114,8 @@ pub struct AppState {
     pub dataset_catalog: DatasetCatalog,
     pub face_gallery: FaceIdentityCatalog,
     pub share_engine: ShareLinkEngine,
+    pub media_delivery_gate: MediaDeliveryGate,
+    pub live_gateway: LiveStreamGateway,
     pub debug_reprocess_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
@@ -1591,16 +1322,16 @@ async fn api_config_save(
             .into_response();
     }
     let commit_res = tokio::spawn(async move {
-        let new_cfg = match state
+        let outcome = match state
             .config_coordinator
-            .commit_raw_yaml(
+            .commit_raw_yaml_full(
                 &body,
                 Some(&state.detector),
                 Some(&state.camera_driver_runtime),
             )
             .await
         {
-            Ok(cfg) => cfg,
+            Ok(out) => out,
             Err(config_coordinator::ConfigCommitError::Validation(msg)) => {
                 return Err((StatusCode::BAD_REQUEST, msg));
             }
@@ -1609,6 +1340,7 @@ async fn api_config_save(
                 return Err((StatusCode::INTERNAL_SERVER_ERROR, msg));
             }
         };
+        let new_cfg = outcome.config;
         let rec_dir = state.media_dir.join("recordings");
         let log_hub = state.log_hub.clone();
         if let Ok(heuristics) = tokio::task::spawn_blocking(move || {
@@ -1619,14 +1351,18 @@ async fn api_config_save(
         {
             emit_heuristics_to_logs(&log_hub, &heuristics);
         }
-        Ok(())
+        Ok((outcome.api_config, outcome.scrubbed_raw_yaml))
     })
     .await;
 
     match commit_res {
-        Ok(Ok(())) => {
-            Json(json!({ "success": true, "message": "Config saved successfully" })).into_response()
-        }
+        Ok(Ok((api_cfg, raw_yaml))) => Json(json!({
+            "success": true,
+            "message": "Config saved successfully",
+            "raw_yaml": raw_yaml,
+            "config": api_cfg
+        }))
+        .into_response(),
         Ok(Err((status, msg))) => {
             (status, Json(json!({ "success": false, "message": msg }))).into_response()
         }
@@ -1714,41 +1450,7 @@ async fn api_config_set(
 }
 
 fn build_detector_catalog_value(state: &AppState) -> Value {
-    let mut cat = state.detector.runtime_catalog();
-    let mut extra_dirs = vec![state.media_dir.join("models")];
-    if let Some(db_parent) = state.db.path().parent() {
-        extra_dirs.push(db_parent.join("models"));
-        extra_dirs.push(db_parent.to_path_buf());
-    }
-    for dir in extra_dirs {
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if let Some(ext) = p.extension().and_then(|e| e.to_str())
-                    && (ext.eq_ignore_ascii_case("xml") || ext.eq_ignore_ascii_case("onnx"))
-                {
-                    let p_str = p.to_string_lossy().to_string();
-                    if !cat.discovered_models.iter().any(|m| m.path == p_str) {
-                        let arch = if p_str.to_ascii_lowercase().contains("yolox") {
-                            "yolox"
-                        } else if p_str.to_ascii_lowercase().contains("yolo")
-                            || ext.eq_ignore_ascii_case("onnx")
-                        {
-                            "yolo-generic"
-                        } else {
-                            "ssd"
-                        };
-                        cat.discovered_models
-                            .push(ninjanvr_infer::DiscoveredModelEntry {
-                                path: p_str,
-                                arch: arch.to_string(),
-                            });
-                    }
-                }
-            }
-        }
-    }
-    serde_json::to_value(cat).unwrap_or_else(|_| json!({}))
+    DetectorModelManager::build_catalog_value(&state.detector, &state.media_dir, state.db.path())
 }
 
 async fn api_detectors_catalog(State(state): State<AppState>) -> Json<Value> {
@@ -1845,79 +1547,6 @@ fn async_stream_lines(
     })
 }
 
-fn escape_prom_label_value(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for ch in raw.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => {}
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
-fn filter_stats_snapshot_for_allowed_cameras(val: &mut Value, allow_list: &[String]) {
-    if allow_list.iter().any(|a| a == "*") {
-        return;
-    }
-    let is_permitted = |cam: &str| {
-        let base = cam.strip_suffix("_sub").unwrap_or(cam).trim();
-        allow_list.iter().any(|a| a == cam || a == base)
-    };
-    let mut retained_cam_fps = 0.0;
-    let mut retained_det_fps = 0.0;
-    if let Some(cams) = val.get_mut("cameras").and_then(|v| v.as_object_mut()) {
-        cams.retain(|k, _| is_permitted(k));
-        for c_stat in cams.values() {
-            retained_cam_fps += c_stat
-                .get("camera_fps")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            retained_det_fps += c_stat
-                .get("detection_fps")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-        }
-    }
-    if let Some(obj) = val.as_object_mut() {
-        let rounded_cam = (retained_cam_fps * 10.0).round() / 10.0;
-        let rounded_det = (retained_det_fps * 10.0).round() / 10.0;
-        obj.insert("camera_fps".to_string(), json!(rounded_cam));
-        obj.insert("process_fps".to_string(), json!(rounded_cam));
-        obj.insert("detection_fps".to_string(), json!(rounded_det));
-    }
-    if let Some(service_obj) = val.get_mut("service").and_then(|s| s.as_object_mut()) {
-        if let Some(cam_storage) = service_obj
-            .get_mut("camera_storage")
-            .and_then(|v| v.as_object_mut())
-        {
-            cam_storage.retain(|k, _| is_permitted(k));
-        }
-        if let Some(heuristics) = service_obj
-            .get_mut("heuristics")
-            .and_then(|v| v.as_array_mut())
-        {
-            heuristics.retain(|h| {
-                let cat = h.get("category").and_then(|v| v.as_str()).unwrap_or("");
-                let target = h.get("target").and_then(|v| v.as_str()).unwrap_or("");
-                if matches!(cat, "vision" | "streams" | "audio") {
-                    let targets: Vec<&str> = target
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    !targets.is_empty() && targets.into_iter().all(is_permitted)
-                } else {
-                    true
-                }
-            });
-        }
-    }
-}
-
 async fn api_stats_history(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1942,36 +1571,6 @@ async fn api_stats_history(
     Json(Value::Array(items))
 }
 
-/// Appends `ninjanvr_detector_inference_ms` samples. Only measured latencies are exported: an
-/// idle or unloaded detector has no latency, and a placeholder would make dashboards show
-/// inference that never happened.
-fn render_detector_inference_metrics(stats_val: &Value, out: &mut String) {
-    let measured_ms = |d_stat: &Value| -> Option<f64> {
-        if d_stat.get("measured").and_then(|v| v.as_bool()) == Some(false) {
-            return None;
-        }
-        d_stat.get("inference_speed").and_then(|v| v.as_f64())
-    };
-    if let Some(primary) = stats_val.get("primary_detector")
-        && let Some(ms) = measured_ms(primary)
-    {
-        out.push_str(&format!(
-            "ninjanvr_detector_inference_ms{{detector=\"primary\"}} {ms:.2}\n"
-        ));
-    }
-    if let Some(dets) = stats_val.get("detectors").and_then(|v| v.as_object()) {
-        for (det_name, d_stat) in dets {
-            let Some(ms) = measured_ms(d_stat) else {
-                continue;
-            };
-            let safe_det = escape_prom_label_value(det_name);
-            out.push_str(&format!(
-                "ninjanvr_detector_inference_ms{{detector=\"{safe_det}\"}} {ms:.2}\n"
-            ));
-        }
-    }
-}
-
 async fn api_prometheus_metrics(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1982,127 +1581,11 @@ async fn api_prometheus_metrics(
     if let Some(ref allow_list) = allowed {
         filter_stats_snapshot_for_allowed_cameras(&mut stats_val, allow_list);
     }
-    let mut out = String::with_capacity(4096);
-
-    out.push_str("# HELP ninjanvr_camera_fps Per-camera frame rate by pipeline role.\n");
-    out.push_str("# TYPE ninjanvr_camera_fps gauge\n");
-    out.push_str(
-        "# HELP ninjanvr_camera_online Camera stream online status (1 = online, 0 = offline).\n",
-    );
-    out.push_str("# TYPE ninjanvr_camera_online gauge\n");
-
-    if let Some(cams) = stats_val.get("cameras").and_then(|v| v.as_object()) {
-        for (cam, c_stat) in cams {
-            let safe_cam = escape_prom_label_value(cam);
-            let cam_fps = c_stat
-                .get("camera_fps")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            let det_fps = c_stat
-                .get("detection_fps")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            let proc_fps = c_stat
-                .get("process_fps")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(cam_fps);
-            let online = if cam_fps > 0.0 { 1 } else { 0 };
-            out.push_str(&format!(
-                "ninjanvr_camera_fps{{camera=\"{safe_cam}\",role=\"camera\"}} {cam_fps:.2}\n"
-            ));
-            out.push_str(&format!(
-                "ninjanvr_camera_fps{{camera=\"{safe_cam}\",role=\"detect\"}} {det_fps:.2}\n"
-            ));
-            out.push_str(&format!(
-                "ninjanvr_camera_fps{{camera=\"{safe_cam}\",role=\"process\"}} {proc_fps:.2}\n"
-            ));
-            out.push_str(&format!(
-                "ninjanvr_camera_online{{camera=\"{safe_cam}\"}} {online}\n"
-            ));
-        }
-    }
-
-    out.push_str(
-        "# HELP ninjanvr_detector_inference_ms AI detector inference latency in milliseconds.\n",
-    );
-    out.push_str("# TYPE ninjanvr_detector_inference_ms gauge\n");
-    render_detector_inference_metrics(&stats_val, &mut out);
-
-    out.push_str("# HELP ninjanvr_storage_used_bytes Used bytes on storage mounts.\n");
-    out.push_str("# TYPE ninjanvr_storage_used_bytes gauge\n");
-    out.push_str("# HELP ninjanvr_storage_total_bytes Total bytes on storage mounts.\n");
-    out.push_str("# TYPE ninjanvr_storage_total_bytes gauge\n");
-    if let Some(storages) = stats_val
-        .get("service")
-        .and_then(|s| s.get("storage"))
-        .and_then(|v| v.as_object())
-    {
-        for (mount_path, st) in storages {
-            let raw_label = if mount_path.contains("recordings") {
-                "recordings"
-            } else if mount_path.contains("clips") {
-                "clips"
-            } else if mount_path.contains("cache") {
-                "cache"
-            } else if mount_path.contains("shm") {
-                "shm"
-            } else {
-                mount_path.as_str()
-            };
-            let label = escape_prom_label_value(raw_label);
-            let used_mb = st.get("used").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let total_mb = st.get("total").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let used_bytes = (used_mb * 1024.0 * 1024.0).round() as u64;
-            let total_bytes = (total_mb * 1024.0 * 1024.0).round() as u64;
-            out.push_str(&format!(
-                "ninjanvr_storage_used_bytes{{mount=\"{label}\"}} {used_bytes}\n"
-            ));
-            out.push_str(&format!(
-                "ninjanvr_storage_total_bytes{{mount=\"{label}\"}} {total_bytes}\n"
-            ));
-        }
-    }
-
-    let sys_cpu = stats_val
-        .get("cpu_usages")
-        .and_then(|c| c.get("ninjanvr.full_system"))
-        .and_then(|f| f.get("cpu"))
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0);
-    let sys_mem_pct = stats_val
-        .get("cpu_usages")
-        .and_then(|c| c.get("ninjanvr.full_system"))
-        .and_then(|f| f.get("mem"))
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0);
-    out.push_str("# HELP ninjanvr_cpu_usage_percent Process CPU usage percentage.\n");
-    out.push_str("# TYPE ninjanvr_cpu_usage_percent gauge\n");
-    out.push_str(&format!("ninjanvr_cpu_usage_percent {sys_cpu:.2}\n"));
-    out.push_str("# HELP ninjanvr_memory_usage_bytes Process resident memory usage in bytes.\n");
-    out.push_str("# TYPE ninjanvr_memory_usage_bytes gauge\n");
-    out.push_str(&format!(
-        "ninjanvr_memory_usage_bytes {}\n",
-        (sys_mem_pct * 1024.0 * 1024.0).round() as u64
-    ));
-
-    out.push_str("# HELP ninjanvr_events_total Total persisted object detection events by camera and label.\n");
-    out.push_str("# TYPE ninjanvr_events_total counter\n");
-    if let Ok(ev_counts) = state.db.query_event_counts_by_camera_and_label() {
-        for (cam, lbl, cnt) in ev_counts {
-            if let Some(ref allow_list) = allowed
-                && !allow_list.iter().any(|a| a == &cam || a == "*")
-            {
-                continue;
-            }
-            let safe_cam = escape_prom_label_value(&cam);
-            let safe_lbl = escape_prom_label_value(&lbl);
-            out.push_str(&format!(
-                "ninjanvr_events_total{{camera=\"{safe_cam}\",label=\"{safe_lbl}\"}} {cnt}\n"
-            ));
-        }
-    }
+    let ev_counts = state
+        .db
+        .query_event_counts_by_camera_and_label()
+        .unwrap_or_default();
+    let out = render_prometheus_exposition(&stats_val, &ev_counts, allowed.as_deref());
 
     (
         [(
@@ -2159,7 +1642,7 @@ async fn build_ai_context_digest(
             cam_name.clone(),
             json!({
                 "enabled": rt_flags.enabled,
-                "online": fps > 0.0 || cam_cfg.enabled,
+                "online": is_camera_stream_online(fps),
                 "fps": fps,
                 "detection_fps": m.map_or(0.0, |x| x.detection_fps),
                 "night_mode": m.is_some_and(|x| x.night_mode),
@@ -2758,7 +2241,7 @@ async fn api_debug_reprocess(
             .detector
             .named_detector(cam_cfg.detect.detector.as_deref())
             .unwrap_or_else(|| state_for_infer.detector.clone());
-        let (model_w, model_h, bgr_order) = active_det.model_dimensions();
+        let (model_w, model_h, _bgr_order) = active_det.model_dimensions();
         let mut tensor_buf = vec![0u8; (model_w * model_h * 3) as usize];
 
         for (rec_start_time, stdout_bytes) in decoded_segments {
@@ -2781,21 +2264,26 @@ async fn api_debug_reprocess(
                     &m_boxes,
                     &tracked_boxes,
                 );
-                let mut raw_dets = Vec::new();
-                for reg in &regions {
-                    ninjanvr_vision::crop_yuv420p_to_tensor_nhwc(
-                        &yuv,
-                        reg,
-                        model_w,
-                        model_h,
-                        bgr_order,
-                        &mut tensor_buf,
-                    );
-                    let dets = active_det.detect_region(&tensor_buf, *reg, det_w, det_h, 0.25);
-                    raw_dets.extend(dets);
-                }
+                let step = pipeline::run_motion_gated_region_inference(
+                    &active_det,
+                    &yuv,
+                    &regions,
+                    &m_boxes,
+                    &tracked_boxes,
+                    &mut tensor_buf,
+                );
+                let raw_dets = step.accepted_detections;
                 let (active_trks, _) = tracker.update(f_ts, &raw_dets, &regions, &cam_cfg);
                 let mut rejected = Vec::new();
+                for d in &step.non_intersecting_detections {
+                    rejected.push(json!({
+                        "label": d.label,
+                        "score": d.score,
+                        "area_px": d.bbox.area(),
+                        "bbox": [d.bbox.x_min, d.bbox.y_min, d.bbox.x_max, d.bbox.y_max],
+                        "reason": "no_motion_or_track_overlap"
+                    }));
+                }
                 for d in &raw_dets {
                     let area = d.bbox.area();
                     if (d.score as f64) < eff_min_score {
@@ -3278,6 +2766,7 @@ async fn api_debug_lpr_simulate(
     let mut eff_lpr_cfg = lpr_cfg.clone();
     eff_lpr_cfg.enabled = true;
     eff_lpr_cfg.min_confidence = eff_lpr_cfg.min_confidence.min(score);
+    let sim_mask_policy = state.media_delivery_gate.camera_mask_policy(&camera).await;
 
     tokio::task::spawn_blocking(move || -> Response {
         let valid_format = ninjanvr_infer::validate_license_plate(
@@ -3305,7 +2794,13 @@ async fn api_debug_lpr_simulate(
         let consensus_conf = consensus.as_ref().map_or(score, |c| c.confidence);
 
         // Generate synthetic 640x360 vehicle + Mercosul plate frame and write snapshot/review artifacts
-        let clean_img = render_synthetic_mercosul_vehicle_frame(&norm_plate);
+        // (enforcing camera PrivacyMaskPolicy fail-closed before writing to disk)
+        let mut clean_img = render_synthetic_mercosul_vehicle_frame(&norm_plate);
+        let can_write_snapshots = if sim_mask_policy.is_configured() {
+            sim_mask_policy.redact_rgb(&mut clean_img)
+        } else {
+            true
+        };
         let mut annotated_img = clean_img.clone();
         let veh_bbox = ninjanvr_vision::BoundingBox::new(140, 80, 500, 310);
         let plate_bbox = ninjanvr_vision::BoundingBox::new(245, 225, 395, 275);
@@ -3313,6 +2808,9 @@ async fn api_debug_lpr_simulate(
             &mut annotated_img,
             &[(veh_bbox, [31, 119, 180]), (plate_bbox, [16, 185, 129])],
         );
+        if sim_mask_policy.is_configured() {
+            let _ = sim_mask_policy.redact_rgb(&mut annotated_img);
+        }
 
         let clips_dir = state.media_dir.join("clips");
         let review_dir = clips_dir.join("review");
@@ -3322,43 +2820,47 @@ async fn api_debug_lpr_simulate(
         let rev_thumb_fname = format!("thumb-{camera}-{rev_id}.webp");
 
         let mut thumb_b64 = None;
-        if let Ok(clean_webp) = ninjanvr_vision::encode_image_webp(&clean_img)
-            && let Err(err) = crate::pipeline::write_contained_media_file(
-                &state.media_dir,
-                &clips_dir,
-                &clean_webp_fname,
-                &clean_webp,
-            )
-        {
-            warn!("Failed to write simulated LPR clean snapshot '{clean_webp_fname}': {err}");
-        }
-        if let Ok(jpg_bytes) = ninjanvr_vision::encode_image_jpeg(&annotated_img)
-            && let Err(err) = crate::pipeline::write_contained_media_file(
-                &state.media_dir,
-                &clips_dir,
-                &jpg_fname,
-                &jpg_bytes,
-            )
-        {
-            warn!("Failed to write simulated LPR JPEG snapshot '{jpg_fname}': {err}");
-        }
-        if let Ok(webp_bytes) = ninjanvr_vision::encode_image_webp(&annotated_img) {
-            thumb_b64 = Some(base64::engine::general_purpose::STANDARD.encode(&webp_bytes));
-            if let Err(err) = crate::pipeline::write_contained_media_file(
-                &state.media_dir,
-                &clips_dir,
-                &webp_fname,
-                &webp_bytes,
-            ) {
-                warn!("Failed to write simulated LPR WebP snapshot '{webp_fname}': {err}");
+        if can_write_snapshots {
+            if let Ok(clean_webp) = ninjanvr_vision::encode_image_webp(&clean_img)
+                && let Err(err) = crate::pipeline::write_contained_media_file(
+                    &state.media_dir,
+                    &clips_dir,
+                    &clean_webp_fname,
+                    &clean_webp,
+                )
+            {
+                warn!("Failed to write simulated LPR clean snapshot '{clean_webp_fname}': {err}");
             }
-            if let Err(err) = crate::pipeline::write_contained_media_file(
-                &state.media_dir,
-                &review_dir,
-                &rev_thumb_fname,
-                &webp_bytes,
-            ) {
-                warn!("Failed to write simulated LPR review thumbnail '{rev_thumb_fname}': {err}");
+            if let Ok(jpg_bytes) = ninjanvr_vision::encode_image_jpeg(&annotated_img)
+                && let Err(err) = crate::pipeline::write_contained_media_file(
+                    &state.media_dir,
+                    &clips_dir,
+                    &jpg_fname,
+                    &jpg_bytes,
+                )
+            {
+                warn!("Failed to write simulated LPR JPEG snapshot '{jpg_fname}': {err}");
+            }
+            if let Ok(webp_bytes) = ninjanvr_vision::encode_image_webp(&annotated_img) {
+                thumb_b64 = Some(base64::engine::general_purpose::STANDARD.encode(&webp_bytes));
+                if let Err(err) = crate::pipeline::write_contained_media_file(
+                    &state.media_dir,
+                    &clips_dir,
+                    &webp_fname,
+                    &webp_bytes,
+                ) {
+                    warn!("Failed to write simulated LPR WebP snapshot '{webp_fname}': {err}");
+                }
+                if let Err(err) = crate::pipeline::write_contained_media_file(
+                    &state.media_dir,
+                    &review_dir,
+                    &rev_thumb_fname,
+                    &webp_bytes,
+                ) {
+                    warn!(
+                        "Failed to write simulated LPR review thumbnail '{rev_thumb_fname}': {err}"
+                    );
+                }
             }
         }
 
@@ -4159,10 +3661,24 @@ async fn compute_stats_snapshot(state: &AppState) -> Value {
     tokio::task::spawn_blocking(move || {
         let state = &state_clone;
         let pid = std::process::id();
-        let go2rtc_pid = state.go2rtc_supervisor.pid().max(1);
+        let raw_go2rtc_pid = state.go2rtc_supervisor.pid();
+        let go2rtc_pid = raw_go2rtc_pid.max(1);
 
-        let (ninjanvr_cpu, ninjanvr_mem) = state.cpu_tracker.sample_pid(pid, 8.5, 19.4);
-        let (go2rtc_cpu, go2rtc_mem) = state.cpu_tracker.sample_pid(go2rtc_pid, 2.8, 3.6);
+        let nvr_res = state
+            .cpu_tracker
+            .sample_pid_resources(pid, 8.5, 19.4, 156_237_824);
+        let (go2rtc_cpu, go2rtc_mem, go2rtc_rss_bytes) =
+            if raw_go2rtc_pid > 0 && raw_go2rtc_pid != pid {
+                let g2r_res =
+                    state
+                        .cpu_tracker
+                        .sample_pid_resources(raw_go2rtc_pid, 2.8, 3.6, 28_991_029);
+                (g2r_res.cpu_pct, g2r_res.mem_pct, g2r_res.rss_bytes)
+            } else {
+                (0.0, 0.0, 0)
+            };
+        let (ninjanvr_cpu, ninjanvr_mem) = (nvr_res.cpu_pct, nvr_res.mem_pct);
+        let total_rss_bytes = nvr_res.rss_bytes.saturating_add(go2rtc_rss_bytes);
 
         let mut cameras_stats = serde_json::Map::new();
         let mut total_cam_fps = 0.0;
@@ -4310,9 +3826,9 @@ async fn compute_stats_snapshot(state: &AppState) -> Value {
                 "cmdline": "ninjanvr"
             }),
         );
-        if go2rtc_pid > 1 {
+        if raw_go2rtc_pid > 0 && raw_go2rtc_pid != pid {
             cpu_usages.insert(
-                go2rtc_pid.to_string(),
+                raw_go2rtc_pid.to_string(),
                 json!({
                     "cpu": format!("{go2rtc_cpu:.1}"),
                     "cpu_average": format!("{go2rtc_cpu:.1}"),
@@ -4448,6 +3964,7 @@ async fn compute_stats_snapshot(state: &AppState) -> Value {
                 "uptime": state.start_instant.elapsed().as_secs(),
                 "version": NINJANVR_VERSION,
                 "latest_version": NINJANVR_VERSION,
+                "memory_usage_bytes": total_rss_bytes,
                 "storage_degraded": storage_degraded_val,
                 "storage_error": storage_error_val,
                 "estimated_retention_days": estimated_retention_days,
@@ -4756,29 +4273,7 @@ pub(crate) fn redact_image_bytes_with_privacy_mask(
     privacy_mask: Option<&Value>,
     prefer_jpeg: bool,
 ) -> (Vec<u8>, &'static str) {
-    let default_mime = if prefer_jpeg {
-        "image/jpeg"
-    } else {
-        "image/webp"
-    };
-    if !has_active_privacy_mask(privacy_mask) {
-        return (raw_bytes.to_vec(), default_mime);
-    }
-    let mut rgb = decode_bounded_snapshot_rgb(raw_bytes)
-        .unwrap_or_else(|| image::RgbImage::from_pixel(64, 36, image::Rgb([12, 14, 18])));
-    if let Some(mask) = privacy_mask
-        && !apply_camera_privacy_mask_or_fail_closed(&mut rgb, mask, 0, 0)
-    {
-        rgb = image::RgbImage::from_pixel(64, 36, image::Rgb([12, 14, 18]));
-    }
-    if prefer_jpeg {
-        let out = ninjanvr_vision::encode_image_jpeg(&rgb).unwrap_or_default();
-        (out, "image/jpeg")
-    } else {
-        let out = ninjanvr_vision::encode_image_webp(&rgb)
-            .unwrap_or_else(|_| b"RIFF\x1a\x00\x00\x00WEBPVP8 ".to_vec());
-        (out, "image/webp")
-    }
+    MediaDeliveryGate::redact_image_bytes_with_mask(raw_bytes, privacy_mask, prefer_jpeg)
 }
 
 pub(crate) async fn redact_image_bytes_with_privacy_mask_async(
@@ -4786,135 +4281,26 @@ pub(crate) async fn redact_image_bytes_with_privacy_mask_async(
     privacy_mask: Option<Value>,
     prefer_jpeg: bool,
 ) -> (Vec<u8>, &'static str) {
-    let default_mime = if prefer_jpeg {
-        "image/jpeg"
-    } else {
-        "image/webp"
-    };
-    if !has_active_privacy_mask(privacy_mask.as_ref()) {
-        return (raw_bytes, default_mime);
-    }
-    tokio::task::spawn_blocking(move || {
-        redact_image_bytes_with_privacy_mask(&raw_bytes, privacy_mask.as_ref(), prefer_jpeg)
-    })
-    .await
-    .unwrap_or_else(|_| {
-        let fallback_rgb = image::RgbImage::from_pixel(64, 36, image::Rgb([12, 14, 18]));
-        if prefer_jpeg {
-            (
-                ninjanvr_vision::encode_image_jpeg(&fallback_rgb).unwrap_or_default(),
-                "image/jpeg",
-            )
-        } else {
-            (
-                ninjanvr_vision::encode_image_webp(&fallback_rgb)
-                    .unwrap_or_else(|_| b"RIFF\x1a\x00\x00\x00WEBPVP8 ".to_vec()),
-                "image/webp",
-            )
-        }
-    })
+    MediaDeliveryGate::redact_image_bytes_with_mask_async(raw_bytes, privacy_mask, prefer_jpeg)
+        .await
 }
 
 pub(crate) async fn camera_privacy_mask_value(
     config: &Arc<RwLock<NinjaConfig>>,
     camera: &str,
 ) -> Option<Value> {
-    let cfg = config.read().await;
-    cfg.cameras.get(camera).map(|c| {
-        if has_active_privacy_mask(Some(&c.privacy_mask)) {
-            normalize_privacy_mask_value_for_resolution(
-                &c.privacy_mask,
-                c.detect.width.max(1),
-                c.detect.height.max(1),
-            )
-        } else {
-            c.privacy_mask.clone()
-        }
-    })
-}
-
-fn redact_event_json_thumbnail_with_masks(active_masks: &HashMap<String, Value>, ev: &mut Value) {
-    let Some(cam) = ev.get("camera").and_then(|v| v.as_str()) else {
-        return;
-    };
-    let Some(mask) = active_masks.get(cam) else {
-        return;
-    };
-    let Some(b64) = ev
-        .get("thumbnail")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    else {
-        return;
-    };
-    let raw_bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .unwrap_or_default();
-    let (redacted, _) = redact_image_bytes_with_privacy_mask(&raw_bytes, Some(mask), false);
-    if let Some(obj) = ev.as_object_mut() {
-        obj.insert(
-            "thumbnail".to_string(),
-            Value::String(base64::engine::general_purpose::STANDARD.encode(redacted)),
-        );
-    }
+    MediaDeliveryGate::new(config.clone())
+        .camera_normalized_mask_value(camera)
+        .await
 }
 
 async fn redact_event_slice_thumbnails_if_masked(
     config: &Arc<RwLock<NinjaConfig>>,
     events: &mut [Value],
 ) {
-    if events.is_empty() {
-        return;
-    }
-    let active_masks: HashMap<String, Value> = {
-        let cfg = config.read().await;
-        cfg.cameras
-            .iter()
-            .filter(|(_, c)| has_active_privacy_mask(Some(&c.privacy_mask)))
-            .map(|(k, c)| {
-                (
-                    k.clone(),
-                    normalize_privacy_mask_value_for_resolution(
-                        &c.privacy_mask,
-                        c.detect.width.max(1),
-                        c.detect.height.max(1),
-                    ),
-                )
-            })
-            .collect()
-    };
-    if active_masks.is_empty() {
-        return;
-    }
-    let needs_redaction = events.iter().any(|ev| {
-        ev.get("camera")
-            .and_then(|v| v.as_str())
-            .is_some_and(|cam| active_masks.contains_key(cam))
-            && ev
-                .get("thumbnail")
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| !s.trim().is_empty())
-    });
-    if !needs_redaction {
-        return;
-    }
-    let mut owned_events: Vec<Value> = events
-        .iter_mut()
-        .map(|ev| std::mem::replace(ev, Value::Null))
-        .collect();
-    if let Ok(redacted_events) = tokio::task::spawn_blocking(move || {
-        for ev in &mut owned_events {
-            redact_event_json_thumbnail_with_masks(&active_masks, ev);
-        }
-        owned_events
-    })
-    .await
-    {
-        for (dst, src) in events.iter_mut().zip(redacted_events) {
-            *dst = src;
-        }
-    }
+    MediaDeliveryGate::new(config.clone())
+        .redact_event_slice_thumbnails(events)
+        .await;
 }
 
 pub(crate) fn ensure_dataset_sample_path(media_dir: &Path, candidate: &Path) -> Option<PathBuf> {
@@ -5133,10 +4519,7 @@ async fn api_review_preview(
         }
         let (privacy_mask_active, cold_dir_opt) = {
             let cfg = state.config.read().await;
-            let masked = cfg
-                .cameras
-                .get(cam)
-                .is_some_and(|c| has_active_privacy_mask(Some(&c.privacy_mask)));
+            let masked = MediaDeliveryGate::blocks_untranscoded_video_in_config(&cfg, cam);
             (masked, resolve_configured_cold_dir(&cfg))
         };
         if privacy_mask_active {
@@ -5911,7 +5294,7 @@ async fn api_event_false_positive(
         }
     }
     let fp = body.is_none_or(|b| b.0.false_positive);
-    if let Err(err) = state.db.set_event_false_positive(&id, fp) {
+    if let Err(err) = EventReviewCoordinator::set_event_false_positive(&state, &id, fp).await {
         warn!("Failed to set event '{id}' false_positive={fp}: {err}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -5921,33 +5304,6 @@ async fn api_event_false_positive(
             })),
         )
             .into_response();
-    }
-    if fp {
-        let _ = create_dataset_sample_from_event_with_config(
-            Some(&state.config),
-            &state.db,
-            &state.media_dir,
-            &id,
-            "hard_negative",
-            None,
-        )
-        .await;
-    } else {
-        let sample_id = if id.starts_with("ds_") {
-            id.clone()
-        } else {
-            format!("ds_{id}")
-        };
-        if let Ok(Some(existing)) = state.db.get_dataset_sample(&sample_id)
-            && existing.sample_kind == "hard_negative"
-        {
-            dataset_catalog::delete_sample_artifacts(
-                &state.media_dir,
-                &existing.id,
-                Some(&existing.image_path),
-            );
-            let _ = state.db.delete_dataset_sample(&sample_id);
-        }
     }
     Json(json!({ "success": true, "false_positive": fp })).into_response()
 }
@@ -6367,65 +5723,6 @@ async fn api_detector_model_upload(
     let resolved_labelmap =
         labelmap_text.unwrap_or_else(|| ninjanvr_db::NINJANVR_SECURITY_CLASSES.join("\n"));
 
-    let models_dir = state.media_dir.join("models");
-    if let Err(err) =
-        atomic_write_within_media_subdir(&state.media_dir, "models", &safe_filename, &model_bytes)
-            .await
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "success": false, "message": err.to_string() })),
-        )
-            .into_response();
-    }
-    let saved_model_path = models_dir.join(&safe_filename);
-
-    if let Some(w_bytes) = &weights_bytes {
-        let w_name = weights_filename
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && is_safe_id(s))
-            .map_or_else(|| format!("{stem}.bin"), String::from);
-        if let Err(err) =
-            atomic_write_within_media_subdir(&state.media_dir, "models", &w_name, w_bytes).await
-        {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "success": false, "message": err.to_string() })),
-            )
-                .into_response();
-        }
-    }
-
-    if let Err(err) = atomic_write_within_media_subdir(
-        &state.media_dir,
-        "models",
-        &safe_labelmap_name,
-        resolved_labelmap.as_bytes(),
-    )
-    .await
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "success": false, "message": err.to_string() })),
-        )
-            .into_response();
-    }
-    let saved_labelmap_path = models_dir.join(&safe_labelmap_name);
-
-    // Also mirror into db_dir/models if writable and not a symlink
-    if let Some(db_parent) = state.db.path().parent() {
-        let _ = atomic_write_within_media_subdir(db_parent, "models", &safe_filename, &model_bytes)
-            .await;
-        let _ = atomic_write_within_media_subdir(
-            db_parent,
-            "models",
-            &safe_labelmap_name,
-            resolved_labelmap.as_bytes(),
-        )
-        .await;
-    }
-
     let model_type = model_type_opt.unwrap_or_else(|| {
         if safe_filename.to_ascii_lowercase().contains("yolox") {
             "yolox".to_string()
@@ -6437,41 +5734,39 @@ async fn api_detector_model_upload(
     let height = height_opt.unwrap_or(640).clamp(64, 2048);
     let input_tensor = input_tensor_opt.unwrap_or_else(|| "nchw".to_string());
     let input_pixel_format = input_pixel_format_opt.unwrap_or_else(|| "rgb".to_string());
-
-    let mut labelmap_btree = BTreeMap::new();
-    for (idx, line) in resolved_labelmap.lines().enumerate() {
-        if labelmap_btree.len() >= 256 {
-            break;
-        }
-        let trimmed = line.trim();
-        if !trimmed.is_empty()
-            && trimmed.len() <= 128
-            && let Ok(id) = i32::try_from(idx)
-        {
-            labelmap_btree.insert(id, trimmed.to_string());
-        }
-    }
-
-    let model_path_str = saved_model_path.to_string_lossy().to_string();
-    let labelmap_path_str = saved_labelmap_path.to_string_lossy().to_string();
-    let model_patch = json!({
-        "model": {
-            "path": model_path_str,
-            "labelmap_path": labelmap_path_str,
-            "width": width,
-            "height": height,
-            "model_type": model_type,
-            "input_tensor": input_tensor,
-            "input_pixel_format": input_pixel_format,
-        }
+    let clean_weights_filename = weights_bytes.as_ref().map(|_| {
+        weights_filename
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && is_safe_id(s))
+            .map_or_else(|| format!("{stem}.bin"), String::from)
     });
 
-    let deploy_outcome = match state
-        .config_coordinator
-        .deploy_detector_model(&model_patch, labelmap_btree, &state.detector)
+    let bundle = StagedModelUploadBundle {
+        safe_filename: safe_filename.clone(),
+        model_bytes,
+        weights_filename: clean_weights_filename,
+        weights_bytes,
+        safe_labelmap_name,
+        labelmap_text: resolved_labelmap,
+        model_type: model_type.clone(),
+        width,
+        height,
+        input_tensor: input_tensor.clone(),
+        input_pixel_format: input_pixel_format.clone(),
+    };
+
+    let (deploy_outcome, saved_model_path, saved_labelmap_path) = match DetectorModelManager::new()
+        .deploy_uploaded_bundle(
+            bundle,
+            &state.media_dir,
+            state.db.path(),
+            &state.detector,
+            &state.config_coordinator,
+        )
         .await
     {
-        Ok(outcome) => outcome,
+        Ok(res) => res,
         Err(config_coordinator::ConfigCommitError::Validation(msg)) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -6487,6 +5782,8 @@ async fn api_detector_model_upload(
                 .into_response();
         }
     };
+    let model_path_str = saved_model_path.to_string_lossy().to_string();
+    let labelmap_path_str = saved_labelmap_path.to_string_lossy().to_string();
 
     match deploy_outcome {
         config_coordinator::ModelDeployOutcome::RolledBack {
@@ -6624,40 +5921,32 @@ async fn api_event_license_plate(
         .as_deref()
         .map(ninjanvr_infer::normalize_license_plate)
         .filter(|s| !s.is_empty());
-
-    let updated = state
-        .db
-        .set_event_license_plate(&id, normalized_plate.as_deref())
-        .unwrap_or(0);
-
     let is_unrestricted = allowed_opt
         .as_ref()
         .is_none_or(|a| a.iter().any(|c| c == "*"));
-    let resolved_sub_label = if updated == 0 {
-        None
-    } else if let Some(explicit_sub) = body.sub_label.as_ref().filter(|s| !s.trim().is_empty()) {
-        Some(explicit_sub.trim().to_string())
-    } else if is_unrestricted && let Some(ref norm_plate) = normalized_plate {
-        let cfg = state.config.read().await;
-        ninjanvr_infer::lookup_known_plate(norm_plate, &cfg.lpr.known_plates)
-    } else {
-        None
-    };
 
-    if updated > 0
-        && let Some(ref sl) = resolved_sub_label
-        && let Err(err) = state.db.set_event_sub_label(&id, Some(sl))
+    let (updated, resolved_sub_label) = match EventReviewCoordinator::assign_event_license_plate(
+        &state,
+        &id,
+        normalized_plate.as_deref(),
+        body.sub_label.as_deref(),
+        is_unrestricted,
+    )
+    .await
     {
-        warn!("Failed to update sub_label for event '{id}' during license plate update: {err:#}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "success": false,
-                "message": "Failed to update event sub_label"
-            })),
-        )
-            .into_response();
-    }
+        Ok(res) => res,
+        Err(err) => {
+            warn!("Failed to update sub_label for event '{id}' during license plate update: {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "message": "Failed to update event sub_label"
+                })),
+            )
+                .into_response();
+        }
+    };
 
     Json(json!({
         "success": updated > 0,
@@ -7109,16 +6398,13 @@ async fn api_event_clip_mp4(
     let Some(ev) = ev_opt else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if let Some(cam) = ev["camera"].as_str() {
-        let privacy_mask_active = {
-            let cfg = state.config.read().await;
-            cfg.cameras
-                .get(cam)
-                .is_some_and(|c| has_active_privacy_mask(Some(&c.privacy_mask)))
-        };
-        if privacy_mask_active {
-            return StatusCode::NOT_FOUND.into_response();
-        }
+    if let Some(cam) = ev["camera"].as_str()
+        && let Some(gate_resp) = state
+            .media_delivery_gate
+            .untranscoded_video_gate_response(cam)
+            .await
+    {
+        return gate_resp;
     }
     let direct_clip = state.media_dir.join("clips").join(format!("{id}.mp4"));
     if let Some(safe_clip) = ensure_clips_artifact_path(&state.media_dir, &direct_clip)
@@ -9427,60 +8713,20 @@ async fn api_camera_ptz_info(
     let pass = creds.1.as_deref();
     let transport = camera_protocols::ReqwestCameraWireTransport::new(state.http_client.clone());
 
-    let presets_soap = build_onvif_get_presets_soap(&profile_token, user, pass);
-    let mut presets_res = send_onvif_soap_request(
-        &state.http_client,
-        &endpoint,
-        "GetPresets",
-        presets_soap,
-        user,
-        pass,
-        timeout,
-    )
-    .await;
-
-    let status_res = match state
+    let (resolved_prof, presets_res, status_res) = state
         .camera_driver_runtime
-        .send_ptz_soap_with_profile_discovery(
+        .query_ptz_presets_and_status(
             &transport,
             &camera,
             &endpoint,
             &profile_token,
             q.profile_token.is_none(),
             cam_cfg.hardware.protocol.as_deref(),
-            "GetStatus",
             (user, pass),
             timeout,
-            |prof| build_onvif_get_status_soap(prof, user, pass),
         )
-        .await
-    {
-        Ok((resolved_prof, status_xml)) => {
-            if resolved_prof != profile_token {
-                profile_token = resolved_prof;
-                let cand_presets_soap = build_onvif_get_presets_soap(&profile_token, user, pass);
-                presets_res = send_onvif_soap_request(
-                    &state.http_client,
-                    &endpoint,
-                    "GetPresets",
-                    cand_presets_soap,
-                    user,
-                    pass,
-                    timeout,
-                )
-                .await;
-            }
-            Ok(status_xml)
-        }
-        Err(err) => {
-            if presets_res.is_ok() {
-                state
-                    .camera_driver_runtime
-                    .set_profile(&camera, &endpoint, &profile_token);
-            }
-            Err(err)
-        }
-    };
+        .await;
+    profile_token = resolved_prof;
 
     let mut merged_presets = match &presets_res {
         Ok(xml) => parse_onvif_presets_xml(xml),
@@ -9852,22 +9098,6 @@ async fn api_camera_ptz_preset(
     };
     let transport = camera_protocols::ReqwestCameraWireTransport::new(state.http_client.clone());
 
-    let goto_res = state
-        .camera_driver_runtime
-        .send_ptz_soap_with_profile_discovery(
-            &transport,
-            &camera,
-            &endpoint,
-            &profile_token,
-            body.profile_token.is_none(),
-            cam_cfg.hardware.protocol.as_deref(),
-            "GotoPreset",
-            (user, pass),
-            timeout,
-            |prof| build_onvif_goto_preset_soap(prof, preset_token, body.speed, user, pass),
-        )
-        .await;
-
     let soft_opt = cam_cfg
         .hardware
         .soft_presets
@@ -9882,131 +9112,51 @@ async fn api_camera_ptz_preset(
                 .cloned()
         });
 
-    match goto_res {
-        Ok(_) => {
-            state
-                .camera_driver_runtime
-                .set_active_preset(&camera, Some(preset_token.to_string()))
-                .await;
+    match state
+        .camera_driver_runtime
+        .goto_preset_with_soft_fallback(
+            &transport,
+            &camera,
+            &endpoint,
+            &profile_token,
+            body.profile_token.is_none(),
+            cam_cfg.hardware.protocol.as_deref(),
+            preset_token,
+            body.speed,
+            soft_opt.as_ref(),
+            (user, pass),
+            timeout,
+        )
+        .await
+    {
+        Ok("SoftPresetRelativeMove") => Json(json!({
+            "success": true,
+            "camera": camera,
+            "operation": "GotoPreset",
+            "preset": preset_token,
+            "active_preset": preset_token,
+            "source": "soft_preset"
+        }))
+        .into_response(),
+        Ok(_) => Json(json!({
+            "success": true,
+            "camera": camera,
+            "operation": "GotoPreset",
+            "preset": preset_token,
+            "active_preset": preset_token
+        }))
+        .into_response(),
+        Err((status, err_msg)) => (
+            status,
             Json(json!({
-                "success": true,
+                "success": false,
                 "camera": camera,
                 "operation": "GotoPreset",
-                "preset": preset_token,
-                "active_preset": preset_token
-            }))
-            .into_response()
-        }
-        Err(_) if soft_opt.is_some() => {
-            // Soft-preset fallback for cameras (like Intelbras iME-360-C) where ONVIF GotoPreset is not implemented
-            let Some(soft) = soft_opt else {
-                unreachable!("guarded by soft_opt.is_some()");
-            };
-            let (resolved_prof, cur_status) = match fetch_ptz_status_with_profile_discovery(
-                &state,
-                &camera,
-                &endpoint,
-                (
-                    &profile_token,
-                    body.profile_token.is_none(),
-                    cam_cfg.hardware.protocol.as_deref(),
-                ),
-                (user, pass),
-                timeout,
-            )
-            .await
-            {
-                Ok(pair) => pair,
-                Err((st, e)) => {
-                    state
-                        .camera_driver_runtime
-                        .set_active_preset(&camera, None)
-                        .await;
-                    return (
-                        st,
-                        Json(json!({
-                            "success": false,
-                            "camera": camera,
-                            "operation": "GotoPreset",
-                            "error": e,
-                            "active_preset": Value::Null
-                        })),
-                    )
-                        .into_response();
-                }
-            };
-            let (dx, dy, dz) = state
-                .camera_driver_runtime
-                .compute_soft_preset_delta(
-                    f64::from(cur_status.pan),
-                    f64::from(cur_status.tilt),
-                    f64::from(cur_status.zoom),
-                    f64::from(soft.pan),
-                    f64::from(soft.tilt),
-                    f64::from(soft.zoom),
-                    0.0,
-                )
-                .map_or((0.0, 0.0, 0.0), |(x, y, z)| (x as f32, y as f32, z as f32));
-            let rel_soap =
-                build_onvif_relative_move_soap(&resolved_prof, dx, dy, dz, body.speed, user, pass);
-            if let Err((st, e)) = send_onvif_soap_request(
-                &state.http_client,
-                &endpoint,
-                "RelativeMove",
-                rel_soap,
-                user,
-                pass,
-                timeout,
-            )
-            .await
-            {
-                state
-                    .camera_driver_runtime
-                    .set_active_preset(&camera, None)
-                    .await;
-                return (
-                    st,
-                    Json(json!({
-                        "success": false,
-                        "camera": camera,
-                        "operation": "GotoPreset",
-                        "error": e,
-                        "active_preset": Value::Null
-                    })),
-                )
-                    .into_response();
-            }
-            state
-                .camera_driver_runtime
-                .set_active_preset(&camera, Some(preset_token.to_string()))
-                .await;
-            Json(json!({
-                "success": true,
-                "camera": camera,
-                "operation": "GotoPreset",
-                "preset": preset_token,
-                "active_preset": preset_token,
-                "source": "soft_preset"
-            }))
-            .into_response()
-        }
-        Err((status, err_msg)) => {
-            state
-                .camera_driver_runtime
-                .set_active_preset(&camera, None)
-                .await;
-            (
-                status,
-                Json(json!({
-                    "success": false,
-                    "camera": camera,
-                    "operation": "GotoPreset",
-                    "error": err_msg,
-                    "active_preset": Value::Null
-                })),
-            )
-                .into_response()
-        }
+                "error": err_msg,
+                "active_preset": Value::Null
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -10588,21 +9738,20 @@ async fn api_camera_hardware_get(
     let onvif_base = format_camera_http_base(&host, onvif_port);
     let dev_ep = format!("{onvif_base}/onvif/device_service");
     let ptz_ep = ptz_ep_opt.unwrap_or_else(|| format!("{onvif_base}/onvif/ptz_service"));
+    let transport = camera_protocols::ReqwestCameraWireTransport::new(state.http_client.clone());
 
-    // 1. Probe ONVIF GetDeviceInformation
+    // 1. Probe ONVIF GetDeviceInformation over CameraWireTransport
     let dev_soap = build_onvif_get_device_info_soap(user, pass);
-    let dev_res = send_onvif_soap_request_with_ns(
-        &state.http_client,
-        &dev_ep,
-        (
+    let dev_res = transport
+        .send_soap(
+            &dev_ep,
             "http://www.onvif.org/ver10/device/wsdl",
             "GetDeviceInformation",
-        ),
-        dev_soap,
-        (user, pass),
-        timeout,
-    )
-    .await;
+            dev_soap,
+            (user, pass),
+            timeout,
+        )
+        .await;
     let host_timed_out = matches!(dev_res, Err((StatusCode::GATEWAY_TIMEOUT, _)));
     let mut dev_info = match &dev_res {
         Ok(xml) => parse_onvif_device_info_xml(xml),
@@ -10651,7 +9800,6 @@ async fn api_camera_hardware_get(
     let mut ptz_ok = false;
     let mut ptz_zoom = false;
     let mut media_discovered: Option<(Vec<String>, Vec<String>)> = None;
-    let transport = camera_protocols::ReqwestCameraWireTransport::new(state.http_client.clone());
     if !host_timed_out {
         let proto_hint = if is_tapo {
             Some("tapo")
@@ -10706,16 +9854,16 @@ async fn api_camera_hardware_get(
                         continue;
                     }
                     let st_soap = build_onvif_get_status_soap(dyn_prof, user, pass);
-                    if let Ok(st_xml) = send_onvif_soap_request(
-                        &state.http_client,
-                        &ptz_ep,
-                        "GetStatus",
-                        st_soap,
-                        user,
-                        pass,
-                        timeout,
-                    )
-                    .await
+                    if let Ok(st_xml) = transport
+                        .send_soap(
+                            &ptz_ep,
+                            "http://www.onvif.org/ver20/ptz/wsdl",
+                            "GetStatus",
+                            st_soap,
+                            (user, pass),
+                            timeout,
+                        )
+                        .await
                     {
                         ptz_ok = true;
                         discovered_profile = dyn_prof.clone();
@@ -10808,62 +9956,17 @@ async fn api_camera_hardware_get(
                     || m.to_ascii_lowercase().contains("imou")
             }))
     {
-        let sys_url = format!("{cgi_base}/cgi-bin/magicBox.cgi?action=getSystemInfo");
-        if let Ok((StatusCode::OK, sys_txt)) = send_http_digest_request(
-            &state.http_client,
-            &state.camera_driver_runtime,
-            reqwest::Method::GET,
-            &sys_url,
-            (user, pass),
-            (None, None),
-            timeout,
-        )
-        .await
-        {
-            let sys_kv = parse_dahua_cgi_kv(&sys_txt);
-            if sys_kv.contains_key("deviceType") || sys_kv.contains_key("serialNumber") {
-                dahua_cgi_ok = true;
-                if dev_info.model.is_none() {
-                    dev_info.model = sys_kv.get("deviceType").cloned();
-                }
-                if dev_info.serial_number.is_none() {
-                    dev_info.serial_number = sys_kv.get("serialNumber").cloned();
-                }
-                if dev_info.manufacturer.is_none() {
-                    dev_info.manufacturer = Some("Intelbras / Dahua".to_string());
-                }
-            }
-        }
-    }
-
-    if dahua_cgi_ok {
-        for chunk in DAHUA_CGI_PROBE_TABLES.chunks(4) {
-            let futs = chunk.iter().map(|&table| {
-                let tbl_url =
-                    format!("{cgi_base}/cgi-bin/configManager.cgi?action=getConfig&name={table}");
-                let client = &state.http_client;
-                let rt = &state.camera_driver_runtime;
-                async move {
-                    let res = send_http_digest_request(
-                        client,
-                        rt,
-                        reqwest::Method::GET,
-                        &tbl_url,
-                        (user, pass),
-                        (None, None),
-                        timeout,
-                    )
-                    .await;
-                    (table, res)
-                }
-            });
-            for (table, res) in futures_util::future::join_all(futs).await {
-                if let Ok((StatusCode::OK, txt)) = res {
-                    let kv = parse_dahua_cgi_kv(&txt);
-                    apply_dahua_cgi_table_to_state(table, &kv, &mut state_map);
-                }
-            }
-        }
+        dahua_cgi_ok = state
+            .camera_driver_runtime
+            .probe_dahua_cgi_system_and_tables(
+                &transport,
+                &cgi_base,
+                &mut dev_info,
+                &mut state_map,
+                (user, pass),
+                timeout,
+            )
+            .await;
     }
 
     let online = dev_res.is_ok() || ptz_ok || imaging_ok || dahua_cgi_ok;
@@ -11312,47 +10415,25 @@ async fn api_camera_hardware_set(
         }
     }
 
-    // 3. Apply Dahua / Intelbras CGI hardware settings via declarative CGI table encoder
+    // 3. Apply Dahua / Intelbras CGI hardware settings via declarative CGI table encoder over transport
     let cgi_pairs = build_dahua_cgi_set_config_pairs(&body);
 
     if !cgi_pairs.is_empty() {
-        let set_url = format!(
-            "{cgi_base}/cgi-bin/configManager.cgi?action=setConfig&{}",
-            cgi_pairs.join("&")
-        );
-        match send_http_digest_request(
-            &state.http_client,
-            &state.camera_driver_runtime,
-            reqwest::Method::GET,
-            &set_url,
-            (user, pass),
-            (None, None),
-            timeout,
-        )
-        .await
+        let cgi_transport =
+            camera_protocols::ReqwestCameraWireTransport::new(state.http_client.clone());
+        match state
+            .camera_driver_runtime
+            .apply_dahua_cgi_set_config(
+                &cgi_transport,
+                &cgi_base,
+                &cgi_pairs,
+                (user, pass),
+                timeout,
+            )
+            .await
         {
-            Ok((StatusCode::OK, resp_txt))
-                if !resp_txt
-                    .trim_start()
-                    .to_ascii_lowercase()
-                    .starts_with("error") =>
-            {
+            Ok(()) => {
                 applied_ops.extend(cgi_pairs);
-            }
-            Ok((st, resp_txt)) => {
-                let scrubbed_snippet: String = scrub_rtsp_credentials(resp_txt.trim())
-                    .chars()
-                    .take(256)
-                    .collect();
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({
-                        "success": false,
-                        "camera": camera,
-                        "error": format!("Camera CGI setConfig returned HTTP {} ({scrubbed_snippet})", st.as_u16())
-                    })),
-                )
-                    .into_response();
             }
             Err((st, err_msg)) => {
                 return (
@@ -11531,8 +10612,10 @@ async fn api_camera_logs_get(
         None => Duration::from_secs(cam_cfg.onvif.timeout_sec.clamp(1, 5)),
     };
 
-    let report = collect_camera_diagnostic_logs(
-        &state.http_client,
+    let diag_transport =
+        camera_protocols::ReqwestCameraWireTransport::new(state.http_client.clone());
+    let report = collect_camera_diagnostic_logs_with_transport(
+        &diag_transport,
         &state.camera_driver_runtime,
         &camera,
         (&host, onvif_port),
@@ -11830,35 +10913,12 @@ pub struct LatestFrameQuery {
 }
 
 const MAX_LAZY_SNAPSHOT_CACHE_ENTRIES: usize = 128;
-const MAX_SNAPSHOT_FRAME_BYTES: usize = 10 * 1024 * 1024;
-const MAX_SNAPSHOT_DIMENSION: u32 = 8192;
-const MAX_SNAPSHOT_DECODE_ALLOC_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_GO2RTC_STREAMS_JSON_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_SNAPSHOT_FRAME_BYTES: usize = 10 * 1024 * 1024;
+pub(crate) const MAX_SNAPSHOT_DIMENSION: u32 = 8192;
+pub(crate) const MAX_SNAPSHOT_DECODE_ALLOC_BYTES: u64 = 64 * 1024 * 1024;
 
 fn decode_bounded_snapshot_rgb(bytes: &[u8]) -> Option<image::RgbImage> {
-    if bytes.is_empty() || bytes.len() > MAX_SNAPSHOT_FRAME_BYTES {
-        return None;
-    }
-    let dim_reader = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()?;
-    let (w, h) = dim_reader.into_dimensions().ok()?;
-    if w == 0 || h == 0 || w > MAX_SNAPSHOT_DIMENSION || h > MAX_SNAPSHOT_DIMENSION {
-        return None;
-    }
-    let rgba_bytes = (w as u64).saturating_mul(h as u64).saturating_mul(4);
-    if rgba_bytes > MAX_SNAPSHOT_DECODE_ALLOC_BYTES {
-        return None;
-    }
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_SNAPSHOT_DIMENSION);
-    limits.max_image_height = Some(MAX_SNAPSHOT_DIMENSION);
-    limits.max_alloc = Some(MAX_SNAPSHOT_DECODE_ALLOC_BYTES);
-    reader.limits(limits);
-    Some(reader.decode().ok()?.to_rgb8())
+    media_redaction::decode_bounded_snapshot_rgb(bytes)
 }
 
 fn apply_camera_privacy_mask_or_fail_closed(
@@ -11867,30 +10927,7 @@ fn apply_camera_privacy_mask_or_fail_closed(
     detect_w: u32,
     detect_h: u32,
 ) -> bool {
-    if rgb.width() == 0 || rgb.height() == 0 {
-        return false;
-    }
-    let src_w = if detect_w > 0 {
-        detect_w
-    } else {
-        rgb.width().max(1)
-    };
-    let src_h = if detect_h > 0 {
-        detect_h
-    } else {
-        rgb.height().max(1)
-    };
-    let norm_mask = normalize_privacy_mask_value_for_resolution(raw_mask, src_w, src_h);
-    if ninjanvr_media::build_privacy_drawbox_filter(Some(&norm_mask)).is_none() {
-        return false;
-    }
-    let poly_mask =
-        ninjanvr_vision::PolygonMask::from_config_value(&norm_mask, rgb.width(), rgb.height());
-    if poly_mask.is_empty() {
-        return false;
-    }
-    ninjanvr_vision::apply_privacy_masks_from_value(rgb, &norm_mask);
-    true
+    MediaDeliveryGate::apply_mask_or_fail_closed(rgb, raw_mask, detect_w, detect_h)
 }
 
 async fn read_bounded_response_bytes(
@@ -12295,37 +11332,11 @@ async fn api_go2rtc_stream_prewarm(
     if let Some(err_resp) = verify_caller_can_mutate(&state, &jar, &headers).await {
         return err_resp.into_response();
     }
-    if !is_safe_go2rtc_stream_name(&stream) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "success": false, "message": "Invalid stream identifier" })),
-        )
-            .into_response();
-    }
-    let base_cam = stream.strip_suffix("_sub").unwrap_or(&stream).trim();
-    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
-        && !allowed.iter().any(|a| a == base_cam || a == "*")
-    {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({ "success": false, "message": "Stream camera is not permitted for this user" })),
-        )
-            .into_response();
-    }
-    let canonical_stream = {
-        let cfg = state.config.read().await;
-        cfg.resolve_mse_stream_alias(&stream).to_string()
-    };
-    let warm = state
-        .mse_hub
-        .prewarm_stream(&state.go2rtc_ws_base, &canonical_stream)
-        .await;
-    Json(json!({
-        "success": true,
-        "stream": stream,
-        "warm": warm,
-    }))
-    .into_response()
+    let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
+    state
+        .live_gateway
+        .prewarm_stream(&state.go2rtc_ws_base, &stream, allowed.as_deref())
+        .await
 }
 
 /// Unified operator snapshot: full-resolution main-stream frame (privacy-masked, fail-closed)
@@ -12479,35 +11490,10 @@ async fn api_go2rtc_streams(
     headers: HeaderMap,
 ) -> Response {
     let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
-    let url = format!("{}/api/streams", state.go2rtc_http_base);
-    match state
-        .http_client
-        .get(&url)
-        .timeout(Duration::from_secs(5))
-        .send()
+    state
+        .live_gateway
+        .list_streams(&state.go2rtc_http_base, allowed.as_deref())
         .await
-    {
-        Ok(resp) => {
-            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
-            if let Some(bytes) =
-                read_bounded_response_bytes(resp, MAX_GO2RTC_STREAMS_JSON_BYTES).await
-                && let Ok(json_val) = serde_json::from_slice::<Value>(&bytes)
-            {
-                let mut scrubbed = scrub_json_value(&json_val);
-                if let Some(ref allow_list) = allowed
-                    && let Some(obj) = scrubbed.as_object_mut()
-                {
-                    obj.retain(|key, _| {
-                        let base_cam = key.strip_suffix("_sub").unwrap_or(key);
-                        allow_list.iter().any(|a| a == base_cam || a == "*")
-                    });
-                }
-                return (status, Json(scrubbed)).into_response();
-            }
-            Json(json!({})).into_response()
-        }
-        Err(_) => Json(json!({})).into_response(),
-    }
 }
 
 async fn api_go2rtc_stream_one(
@@ -12516,106 +11502,16 @@ async fn api_go2rtc_stream_one(
     headers: HeaderMap,
     AxumPath(stream): AxumPath<String>,
 ) -> Response {
-    if !is_safe_go2rtc_stream_name(&stream) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "success": false, "message": "Invalid stream identifier" })),
-        )
-            .into_response();
-    }
-    let base_cam = stream.strip_suffix("_sub").unwrap_or(&stream).trim();
-    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
-        && !allowed.iter().any(|a| a == base_cam || a == "*")
-    {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({ "success": false, "message": "Stream camera is not permitted for this user" })),
-        )
-            .into_response();
-    }
-    let encoded_stream = urlencoding_simple(&stream);
-    let url = format!(
-        "{}/api/streams?src={encoded_stream}&video=all&audio=all&microphone=",
-        state.go2rtc_http_base
-    );
-    match state
-        .http_client
-        .get(&url)
-        .timeout(Duration::from_secs(5))
-        .send()
+    let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
+    state
+        .live_gateway
+        .get_stream_one(&state.go2rtc_http_base, &stream, allowed.as_deref())
         .await
-    {
-        Ok(resp) => {
-            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
-            if let Some(bytes) =
-                read_bounded_response_bytes(resp, MAX_GO2RTC_STREAMS_JSON_BYTES).await
-                && let Ok(json_val) = serde_json::from_slice::<Value>(&bytes)
-            {
-                return (status, Json(scrub_json_value(&json_val))).into_response();
-            }
-            Json(json!({})).into_response()
-        }
-        Err(_) => Json(json!({})).into_response(),
-    }
 }
 
-const MAX_WEBRTC_SDP_BYTES: usize = 256 * 1024;
 const MAX_STATE_WS_MESSAGE_BYTES: usize = 64 * 1024;
-const MAX_GO2RTC_WS_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_GO2RTC_WS_MESSAGE_BYTES: usize = live_gateway::MAX_GO2RTC_WS_MESSAGE_BYTES;
 const MAX_VOD_SEGMENTS: usize = 8640;
-
-fn query_has_disallowed_go2rtc_dst(query: &str) -> bool {
-    query.contains(';')
-        || query.split('&').any(|kv| {
-            let raw_k = kv.split('=').next().unwrap_or(kv).trim();
-            raw_k.eq_ignore_ascii_case("dst")
-                || percent_decode_segment(raw_k).is_some_and(|dk| dk.eq_ignore_ascii_case("dst"))
-        })
-}
-
-fn is_webrtc_audio_talkback_offer(sdp_bytes: &[u8]) -> bool {
-    let Ok(sdp) = std::str::from_utf8(sdp_bytes) else {
-        return false;
-    };
-    let mut has_audio = false;
-    let mut audio_recv_or_inactive_only = false;
-    let mut in_audio_section = false;
-    for raw_line in sdp.lines() {
-        let line = raw_line.trim();
-        if let Some(media_rest) = line.strip_prefix("m=") {
-            if media_rest.starts_with("video ") || media_rest == "video" {
-                return false;
-            }
-            in_audio_section = media_rest.starts_with("audio ") || media_rest == "audio";
-            if in_audio_section {
-                has_audio = true;
-            }
-            continue;
-        }
-        if in_audio_section && (line == "a=recvonly" || line == "a=inactive") {
-            audio_recv_or_inactive_only = true;
-        }
-    }
-    has_audio && !audio_recv_or_inactive_only
-}
-
-fn rewrite_query_src_param(query: &str, new_src: &str) -> String {
-    let mut parts = Vec::new();
-    let mut replaced = false;
-    for kv in query.split('&') {
-        if kv.is_empty() {
-            continue;
-        }
-        let (raw_k, _) = kv.split_once('=').unwrap_or((kv, ""));
-        if !replaced && raw_k.eq_ignore_ascii_case("src") {
-            parts.push(format!("src={new_src}"));
-            replaced = true;
-        } else {
-            parts.push(kv.to_string());
-        }
-    }
-    parts.join("&")
-}
 
 async fn api_go2rtc_webrtc(
     State(state): State<AppState>,
@@ -12634,100 +11530,17 @@ async fn api_go2rtc_webrtc(
         )
             .into_response();
     }
-    if body.len() > MAX_WEBRTC_SDP_BYTES {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(json!({
-                "success": false,
-                "message": "WebRTC SDP offer exceeds maximum allowed size"
-            })),
-        )
-            .into_response();
-    }
     let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
-    if let Err(msg) = validate_go2rtc_query_streams(uri.query(), allowed.as_deref()) {
-        let status = if msg == "Stream camera is not permitted for this user" {
-            StatusCode::FORBIDDEN
-        } else {
-            StatusCode::BAD_REQUEST
-        };
-        return (status, Json(json!({ "success": false, "message": msg }))).into_response();
-    }
-    let query = uri.query().unwrap_or("");
-    let Some(raw_src) = (!query_has_disallowed_go2rtc_dst(query))
-        .then(|| mse_hub::extract_stream_src_from_query(query))
-        .flatten()
-    else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "success": false,
-                "message": "Invalid or ambiguous stream src query parameter"
-            })),
+    state
+        .live_gateway
+        .negotiate_webrtc_sdp(
+            &state.go2rtc_http_base,
+            uri.query(),
+            &headers,
+            body,
+            allowed.as_deref(),
         )
-            .into_response();
-    };
-    let upstream_query = if !raw_src.ends_with("_talk")
-        && is_webrtc_audio_talkback_offer(&body)
-        && state
-            .config
-            .read()
-            .await
-            .has_dedicated_talk_stream(&raw_src)
-    {
-        rewrite_query_src_param(query, &format!("{raw_src}_talk"))
-    } else {
-        query.to_string()
-    };
-    let url = if upstream_query.is_empty() {
-        format!("{}/api/webrtc", state.go2rtc_http_base)
-    } else {
-        format!("{}/api/webrtc?{upstream_query}", state.go2rtc_http_base)
-    };
-    let mut req = state
-        .http_client
-        .post(&url)
-        .timeout(Duration::from_secs(5))
-        .body(body.to_vec());
-    if let Some(ct) = headers.get(header::CONTENT_TYPE) {
-        req = req.header(header::CONTENT_TYPE, ct);
-    } else {
-        req = req.header(header::CONTENT_TYPE, "application/sdp");
-    }
-    match req.send().await {
-        Ok(resp) => {
-            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
-            let content_type = resp
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("application/sdp")
-                .to_string();
-            let Some(bytes) = read_bounded_response_bytes(resp, MAX_WEBRTC_SDP_BYTES).await else {
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    "Upstream go2rtc WebRTC response exceeded maximum size",
-                )
-                    .into_response();
-            };
-            let body_out = if let Ok(text) = std::str::from_utf8(&bytes) {
-                Bytes::from(scrub_rtsp_credentials(text))
-            } else {
-                bytes
-            };
-            (
-                status,
-                [(header::CONTENT_TYPE, content_type)],
-                Body::from(body_out),
-            )
-                .into_response()
-        }
-        Err(err) => (
-            StatusCode::BAD_GATEWAY,
-            scrub_rtsp_credentials(&err.to_string()),
-        )
-            .into_response(),
-    }
+        .await
 }
 
 async fn ws_state_handler(
@@ -12970,7 +11783,10 @@ async fn ws_go2rtc_proxy(
             .into_response();
     }
     let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
-    if let Err(msg) = validate_go2rtc_query_streams(uri.query(), allowed.as_deref()) {
+    let known = state.live_gateway.known_camera_set().await;
+    if let Err(msg) =
+        validate_go2rtc_query_streams_with_known(uri.query(), allowed.as_deref(), Some(&known))
+    {
         let status = if msg == "Stream camera is not permitted for this user"
             || (msg == "Missing stream src query parameter" && allowed.is_some())
         {
@@ -12981,7 +11797,7 @@ async fn ws_go2rtc_proxy(
         return (status, Json(json!({ "message": msg }))).into_response();
     }
     let query = uri.query().unwrap_or("").to_string();
-    if query_has_disallowed_go2rtc_dst(&query)
+    if live_gateway::query_has_disallowed_go2rtc_dst(&query)
         || mse_hub::extract_stream_src_from_query(&query).is_none()
     {
         return (
@@ -12997,250 +11813,13 @@ async fn ws_go2rtc_proxy(
     let is_webrtc_ws = uri.path().starts_with("/live/webrtc");
     ws.max_message_size(MAX_GO2RTC_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_GO2RTC_WS_MESSAGE_BYTES)
-        .on_upgrade(move |client_ws| {
-            bridge_go2rtc_ws_with_mode(client_ws, state, query, is_webrtc_ws)
+        .on_upgrade(move |client_ws| async move {
+            state
+                .live_gateway
+                .bridge_ws(client_ws, &state.go2rtc_ws_base, query, is_webrtc_ws)
+                .await;
         })
         .into_response()
-}
-
-async fn send_client_ws_bounded(
-    sink: &mut futures_util::stream::SplitSink<WebSocket, AxumWsMsg>,
-    msg: AxumWsMsg,
-) -> bool {
-    matches!(
-        tokio::time::timeout(Duration::from_secs(5), sink.send(msg)).await,
-        Ok(Ok(()))
-    )
-}
-
-async fn send_mse_burst_bounded(
-    sink: &mut futures_util::stream::SplitSink<WebSocket, AxumWsMsg>,
-    burst: mse_hub::MseGopBurst,
-    send_headers: bool,
-) -> Option<u64> {
-    if send_headers {
-        if !send_client_ws_bounded(sink, AxumWsMsg::Text(burst.codec_msg.into())).await {
-            return None;
-        }
-        if !send_client_ws_bounded(sink, AxumWsMsg::Binary(burst.init_segment)).await {
-            return None;
-        }
-    }
-    for frag in burst.gop_fragments {
-        if !send_client_ws_bounded(sink, AxumWsMsg::Binary(frag)).await {
-            return None;
-        }
-    }
-    Some(burst.last_seq)
-}
-
-async fn bridge_go2rtc_ws_with_mode(
-    client_ws: WebSocket,
-    state: AppState,
-    query: String,
-    is_webrtc_ws: bool,
-) {
-    let stream_src = if is_webrtc_ws {
-        None
-    } else if let Some(raw_src) = mse_hub::extract_stream_src_from_query(&query) {
-        let cfg = state.config.read().await;
-        Some(cfg.resolve_mse_stream_alias(&raw_src).to_string())
-    } else {
-        None
-    };
-
-    // If a stream `src` is specified on `/live/mse/api/ws`, use MseStreamHub's shared single-upstream
-    // publisher so the instant GOP burst and all subsequent live fragments share a continuous tfdt timeline.
-    if let Some(ref src) = stream_src {
-        let (mut client_sink, mut client_stream) = client_ws.split();
-
-        // Wait briefly for client MSE handshake (or proceed immediately if none arrives within 40ms)
-        match tokio::time::timeout(Duration::from_millis(40), client_stream.next()).await {
-            Ok(Some(Ok(AxumWsMsg::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => return,
-            _ => {}
-        }
-
-        let Some(mut sub) = state
-            .mse_hub
-            .subscribe_client(&state.go2rtc_ws_base, src)
-            .await
-        else {
-            return;
-        };
-
-        let mut last_sent_seq = 0u64;
-        let mut sent_init = false;
-        if let Some(burst) = sub.burst.take() {
-            let Some(seq) = send_mse_burst_bounded(&mut client_sink, burst, true).await else {
-                return;
-            };
-            last_sent_seq = seq;
-            sub.last_seq = sub.last_seq.max(seq);
-            sent_init = true;
-        }
-
-        loop {
-            tokio::select! {
-                biased;
-                client_msg = client_stream.next() => {
-                    match client_msg {
-                        Some(Ok(AxumWsMsg::Ping(p))) => {
-                            if !send_client_ws_bounded(&mut client_sink, AxumWsMsg::Pong(p)).await {
-                                break;
-                            }
-                        }
-                        Some(Ok(AxumWsMsg::Text(t))) if t.len() > MAX_STATE_WS_MESSAGE_BYTES => break,
-                        Some(Ok(AxumWsMsg::Binary(b))) if b.len() > MAX_STATE_WS_MESSAGE_BYTES => break,
-                        Some(Ok(AxumWsMsg::Close(_))) | Some(Err(_)) | None => break,
-                        _ => {}
-                    }
-                }
-                live_pkt = sub.recv_or_resync(&state.mse_hub, src) => {
-                    match live_pkt {
-                        Ok(mse_hub::MseLivePacket::Codec(_)) | Ok(mse_hub::MseLivePacket::Init(_)) => {
-                            if !sent_init
-                                && let Some(burst) = state.mse_hub.get_fresh_burst(src).await
-                            {
-                                let Some(seq) = send_mse_burst_bounded(&mut client_sink, burst, true).await else {
-                                    break;
-                                };
-                                last_sent_seq = seq;
-                                sub.last_seq = sub.last_seq.max(seq);
-                                sent_init = true;
-                            } else if sent_init {
-                                // Upstream go2rtc session reconnected and emitted a new codec/init header
-                                // (which resets fMP4 tfdt timestamps). Close client WS so the player
-                                // reconnects with a clean MediaSource and the fresh GOP burst.
-                                break;
-                            }
-                        }
-                        Ok(mse_hub::MseLivePacket::Fragment { seq, bytes }) => {
-                            if !sent_init {
-                                if let Some(burst) = state.mse_hub.get_fresh_burst(src).await {
-                                    let Some(b_seq) = send_mse_burst_bounded(&mut client_sink, burst, true).await else {
-                                        break;
-                                    };
-                                    last_sent_seq = b_seq;
-                                    sub.last_seq = sub.last_seq.max(b_seq);
-                                    sent_init = true;
-                                }
-                                continue;
-                            }
-                            if seq <= last_sent_seq {
-                                continue;
-                            }
-                            last_sent_seq = seq;
-                            if !send_client_ws_bounded(&mut client_sink, AxumWsMsg::Binary(bytes)).await {
-                                break;
-                            }
-                        }
-                        Err(Some(burst)) => {
-                            let send_headers = !sent_init;
-                            let Some(b_seq) = send_mse_burst_bounded(&mut client_sink, burst, send_headers).await else {
-                                break;
-                            };
-                            sent_init = true;
-                            last_sent_seq = b_seq;
-                            sub.last_seq = sub.last_seq.max(b_seq);
-                        }
-                        Err(None) => {
-                            if state.mse_hub.get_fresh_burst(src).await.is_none() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return;
-    }
-
-    let target_url = if query.is_empty() {
-        format!("{}/api/ws", state.go2rtc_ws_base)
-    } else {
-        format!("{}/api/ws?{query}", state.go2rtc_ws_base)
-    };
-
-    let ws_cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
-        .max_message_size(Some(MAX_GO2RTC_WS_MESSAGE_BYTES))
-        .max_frame_size(Some(MAX_GO2RTC_WS_MESSAGE_BYTES));
-    let Ok(Ok((upstream_ws, _))) = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio_tungstenite::connect_async_with_config(&target_url, Some(ws_cfg), false),
-    )
-    .await
-    else {
-        warn!(
-            "Failed to connect upstream go2rtc WS at {}",
-            scrub_rtsp_credentials(&target_url)
-        );
-        return;
-    };
-
-    let (mut client_sink, mut client_stream) = client_ws.split();
-    let (mut up_sink, mut up_stream) = upstream_ws.split();
-
-    let c2u = async {
-        while let Some(Ok(msg)) = client_stream.next().await {
-            let out = match msg {
-                AxumWsMsg::Text(t) => {
-                    if t.len() > MAX_GO2RTC_WS_MESSAGE_BYTES {
-                        break;
-                    }
-                    TungMsg::Text(t.to_string().into())
-                }
-                AxumWsMsg::Binary(b) => {
-                    if b.len() > MAX_GO2RTC_WS_MESSAGE_BYTES {
-                        break;
-                    }
-                    TungMsg::Binary(b)
-                }
-                AxumWsMsg::Ping(p) => TungMsg::Ping(p),
-                AxumWsMsg::Pong(p) => TungMsg::Pong(p),
-                AxumWsMsg::Close(_) => break,
-            };
-            if !matches!(
-                tokio::time::timeout(Duration::from_secs(5), up_sink.send(out)).await,
-                Ok(Ok(()))
-            ) {
-                break;
-            }
-        }
-    };
-
-    let u2c = async {
-        while let Some(Ok(msg)) = up_stream.next().await {
-            let out = match msg {
-                TungMsg::Text(t) => {
-                    if t.len() > MAX_GO2RTC_WS_MESSAGE_BYTES {
-                        break;
-                    }
-                    AxumWsMsg::Text(scrub_rtsp_credentials(&t).into())
-                }
-                TungMsg::Binary(b) => {
-                    if b.len() > MAX_GO2RTC_WS_MESSAGE_BYTES {
-                        break;
-                    }
-                    AxumWsMsg::Binary(b)
-                }
-                TungMsg::Ping(p) => AxumWsMsg::Ping(p),
-                TungMsg::Pong(p) => AxumWsMsg::Pong(p),
-                TungMsg::Close(_) => break,
-                TungMsg::Frame(_) => continue,
-            };
-            if !matches!(
-                tokio::time::timeout(Duration::from_secs(5), client_sink.send(out)).await,
-                Ok(Ok(()))
-            ) {
-                break;
-            }
-        }
-    };
-
-    tokio::select! {
-        _ = c2u => {},
-        _ = u2c => {},
-    }
 }
 
 pub(crate) fn resolve_recording_disk_path(media_dir: &Path, db_path: &str) -> PathBuf {
@@ -13281,14 +11860,12 @@ async fn vod_master_m3u8(
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let privacy_mask_active = {
-        let cfg = state.config.read().await;
-        cfg.cameras
-            .get(&camera)
-            .is_some_and(|c| has_active_privacy_mask(Some(&c.privacy_mask)))
-    };
-    if privacy_mask_active {
-        return StatusCode::NOT_FOUND.into_response();
+    if let Some(gate_resp) = state
+        .media_delivery_gate
+        .untranscoded_video_gate_response(&camera)
+        .await
+    {
+        return gate_resp;
     }
     (
         [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
@@ -13368,10 +11945,7 @@ async fn vod_index_m3u8(
     }
     let (privacy_mask_active, cold_dir_opt) = {
         let cfg = state.config.read().await;
-        let masked = cfg
-            .cameras
-            .get(&camera)
-            .is_some_and(|c| has_active_privacy_mask(Some(&c.privacy_mask)));
+        let masked = MediaDeliveryGate::blocks_untranscoded_video_in_config(&cfg, &camera);
         (masked, resolve_configured_cold_dir(&cfg))
     };
     if privacy_mask_active {
@@ -13462,10 +12036,7 @@ async fn vod_init_mp4(
     }
     let (privacy_mask_active, cold_dir_opt) = {
         let cfg = state.config.read().await;
-        let masked = cfg
-            .cameras
-            .get(&camera)
-            .is_some_and(|c| has_active_privacy_mask(Some(&c.privacy_mask)));
+        let masked = MediaDeliveryGate::blocks_untranscoded_video_in_config(&cfg, &camera);
         (masked, resolve_configured_cold_dir(&cfg))
     };
     if privacy_mask_active {
@@ -13524,10 +12095,7 @@ async fn vod_segment_m4s(
     }
     let (privacy_mask_active, cold_dir_opt) = {
         let cfg = state.config.read().await;
-        let masked = cfg
-            .cameras
-            .get(&camera)
-            .is_some_and(|c| has_active_privacy_mask(Some(&c.privacy_mask)));
+        let masked = MediaDeliveryGate::blocks_untranscoded_video_in_config(&cfg, &camera);
         (masked, resolve_configured_cold_dir(&cfg))
     };
     if privacy_mask_active {
@@ -13979,7 +12547,6 @@ pub async fn new_app_state(
             camera_metrics: camera_metrics.clone(),
             media_dir: media_dir.clone(),
             log_hub: log_hub.clone(),
-            ptz_active_presets: ptz_active_presets.clone(),
             camera_driver_runtime: camera_driver_runtime.clone(),
             snapshot_http_client: pipeline::build_snapshot_http_client(),
             high_res_snapshot_semaphore: Arc::new(tokio::sync::Semaphore::new(
@@ -14012,8 +12579,15 @@ pub async fn new_app_state(
         web_dir
     };
 
-    let config_coordinator = ConfigCoordinator::new(shared_cfg.clone());
+    let config_coordinator =
+        ConfigCoordinator::new(shared_cfg.clone()).with_mse_hub(mse_hub.clone());
     let share_engine = ShareLinkEngine::new();
+    let media_delivery_gate = MediaDeliveryGate::new(shared_cfg.clone());
+    let live_gateway = LiveStreamGateway::new(
+        shared_cfg.clone(),
+        mse_hub.clone(),
+        Arc::new(ReqwestGo2RtcUpstream::new(http_client.clone())),
+    );
     let state = AppState {
         config: shared_cfg,
         config_coordinator,
@@ -14046,6 +12620,8 @@ pub async fn new_app_state(
         dataset_catalog: DatasetCatalog::new(),
         face_gallery: FaceIdentityCatalog::new(),
         share_engine,
+        media_delivery_gate,
+        live_gateway,
         debug_reprocess_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
     };
 
@@ -14120,9 +12696,11 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::Request;
     use axum_extra::extract::cookie::Cookie;
+    use futures_util::SinkExt;
     use hmac::{Hmac, KeyInit, Mac};
     use jsonwebtoken::{Algorithm, EncodingKey, Header};
     use sha2::{Digest, Sha256};
+    use tokio_tungstenite::tungstenite::protocol::Message as TungMsg;
     use tower::ServiceExt;
 
     #[test]
@@ -17105,6 +15683,29 @@ version: 0.18-0
             assert_eq!(models_json["models"][0], expected_first);
         }
 
+        let rev_gem_thumb = state
+            .media_dir
+            .join("clips/review/thumb-rev_gemini_fp.webp");
+        std::fs::create_dir_all(rev_gem_thumb.parent().unwrap()).unwrap();
+        std::fs::write(&rev_gem_thumb, b"RIFF_GEM_REV_THUMB").unwrap();
+        state
+            .db
+            .insert_review_segment(&ninjanvr_db::ReviewItemDto {
+                id: "rev_gemini_fp".to_string(),
+                camera: "front_door".to_string(),
+                start_time: 1700000000.0,
+                end_time: Some(1700000005.0),
+                severity: "alert".to_string(),
+                thumb_path: "/media/ninjanvr/clips/review/thumb-rev_gemini_fp.webp".to_string(),
+                data: json!({
+                    "detections": ["ev_gemini_fp"],
+                    "objects": ["person"]
+                }),
+                has_been_reviewed: false,
+            })
+            .unwrap();
+        let mut ws_gem_rx = state.comms.subscribe_ws();
+
         let resp_gem = app
             .clone()
             .oneshot(
@@ -17125,6 +15726,23 @@ version: 0.18-0
             gem_json["ai_verification"]["reason"],
             "Static patio fern misclassified as person"
         );
+        assert!(
+            state
+                .db
+                .get_review_by_id("rev_gemini_fp")
+                .unwrap()
+                .is_none(),
+            "auto_suppress_false_positives must reconcile and delete empty reviewsegment"
+        );
+        assert!(
+            !rev_gem_thumb.exists(),
+            "auto_suppress_false_positives must unlink deleted review thumbnail"
+        );
+        let ws_ev_msg = ws_gem_rx.recv().await.unwrap();
+        let ws_rev_msg = ws_gem_rx.recv().await.unwrap();
+        assert!(ws_ev_msg.contains("\"topic\":\"events\""));
+        assert!(ws_rev_msg.contains("\"topic\":\"reviews\""));
+        assert!(ws_rev_msg.contains("rev_gemini_fp"));
 
         // Verify event row has ai_verification persisted and false_positive = true
         let ev_after = state.db.get_event("ev_gemini_fp").unwrap().unwrap();

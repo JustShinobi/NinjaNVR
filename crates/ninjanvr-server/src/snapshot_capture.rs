@@ -66,16 +66,23 @@ pub fn render_main_stream_snapshot(
     detect_w: u32,
     detect_h: u32,
 ) -> Option<(Vec<u8>, u32, u32)> {
-    let mask = privacy_mask.filter(|m| crate::has_active_privacy_mask(Some(m)));
-    match mask {
-        None => {
+    let policy_probe = ninjanvr_vision::PrivacyMaskPolicy::from_optional_value(
+        privacy_mask,
+        detect_w.max(1),
+        detect_h.max(1),
+    );
+    match policy_probe {
+        ninjanvr_vision::PrivacyMaskPolicy::Disabled => {
             let (w, h) = probe_jpeg_dimensions(bytes)?;
             Some((bytes.to_vec(), w, h))
         }
-        Some(mask) => {
+        ninjanvr_vision::PrivacyMaskPolicy::InvalidFailClosed(_) => None,
+        ninjanvr_vision::PrivacyMaskPolicy::Active(_) => {
+            let raw_mask = privacy_mask?;
             let mut rgb = crate::decode_bounded_snapshot_rgb(bytes)?;
-            if !crate::apply_camera_privacy_mask_or_fail_closed(&mut rgb, mask, detect_w, detect_h)
-            {
+            if !crate::media_redaction::MediaDeliveryGate::apply_mask_or_fail_closed(
+                &mut rgb, raw_mask, detect_w, detect_h,
+            ) {
                 return None;
             }
             let (w, h) = (rgb.width(), rgb.height());

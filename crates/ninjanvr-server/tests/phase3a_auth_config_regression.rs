@@ -2367,3 +2367,245 @@ version: 0.18-0
     upstream_task.abort();
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+#[tokio::test]
+async fn longest_camera_key_stream_rbac_scoped_config_driver_diff_and_invalid_export_fail_closed() {
+    let tmp_dir =
+        std::env::temp_dir().join(format!("ninjanvr_audit_rbac_exp_{}", rand::random::<u64>()));
+    let web_dir = tmp_dir.join("web");
+    let media_dir = tmp_dir.join("media");
+    let exports_dir = media_dir.join("exports");
+    std::fs::create_dir_all(&web_dir).unwrap();
+    std::fs::create_dir_all(&exports_dir).unwrap();
+    std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
+
+    let cfg_path = tmp_dir.join("config.yml");
+    let db_path = tmp_dir.join("ninjanvr.db");
+    let yaml = format!(
+        r#"
+database:
+  path: {}
+auth:
+  enabled: true
+go2rtc:
+  streams:
+    lobby: rtsp://192.0.2.10/main
+    lobby_talk: tapo://192.0.2.10
+    lobby_sub: rtsp://192.0.2.11/main
+    lobby_sub_talk: tapo://192.0.2.11
+    quarto: rtsp://192.0.2.12/main
+    quarto_sub: rtsp://192.0.2.12/sub
+    quarto_talk: tapo://192.0.2.12
+    quarto_sub_talk: tapo://192.0.2.12?sub=1
+cameras:
+  lobby:
+    enabled: true
+  lobby_sub:
+    enabled: true
+  quarto:
+    enabled: true
+"#,
+        db_path.display()
+    );
+    std::fs::write(&cfg_path, &yaml).unwrap();
+
+    let state = new_app_state(&cfg_path, web_dir, media_dir.clone(), false)
+        .await
+        .unwrap();
+    state
+        .db
+        .create_user_with_cameras("lobby_user", "pass1234", "operator", "lobby", 1000)
+        .unwrap();
+    state
+        .db
+        .create_user_with_cameras("quarto_user", "pass1234", "operator", "quarto", 1000)
+        .unwrap();
+    let app = build_router_with_auth(state.clone(), true);
+
+    let lobby_hdr = format!(
+        "Bearer {}",
+        mint_test_jwt(&state.jwt_secret, "lobby_user", "operator", Some("lobby"))
+    );
+    let quarto_hdr = format!(
+        "Bearer {}",
+        mint_test_jwt(&state.jwt_secret, "quarto_user", "operator", Some("quarto"))
+    );
+
+    // 1. User scoped to `lobby` MUST get 403 on `lobby_sub` and `lobby_sub_talk` across `/live/*` and `/api/go2rtc/streams/*`
+    for forbidden_uri in [
+        "/live/mse?src=lobby_sub",
+        "/live/mse?src=lobby_sub_talk",
+        "/api/go2rtc/webrtc?src=lobby_sub_talk",
+        "/api/go2rtc/streams/lobby_sub",
+        "/api/go2rtc/streams/lobby_sub_talk",
+        "/api/go2rtc/streams/lobby_sub_talk/prewarm",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(forbidden_uri)
+                    .header(header::AUTHORIZATION, &lobby_hdr)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "lobby-only user must be forbidden on {forbidden_uri}"
+        );
+    }
+
+    // 2. User scoped to `quarto` MUST pass auth_gate (not 403) on `quarto_talk` and `quarto_sub_talk`
+    for permitted_uri in [
+        "/api/go2rtc/streams/quarto_talk",
+        "/api/go2rtc/streams/quarto_sub_talk",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(permitted_uri)
+                    .header(header::AUTHORIZATION, &quarto_hdr)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "quarto user must be permitted through auth_gate on {permitted_uri}"
+        );
+    }
+
+    // 3. Scoped GET /api/config for `lobby` hides `lobby_sub` and `lobby_sub_talk` while keeping `lobby` and `lobby_talk`
+    let r_cfg_lobby = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/config")
+                .header(header::AUTHORIZATION, &lobby_hdr)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_cfg_lobby.status(), StatusCode::OK);
+    let cfg_lobby: Value =
+        serde_json::from_slice(&to_bytes(r_cfg_lobby.into_body(), 65536).await.unwrap()).unwrap();
+    let lobby_streams = cfg_lobby["go2rtc"]["streams"].as_object().unwrap();
+    assert!(lobby_streams.contains_key("lobby"));
+    assert!(lobby_streams.contains_key("lobby_talk"));
+    assert!(!lobby_streams.contains_key("lobby_sub"));
+    assert!(!lobby_streams.contains_key("lobby_sub_talk"));
+
+    let r_cfg_quarto = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/config")
+                .header(header::AUTHORIZATION, &quarto_hdr)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cfg_quarto: Value =
+        serde_json::from_slice(&to_bytes(r_cfg_quarto.into_body(), 65536).await.unwrap()).unwrap();
+    let quarto_streams = cfg_quarto["go2rtc"]["streams"].as_object().unwrap();
+    for k in ["quarto", "quarto_sub", "quarto_talk", "quarto_sub_talk"] {
+        assert!(
+            quarto_streams.contains_key(k),
+            "expected {k} in scoped quarto streams"
+        );
+    }
+
+    // 4. diff_driver_invalidated_cameras detects `enabled` toggle and `{cam}_talk` / `{cam}_sub_talk` stream updates
+    {
+        let base_cfg = state.config.read().await.clone();
+        let mut next_enabled = base_cfg.clone();
+        next_enabled.cameras.get_mut("quarto").unwrap().enabled = false;
+        assert_eq!(
+            ninjanvr_server::config_coordinator::diff_driver_invalidated_cameras(
+                &base_cfg,
+                &next_enabled
+            ),
+            vec!["quarto".to_string()]
+        );
+
+        let mut next_talk = base_cfg.clone();
+        next_talk.go2rtc.streams.insert(
+            "quarto_sub_talk".to_string(),
+            json!("tapo://192.0.2.99?sub=1"),
+        );
+        assert_eq!(
+            ninjanvr_server::config_coordinator::diff_driver_invalidated_cameras(
+                &base_cfg, &next_talk
+            ),
+            vec!["quarto".to_string()]
+        );
+    }
+
+    // 5. Static `/exports/*.mp4` works when camera privacy_mask is `Active`, and fails closed (404) when `InvalidFailClosed`
+    std::fs::write(exports_dir.join("exp_lobby_1.mp4"), b"REDACTED_MP4_EXPORT").unwrap();
+    state
+        .db
+        .insert_export(&ExportRow {
+            id: "exp_lobby_1".to_string(),
+            camera: "lobby".to_string(),
+            name: "Lobby Export".to_string(),
+            date: 1_700_000_000.0,
+            video_path: "/media/ninjanvr/exports/exp_lobby_1.mp4".to_string(),
+            thumb_path: "/media/ninjanvr/clips/exp_lobby_1.webp".to_string(),
+            in_progress: false,
+        })
+        .unwrap();
+
+    {
+        let mut cfg = state.config.write().await;
+        cfg.cameras.get_mut("lobby").unwrap().privacy_mask =
+            json!(["0.1,0.1,0.5,0.1,0.5,0.5,0.1,0.5"]);
+    }
+    let r_exp_active = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/exports/exp_lobby_1.mp4")
+                .header(header::AUTHORIZATION, &lobby_hdr)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        r_exp_active.status(),
+        StatusCode::OK,
+        "Redacted /exports/*.mp4 must remain accessible when privacy_mask is Active"
+    );
+
+    {
+        let mut cfg = state.config.write().await;
+        cfg.cameras.get_mut("lobby").unwrap().privacy_mask = json!(["corrupt_invalid_mask"]);
+    }
+    let r_exp_invalid = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/exports/exp_lobby_1.mp4")
+                .header(header::AUTHORIZATION, &lobby_hdr)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        r_exp_invalid.status(),
+        StatusCode::NOT_FOUND,
+        "/exports/*.mp4 must fail closed with 404 when camera privacy_mask is InvalidFailClosed"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}

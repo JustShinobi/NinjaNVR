@@ -807,6 +807,212 @@ pub fn is_frame_night_ir(yuv_data: &[u8], width: u32, height: u32) -> bool {
     is_monochrome_ir(yuv_data, width, height)
 }
 
+/// Stateful coordinator ensuring post-hoc event triage mutations (`false_positive`,
+/// `recognized_license_plate`, `sub_label`) update SQLite `event` + `reviewsegment`,
+/// unlink orphaned review thumbnails, synchronize `hard_negative` dataset samples,
+/// and broadcast live `"events"` and `"reviews"` WebSocket frames identically to
+/// in-flight `VisionPipeline` transitions.
+pub struct EventReviewCoordinator;
+
+impl EventReviewCoordinator {
+    /// Broadcasts `"events"` and `"reviews"` updates for `event_id` over `state.comms`.
+    pub async fn broadcast_event_and_review_updates(state: &crate::AppState, event_id: &str) {
+        let db = state.db.clone();
+        let eid = event_id.to_string();
+        let Ok((ev_opt, reviews)) = tokio::task::spawn_blocking(move || {
+            let ev = db.get_event(&eid).ok().flatten();
+            let revs = db.get_reviews_referencing_event(&eid).unwrap_or_default();
+            (ev, revs)
+        })
+        .await
+        else {
+            return;
+        };
+        if let Some(ev_val) = ev_opt {
+            let mut ev_slice = [ev_val];
+            state
+                .media_delivery_gate
+                .redact_event_slice_thumbnails(&mut ev_slice)
+                .await;
+            let [redacted_ev] = ev_slice;
+            state.comms.publish_json(
+                "events",
+                &serde_json::json!({
+                    "type": "update",
+                    "before": redacted_ev,
+                    "after": redacted_ev,
+                }),
+            );
+        }
+        for rev in reviews {
+            state.comms.publish_json(
+                "reviews",
+                &serde_json::json!({
+                    "type": "update",
+                    "before": rev,
+                    "after": rev,
+                }),
+            );
+        }
+    }
+
+    /// Toggles `false_positive` on `event_id`, reconciles referencing `reviewsegment` rows
+    /// (downgrading severity or deleting empty review segments and their thumbnails), syncs
+    /// the `hard_negative` dataset sample, and broadcasts `"events"` + `"reviews"` WS updates.
+    pub async fn set_event_false_positive(
+        state: &crate::AppState,
+        event_id: &str,
+        fp: bool,
+    ) -> Result<usize, String> {
+        let db = state.db.clone();
+        let media_dir = state.media_dir.clone();
+        let eid = event_id.to_string();
+        let (updated, prune_outcome, updated_ev) =
+            tokio::task::spawn_blocking(move || -> Result<_, String> {
+                let before_ev = db.get_event(&eid).ok().flatten();
+                let updated = db
+                    .set_event_false_positive(&eid, fp)
+                    .map_err(|e| e.to_string())?;
+                let prune = if updated > 0 {
+                    db.reconcile_reviews_for_event_false_positive(&eid, fp)
+                        .unwrap_or_default()
+                } else {
+                    ninjanvr_db::PostHocReviewPruneOutcome::default()
+                };
+                for (del_rev, thumb_path) in &prune.deleted_reviews {
+                    crate::media_lifecycle::cleanup_review_media_artifacts(
+                        &media_dir,
+                        &del_rev.id,
+                        Some(thumb_path),
+                    );
+                }
+                let after_ev = db.get_event(&eid).ok().flatten();
+                Ok((updated, prune, (before_ev, after_ev)))
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+
+        if fp {
+            let _ = crate::dataset_catalog::create_dataset_sample_from_event_with_config(
+                Some(&state.config),
+                &state.db,
+                &state.media_dir,
+                event_id,
+                "hard_negative",
+                None,
+            )
+            .await;
+        } else {
+            let sample_id = if event_id.starts_with("ds_") {
+                event_id.to_string()
+            } else {
+                format!("ds_{event_id}")
+            };
+            if let Ok(Some(existing)) = state.db.get_dataset_sample(&sample_id)
+                && existing.sample_kind == "hard_negative"
+            {
+                crate::dataset_catalog::delete_sample_artifacts(
+                    &state.media_dir,
+                    &existing.id,
+                    Some(&existing.image_path),
+                );
+                let _ = state.db.delete_dataset_sample(&sample_id);
+            }
+        }
+
+        if let (Some(before_ev), Some(after_ev)) = updated_ev {
+            let mut ev_pair = [before_ev, after_ev];
+            state
+                .media_delivery_gate
+                .redact_event_slice_thumbnails(&mut ev_pair)
+                .await;
+            let [before_ev, after_ev] = ev_pair;
+            state.comms.publish_json(
+                "events",
+                &serde_json::json!({
+                    "type": "update",
+                    "before": before_ev,
+                    "after": after_ev,
+                }),
+            );
+        }
+        for (before_rev, after_rev) in prune_outcome.updated_reviews {
+            state.comms.publish_json(
+                "reviews",
+                &serde_json::json!({
+                    "type": "update",
+                    "before": before_rev,
+                    "after": after_rev,
+                }),
+            );
+        }
+        for (deleted_rev, _) in prune_outcome.deleted_reviews {
+            state.comms.publish_json(
+                "reviews",
+                &serde_json::json!({
+                    "type": "end",
+                    "before": deleted_rev,
+                    "after": deleted_rev,
+                }),
+            );
+        }
+
+        Ok(updated)
+    }
+
+    /// Assigns or clears `recognized_license_plate` (and optional/known `sub_label`) on `event_id`,
+    /// propagating both to referencing `reviewsegment` rows and broadcasting live WS updates.
+    pub async fn assign_event_license_plate(
+        state: &crate::AppState,
+        event_id: &str,
+        normalized_plate: Option<&str>,
+        explicit_sub_label: Option<&str>,
+        is_unrestricted: bool,
+    ) -> Result<(usize, Option<String>), String> {
+        let resolved_known_sub = if explicit_sub_label.is_none()
+            && is_unrestricted
+            && let Some(norm_p) = normalized_plate
+        {
+            let cfg = state.config.read().await;
+            ninjanvr_infer::lookup_known_plate(norm_p, &cfg.lpr.known_plates)
+        } else {
+            None
+        };
+        let db = state.db.clone();
+        let eid = event_id.to_string();
+        let plate_owned = normalized_plate.map(str::to_string);
+        let explicit_owned = explicit_sub_label
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let (updated, final_sub) =
+            tokio::task::spawn_blocking(move || -> Result<(usize, Option<String>), String> {
+                let updated = db
+                    .set_event_license_plate(&eid, plate_owned.as_deref())
+                    .unwrap_or(0);
+                let resolved_sub = if updated == 0 {
+                    None
+                } else {
+                    explicit_owned.or(resolved_known_sub)
+                };
+                if updated > 0
+                    && let Some(ref sl) = resolved_sub
+                {
+                    db.set_event_sub_label(&eid, Some(sl))
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok((updated, resolved_sub))
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+
+        if updated > 0 {
+            Self::broadcast_event_and_review_updates(state, event_id).await;
+        }
+        Ok((updated, final_sub))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1303,5 +1509,207 @@ mod tests {
             false,
             &["new_zone".to_string()],
         ));
+    }
+
+    #[tokio::test]
+    async fn post_hoc_event_coordinator_reconciles_reviews_thumbnails_plates_and_ws_broadcasts() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr_ev_coord_{}", rand::random::<u64>()));
+        let web_dir = tmp_dir.join("web");
+        let media_dir = tmp_dir.join("media");
+        std::fs::create_dir_all(&web_dir).unwrap();
+        std::fs::create_dir_all(media_dir.join("clips/review")).unwrap();
+        std::fs::create_dir_all(media_dir.join("dataset")).unwrap();
+
+        let cfg_path = tmp_dir.join("config.yml");
+        let db_path = tmp_dir.join("ninjanvr.db");
+        let yaml = format!(
+            "database:\n  path: {}\ncameras:\n  driveway:\n    enabled: true\nlpr:\n  enabled: true\n  known_plates:\n    BRA2E19: OwnerCar\n",
+            db_path.display()
+        );
+        std::fs::write(&cfg_path, &yaml).unwrap();
+        let state = crate::new_app_state(&cfg_path, web_dir, media_dir.clone(), false)
+            .await
+            .unwrap();
+
+        let mut ws_rx = state.comms.subscribe_ws();
+
+        // Insert a closed alert event and its persisted single-detection review segment + thumbnail
+        let ev = EventDto {
+            id: "1730600000.000000-ev01".to_string(),
+            camera: "driveway".to_string(),
+            label: "car".to_string(),
+            zones: json!(["gate"]),
+            start_time: 1730600000.0,
+            end_time: Some(1730600006.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.92),
+            false_positive: Some(false),
+            box_coords: Some(json!([0.1, 0.2, 0.6, 0.8])),
+            data: json!({
+                "score": 0.92,
+                "top_score": 0.92,
+                "max_severity": "alert",
+                "box": [0.1, 0.2, 0.6, 0.8]
+            }),
+            thumbnail: None,
+            area: Some(12_000),
+            ratio: Some(1.2),
+            score: Some(0.92),
+            stationary: false,
+        };
+        state.db.upsert_event(&ev).unwrap();
+
+        let thumb_disk = media_dir.join("clips/review/thumb-driveway-rev01.webp");
+        std::fs::write(&thumb_disk, b"RIFF_THUMB").unwrap();
+        let rev = ninjanvr_db::ReviewItemDto {
+            id: "rev01".to_string(),
+            camera: "driveway".to_string(),
+            start_time: 1730599999.0,
+            end_time: Some(1730600008.0),
+            severity: "alert".to_string(),
+            thumb_path: "/media/ninjanvr/clips/review/thumb-driveway-rev01.webp".to_string(),
+            data: json!({
+                "detections": [ev.id.clone()],
+                "objects": ["car"],
+                "zones": ["gate"],
+                "sub_labels": []
+            }),
+            has_been_reviewed: false,
+        };
+        state.db.insert_review_segment(&rev).unwrap();
+
+        // 1. Assigning license plate propagates `recognized_license_plates` + `sub_labels` to reviewsegment and broadcasts WS
+        let (updated, resolved_sub) = EventReviewCoordinator::assign_event_license_plate(
+            &state,
+            &ev.id,
+            Some("BRA2E19"),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated, 1);
+        assert_eq!(resolved_sub.as_deref(), Some("OwnerCar"));
+        let revs_after_plate = state.db.get_reviews_referencing_event(&ev.id).unwrap();
+        assert_eq!(revs_after_plate.len(), 1);
+        assert_eq!(
+            revs_after_plate[0].data["recognized_license_plates"],
+            json!(["BRA2E19"])
+        );
+        assert_eq!(revs_after_plate[0].data["sub_labels"], json!(["OwnerCar"]));
+        let ws_ev_plate = ws_rx.recv().await.unwrap();
+        let ws_rev_plate = ws_rx.recv().await.unwrap();
+        assert!(ws_ev_plate.contains("\"topic\":\"events\""));
+        assert!(ws_rev_plate.contains("\"topic\":\"reviews\""));
+
+        // 2. Marking closed event false_positive=true deletes the empty reviewsegment, unlinks thumbnail, and broadcasts WS `end`
+        let fp_updated = EventReviewCoordinator::set_event_false_positive(&state, &ev.id, true)
+            .await
+            .unwrap();
+        assert_eq!(fp_updated, 1);
+        assert!(
+            state
+                .db
+                .get_reviews_referencing_event(&ev.id)
+                .unwrap()
+                .is_empty(),
+            "Empty reviewsegment must be deleted when its sole detection is marked false_positive"
+        );
+        assert!(
+            !thumb_disk.exists(),
+            "Orphaned review thumbnail must be unlinked when reviewsegment is deleted"
+        );
+        let ws_ev_fp = ws_rx.recv().await.unwrap();
+        let ws_rev_fp = ws_rx.recv().await.unwrap();
+        assert!(ws_ev_fp.contains("\"topic\":\"events\""));
+        let rev_env: serde_json::Value = serde_json::from_str(&ws_rev_fp).unwrap();
+        assert_eq!(rev_env["topic"], "reviews");
+        let rev_inner: serde_json::Value = match &rev_env["payload"] {
+            serde_json::Value::String(s) => serde_json::from_str(s).unwrap(),
+            other => other.clone(),
+        };
+        assert_eq!(rev_inner["type"], "end");
+
+        // 3. Undoing false_positive (fp=false) reconstructs `rev-restored-<id>` and broadcasts WS `update`
+        let undo_updated = EventReviewCoordinator::set_event_false_positive(&state, &ev.id, false)
+            .await
+            .unwrap();
+        assert_eq!(undo_updated, 1);
+        let restored_revs = state.db.get_reviews_referencing_event(&ev.id).unwrap();
+        assert_eq!(restored_revs.len(), 1);
+        assert_eq!(restored_revs[0].id, format!("rev-restored-{}", ev.id));
+        let _ = ws_rx.recv().await.unwrap();
+        let ws_rev_undo = ws_rx.recv().await.unwrap();
+        assert!(ws_rev_undo.contains("\"topic\":\"reviews\""));
+        assert!(ws_rev_undo.contains("rev-restored-"));
+
+        // 4. Post-hoc privacy_mask redacts base64 `thumbnail` BEFORE `/ws` `"events"` broadcast
+        let bright = image::RgbImage::from_pixel(64, 64, image::Rgb([245, 245, 245]));
+        let bright_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            ninjanvr_vision::encode_image_webp(&bright).unwrap(),
+        );
+        let mut masked_ev = ev.clone();
+        masked_ev.id = "1730600010.000000-ev02".to_string();
+        masked_ev.thumbnail = Some(bright_b64.clone());
+        masked_ev.data = json!({
+            "max_severity": "alert",
+            "region": [0.0, 0.0, 1.0, 1.0]
+        });
+        state.db.upsert_event(&masked_ev).unwrap();
+        {
+            let mut cfg = state.config.write().await;
+            cfg.cameras.get_mut("driveway").unwrap().privacy_mask =
+                json!(["0.0,0.0,1.0,0.0,1.0,1.0,0.0,1.0"]);
+        }
+
+        EventReviewCoordinator::broadcast_event_and_review_updates(&state, &masked_ev.id).await;
+        let ws_masked_bcast = ws_rx.recv().await.unwrap();
+        let env_bcast: serde_json::Value = serde_json::from_str(&ws_masked_bcast).unwrap();
+        let inner_bcast: serde_json::Value = match &env_bcast["payload"] {
+            serde_json::Value::String(s) => serde_json::from_str(s).unwrap(),
+            other => other.clone(),
+        };
+        let bcast_thumb_b64 = inner_bcast["after"]["thumbnail"].as_str().unwrap();
+        assert_ne!(
+            bcast_thumb_b64, bright_b64,
+            "broadcast_event_and_review_updates must redact unredacted DB base64 thumbnail over /ws"
+        );
+        let bcast_rgb = crate::decode_bounded_snapshot_rgb(
+            &base64::Engine::decode(&base64::engine::general_purpose::STANDARD, bcast_thumb_b64)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(bcast_rgb.get_pixel(32, 32)[0] < 30);
+
+        let _ = EventReviewCoordinator::set_event_false_positive(&state, &masked_ev.id, true)
+            .await
+            .unwrap();
+        let ws_masked_fp = ws_rx.recv().await.unwrap();
+        let env_fp: serde_json::Value = serde_json::from_str(&ws_masked_fp).unwrap();
+        let inner_fp: serde_json::Value = match &env_fp["payload"] {
+            serde_json::Value::String(s) => serde_json::from_str(s).unwrap(),
+            other => other.clone(),
+        };
+        for side in ["before", "after"] {
+            let side_b64 = inner_fp[side]["thumbnail"].as_str().unwrap();
+            assert_ne!(
+                side_b64, bright_b64,
+                "set_event_false_positive must redact {side} base64 thumbnail over /ws"
+            );
+            let side_rgb = crate::decode_bounded_snapshot_rgb(
+                &base64::Engine::decode(&base64::engine::general_purpose::STANDARD, side_b64)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(side_rgb.get_pixel(32, 32)[0] < 30);
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

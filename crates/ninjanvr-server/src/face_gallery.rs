@@ -18,7 +18,7 @@
 //!   sub-label filtering across five HTTP route handlers in `lib.rs`, duplicating case-insensitive
 //!   profile resolution and preventing isolated unit testing.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -30,16 +30,18 @@ use axum_extra::extract::cookie::CookieJar;
 use base64::Engine;
 use ninjanvr_db::{EventFilter, NinjaDatabase};
 use ninjanvr_infer::{AiDetectorEngine, EnrolledFaceProfile};
+use ninjanvr_vision::PrivacyMaskPolicy;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::dataset_catalog::{
     MAX_DATASET_SAMPLE_FILE_BYTES, event_uses_xywh_norm_boxes, extract_event_box_array,
 };
+use crate::media_redaction::MediaDeliveryGate;
 use crate::{
     AppState, caller_can_mutate, decode_bounded_snapshot_rgb, effective_caller_allowed_cameras,
-    ensure_clips_artifact_path, is_safe_id, read_bounded_non_symlink_bytes_sync,
-    redact_image_bytes_with_privacy_mask, unix_now, verify_cookie_csrf_origin,
+    ensure_clips_artifact_path, is_safe_id, read_bounded_non_symlink_bytes_sync, unix_now,
+    verify_cookie_csrf_origin,
 };
 
 #[derive(Debug, Deserialize, Default)]
@@ -219,7 +221,7 @@ pub fn remove_face_profile_from_clips_mirror(media_dir: &Path, profile_name: &st
 pub fn load_event_face_sample_bytes_from_db_sync(
     db: &NinjaDatabase,
     media_dir: &Path,
-    privacy_masks: &HashMap<String, Value>,
+    privacy_policies: &BTreeMap<String, PrivacyMaskPolicy>,
     event_id: &str,
 ) -> Vec<u8> {
     if !is_safe_id(event_id) {
@@ -228,7 +230,7 @@ pub fn load_event_face_sample_bytes_from_db_sync(
     let clips_dir = media_dir.join("clips");
     if let Ok(Some(ev)) = db.get_event(event_id) {
         let cam_opt = ev["camera"].as_str().filter(|c| is_safe_id(c));
-        let priv_mask = cam_opt.and_then(|cam| privacy_masks.get(cam));
+        let priv_policy = cam_opt.and_then(|cam| privacy_policies.get(cam));
         if let Some(cam) = cam_opt {
             for (candidate, is_jpeg) in [
                 (
@@ -244,7 +246,15 @@ pub fn load_event_face_sample_bytes_from_db_sync(
                         read_bounded_non_symlink_bytes_sync(&safe_p, MAX_DATASET_SAMPLE_FILE_BYTES)
                     && !bytes.is_empty()
                 {
-                    let (out, _) = redact_image_bytes_with_privacy_mask(&bytes, priv_mask, is_jpeg);
+                    let out = match priv_policy {
+                        Some(policy) => {
+                            MediaDeliveryGate::redact_image_bytes_with_policy(
+                                &bytes, policy, is_jpeg,
+                            )
+                            .0
+                        }
+                        None => bytes,
+                    };
                     if let Some(cropped) = crop_event_face_square_from_bytes(&ev, &out) {
                         return cropped;
                     }
@@ -256,7 +266,12 @@ pub fn load_event_face_sample_bytes_from_db_sync(
             && let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(thumb_b64.trim())
             && !decoded.is_empty()
         {
-            let (out, _) = redact_image_bytes_with_privacy_mask(&decoded, priv_mask, false);
+            let out = match priv_policy {
+                Some(policy) => {
+                    MediaDeliveryGate::redact_image_bytes_with_policy(&decoded, policy, false).0
+                }
+                None => decoded,
+            };
             if let Some(cropped) = crop_event_face_square_from_bytes(&ev, &out) {
                 return cropped;
             }
@@ -269,10 +284,15 @@ pub fn load_event_face_sample_bytes_from_db_sync(
 /// Synchronously loads and privacy-redacts the 112x112 face sample bytes for `event_id`.
 pub fn load_event_face_sample_bytes_sync(
     state: &AppState,
-    privacy_masks: &HashMap<String, Value>,
+    privacy_policies: &BTreeMap<String, PrivacyMaskPolicy>,
     event_id: &str,
 ) -> Vec<u8> {
-    load_event_face_sample_bytes_from_db_sync(&state.db, &state.media_dir, privacy_masks, event_id)
+    load_event_face_sample_bytes_from_db_sync(
+        &state.db,
+        &state.media_dir,
+        privacy_policies,
+        event_id,
+    )
 }
 
 /// Asynchronously loads and privacy-redacts the 112x112 face sample bytes for `event_id`.
@@ -280,18 +300,15 @@ pub async fn load_event_face_sample_bytes(state: &AppState, event_id: &str) -> V
     if !is_safe_id(event_id) {
         return format!("event-face-sample:{event_id}").into_bytes();
     }
-    let masks: HashMap<String, Value> = {
+    let policies: BTreeMap<String, PrivacyMaskPolicy> = {
         let cfg = state.config.read().await;
-        cfg.cameras
-            .iter()
-            .map(|(k, v)| (k.clone(), v.privacy_mask.clone()))
-            .collect()
+        MediaDeliveryGate::configured_camera_policies(&cfg)
     };
     let state_owned = state.clone();
     let event_id_owned = event_id.to_string();
     let fallback_id = event_id.to_string();
     tokio::task::spawn_blocking(move || {
-        load_event_face_sample_bytes_sync(&state_owned, &masks, &event_id_owned)
+        load_event_face_sample_bytes_sync(&state_owned, &policies, &event_id_owned)
     })
     .await
     .unwrap_or_else(|_| format!("event-face-sample:{fallback_id}").into_bytes())
@@ -304,7 +321,7 @@ pub fn backfill_face_gallery_events_with_db(
     media_dir: &Path,
     faces_dir: &Path,
     similarity_threshold: f32,
-    privacy_masks: &HashMap<String, Value>,
+    privacy_policies: &BTreeMap<String, PrivacyMaskPolicy>,
     exclude_event_id: Option<&str>,
 ) -> usize {
     let candidates = db
@@ -321,7 +338,7 @@ pub fn backfill_face_gallery_events_with_db(
         };
         if exclude_event_id.is_some_and(|ex| ex == ev_id) {
             continue;
-        }
+        };
         let existing_sub = ev["sub_label"]
             .as_str()
             .or_else(|| ev["data"]["sub_label"].as_str())
@@ -329,9 +346,9 @@ pub fn backfill_face_gallery_events_with_db(
             .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("unknown"));
         if existing_sub.is_some() {
             continue;
-        }
+        };
         let sample_bytes =
-            load_event_face_sample_bytes_from_db_sync(db, media_dir, privacy_masks, ev_id);
+            load_event_face_sample_bytes_from_db_sync(db, media_dir, privacy_policies, ev_id);
         if let Some(m) =
             detector.match_face_crop(faces_dir, &sample_bytes, similarity_threshold, false)
             && m.is_known
@@ -351,7 +368,7 @@ pub fn backfill_face_gallery_events(
     state: &AppState,
     faces_dir: &Path,
     similarity_threshold: f32,
-    privacy_masks: &HashMap<String, Value>,
+    privacy_policies: &BTreeMap<String, PrivacyMaskPolicy>,
     exclude_event_id: Option<&str>,
 ) -> usize {
     backfill_face_gallery_events_with_db(
@@ -360,7 +377,7 @@ pub fn backfill_face_gallery_events(
         &state.media_dir,
         faces_dir,
         similarity_threshold,
-        privacy_masks,
+        privacy_policies,
         exclude_event_id,
     )
 }
@@ -438,7 +455,7 @@ impl FaceIdentityCatalog {
         sample_id: &str,
         payload_bytes: &[u8],
         event_to_assign: Option<&str>,
-        backfill_opts: Option<(f32, &HashMap<String, Value>)>,
+        backfill_opts: Option<(f32, &BTreeMap<String, PrivacyMaskPolicy>)>,
     ) -> Result<FaceEnrollmentOutcome> {
         let faces_dir = self.faces_dir(media_dir);
         let (saved_path, emb) =
@@ -457,19 +474,20 @@ impl FaceIdentityCatalog {
             let _ = db.set_event_sub_label_with_score(ev_id, Some(&canonical_name), Some(1.0));
         }
 
-        let backfilled_events = if let Some((similarity_threshold, privacy_masks)) = backfill_opts {
-            backfill_face_gallery_events_with_db(
-                db,
-                detector,
-                media_dir,
-                &faces_dir,
-                similarity_threshold,
-                privacy_masks,
-                event_to_assign,
-            )
-        } else {
-            0
-        };
+        let backfilled_events =
+            if let Some((similarity_threshold, privacy_policies)) = backfill_opts {
+                backfill_face_gallery_events_with_db(
+                    db,
+                    detector,
+                    media_dir,
+                    &faces_dir,
+                    similarity_threshold,
+                    privacy_policies,
+                    event_to_assign,
+                )
+            } else {
+                0
+            };
 
         Ok(FaceEnrollmentOutcome {
             canonical_name,
@@ -700,6 +718,13 @@ pub async fn api_event_sub_label(
         updated: 0,
     });
 
+    if outcome.updated > 0 {
+        crate::track_lifecycle::EventReviewCoordinator::broadcast_event_and_review_updates(
+            &state, &id,
+        )
+        .await;
+    }
+
     Json(json!({
         "success": true,
         "updated": outcome.updated,
@@ -839,18 +864,16 @@ pub async fn api_face_enroll(
         body_bytes.to_vec()
     };
 
-    let (similarity_threshold, privacy_masks) = {
+    let (similarity_threshold, privacy_policies) = {
         let cfg = state.config.read().await;
-        let masks: HashMap<String, Value> = cfg
-            .cameras
-            .iter()
-            .map(|(k, v)| (k.clone(), v.privacy_mask.clone()))
-            .collect();
-        (cfg.face_recognition.similarity_threshold, masks)
+        (
+            cfg.face_recognition.similarity_threshold,
+            MediaDeliveryGate::configured_camera_policies(&cfg),
+        )
     };
     let state_for_enroll = state.clone();
     let enroll_res = tokio::task::spawn_blocking(move || {
-        let backfill_opts = should_backfill.then_some((similarity_threshold, &privacy_masks));
+        let backfill_opts = should_backfill.then_some((similarity_threshold, &privacy_policies));
         state_for_enroll.face_gallery.enroll_profile(
             &state_for_enroll.db,
             &state_for_enroll.detector,
@@ -1213,6 +1236,35 @@ mod tests {
         assert!(
             db.get_event("ev_face_2").unwrap().unwrap()["sub_label"].is_null(),
             "ev_face_2 sub_label must be cleared after profile deletion"
+        );
+
+        // 5. Detect-resolution pixel mask (640x360) scales proportionally onto high-res (1280x720) face snapshot
+        let cfg_yaml = r#"
+cameras:
+  front_door:
+    enabled: true
+    detect:
+      width: 640
+      height: 360
+    privacy_mask: "0,0,640,360"
+"#;
+        let cfg = ninjanvr_config::NinjaConfig::from_yaml_str(cfg_yaml, PathBuf::new()).unwrap();
+        let policies = MediaDeliveryGate::configured_camera_policies(&cfg);
+        let hr_bright = image::RgbImage::from_pixel(1280, 720, image::Rgb([240, 240, 240]));
+        let hr_webp = ninjanvr_vision::encode_image_webp(&hr_bright).unwrap();
+        std::fs::write(
+            media_dir.join("clips/front_door-ev_face_1-clean.webp"),
+            &hr_webp,
+        )
+        .unwrap();
+
+        let redacted_face_bytes =
+            load_event_face_sample_bytes_from_db_sync(&db, &media_dir, &policies, "ev_face_1");
+        let redacted_face_rgb = decode_bounded_snapshot_rgb(&redacted_face_bytes).unwrap();
+        // Bottom-right region of 112x112 face crop (which maps past x=640,y=360 on 1280x720!) must also be redacted
+        assert!(
+            redacted_face_rgb.get_pixel(100, 100)[0] < 30,
+            "640x360 detect-space full-frame pixel mask must cover the entire 1280x720 high-res snapshot"
         );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);

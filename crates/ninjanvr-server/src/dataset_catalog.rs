@@ -13,7 +13,7 @@
 //!   Couples `reqwest::Client`, `NinjaDatabase`, `RwLock<NinjaConfig>`, and `static LazyLock<Semaphore>`
 //!   singletons inside `lib.rs`, leaking concurrency state across test instances.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -28,7 +28,7 @@ use base64::Engine;
 use image::{Rgb, RgbImage};
 use ninjanvr_config::{GenAiConfig, NinjaConfig};
 use ninjanvr_db::{DatasetAnnotationBox, DatasetSampleDto, NinjaDatabase};
-use ninjanvr_vision::{PolygonMask, apply_privacy_mask_rgb, encode_image_webp};
+use ninjanvr_vision::{PrivacyMaskPolicy, encode_image_webp};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{RwLock, Semaphore};
@@ -1246,15 +1246,13 @@ fn redact_sample_bytes_once(
 
     match build_mask_config_value(masks) {
         Some(mask_val) => {
-            let poly_mask = PolygonMask::from_config_value(&mask_val, rgb.width(), rgb.height());
-            if poly_mask.is_empty() {
+            let policy = PrivacyMaskPolicy::from_value(&mask_val, rgb.width(), rgb.height());
+            if !matches!(policy, PrivacyMaskPolicy::Active(_)) || !policy.redact_rgb(&mut rgb) {
                 rgb = RgbImage::from_pixel(
                     rgb.width().max(1),
                     rgb.height().max(1),
                     Rgb([12, 14, 18]),
                 );
-            } else {
-                apply_privacy_mask_rgb(&mut rgb, &poly_mask);
             }
         }
         None => {
@@ -2095,10 +2093,11 @@ pub fn scrub_genai_secret_in_error(raw: String, api_key: &str) -> String {
 }
 
 pub async fn verify_event_with_genai(state: &AppState, event_id: &str) -> Result<Value> {
-    verify_event_with_genai_components(
+    verify_event_with_genai_components_and_comms(
         state.config.clone(),
         state.db.clone(),
         state.media_dir.clone(),
+        Some(&state.comms),
         event_id,
     )
     .await
@@ -2108,6 +2107,16 @@ pub async fn verify_event_with_genai_components(
     config: Arc<RwLock<NinjaConfig>>,
     db: NinjaDatabase,
     media_dir: PathBuf,
+    event_id: &str,
+) -> Result<Value> {
+    verify_event_with_genai_components_and_comms(config, db, media_dir, None, event_id).await
+}
+
+pub async fn verify_event_with_genai_components_and_comms(
+    config: Arc<RwLock<NinjaConfig>>,
+    db: NinjaDatabase,
+    media_dir: PathBuf,
+    comms: Option<&ninjanvr_comms::SharedCommsHub>,
     event_id: &str,
 ) -> Result<Value> {
     if !is_safe_id(event_id) {
@@ -2223,7 +2232,21 @@ pub async fn verify_event_with_genai_components(
 
     let auto_suppressed = !is_true_positive && genai.auto_suppress_false_positives;
     if auto_suppressed {
-        let _ = db.set_event_false_positive(event_id, true)?;
+        let before_ev = db.get_event(event_id).ok().flatten();
+        let updated = db.set_event_false_positive(event_id, true)?;
+        let prune_outcome = if updated > 0 {
+            db.reconcile_reviews_for_event_false_positive(event_id, true)
+                .unwrap_or_default()
+        } else {
+            ninjanvr_db::PostHocReviewPruneOutcome::default()
+        };
+        for (del_rev, thumb_path) in &prune_outcome.deleted_reviews {
+            crate::media_lifecycle::cleanup_review_media_artifacts(
+                &media_dir,
+                &del_rev.id,
+                Some(thumb_path),
+            );
+        }
         let _ = create_dataset_sample_from_event_with_config(
             Some(&config),
             &db,
@@ -2233,6 +2256,44 @@ pub async fn verify_event_with_genai_components(
             None,
         )
         .await;
+        if let Some(comms_hub) = comms {
+            let after_ev = db.get_event(event_id).ok().flatten();
+            if let (Some(before_val), Some(after_val)) = (before_ev, after_ev) {
+                let mut ev_pair = [before_val, after_val];
+                crate::media_redaction::MediaDeliveryGate::new(config.clone())
+                    .redact_event_slice_thumbnails(&mut ev_pair)
+                    .await;
+                let [before_val, after_val] = ev_pair;
+                comms_hub.publish_json(
+                    "events",
+                    &json!({
+                        "type": "update",
+                        "before": before_val,
+                        "after": after_val,
+                    }),
+                );
+            }
+            for (before_rev, after_rev) in prune_outcome.updated_reviews {
+                comms_hub.publish_json(
+                    "reviews",
+                    &json!({
+                        "type": "update",
+                        "before": before_rev,
+                        "after": after_rev,
+                    }),
+                );
+            }
+            for (deleted_rev, _) in prune_outcome.deleted_reviews {
+                comms_hub.publish_json(
+                    "reviews",
+                    &json!({
+                        "type": "end",
+                        "before": deleted_rev,
+                        "after": deleted_rev,
+                    }),
+                );
+            }
+        }
     }
 
     Ok(json!({
@@ -3734,22 +3795,9 @@ pub async fn api_dataset_export_zip(
             .into_response();
     };
     let allowed = effective_caller_allowed_cameras(&state, &jar, &headers).await;
-    let privacy_masks: HashMap<String, Value> = {
+    let privacy_policies = {
         let cfg = state.config.read().await;
-        cfg.cameras
-            .iter()
-            .filter(|(_, v)| has_active_privacy_mask(Some(&v.privacy_mask)))
-            .map(|(k, v)| {
-                (
-                    k.clone(),
-                    crate::normalize_privacy_mask_value_for_resolution(
-                        &v.privacy_mask,
-                        v.detect.width.max(1),
-                        v.detect.height.max(1),
-                    ),
-                )
-            })
-            .collect()
+        crate::media_redaction::MediaDeliveryGate::configured_camera_policies(&cfg)
     };
     let state_for_zip = state.clone();
     let Ok(zip_bytes) = tokio::task::spawn_blocking(move || {
@@ -3787,9 +3835,15 @@ pub async fn api_dataset_export_zip(
                 "train"
             };
             let raw_img_bytes = load_dataset_sample_image_bytes_sync(&state_for_zip, &sample);
-            let priv_mask = privacy_masks.get(&sample.camera);
-            let (img_bytes, _) =
-                redact_image_bytes_with_privacy_mask(&raw_img_bytes, priv_mask, false);
+            let (img_bytes, _) = if let Some(policy) = privacy_policies.get(&sample.camera) {
+                crate::media_redaction::MediaDeliveryGate::redact_image_bytes_with_policy(
+                    &raw_img_bytes,
+                    policy,
+                    false,
+                )
+            } else {
+                redact_image_bytes_with_privacy_mask(&raw_img_bytes, None, false)
+            };
             drop(raw_img_bytes);
 
             let label_txt = if sample.sample_kind == "hard_negative" || sample.annotations.is_empty()

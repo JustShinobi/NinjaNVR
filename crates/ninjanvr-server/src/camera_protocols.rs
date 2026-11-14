@@ -1107,6 +1107,302 @@ impl CameraDriverRuntime {
         .await
         .map_err(|(_, err_msg)| err_msg)
     }
+
+    /// Queries ONVIF `GetPresets` and `GetStatus` over `transport` (re-querying `GetPresets` if
+    /// `GetStatus` auto-discovers a different `ProfileToken`).
+    #[expect(clippy::too_many_arguments)]
+    pub async fn query_ptz_presets_and_status(
+        &self,
+        transport: &dyn CameraWireTransport,
+        camera: &str,
+        endpoint: &str,
+        initial_profile: &str,
+        allow_discovery: bool,
+        protocol_hint: Option<&str>,
+        (user, pass): (Option<&str>, Option<&str>),
+        timeout: Duration,
+    ) -> (
+        String,
+        std::result::Result<String, (StatusCode, String)>,
+        std::result::Result<String, (StatusCode, String)>,
+    ) {
+        let mut profile_token = initial_profile.to_string();
+        let presets_soap = build_onvif_get_presets_soap(&profile_token, user, pass);
+        let mut presets_res = transport
+            .send_soap(
+                endpoint,
+                "http://www.onvif.org/ver20/ptz/wsdl",
+                "GetPresets",
+                presets_soap,
+                (user, pass),
+                timeout,
+            )
+            .await;
+
+        let status_res = match self
+            .send_ptz_soap_with_profile_discovery(
+                transport,
+                camera,
+                endpoint,
+                &profile_token,
+                allow_discovery,
+                protocol_hint,
+                "GetStatus",
+                (user, pass),
+                timeout,
+                |prof| build_onvif_get_status_soap(prof, user, pass),
+            )
+            .await
+        {
+            Ok((resolved_prof, status_xml)) => {
+                if resolved_prof != profile_token {
+                    profile_token = resolved_prof;
+                    let cand_presets_soap =
+                        build_onvif_get_presets_soap(&profile_token, user, pass);
+                    presets_res = transport
+                        .send_soap(
+                            endpoint,
+                            "http://www.onvif.org/ver20/ptz/wsdl",
+                            "GetPresets",
+                            cand_presets_soap,
+                            (user, pass),
+                            timeout,
+                        )
+                        .await;
+                }
+                Ok(status_xml)
+            }
+            Err(err) => {
+                if presets_res.is_ok() {
+                    self.set_profile(camera, endpoint, &profile_token);
+                }
+                Err(err)
+            }
+        };
+
+        (profile_token, presets_res, status_res)
+    }
+
+    /// Executes ONVIF `GotoPreset` over `transport`, falling back to `GetStatus` + soft-preset
+    /// delta calculation + `RelativeMove` when `GotoPreset` is unsupported and `soft_preset` exists,
+    /// and updating the camera's active preset state atomically.
+    #[expect(clippy::too_many_arguments)]
+    pub async fn goto_preset_with_soft_fallback(
+        &self,
+        transport: &dyn CameraWireTransport,
+        camera: &str,
+        endpoint: &str,
+        initial_profile: &str,
+        allow_discovery: bool,
+        protocol_hint: Option<&str>,
+        preset_token: &str,
+        speed: Option<f32>,
+        soft_preset: Option<&ninjanvr_config::CameraSoftPreset>,
+        (user, pass): (Option<&str>, Option<&str>),
+        timeout: Duration,
+    ) -> std::result::Result<&'static str, (StatusCode, String)> {
+        let goto_res = self
+            .send_ptz_soap_with_profile_discovery(
+                transport,
+                camera,
+                endpoint,
+                initial_profile,
+                allow_discovery,
+                protocol_hint,
+                "GotoPreset",
+                (user, pass),
+                timeout,
+                |prof| build_onvif_goto_preset_soap(prof, preset_token, speed, user, pass),
+            )
+            .await;
+
+        match goto_res {
+            Ok(_) => {
+                self.set_active_preset(camera, Some(preset_token.to_string()))
+                    .await;
+                Ok("GotoPreset")
+            }
+            Err(_) if soft_preset.is_some() => {
+                let Some(soft) = soft_preset else {
+                    unreachable!("guarded by soft_preset.is_some()");
+                };
+                let (resolved_prof, cur_status, _xml) = match self
+                    .fetch_ptz_status_with_discovery(
+                        transport,
+                        camera,
+                        endpoint,
+                        initial_profile,
+                        allow_discovery,
+                        protocol_hint,
+                        (user, pass),
+                        timeout,
+                    )
+                    .await
+                {
+                    Ok(res) => res,
+                    Err(err) => {
+                        self.set_active_preset(camera, None).await;
+                        return Err(err);
+                    }
+                };
+                let (dx, dy, dz) = self
+                    .compute_soft_preset_delta(
+                        f64::from(cur_status.pan),
+                        f64::from(cur_status.tilt),
+                        f64::from(cur_status.zoom),
+                        f64::from(soft.pan),
+                        f64::from(soft.tilt),
+                        f64::from(soft.zoom),
+                        0.0,
+                    )
+                    .map_or((0.0, 0.0, 0.0), |(x, y, z)| (x as f32, y as f32, z as f32));
+                let rel_soap =
+                    build_onvif_relative_move_soap(&resolved_prof, dx, dy, dz, speed, user, pass);
+                if let Err(err) = transport
+                    .send_soap(
+                        endpoint,
+                        "http://www.onvif.org/ver20/ptz/wsdl",
+                        "RelativeMove",
+                        rel_soap,
+                        (user, pass),
+                        timeout,
+                    )
+                    .await
+                {
+                    self.set_active_preset(camera, None).await;
+                    return Err(err);
+                }
+                self.set_active_preset(camera, Some(preset_token.to_string()))
+                    .await;
+                Ok("SoftPresetRelativeMove")
+            }
+            Err(err) => {
+                self.set_active_preset(camera, None).await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Probes Dahua/Intelbras `magicBox.cgi?action=getSystemInfo` and `DAHUA_CGI_PROBE_TABLES`
+    /// entirely over `transport`.
+    pub async fn probe_dahua_cgi_system_and_tables(
+        &self,
+        transport: &dyn CameraWireTransport,
+        cgi_base: &str,
+        dev_info: &mut CameraDeviceIdentity,
+        state_map: &mut serde_json::Map<String, serde_json::Value>,
+        (user, pass): (Option<&str>, Option<&str>),
+        timeout: Duration,
+    ) -> bool {
+        let sys_url = format!("{cgi_base}/cgi-bin/magicBox.cgi?action=getSystemInfo");
+        let mut dahua_cgi_ok = false;
+        if let Ok((StatusCode::OK, sys_txt)) = transport
+            .send_digest_http(
+                self,
+                reqwest::Method::GET,
+                &sys_url,
+                (user, pass),
+                (None, None),
+                timeout,
+            )
+            .await
+        {
+            let sys_kv = parse_dahua_cgi_kv(&sys_txt);
+            if sys_kv.contains_key("deviceType") || sys_kv.contains_key("serialNumber") {
+                dahua_cgi_ok = true;
+                if dev_info.model.is_none() {
+                    dev_info.model = sys_kv.get("deviceType").cloned();
+                }
+                if dev_info.serial_number.is_none() {
+                    dev_info.serial_number = sys_kv.get("serialNumber").cloned();
+                }
+                if dev_info.manufacturer.is_none() {
+                    dev_info.manufacturer = Some("Intelbras / Dahua".to_string());
+                }
+            }
+        }
+        if dahua_cgi_ok {
+            for chunk in DAHUA_CGI_PROBE_TABLES.chunks(4) {
+                let futs = chunk.iter().map(|&table| {
+                    let tbl_url = format!(
+                        "{cgi_base}/cgi-bin/configManager.cgi?action=getConfig&name={table}"
+                    );
+                    async move {
+                        let res = transport
+                            .send_digest_http(
+                                self,
+                                reqwest::Method::GET,
+                                &tbl_url,
+                                (user, pass),
+                                (None, None),
+                                timeout,
+                            )
+                            .await;
+                        (table, res)
+                    }
+                });
+                for (table, res) in futures_util::future::join_all(futs).await {
+                    if let Ok((StatusCode::OK, txt)) = res {
+                        let kv = parse_dahua_cgi_kv(&txt);
+                        apply_dahua_cgi_table_to_state(table, &kv, state_map);
+                    }
+                }
+            }
+        }
+        dahua_cgi_ok
+    }
+
+    /// Applies encoded Dahua/Intelbras CGI `configManager.cgi?action=setConfig` pairs over `transport`.
+    pub async fn apply_dahua_cgi_set_config(
+        &self,
+        transport: &dyn CameraWireTransport,
+        cgi_base: &str,
+        cgi_pairs: &[String],
+        (user, pass): (Option<&str>, Option<&str>),
+        timeout: Duration,
+    ) -> std::result::Result<(), (StatusCode, String)> {
+        if cgi_pairs.is_empty() {
+            return Ok(());
+        }
+        let set_url = format!(
+            "{cgi_base}/cgi-bin/configManager.cgi?action=setConfig&{}",
+            cgi_pairs.join("&")
+        );
+        match transport
+            .send_digest_http(
+                self,
+                reqwest::Method::GET,
+                &set_url,
+                (user, pass),
+                (None, None),
+                timeout,
+            )
+            .await
+        {
+            Ok((StatusCode::OK, resp_txt))
+                if !resp_txt
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("error") =>
+            {
+                Ok(())
+            }
+            Ok((st, resp_txt)) => {
+                let scrubbed_snippet: String = scrub_rtsp_credentials(resp_txt.trim())
+                    .chars()
+                    .take(256)
+                    .collect();
+                Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!(
+                        "Camera CGI setConfig returned HTTP {} ({scrubbed_snippet})",
+                        st.as_u16()
+                    ),
+                ))
+            }
+            Err(err) => Err(err),
+        }
+    }
 }
 
 pub type WireSoapFuture<'a> = std::pin::Pin<
@@ -4468,11 +4764,9 @@ pub struct CameraDiagnosticReport {
     pub lines: Vec<String>,
 }
 
-/// Queries supported camera log and event diagnostic channels (`ONVIF GetDeviceInformation`,
-/// `ONVIF GetSystemLog`, `ONVIF PullPointSubscription`, and `Dahua CGI` diagnostics/syslog status)
-/// according to the camera's `CameraProtocolSpec`.
-pub async fn collect_camera_diagnostic_logs(
-    client: &reqwest::Client,
+/// Queries supported camera log and event diagnostic channels over `&dyn CameraWireTransport`.
+pub async fn collect_camera_diagnostic_logs_with_transport(
+    transport: &dyn CameraWireTransport,
     runtime: &CameraDriverRuntime,
     camera: &str,
     (host, onvif_port): (&str, u16),
@@ -4489,18 +4783,16 @@ pub async fn collect_camera_diagnostic_logs(
 
     // 1. ONVIF Device Identity
     let dev_soap = build_onvif_get_device_info_soap(user, pass);
-    if let Ok(xml) = send_onvif_soap_request_with_ns(
-        client,
-        &dev_ep,
-        (
+    if let Ok(xml) = transport
+        .send_soap(
+            &dev_ep,
             "http://www.onvif.org/ver10/device/wsdl",
             "GetDeviceInformation",
-        ),
-        dev_soap,
-        (user, pass),
-        timeout,
-    )
-    .await
+            dev_soap,
+            (user, pass),
+            timeout,
+        )
+        .await
     {
         online = true;
         sources.push("onvif:GetDeviceInformation".to_string());
@@ -4514,18 +4806,19 @@ pub async fn collect_camera_diagnostic_logs(
         ));
     }
 
-    // 2. ONVIF GetSystemLog (for protocols that support it: Hikvision ISAPI, Axis, Reolink, Standard ONVIF)
+    // 2. ONVIF GetSystemLog
     if spec.supports_onvif_system_log {
         let log_soap = build_onvif_get_system_log_soap("System", user, pass);
-        if let Ok(xml) = send_onvif_soap_request_with_ns(
-            client,
-            &dev_ep,
-            ("http://www.onvif.org/ver10/device/wsdl", "GetSystemLog"),
-            log_soap,
-            (user, pass),
-            timeout,
-        )
-        .await
+        if let Ok(xml) = transport
+            .send_soap(
+                &dev_ep,
+                "http://www.onvif.org/ver10/device/wsdl",
+                "GetSystemLog",
+                log_soap,
+                (user, pass),
+                timeout,
+            )
+            .await
         {
             online = true;
             sources.push("onvif:GetSystemLog".to_string());
@@ -4535,7 +4828,7 @@ pub async fn collect_camera_diagnostic_logs(
         }
     }
 
-    // 3. ONVIF PullPoint Event Subscription (Tapo C200 :2020/onvif/service and ONVIF Profile S/T)
+    // 3. ONVIF PullPoint Event Subscription
     if spec.supports_onvif_pull_events {
         let ev_ep = if spec.id == "tapo" {
             format!("{onvif_base}/onvif/service")
@@ -4543,18 +4836,16 @@ pub async fn collect_camera_diagnostic_logs(
             format!("{onvif_base}/onvif/event_service")
         };
         let sub_soap = build_onvif_create_pull_point_soap(user, pass);
-        if let Ok(sub_xml) = send_onvif_soap_request_with_ns(
-            client,
-            &ev_ep,
-            (
+        if let Ok(sub_xml) = transport
+            .send_soap(
+                &ev_ep,
                 "http://www.onvif.org/ver10/events/wsdl/EventPortType",
                 "CreatePullPointSubscriptionRequest",
-            ),
-            sub_soap,
-            (user, pass),
-            timeout,
-        )
-        .await
+                sub_soap,
+                (user, pass),
+                timeout,
+            )
+            .await
         {
             online = true;
             sources.push("onvif:PullPointEvents".to_string());
@@ -4563,18 +4854,16 @@ pub async fn collect_camera_diagnostic_logs(
                 .filter(|u| is_safe_onvif_endpoint_url(u))
             {
                 let pull_soap = build_onvif_pull_messages_soap(user, pass);
-                if let Ok(pull_xml) = send_onvif_soap_request_with_ns(
-                    client,
-                    sub_addr,
-                    (
+                if let Ok(pull_xml) = transport
+                    .send_soap(
+                        sub_addr,
                         "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription",
                         "PullMessagesRequest",
-                    ),
-                    pull_soap,
-                    (user, pass),
-                    timeout,
-                )
-                .await
+                        pull_soap,
+                        (user, pass),
+                        timeout,
+                    )
+                    .await
                 {
                     let (cam_clock, ev_list) = parse_onvif_pull_messages_xml(&pull_xml);
                     if let Some(clk) = cam_clock {
@@ -4587,20 +4876,17 @@ pub async fn collect_camera_diagnostic_logs(
                         lines.push(format!("[onvif/event] {ev}"));
                     }
                 }
-                // Always Unsubscribe immediately so no subscription slot is leaked on the camera
                 let unsub_soap = build_onvif_unsubscribe_soap(user, pass);
-                let _ = send_onvif_soap_request_with_ns(
-                    client,
-                    sub_addr,
-                    (
+                let _ = transport
+                    .send_soap(
+                        sub_addr,
                         "http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager",
                         "UnsubscribeRequest",
-                    ),
-                    unsub_soap,
-                    (user, pass),
-                    Duration::from_secs(2),
-                )
-                .await;
+                        unsub_soap,
+                        (user, pass),
+                        Duration::from_secs(2),
+                    )
+                    .await;
             }
         }
     }
@@ -4630,16 +4916,16 @@ pub async fn collect_camera_diagnostic_logs(
             ),
         ] {
             let url = format!("{cgi_base}{path}");
-            if let Ok((StatusCode::OK, txt)) = send_http_digest_request(
-                client,
-                runtime,
-                reqwest::Method::GET,
-                &url,
-                (user, pass),
-                (None, None),
-                timeout,
-            )
-            .await
+            if let Ok((StatusCode::OK, txt)) = transport
+                .send_digest_http(
+                    runtime,
+                    reqwest::Method::GET,
+                    &url,
+                    (user, pass),
+                    (None, None),
+                    timeout,
+                )
+                .await
             {
                 online = true;
                 if !sources.contains(&"dahua_cgi".to_string()) {
@@ -4672,6 +4958,31 @@ pub async fn collect_camera_diagnostic_logs(
         sources_queried: sources,
         lines,
     }
+}
+
+/// Queries supported camera log and event diagnostic channels (`ONVIF GetDeviceInformation`,
+/// `ONVIF GetSystemLog`, `ONVIF PullPointSubscription`, and `Dahua CGI` diagnostics/syslog status)
+/// according to the camera's `CameraProtocolSpec`.
+pub async fn collect_camera_diagnostic_logs(
+    client: &reqwest::Client,
+    runtime: &CameraDriverRuntime,
+    camera: &str,
+    (host, onvif_port): (&str, u16),
+    (user, pass): (Option<&str>, Option<&str>),
+    spec: &CameraProtocolSpec,
+    timeout: Duration,
+) -> CameraDiagnosticReport {
+    let transport = ReqwestCameraWireTransport::new(client.clone());
+    collect_camera_diagnostic_logs_with_transport(
+        &transport,
+        runtime,
+        camera,
+        (host, onvif_port),
+        (user, pass),
+        spec,
+        timeout,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -5109,6 +5420,11 @@ mod tests {
                         "<s:Envelope><s:Body><tds:SystemRebootResponse/></s:Body></s:Envelope>"
                             .to_string(),
                     )
+                } else if act == "RelativeMove" {
+                    Ok(
+                        "<s:Envelope><s:Body><tptz:RelativeMoveResponse/></s:Body></s:Envelope>"
+                            .to_string(),
+                    )
                 } else {
                     Err((
                         StatusCode::BAD_REQUEST,
@@ -5205,5 +5521,34 @@ mod tests {
         rt.clear_active_preset_if_matching("escritorio", &["other", "DESK_VIEW"])
             .await;
         assert_eq!(rt.get_active_preset("escritorio", None).await, None);
+
+        // 5. Soft-preset fallback executes GotoPreset -> GetStatus -> RelativeMove over FakeCameraWireTransport
+        let soft = ninjanvr_config::CameraSoftPreset {
+            name: "door_angle".to_string(),
+            pan: -0.25,
+            tilt: 0.20,
+            zoom: 0.50,
+        };
+        let op = rt
+            .goto_preset_with_soft_fallback(
+                &fake_transport,
+                "escritorio",
+                endpoint,
+                "profile_1",
+                false,
+                Some("tapo"),
+                "soft_1",
+                Some(0.8),
+                Some(&soft),
+                (Some("admin"), Some("secret")),
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("soft preset fallback over FakeCameraWireTransport must succeed");
+        assert_eq!(op, "SoftPresetRelativeMove");
+        assert_eq!(
+            rt.get_active_preset("escritorio", None).await.as_deref(),
+            Some("soft_1")
+        );
     }
 }

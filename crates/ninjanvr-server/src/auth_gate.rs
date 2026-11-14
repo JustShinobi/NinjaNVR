@@ -37,7 +37,7 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::{
-    AppState, filter_stats_snapshot_for_allowed_cameras, has_active_privacy_mask, is_safe_id,
+    AppState, filter_stats_snapshot_for_allowed_cameras, is_safe_id,
     open_regular_non_symlink_readonly, strip_share_artifact_prefix, unix_now,
 };
 
@@ -852,17 +852,20 @@ pub fn normalize_http_path_for_auth(raw: &str) -> Option<String> {
 }
 
 pub fn is_safe_go2rtc_stream_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 128
-        && !name.starts_with('.')
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    ninjanvr_config::is_safe_go2rtc_stream_name(name)
 }
 
 pub fn validate_go2rtc_query_streams(
     query: Option<&str>,
     allowed_set: Option<&[String]>,
+) -> Result<Vec<String>, &'static str> {
+    validate_go2rtc_query_streams_with_known(query, allowed_set, None)
+}
+
+pub fn validate_go2rtc_query_streams_with_known(
+    query: Option<&str>,
+    allowed_set: Option<&[String]>,
+    known_cameras: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<Vec<String>, &'static str> {
     let Some(q) = query.filter(|s| !s.trim().is_empty()) else {
         return Err("Missing stream src query parameter");
@@ -883,23 +886,15 @@ pub fn validate_go2rtc_query_streams(
             return Err("Invalid query encoding");
         }
         if k.eq_ignore_ascii_case("src") || k.eq_ignore_ascii_case("dst") {
-            if !is_safe_go2rtc_stream_name(&v) {
+            let Some(route) = ninjanvr_config::parse_go2rtc_stream_route(&v, known_cameras) else {
                 return Err("Invalid stream identifier");
-            }
-            let base_cam = v
-                .strip_suffix("_sub")
-                .or_else(|| v.strip_suffix("_talk"))
-                .unwrap_or(&v)
-                .trim();
-            if base_cam.is_empty() {
-                return Err("Invalid stream identifier");
-            }
+            };
             if let Some(allowed) = allowed_set
-                && !allowed.iter().any(|a| a == base_cam || a == "*")
+                && !allowed.iter().any(|a| a == &route.camera || a == "*")
             {
                 return Err("Stream camera is not permitted for this user");
             }
-            query_cams.push(base_cam.to_string());
+            query_cams.push(route.camera);
         }
     }
     if query_cams.is_empty() {
@@ -1189,25 +1184,12 @@ pub async fn auth_gate_middleware(
         )
             .into_response();
     }
-    let (auth_cfg, camera_keys, active_masks) = {
+    let (auth_cfg, camera_keys, known_cameras, active_policies) = {
         let cfg = state.config.read().await;
         let keys: Vec<String> = cfg.cameras.keys().cloned().collect();
-        let masks: std::collections::BTreeMap<String, Value> = cfg
-            .cameras
-            .iter()
-            .filter(|(_, c)| crate::has_active_privacy_mask(Some(&c.privacy_mask)))
-            .map(|(k, c)| {
-                (
-                    k.clone(),
-                    crate::normalize_privacy_mask_value_for_resolution(
-                        &c.privacy_mask,
-                        c.detect.width.max(1),
-                        c.detect.height.max(1),
-                    ),
-                )
-            })
-            .collect();
-        (cfg.auth.clone(), keys, masks)
+        let known: std::collections::BTreeSet<String> = keys.iter().cloned().collect();
+        let policies = crate::media_redaction::MediaDeliveryGate::configured_camera_policies(&cfg);
+        (cfg.auth.clone(), keys, known, policies)
     };
     let is_static_media_route = path == "/exports"
         || path.starts_with("/exports/")
@@ -1340,8 +1322,11 @@ pub async fn auth_gate_middleware(
             None
         };
         if (path.starts_with("/live/") || path == "/live" || path == "/api/go2rtc/webrtc")
-            && let Err(msg) =
-                validate_go2rtc_query_streams(req.uri().query(), allowed_set_opt.as_deref())
+            && let Err(msg) = validate_go2rtc_query_streams_with_known(
+                req.uri().query(),
+                allowed_set_opt.as_deref(),
+                Some(&known_cameras),
+            )
         {
             let status = if msg == "Stream camera is not permitted for this user"
                 || (msg == "Missing stream src query parameter" && allowed_set_opt.is_some())
@@ -1366,18 +1351,17 @@ pub async fn auth_gate_middleware(
                 )
                     .into_response();
             };
-            if !is_safe_go2rtc_stream_name(&decoded_seg) {
+            let Some(route) =
+                ninjanvr_config::parse_go2rtc_stream_route(&decoded_seg, Some(&known_cameras))
+            else {
                 state.log_hub.push_nginx(&method, &path, 400);
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(json!({ "message": "Invalid stream identifier" })),
                 )
                     .into_response();
-            }
-            let base_cam = decoded_seg
-                .strip_suffix("_sub")
-                .unwrap_or(&decoded_seg)
-                .trim();
+            };
+            let base_cam = route.camera.as_str();
             if let Some(ref allowed_set) = allowed_set_opt
                 && (base_cam.is_empty() || !allowed_set.iter().any(|a| a == base_cam || a == "*"))
             {
@@ -1420,8 +1404,9 @@ pub async fn auth_gate_middleware(
                         let (k, v) = kv.split_once('=')?;
                         let dk = percent_decode_segment(k)?;
                         let dv = percent_decode_segment(v)?;
-                        if dk == "src" || dk == "dst" {
-                            Some(dv.strip_suffix("_sub").unwrap_or(&dv).to_string())
+                        if dk.eq_ignore_ascii_case("src") || dk.eq_ignore_ascii_case("dst") {
+                            ninjanvr_config::parse_go2rtc_stream_route(&dv, Some(&known_cameras))
+                                .map(|r| r.camera)
                         } else {
                             None
                         }
@@ -1581,39 +1566,56 @@ pub async fn auth_gate_middleware(
         }
     }
 
-    let mut active_clip_mask: Option<Value> = None;
-    if !active_masks.is_empty()
+    let mut active_clip_policy: Option<ninjanvr_vision::PrivacyMaskPolicy> = None;
+    let any_invalid_policy = active_policies.values().any(|p| p.is_invalid());
+    if !active_policies.is_empty()
         && (path == "/recordings"
             || path.starts_with("/recordings/")
-            || path.starts_with("/exports/share_clip_")
+            || path == "/exports"
+            || path.starts_with("/exports/")
             || path == "/clips"
             || path.starts_with("/clips/"))
     {
+        let is_non_share_clip_export = (path == "/exports" || path.starts_with("/exports/"))
+            && !path.starts_with("/exports/share_clip_");
         match resolve_static_media_camera_with_keys(&state, &path, &camera_keys) {
             Some(cam) => {
-                if let Some(mask) = active_masks.get(&cam) {
-                    let path_lc = path.to_ascii_lowercase();
-                    let is_clip_image = path.starts_with("/clips/")
-                        && !path.starts_with("/clips/faces/")
-                        && (path_lc.ends_with(".jpg")
-                            || path_lc.ends_with(".jpeg")
-                            || path_lc.ends_with(".webp")
-                            || path_lc.ends_with(".png"));
-                    if !is_clip_image {
-                        state.log_hub.push_nginx(&method, &path, 404);
-                        return StatusCode::NOT_FOUND.into_response();
+                let cam_trimmed = cam.trim();
+                if let Some(policy) = active_policies
+                    .get(&cam)
+                    .or_else(|| active_policies.get(cam_trimmed))
+                {
+                    if is_non_share_clip_export {
+                        if policy.is_invalid() {
+                            state.log_hub.push_nginx(&method, &path, 404);
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
+                    } else {
+                        let path_lc = path.to_ascii_lowercase();
+                        let is_clip_image = path.starts_with("/clips/")
+                            && !path.starts_with("/clips/faces/")
+                            && (path_lc.ends_with(".jpg")
+                                || path_lc.ends_with(".jpeg")
+                                || path_lc.ends_with(".webp")
+                                || path_lc.ends_with(".png"));
+                        if !is_clip_image || policy.is_invalid() {
+                            state.log_hub.push_nginx(&method, &path, 404);
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
+                        active_clip_policy = Some(policy.clone());
                     }
-                    active_clip_mask = Some(mask.clone());
                 }
             }
             None => {
-                state.log_hub.push_nginx(&method, &path, 404);
-                return StatusCode::NOT_FOUND.into_response();
+                if !is_non_share_clip_export || any_invalid_policy {
+                    state.log_hub.push_nginx(&method, &path, 404);
+                    return StatusCode::NOT_FOUND.into_response();
+                }
             }
         }
     }
 
-    if active_clip_mask.is_some() {
+    if active_clip_policy.is_some() {
         req.headers_mut().remove(header::RANGE);
         req.headers_mut().remove(header::IF_RANGE);
         req.headers_mut().remove(header::IF_NONE_MATCH);
@@ -1621,7 +1623,7 @@ pub async fn auth_gate_middleware(
     }
 
     let mut resp = next.run(req).await;
-    if let Some(mask) = active_clip_mask {
+    if let Some(policy) = active_clip_policy {
         if method == "HEAD" {
             resp.headers_mut().remove(header::ETAG);
             resp.headers_mut().remove(header::LAST_MODIFIED);
@@ -1631,12 +1633,13 @@ pub async fn auth_gate_middleware(
                 p_lc.ends_with(".jpg") || p_lc.ends_with(".jpeg")
             };
             if let Ok(raw_bytes) = axum::body::to_bytes(resp.into_body(), 32 * 1024 * 1024).await {
-                let (redacted_bytes, mime) = crate::redact_image_bytes_with_privacy_mask_async(
-                    raw_bytes.to_vec(),
-                    Some(mask),
-                    prefer_jpeg,
-                )
-                .await;
+                let (redacted_bytes, mime) =
+                    crate::media_redaction::MediaDeliveryGate::redact_image_bytes_with_policy_async(
+                        raw_bytes.to_vec(),
+                        policy,
+                        prefer_jpeg,
+                    )
+                    .await;
                 resp = ([(header::CONTENT_TYPE, mime)], redacted_bytes).into_response();
             } else {
                 resp = StatusCode::NOT_FOUND.into_response();
@@ -3441,13 +3444,11 @@ pub async fn authorize_review_media(
     {
         return Err(ReviewMediaDenied::Forbidden);
     }
-    let privacy_mask_active = {
-        let cfg = state.config.read().await;
-        cfg.cameras
-            .get(&item.camera)
-            .is_some_and(|c| has_active_privacy_mask(Some(&c.privacy_mask)))
-    };
-    if privacy_mask_active {
+    if state
+        .media_delivery_gate
+        .blocks_untranscoded_video(&item.camera)
+        .await
+    {
         return Err(ReviewMediaDenied::NotFound);
     }
     Ok(item)

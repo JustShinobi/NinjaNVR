@@ -1,10 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use axum::extract::ws::{Message as AxumWsMsg, WebSocket};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::{Notify, RwLock, broadcast};
 use tokio_tungstenite::tungstenite::Message as TungMsg;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -14,7 +15,8 @@ pub const MAX_GOP_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_INIT_SEGMENT_BYTES: usize = 512 * 1024;
 pub const MAX_CODEC_MSG_BYTES: usize = 4096;
 pub const MAX_CACHED_STREAMS: usize = 64;
-pub const MAX_FMP4_BOXES_PER_LEVEL: usize = 256;
+pub const MAX_FMP4_BOXES_PER_LEVEL: usize = ninjanvr_vod::iso_bmff::MAX_EXACT_FMP4_BOXES_PER_LEVEL;
+pub const MAX_CLIENT_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_GOP_CACHE_AGE: Duration = Duration::from_secs(10);
 pub const PREWARM_KEEPALIVE_TTL: Duration = Duration::from_secs(45);
 pub const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -24,124 +26,19 @@ pub const UPSTREAM_SEND_TIMEOUT: Duration = Duration::from_secs(3);
 /// and does not start with `.` so stream names cannot inject query parameters, fragments,
 /// or path traversal sequences into upstream WebSocket URLs.
 pub fn is_valid_stream_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 128
-        && !name.starts_with('.')
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
-fn parse_exact_iso_boxes(mut buf: &[u8]) -> Option<Vec<([u8; 4], &[u8])>> {
-    if buf.len() < 8 {
-        return None;
-    }
-    let mut out = Vec::new();
-    while !buf.is_empty() {
-        if buf.len() < 8 || out.len() >= MAX_FMP4_BOXES_PER_LEVEL {
-            return None;
-        }
-        let size32 = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
-        let box_type = [buf[4], buf[5], buf[6], buf[7]];
-        let (box_len, hdr_len) = if size32 == 1 {
-            if buf.len() < 16 {
-                return None;
-            }
-            let size64 = u64::from_be_bytes([
-                buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-            ]);
-            if size64 < 16 {
-                return None;
-            }
-            (usize::try_from(size64).ok()?, 16usize)
-        } else if size32 == 0 {
-            return None;
-        } else {
-            if size32 < 8 {
-                return None;
-            }
-            (size32 as usize, 8usize)
-        };
-        if box_len > buf.len() {
-            return None;
-        }
-        out.push((box_type, &buf[hdr_len..box_len]));
-        buf = &buf[box_len..];
-    }
-    Some(out)
+    ninjanvr_config::is_safe_go2rtc_stream_name(name)
 }
 
 /// Validates that `buf` is a structurally complete ISO-BMFF fMP4 initialization segment
 /// containing both `ftyp` and non-empty `moov` boxes, no `moof` box, and zero truncated/trailing bytes.
 pub fn is_complete_fmp4_init_segment(buf: &[u8]) -> bool {
-    if buf.is_empty() || buf.len() > MAX_INIT_SEGMENT_BYTES {
-        return false;
-    }
-    let Some(boxes) = parse_exact_iso_boxes(buf) else {
-        return false;
-    };
-    let has_ftyp = boxes
-        .iter()
-        .any(|(t, body)| t == b"ftyp" && body.len() >= 8);
-    let has_moov = boxes
-        .iter()
-        .any(|(t, body)| t == b"moov" && !body.is_empty());
-    let has_moof = boxes.iter().any(|(t, _)| t == b"moof");
-    has_ftyp && has_moov && !has_moof && ninjanvr_vod::is_fmp4_init_segment(buf)
+    ninjanvr_vod::iso_bmff::is_complete_fmp4_init_segment(buf, MAX_INIT_SEGMENT_BYTES)
 }
 
 /// Validates that `buf` is a structurally complete ISO-BMFF fMP4 media fragment (`moof` + `mdat`)
 /// with exact box boundaries and at least one valid `traf` (`tfhd` + `trun`).
 pub fn is_complete_fmp4_media_fragment(buf: &[u8]) -> bool {
-    if buf.is_empty() || buf.len() > MAX_GOP_BYTES {
-        return false;
-    }
-    let Some(top_boxes) = parse_exact_iso_boxes(buf) else {
-        return false;
-    };
-    let has_ftyp_or_moov = top_boxes.iter().any(|(t, _)| t == b"ftyp" || t == b"moov");
-    if has_ftyp_or_moov {
-        return false;
-    }
-    let has_mdat = top_boxes
-        .iter()
-        .any(|(t, body)| t == b"mdat" && !body.is_empty());
-    if !has_mdat {
-        return false;
-    }
-    let mut saw_moof = false;
-    for (top_type, moof_body) in &top_boxes {
-        if top_type != b"moof" {
-            continue;
-        }
-        saw_moof = true;
-        let Some(moof_boxes) = parse_exact_iso_boxes(moof_body) else {
-            return false;
-        };
-        let mut valid_traf_in_moof = false;
-        for (btype, bbody) in &moof_boxes {
-            if btype != b"traf" {
-                continue;
-            }
-            let Some(traf_boxes) = parse_exact_iso_boxes(bbody) else {
-                return false;
-            };
-            let has_tfhd = traf_boxes
-                .iter()
-                .any(|(t, body)| t == b"tfhd" && body.len() >= 8);
-            let has_trun = traf_boxes
-                .iter()
-                .any(|(t, body)| t == b"trun" && body.len() >= 8);
-            if !has_tfhd || !has_trun {
-                return false;
-            }
-            valid_traf_in_moof = true;
-        }
-        if !valid_traf_in_moof {
-            return false;
-        }
-    }
-    saw_moof
+    ninjanvr_vod::iso_bmff::is_complete_fmp4_media_fragment(buf, MAX_GOP_BYTES)
 }
 
 #[derive(Debug, Clone)]
@@ -292,11 +189,31 @@ impl MseGopCache {
 }
 
 struct UpstreamSession {
+    session_id: u64,
     expires_at: Instant,
     persistent: bool,
     active_clients: Arc<AtomicUsize>,
     ready_notify: Arc<Notify>,
+    cancel_notify: Arc<Notify>,
     tx: broadcast::Sender<MseLivePacket>,
+}
+
+/// Outbound WebSocket frame emitted by [`MseStreamHub::pump_client_session`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MseClientOutFrame {
+    Text(String),
+    Binary(Bytes),
+    Pong(Bytes),
+}
+
+/// Inbound WebSocket frame consumed by [`MseStreamHub::pump_client_session`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MseClientInFrame {
+    Text(usize),
+    Binary(usize),
+    Ping(Bytes),
+    Pong,
+    Close,
 }
 
 pub struct MseClientSubscription {
@@ -371,6 +288,7 @@ impl Drop for MseClientSubscription {
 pub struct MseStreamHub {
     caches: Arc<RwLock<HashMap<String, MseGopCache>>>,
     sessions: Arc<RwLock<HashMap<String, UpstreamSession>>>,
+    next_session_id: Arc<AtomicU64>,
 }
 
 impl MseStreamHub {
@@ -509,16 +427,20 @@ impl MseStreamHub {
             }
         }
 
+        let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed) + 1;
         let notify = Arc::new(Notify::new());
+        let cancel_notify = Arc::new(Notify::new());
         let (tx, rx) = broadcast::channel(256);
         let active_clients = Arc::new(AtomicUsize::new(0));
         sessions.insert(
             stream_key.to_string(),
             UpstreamSession {
+                session_id,
                 expires_at: new_expires,
                 persistent,
                 active_clients: active_clients.clone(),
                 ready_notify: notify.clone(),
+                cancel_notify: cancel_notify.clone(),
                 tx,
             },
         );
@@ -529,10 +451,51 @@ impl MseStreamHub {
         let stream_owned = stream_key.to_string();
         let notify_bg = notify.clone();
         tokio::spawn(async move {
-            run_upstream_worker(hub, ws_base, stream_owned, notify_bg).await;
+            run_upstream_worker(
+                hub,
+                ws_base,
+                stream_owned,
+                session_id,
+                notify_bg,
+                cancel_notify,
+            )
+            .await;
         });
 
         Some((notify, rx, active_clients))
+    }
+
+    /// Invalidates and closes cached GOP bursts and active upstream sessions for `camera`
+    /// (`{cam}`, `{cam}_sub`, `{cam}_talk`, and `{cam}_sub_talk`).
+    pub async fn invalidate_camera_streams(&self, camera: &str) {
+        let trimmed = camera.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let stream_keys = [
+            trimmed.to_string(),
+            format!("{trimmed}_sub"),
+            format!("{trimmed}_talk"),
+            format!("{trimmed}_sub_talk"),
+        ];
+        {
+            let mut caches = self.caches.write().await;
+            for key in &stream_keys {
+                caches.remove(key);
+            }
+        }
+        let mut sessions = self.sessions.write().await;
+        for key in &stream_keys {
+            if let Some(removed) = sessions.remove(key) {
+                removed.cancel_notify.notify_waiters();
+            }
+        }
+    }
+
+    /// Returns `true` when `stream` currently holds an active upstream session or warm GOP burst.
+    pub async fn has_active_or_cached_stream(&self, stream: &str) -> bool {
+        let key = stream.trim();
+        self.sessions.read().await.contains_key(key) || self.get_fresh_burst(key).await.is_some()
     }
 
     /// Spawns or refreshes a shared background upstream `go2rtc` MSE consumer for `stream`
@@ -645,13 +608,189 @@ impl MseStreamHub {
 
         Some(sub)
     }
+
+    /// Pumps a single MSE client session over an abstract WebSocket sink/stream pair,
+    /// encapsulating initial GOP burst delivery, monotonic sequence deduplication,
+    /// lag-triggered IDR keyframe resync, and clean teardown on upstream codec/init reset.
+    pub async fn pump_client_session<S, R, SinkErr, StreamErr>(
+        &self,
+        mut client_sink: S,
+        mut client_stream: R,
+        go2rtc_ws_base: &str,
+        stream: &str,
+    ) where
+        S: Sink<MseClientOutFrame, Error = SinkErr> + Unpin,
+        R: Stream<Item = Result<MseClientInFrame, StreamErr>> + Unpin,
+    {
+        async fn send_frame_bounded<S, SinkErr>(sink: &mut S, frame: MseClientOutFrame) -> bool
+        where
+            S: Sink<MseClientOutFrame, Error = SinkErr> + Unpin,
+        {
+            matches!(
+                tokio::time::timeout(Duration::from_secs(5), sink.send(frame)).await,
+                Ok(Ok(()))
+            )
+        }
+
+        async fn send_burst_bounded<S, SinkErr>(
+            sink: &mut S,
+            burst: MseGopBurst,
+            send_headers: bool,
+        ) -> Option<u64>
+        where
+            S: Sink<MseClientOutFrame, Error = SinkErr> + Unpin,
+        {
+            if send_headers {
+                if !send_frame_bounded(sink, MseClientOutFrame::Text(burst.codec_msg)).await {
+                    return None;
+                }
+                if !send_frame_bounded(sink, MseClientOutFrame::Binary(burst.init_segment)).await {
+                    return None;
+                }
+            }
+            for frag in burst.gop_fragments {
+                if !send_frame_bounded(sink, MseClientOutFrame::Binary(frag)).await {
+                    return None;
+                }
+            }
+            Some(burst.last_seq)
+        }
+
+        // Wait briefly for client MSE handshake (or proceed immediately if none arrives within 40ms)
+        match tokio::time::timeout(Duration::from_millis(40), client_stream.next()).await {
+            Ok(Some(Ok(MseClientInFrame::Close))) | Ok(Some(Err(_))) | Ok(None) => return,
+            Ok(Some(Ok(MseClientInFrame::Ping(p)))) => {
+                if !send_frame_bounded(&mut client_sink, MseClientOutFrame::Pong(p)).await {
+                    return;
+                }
+            }
+            Ok(Some(Ok(MseClientInFrame::Text(len))))
+            | Ok(Some(Ok(MseClientInFrame::Binary(len))))
+                if len > MAX_CLIENT_CONTROL_FRAME_BYTES =>
+            {
+                return;
+            }
+            _ => {}
+        }
+
+        let Some(mut sub) = self.subscribe_client(go2rtc_ws_base, stream).await else {
+            return;
+        };
+
+        let mut last_sent_seq = 0u64;
+        let mut sent_init = false;
+        if let Some(burst) = sub.burst.take() {
+            let Some(seq) = send_burst_bounded(&mut client_sink, burst, true).await else {
+                return;
+            };
+            last_sent_seq = seq;
+            sub.last_seq = sub.last_seq.max(seq);
+            sent_init = true;
+        }
+
+        loop {
+            tokio::select! {
+                biased;
+                client_msg = client_stream.next() => {
+                    match client_msg {
+                        Some(Ok(MseClientInFrame::Ping(p))) => {
+                            if !send_frame_bounded(&mut client_sink, MseClientOutFrame::Pong(p)).await {
+                                break;
+                            }
+                        }
+                        Some(Ok(MseClientInFrame::Text(len))) | Some(Ok(MseClientInFrame::Binary(len)))
+                            if len > MAX_CLIENT_CONTROL_FRAME_BYTES => break,
+                        Some(Ok(MseClientInFrame::Close)) | Some(Err(_)) | None => break,
+                        Some(Ok(_)) => {}
+                    }
+                }
+                live_pkt = sub.recv_or_resync(self, stream) => {
+                    match live_pkt {
+                        Ok(MseLivePacket::Codec(_)) | Ok(MseLivePacket::Init(_)) => {
+                            if !sent_init
+                                && let Some(burst) = self.get_fresh_burst(stream).await
+                            {
+                                let Some(seq) = send_burst_bounded(&mut client_sink, burst, true).await else {
+                                    break;
+                                };
+                                last_sent_seq = seq;
+                                sub.last_seq = sub.last_seq.max(seq);
+                                sent_init = true;
+                            } else if sent_init {
+                                // Upstream go2rtc session reconnected and emitted a new codec/init header
+                                // (which resets fMP4 tfdt timestamps). Close client WS so the player
+                                // reconnects with a clean MediaSource and the fresh GOP burst.
+                                break;
+                            }
+                        }
+                        Ok(MseLivePacket::Fragment { seq, bytes }) => {
+                            if !sent_init {
+                                if let Some(burst) = self.get_fresh_burst(stream).await {
+                                    let Some(b_seq) = send_burst_bounded(&mut client_sink, burst, true).await else {
+                                        break;
+                                    };
+                                    last_sent_seq = b_seq;
+                                    sub.last_seq = sub.last_seq.max(b_seq);
+                                    sent_init = true;
+                                }
+                                continue;
+                            }
+                            if seq <= last_sent_seq {
+                                continue;
+                            }
+                            last_sent_seq = seq;
+                            if !send_frame_bounded(&mut client_sink, MseClientOutFrame::Binary(bytes)).await {
+                                break;
+                            }
+                        }
+                        Err(Some(burst)) => {
+                            let send_headers = !sent_init;
+                            let Some(b_seq) = send_burst_bounded(&mut client_sink, burst, send_headers).await else {
+                                break;
+                            };
+                            sent_init = true;
+                            last_sent_seq = b_seq;
+                            sub.last_seq = sub.last_seq.max(b_seq);
+                        }
+                        Err(None) => break,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Convenience wrapper pumping an Axum [`WebSocket`] through [`Self::pump_client_session`].
+    pub async fn pump_client_ws(&self, client_ws: WebSocket, go2rtc_ws_base: &str, stream: &str) {
+        let (ws_sink, ws_stream) = client_ws.split();
+        let mapped_sink = ws_sink.with(|frame: MseClientOutFrame| {
+            let msg = match frame {
+                MseClientOutFrame::Text(t) => AxumWsMsg::Text(t.into()),
+                MseClientOutFrame::Binary(b) => AxumWsMsg::Binary(b),
+                MseClientOutFrame::Pong(p) => AxumWsMsg::Pong(p),
+            };
+            std::future::ready(Ok::<AxumWsMsg, axum::Error>(msg))
+        });
+        let mapped_stream = ws_stream.map(|res| {
+            res.map(|msg| match msg {
+                AxumWsMsg::Text(t) => MseClientInFrame::Text(t.len()),
+                AxumWsMsg::Binary(b) => MseClientInFrame::Binary(b.len()),
+                AxumWsMsg::Ping(p) => MseClientInFrame::Ping(p),
+                AxumWsMsg::Pong(_) => MseClientInFrame::Pong,
+                AxumWsMsg::Close(_) => MseClientInFrame::Close,
+            })
+        });
+        self.pump_client_session(mapped_sink, mapped_stream, go2rtc_ws_base, stream)
+            .await;
+    }
 }
 
 async fn run_upstream_worker(
     hub: MseStreamHub,
     go2rtc_ws_base: String,
     stream: String,
+    session_id: u64,
     notify: Arc<Notify>,
+    cancel_notify: Arc<Notify>,
 ) {
     if !is_valid_stream_name(&stream) {
         notify.notify_waiters();
@@ -671,11 +810,16 @@ async fn run_upstream_worker(
         let should_run = {
             let mut sessions = hub.sessions.write().await;
             let active = sessions.get(&stream).is_some_and(|s| {
-                s.persistent
-                    || s.active_clients.load(Ordering::SeqCst) > 0
-                    || Instant::now() < s.expires_at
+                s.session_id == session_id
+                    && (s.persistent
+                        || s.active_clients.load(Ordering::SeqCst) > 0
+                        || Instant::now() < s.expires_at)
             });
-            if !active {
+            if !active
+                && sessions
+                    .get(&stream)
+                    .is_some_and(|s| s.session_id == session_id)
+            {
                 sessions.remove(&stream);
             }
             active
@@ -704,7 +848,10 @@ async fn run_upstream_worker(
                 loop {
                     let keep_alive = {
                         let mut sessions = hub.sessions.write().await;
-                        if let Some(s) = sessions.get_mut(&stream) {
+                        if let Some(s) = sessions
+                            .get_mut(&stream)
+                            .filter(|s| s.session_id == session_id)
+                        {
                             if s.active_clients.load(Ordering::SeqCst) > 0 {
                                 s.expires_at = Instant::now() + PREWARM_KEEPALIVE_TTL;
                                 true
@@ -721,7 +868,15 @@ async fn run_upstream_worker(
                         break;
                     }
 
-                    match tokio::time::timeout(Duration::from_secs(3), stream_rx.next()).await {
+                    let recv_step = tokio::select! {
+                        biased;
+                        _ = cancel_notify.notified() => {
+                            let _ = tokio::time::timeout(Duration::from_millis(200), sink.close()).await;
+                            break;
+                        }
+                        res = tokio::time::timeout(Duration::from_secs(3), stream_rx.next()) => res,
+                    };
+                    match recv_step {
                         Ok(Some(Ok(TungMsg::Text(t)))) => {
                             consecutive_timeouts = 0;
                             hub.ingest_upstream_text(&stream, t.as_str()).await;
@@ -758,13 +913,20 @@ async fn run_upstream_worker(
 
         let (should_retry, has_active_clients) = {
             let mut sessions = hub.sessions.write().await;
-            let state = sessions.get(&stream).map(|s| {
-                let clients = s.active_clients.load(Ordering::SeqCst) > 0;
-                let active = s.persistent || clients || Instant::now() < s.expires_at;
-                (active, clients)
-            });
+            let state = sessions
+                .get(&stream)
+                .filter(|s| s.session_id == session_id)
+                .map(|s| {
+                    let clients = s.active_clients.load(Ordering::SeqCst) > 0;
+                    let active = s.persistent || clients || Instant::now() < s.expires_at;
+                    (active, clients)
+                });
             let (active, clients) = state.unwrap_or((false, false));
-            if !active {
+            if !active
+                && sessions
+                    .get(&stream)
+                    .is_some_and(|s| s.session_id == session_id)
+            {
                 sessions.remove(&stream);
             }
             (active, clients)
@@ -793,7 +955,10 @@ async fn run_upstream_worker(
                 }
             }
         };
-        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        tokio::select! {
+            _ = cancel_notify.notified() => break,
+            _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+        }
     }
 
     {
@@ -1092,6 +1257,45 @@ mod tests {
         let active_ref = sub.active_clients.clone();
         drop(sub);
         assert_eq!(active_ref.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn pump_client_session_exits_cleanly_on_closed_upstream_even_when_fresh_burst_cached() {
+        let hub = MseStreamHub::new();
+        let stream = "spin_cam_sub";
+        hub.ingest_upstream_text(
+            stream,
+            r#"{"type":"mse","value":"video/mp4; codecs=\"avc1.640029\""}"#,
+        )
+        .await;
+        hub.ingest_upstream_binary(stream, build_test_init_segment())
+            .await;
+        hub.ingest_upstream_binary(stream, build_test_fragment(true, &[0x21; 64]))
+            .await;
+        assert!(hub.get_fresh_burst(stream).await.is_some());
+
+        let hub_for_client = hub.clone();
+        let pump_task = tokio::spawn(async move {
+            let sink = futures_util::sink::drain().sink_map_err(|e| match e {});
+            let client_in = futures_util::stream::pending::<Result<MseClientInFrame, ()>>();
+            hub_for_client
+                .pump_client_session(sink, client_in, "ws://127.0.0.1:9", stream)
+                .await;
+        });
+
+        // Wait past the 40ms initial handshake timeout so pump_client_session enters its select! loop
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        // Drop the upstream broadcast sender while `caches[stream]` STILL holds the fresh (<10s) GOP burst!
+        hub.sessions.write().await.remove(stream);
+        assert!(
+            hub.get_fresh_burst(stream).await.is_some(),
+            "fresh burst must still be cached while testing closed upstream exit"
+        );
+
+        tokio::time::timeout(Duration::from_millis(400), pump_task)
+            .await
+            .expect("pump_client_session must exit immediately on RecvError::Closed instead of spinning")
+            .expect("pump_client_session task must not panic");
     }
 
     #[tokio::test]

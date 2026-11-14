@@ -13,8 +13,8 @@ use ninjanvr_media::{SharedActivityLedger, YuvFrame, backup_alert_clip, resolve_
 use ninjanvr_track::{ByteTracker, TrackedObject, should_replace_snapshot};
 pub use ninjanvr_vision::classify_dominant_color_tag;
 use ninjanvr_vision::{
-    BoundingBox, CameraRoiStateMonitor, RgbImage, RoiStateTransition, SimdMotionDetector,
-    annotate_rgb_image_with_boxes, apply_privacy_masks_from_value, check_frame_tamper,
+    BoundingBox, CameraRoiStateMonitor, PrivacyMaskPolicy, RgbImage, RoiStateTransition,
+    SimdMotionDetector, annotate_rgb_image_with_boxes, check_frame_tamper,
     compute_inference_regions, crop_yuv420p_to_tensor_nhwc, encode_image_jpeg,
     encode_image_jpeg_with_quality, encode_image_webp, yuv420p_to_rgb_image,
     yuv420p_to_rgb_image_scaled,
@@ -216,82 +216,37 @@ pub fn sanitize_filename_component(raw: &str) -> String {
     }
 }
 
-fn normalize_coord_string(s: &str, src_w: u32, src_h: u32) -> String {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let mut nums = Vec::new();
-    for part in trimmed.split(',') {
-        let Ok(v) = part.trim().parse::<f32>() else {
-            return String::new();
-        };
-        if !v.is_finite() || v < 0.0 {
-            return String::new();
-        }
-        nums.push(v);
-    }
-    if nums.len() < 6 || !nums.len().is_multiple_of(2) {
-        return String::new();
-    }
-    let is_already_normalized = nums.iter().all(|&v| (0.0..=1.0).contains(&v));
-    if is_already_normalized {
-        return trimmed.to_string();
-    }
-    let fw = src_w.max(1) as f32;
-    let fh = src_h.max(1) as f32;
-    let mut parts = Vec::with_capacity(nums.len());
-    for (idx, &val) in nums.iter().enumerate() {
-        let norm = if idx % 2 == 0 {
-            (val / fw).clamp(0.0, 1.0)
-        } else {
-            (val / fh).clamp(0.0, 1.0)
-        };
-        parts.push(format!("{norm:.6}"));
-    }
-    parts.join(",")
-}
-
-fn normalize_privacy_mask_inner(mask_val: &Value, src_w: u32, src_h: u32, depth: usize) -> Value {
-    if depth > MAX_PRIVACY_MASK_DEPTH {
-        return Value::Null;
-    }
-    match mask_val {
-        Value::Null => Value::Null,
-        Value::String(s) => Value::String(normalize_coord_string(s, src_w, src_h)),
-        Value::Array(arr) => Value::Array(
-            arr.iter()
-                .map(|v| normalize_privacy_mask_inner(v, src_w, src_h, depth + 1))
-                .collect(),
-        ),
-        Value::Object(map) => {
-            let mut out = serde_json::Map::with_capacity(map.len());
-            for (k, v) in map {
-                if k == "mode" || k == "style" || k == "pixelate" || k == "block_size" {
-                    out.insert(k.clone(), v.clone());
-                } else if let Some(s) = v.as_str() {
-                    out.insert(
-                        k.clone(),
-                        Value::String(normalize_coord_string(s, src_w, src_h)),
-                    );
-                } else {
-                    out.insert(
-                        k.clone(),
-                        normalize_privacy_mask_inner(v, src_w, src_h, depth + 1),
-                    );
-                }
-            }
-            Value::Object(out)
-        }
-        other => other.clone(),
-    }
-}
-
 /// Converts any pixel-space polygon coordinates in `mask_val` into normalized `[0.0..1.0]`
-/// coordinates relative to `(src_w, src_h)` so applying the privacy mask to downscaled thumbnails
-/// (`180p`, `360p`) or upscaled high-res main-stream frames (`1080p`, `4K`) redacts the exact same area.
+/// coordinates relative to `(src_w, src_h)` via [`PrivacyMaskPolicy`] so applying the privacy mask
+/// to downscaled thumbnails (`180p`, `360p`) or upscaled high-res main-stream frames (`1080p`, `4K`)
+/// redacts the exact same area.
 pub fn normalize_privacy_mask_for_resolution(mask_val: &Value, src_w: u32, src_h: u32) -> Value {
-    normalize_privacy_mask_inner(mask_val, src_w, src_h, 0)
+    let eff_w = src_w.max(1);
+    let eff_h = src_h.max(1);
+    let policy = PrivacyMaskPolicy::from_value(mask_val, eff_w, eff_h);
+    if policy.is_invalid()
+        && let Value::Array(arr) = mask_val
+        && !arr.is_empty()
+        && arr.iter().all(Value::is_string)
+    {
+        return Value::Array(
+            arr.iter()
+                .map(|item| {
+                    let p = PrivacyMaskPolicy::from_value(item, eff_w, eff_h);
+                    if p.is_invalid() || !p.is_configured() {
+                        Value::String(String::new())
+                    } else if let Value::Array(mut norm_arr) = p.to_normalized_value()
+                        && norm_arr.len() == 1
+                    {
+                        norm_arr.pop().unwrap_or(Value::String(String::new()))
+                    } else {
+                        p.to_normalized_value()
+                    }
+                })
+                .collect(),
+        );
+    }
+    policy.to_normalized_value()
 }
 
 /// Atomically writes `bytes` to `target_dir.join(filename)` after verifying that `media_dir`,
@@ -606,6 +561,7 @@ pub struct CameraVisionSession {
     pub active_review: Option<ActiveReviewState>,
     pub track_snapshots: HashMap<String, TrackPersistSnapshot>,
     pub normalized_priv_mask: Value,
+    pub privacy_mask_policy: PrivacyMaskPolicy,
     pub prev_motion_on: bool,
     pub prev_label_counts: BTreeMap<String, usize>,
     pub prev_total_objs: usize,
@@ -635,6 +591,8 @@ impl CameraVisionSession {
         let tensor_buf = vec![0u8; init_tensor_len];
         let cam_arc: Arc<str> = Arc::from(camera.as_str());
         let safe_cam_file = sanitize_filename_component(&camera);
+        let privacy_mask_policy =
+            PrivacyMaskPolicy::from_value(&cam_cfg.privacy_mask, width, height);
         let normalized_priv_mask =
             normalize_privacy_mask_for_resolution(&cam_cfg.privacy_mask, width, height);
         let mut prev_label_counts = BTreeMap::new();
@@ -657,6 +615,7 @@ impl CameraVisionSession {
             active_review: None,
             track_snapshots: HashMap::new(),
             normalized_priv_mask,
+            privacy_mask_policy,
             prev_motion_on: false,
             prev_label_counts,
             prev_total_objs: 0,
@@ -698,6 +657,11 @@ impl CameraVisionSession {
                 self.tracker.reconfigure_regions(&self.cam_cfg);
             }
             if delta.privacy_mask {
+                self.privacy_mask_policy = PrivacyMaskPolicy::from_value(
+                    &self.cam_cfg.privacy_mask,
+                    self.width,
+                    self.height,
+                );
                 self.normalized_priv_mask = normalize_privacy_mask_for_resolution(
                     &self.cam_cfg.privacy_mask,
                     self.width,
@@ -850,7 +814,7 @@ impl CameraVisionSession {
             .detector
             .named_detector(self.cam_cfg.detect.detector.as_deref())
             .unwrap_or_else(|| pipeline.detector.clone());
-        let (model_w, model_h, bgr_order) = active_det.model_dimensions();
+        let (model_w, model_h, _bgr_order) = active_det.model_dimensions();
         let needed_tensor_len = (model_w as usize)
             .saturating_mul(model_h as usize)
             .saturating_mul(3);
@@ -880,26 +844,15 @@ impl CameraVisionSession {
             let tracked_for_infer = tracked_boxes.clone();
             let mut buf = std::mem::take(&mut self.tensor_buf);
             match tokio::task::spawn_blocking(move || {
-                let mut dets_out = Vec::new();
-                let mut calls = 0u64;
-                for region in &regions_for_infer {
-                    crop_yuv420p_to_tensor_nhwc(
-                        &frame_for_infer,
-                        region,
-                        model_w,
-                        model_h,
-                        bgr_order,
-                        &mut buf,
-                    );
-                    calls += 1;
-                    let mut dets = det_engine.detect_region(&buf, *region, width, height, 0.40);
-                    dets.retain(|d| {
-                        motion_for_infer.iter().any(|mb| mb.intersects(&d.bbox))
-                            || tracked_for_infer.iter().any(|tb| tb.intersects(&d.bbox))
-                    });
-                    dets_out.extend(dets);
-                }
-                (dets_out, buf, calls)
+                let step = run_motion_gated_region_inference(
+                    &det_engine,
+                    &frame_for_infer,
+                    &regions_for_infer,
+                    &motion_for_infer,
+                    &tracked_for_infer,
+                    &mut buf,
+                );
+                (step.accepted_detections, buf, step.detect_calls)
             })
             .await
             {
@@ -1031,13 +984,14 @@ impl CameraVisionSession {
                 )
         });
         if self.cam_cfg.record.enabled
+            && !self.privacy_mask_policy.is_invalid()
             && self
                 .preview_sampler
                 .should_write(now, motion_on, moving_objects, fast_object)
         {
             let store = pipeline.preview_frames.clone();
             let frame_for_preview = yuv_frame.clone();
-            let mask_for_preview = self.normalized_priv_mask.clone();
+            let policy_for_preview = self.privacy_mask_policy.clone();
             let cam_for_preview = self.camera.clone();
             let ts_ms = (now.max(0.0) * 1000.0) as u64;
             tokio::task::spawn_blocking(move || {
@@ -1047,7 +1001,9 @@ impl CameraVisionSession {
                     &[],
                     Some(crate::preview_frames::PREVIEW_FRAME_HEIGHT),
                 );
-                apply_privacy_masks_from_value(&mut rgb, &mask_for_preview);
+                if !policy_for_preview.redact_rgb(&mut rgb) {
+                    return;
+                }
                 match encode_image_jpeg_with_quality(
                     &rgb,
                     crate::preview_frames::PREVIEW_FRAME_JPEG_QUALITY,
@@ -1065,43 +1021,50 @@ impl CameraVisionSession {
         }
 
         if frame_count == 1 || frame_count.is_multiple_of(150) {
-            let annotated: Vec<(BoundingBox, [u8; 3])> = if self.cam_cfg.snapshots.bounding_box {
-                active_tracks
-                    .iter()
-                    .map(|t| (t.bbox, [31, 119, 180]))
-                    .collect()
+            if self.privacy_mask_policy.is_invalid() {
+                pipeline.latest_frames.write().await.remove(&self.camera);
             } else {
-                Vec::new()
-            };
-            let frame_for_latest = yuv_frame.clone();
-            let mask_for_latest = self.normalized_priv_mask.clone();
-            let media_root_for_latest = pipeline.media_dir.clone();
-            let clips_dir_for_latest = pipeline.media_dir.join("clips");
-            let latest_name = format!("latest_{}.jpg", self.safe_cam_file);
-            if let Ok(Some(jpeg_bytes)) = tokio::task::spawn_blocking(move || {
-                let mut rgb =
-                    yuv420p_to_rgb_image_scaled(&frame_for_latest, None, &annotated, Some(360));
-                apply_privacy_masks_from_value(&mut rgb, &mask_for_latest);
-                let Ok(jpeg_bytes) = encode_image_jpeg(&rgb) else {
-                    return None;
+                let annotated: Vec<(BoundingBox, [u8; 3])> = if self.cam_cfg.snapshots.bounding_box
+                {
+                    active_tracks
+                        .iter()
+                        .map(|t| (t.bbox, [31, 119, 180]))
+                        .collect()
+                } else {
+                    Vec::new()
                 };
-                if let Err(err) = write_contained_media_file(
-                    &media_root_for_latest,
-                    &clips_dir_for_latest,
-                    &latest_name,
-                    &jpeg_bytes,
-                ) {
-                    warn!("Failed to write latest frame {latest_name}: {err:#}");
+                let frame_for_latest = yuv_frame.clone();
+                let policy_for_latest = self.privacy_mask_policy.clone();
+                let media_root_for_latest = pipeline.media_dir.clone();
+                let clips_dir_for_latest = pipeline.media_dir.join("clips");
+                let latest_name = format!("latest_{}.jpg", self.safe_cam_file);
+                if let Ok(Some(jpeg_bytes)) = tokio::task::spawn_blocking(move || {
+                    let mut rgb =
+                        yuv420p_to_rgb_image_scaled(&frame_for_latest, None, &annotated, Some(360));
+                    if !policy_for_latest.redact_rgb(&mut rgb) {
+                        return None;
+                    }
+                    let Ok(jpeg_bytes) = encode_image_jpeg(&rgb) else {
+                        return None;
+                    };
+                    if let Err(err) = write_contained_media_file(
+                        &media_root_for_latest,
+                        &clips_dir_for_latest,
+                        &latest_name,
+                        &jpeg_bytes,
+                    ) {
+                        warn!("Failed to write latest frame {latest_name}: {err:#}");
+                    }
+                    Some(jpeg_bytes)
+                })
+                .await
+                {
+                    pipeline
+                        .latest_frames
+                        .write()
+                        .await
+                        .insert(self.camera.clone(), jpeg_bytes);
                 }
-                Some(jpeg_bytes)
-            })
-            .await
-            {
-                pipeline
-                    .latest_frames
-                    .write()
-                    .await
-                    .insert(self.camera.clone(), jpeg_bytes);
             }
         }
 
@@ -1132,6 +1095,56 @@ impl CameraVisionSession {
     }
 }
 
+/// Output of a single motion-gated region inference step shared by live [`CameraVisionSession`]
+/// and forensic replay (`/api/debug/reprocess`).
+pub struct MotionGatedInferenceStep {
+    pub accepted_detections: Vec<ninjanvr_infer::DetectionResult>,
+    pub non_intersecting_detections: Vec<ninjanvr_infer::DetectionResult>,
+    pub detect_calls: u64,
+}
+
+/// Executes region cropping, `0.40`-floor primary/named detector inference, and motion/track
+/// bounding-box intersection filtering identically across live vision sessions and replay.
+pub fn run_motion_gated_region_inference(
+    det_engine: &AiDetectorEngine,
+    yuv_frame: &YuvFrame,
+    regions: &[BoundingBox],
+    motion_boxes: &[BoundingBox],
+    tracked_boxes: &[BoundingBox],
+    tensor_buf: &mut Vec<u8>,
+) -> MotionGatedInferenceStep {
+    let (model_w, model_h, bgr_order) = det_engine.model_dimensions();
+    let needed_tensor_len = (model_w as usize)
+        .saturating_mul(model_h as usize)
+        .saturating_mul(3);
+    if tensor_buf.len() != needed_tensor_len {
+        tensor_buf.resize(needed_tensor_len, 0);
+    }
+    let mut accepted_detections = Vec::new();
+    let mut non_intersecting_detections = Vec::new();
+    let mut detect_calls = 0u64;
+    for region in regions {
+        crop_yuv420p_to_tensor_nhwc(yuv_frame, region, model_w, model_h, bgr_order, tensor_buf);
+        detect_calls += 1;
+        let dets =
+            det_engine.detect_region(tensor_buf, *region, yuv_frame.width, yuv_frame.height, 0.40);
+        for d in dets {
+            if motion_boxes.iter().any(|mb| mb.intersects(&d.bbox))
+                || tracked_boxes.iter().any(|tb| tb.intersects(&d.bbox))
+            {
+                accepted_detections.push(d);
+            } else {
+                non_intersecting_detections.push(d);
+            }
+        }
+    }
+    MotionGatedInferenceStep {
+        accepted_detections,
+        non_intersecting_detections,
+        detect_calls,
+    }
+}
+
 pub struct VisionPipeline {
     pub config: Arc<RwLock<NinjaConfig>>,
     pub db: NinjaDatabase,
@@ -1144,7 +1157,6 @@ pub struct VisionPipeline {
     pub camera_metrics: SharedCameraMetrics,
     pub media_dir: PathBuf,
     pub log_hub: crate::LogBufferHub,
-    pub ptz_active_presets: Arc<RwLock<HashMap<String, Option<String>>>>,
     pub camera_driver_runtime: crate::camera_protocols::CameraDriverRuntime,
     pub snapshot_http_client: Option<reqwest::Client>,
     pub high_res_snapshot_semaphore: Arc<Semaphore>,
@@ -1214,6 +1226,41 @@ impl VisionPipeline {
         }
     }
 
+    /// Prunes detections marked `false_positive = 1` in SQLite from `rev` before flushing,
+    /// returning `false` when zero non-false-positive detections remain (so caller drops `rev`).
+    async fn reconcile_active_review_against_db(&self, rev: &mut ActiveReviewState) -> bool {
+        let det_ids = rev.detections.clone();
+        if det_ids.is_empty() {
+            return false;
+        }
+        let db_for_fp = self.db.clone();
+        let fp_summary = tokio::task::spawn_blocking(move || {
+            db_for_fp
+                .summarize_review_detections_fp_state(&det_ids)
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+
+        if !fp_summary.fp_ids.is_empty() {
+            rev.detections.retain(|id| !fp_summary.fp_ids.contains(id));
+            if rev.detections.is_empty() {
+                return false;
+            }
+            rev.objects = fp_summary.labels;
+            rev.sub_labels = fp_summary.sub_labels;
+            rev.sub_label_score = fp_summary.max_sub_score;
+            rev.detected_attributes = fp_summary
+                .detected_attributes
+                .into_iter()
+                .filter_map(|v| serde_json::from_value(v).ok())
+                .collect();
+            rev.zones = fp_summary.zones;
+            recompute_active_review_severity(rev, fp_summary.any_alert);
+        }
+        true
+    }
+
     /// Closes and flushes `active_review` (if `Some`) with `type: "end"`.
     pub async fn close_active_review(
         &self,
@@ -1221,7 +1268,9 @@ impl VisionPipeline {
         active_review: &mut Option<ActiveReviewState>,
         context_label: &str,
     ) {
-        if let Some(rev) = active_review.take() {
+        if let Some(mut rev) = active_review.take()
+            && self.reconcile_active_review_against_db(&mut rev).await
+        {
             let dto = rev.to_dto(camera, Some(rev.last_activity_time));
             let before_dto = rev.prev_dto.unwrap_or_else(|| dto.clone());
             self.persist_and_publish_review_dto(camera, &dto, &before_dto, "end", context_label)
@@ -1771,8 +1820,11 @@ impl VisionPipeline {
         let review_dir = self.media_dir.join("clips").join("review");
         let clips_dir = self.media_dir.join("clips");
         let safe_cam_file = sanitize_filename_component(camera);
-        let normalized_priv_mask =
-            normalize_privacy_mask_for_resolution(&cam_cfg.privacy_mask, frame.width, frame.height);
+        let priv_mask_policy = PrivacyMaskPolicy::from_value(
+            &cam_cfg.privacy_mask,
+            frame.width.max(1),
+            frame.height.max(1),
+        );
 
         bound_track_snapshots_capacity(track_snapshots, active_tracks, ended_tracks);
 
@@ -1831,17 +1883,18 @@ impl VisionPipeline {
                 None
             };
 
-            let face_match = if let Some(face_crop_box) = resolve_face_recognition_candidate_bbox(
-                trk,
-                prev.as_ref(),
-                lpr_consensus.as_ref(),
-                &face_cfg,
-                frame.width,
-                frame.height,
-            ) {
+            let face_match = if !priv_mask_policy.is_invalid()
+                && let Some(face_crop_box) = resolve_face_recognition_candidate_bbox(
+                    trk,
+                    prev.as_ref(),
+                    lpr_consensus.as_ref(),
+                    &face_cfg,
+                    frame.width,
+                    frame.height,
+                ) {
                 let full_redacted = cached_redacted_full_rgb.get_or_insert_with(|| {
                     let mut img = yuv420p_to_rgb_image(frame, None, &[]);
-                    apply_privacy_masks_from_value(&mut img, &normalized_priv_mask);
+                    let _ = priv_mask_policy.redact_rgb(&mut img);
                     img
                 });
                 let face_rgb = crop_and_scale_rgb_square(full_redacted, face_crop_box, 112);
@@ -1978,11 +2031,11 @@ impl VisionPipeline {
                     &trk.zones,
                     &trk.entered_zones,
                 );
-                if replace_snap {
+                if replace_snap && !priv_mask_policy.is_invalid() {
                     let clean_img = cached_redacted_full_rgb
                         .get_or_insert_with(|| {
                             let mut img = yuv420p_to_rgb_image(frame, None, &[]);
-                            apply_privacy_masks_from_value(&mut img, &normalized_priv_mask);
+                            let _ = priv_mask_policy.redact_rgb(&mut img);
                             img
                         })
                         .clone();
@@ -1996,7 +2049,7 @@ impl VisionPipeline {
                     let region_for_snap = trk.region;
                     let bbox_for_snap = trk.bbox;
                     let draw_bbox_snap = cam_cfg.snapshots.bounding_box;
-                    let mask_for_snap = normalized_priv_mask.clone();
+                    let policy_for_snap = priv_mask_policy.clone();
                     let media_root_for_snap = self.media_dir.clone();
                     let clips_dir_for_snap = clips_dir.clone();
                     let do_disk_snaps = snapshots_active;
@@ -2040,7 +2093,9 @@ impl VisionPipeline {
                                     &mut full_img,
                                     &[(bbox_for_snap, [31, 119, 180])],
                                 );
-                                apply_privacy_masks_from_value(&mut full_img, &mask_for_snap);
+                                if !policy_for_snap.redact_rgb(&mut full_img) {
+                                    return None;
+                                }
                             }
                             if let Ok(jpg) = encode_image_jpeg(&full_img)
                                 && let Err(err) = write_contained_media_file(
@@ -2063,8 +2118,8 @@ impl VisionPipeline {
                                 boxes_for_thumb,
                                 Some(360),
                             );
-                            apply_privacy_masks_from_value(&mut thumb_img, &mask_for_snap);
-                            if let Ok(webp) = encode_image_webp(&thumb_img)
+                            if policy_for_snap.redact_rgb(&mut thumb_img)
+                                && let Ok(webp) = encode_image_webp(&thumb_img)
                                 && let Err(err) = write_contained_media_file(
                                     &media_root_for_snap,
                                     &clips_dir_for_snap,
@@ -2094,7 +2149,7 @@ impl VisionPipeline {
                         let det_w = frame.width;
                         let det_h = frame.height;
                         let draw_bbox = cam_cfg.snapshots.bounding_box;
-                        let priv_mask = normalized_priv_mask.clone();
+                        let priv_policy = priv_mask_policy.clone();
                         let media_root_clone = self.media_dir.clone();
                         let clips_dir_clone = clips_dir.clone();
                         tokio::spawn(async move {
@@ -2123,7 +2178,9 @@ impl VisionPipeline {
                                         if let Some(mut hr_rgb) =
                                             decode_bounded_high_res_snapshot(&bytes, det_w, det_h)
                                         {
-                                            apply_privacy_masks_from_value(&mut hr_rgb, &priv_mask);
+                                            if !priv_policy.redact_rgb(&mut hr_rgb) {
+                                                return;
+                                            }
                                             if let Ok(hr_clean_webp) = encode_image_webp(&hr_rgb) {
                                                 let _ = write_contained_media_file(
                                                     &media_root_clone,
@@ -2151,10 +2208,9 @@ impl VisionPipeline {
                                                     &mut hr_rgb,
                                                     &[(projected, [31, 119, 180])],
                                                 );
-                                                apply_privacy_masks_from_value(
-                                                    &mut hr_rgb,
-                                                    &priv_mask,
-                                                );
+                                                if !priv_policy.redact_rgb(&mut hr_rgb) {
+                                                    return;
+                                                }
                                             }
                                             if let Ok(hr_jpg) = encode_image_jpeg(&hr_rgb) {
                                                 let _ = write_contained_media_file(
@@ -2301,15 +2357,17 @@ impl VisionPipeline {
                         let cfg_clone = self.config.clone();
                         let db_clone = self.db.clone();
                         let media_clone = self.media_dir.clone();
+                        let comms_clone = self.comms.clone();
                         let ev_id_owned = trk.id.clone();
                         tokio::spawn(async move {
                             let _permit = genai_permit;
                             let _ = tokio::time::timeout(
                                 GENAI_VERIFY_TIMEOUT,
-                                crate::verify_event_with_genai_components(
+                                crate::verify_event_with_genai_components_and_comms(
                                     cfg_clone,
                                     db_clone,
                                     media_clone,
+                                    Some(&comms_clone),
                                     &ev_id_owned,
                                 ),
                             )
@@ -2425,11 +2483,11 @@ impl VisionPipeline {
                 }
             });
 
-            if rev.absorb_track(trk, &enriched, is_alert, now) {
+            if rev.absorb_track(trk, &enriched, is_alert, now) && !priv_mask_policy.is_invalid() {
                 let frame_for_rev = frame.clone();
                 let bbox_for_rev = trk.bbox;
                 let draw_bbox_rev = cam_cfg.snapshots.bounding_box;
-                let mask_for_rev = normalized_priv_mask.clone();
+                let policy_for_rev = priv_mask_policy.clone();
                 let media_root_for_rev = self.media_dir.clone();
                 let review_dir_for_rev = review_dir.clone();
                 let safe_cam_for_rev = safe_cam_file.clone();
@@ -2442,7 +2500,9 @@ impl VisionPipeline {
                     };
                     let mut rev_img =
                         yuv420p_to_rgb_image_scaled(&frame_for_rev, None, rev_boxes, Some(180));
-                    apply_privacy_masks_from_value(&mut rev_img, &mask_for_rev);
+                    if !policy_for_rev.redact_rgb(&mut rev_img) {
+                        return;
+                    }
                     if let Ok(webp) = encode_image_webp(&rev_img) {
                         let fname = format!("thumb-{safe_cam_for_rev}-{safe_rev_id}.webp");
                         if let Err(err) = write_contained_media_file(
@@ -2592,10 +2652,15 @@ impl VisionPipeline {
         }
 
         // Flush or close active review segment with {type, before, after} schema
-        if let Some(rev) = active_review {
+        if let Some(rev) = active_review.as_mut() {
             let decision = evaluate_review_cutoff_and_checkpoint(rev, cam_cfg, active_tracks, now);
 
             if decision.should_flush {
+                if !self.reconcile_active_review_against_db(rev).await {
+                    *active_review = None;
+                    return;
+                }
+
                 let dto = rev.to_dto(camera, decision.end_time);
                 let before_dto = rev.prev_dto.clone().unwrap_or_else(|| dto.clone());
                 let review_persisted = self
@@ -2789,11 +2854,7 @@ mod tests {
         let comms = Arc::new(CommsHub::new());
         let detector = Arc::new(AiDetectorEngine::new(&cfg));
 
-        let ptz_active_presets = Arc::new(RwLock::new(HashMap::new()));
-        let camera_driver_runtime =
-            crate::camera_protocols::CameraDriverRuntime::with_active_presets(
-                ptz_active_presets.clone(),
-            );
+        let camera_driver_runtime = crate::camera_protocols::CameraDriverRuntime::new();
         let pipeline = VisionPipeline {
             config: Arc::new(RwLock::new(cfg)),
             db,
@@ -2806,7 +2867,6 @@ mod tests {
             camera_metrics: Arc::new(RwLock::new(HashMap::new())),
             media_dir,
             log_hub: crate::LogBufferHub::new(),
-            ptz_active_presets,
             camera_driver_runtime,
             snapshot_http_client: build_snapshot_http_client(),
             high_res_snapshot_semaphore: Arc::new(Semaphore::new(
@@ -4924,6 +4984,122 @@ cameras:
         assert!(session.track_snapshots.is_empty());
         let saved_reviews_after = pipeline.db.query_reviews(&ReviewFilter::default()).unwrap();
         assert_eq!(saved_reviews_after.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn active_review_cutoff_drops_without_reinserting_when_post_hoc_fp_deletes_review() {
+        let (pipeline, tmp_dir) = build_isolated_pipeline("fp-cutoff-race");
+        let camera = "front_door";
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.detect.width = 320;
+        cam_cfg.detect.height = 180;
+        cam_cfg.record.enabled = true;
+
+        pipeline
+            .db
+            .upsert_event(&ninjanvr_db::EventDto {
+                id: "trk_fp_race_1".to_string(),
+                camera: camera.to_string(),
+                label: "person".to_string(),
+                zones: json!([]),
+                start_time: 1000.0,
+                end_time: None,
+                has_clip: true,
+                has_snapshot: true,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: None,
+                top_score: Some(0.89),
+                false_positive: Some(false),
+                box_coords: Some(json!([0.1, 0.1, 0.4, 0.7])),
+                data: json!({ "max_severity": "alert" }),
+                thumbnail: None,
+                area: None,
+                ratio: None,
+                score: Some(0.89),
+                stationary: false,
+            })
+            .unwrap();
+
+        let rev_dto = ReviewItemDto {
+            id: "rev_fp_race_1".to_string(),
+            camera: camera.to_string(),
+            start_time: 1000.0,
+            end_time: None,
+            severity: "alert".to_string(),
+            thumb_path: "/clips/review/thumb-rev_fp_race_1.webp".to_string(),
+            data: json!({
+                "detections": ["trk_fp_race_1"],
+                "objects": ["person"]
+            }),
+            has_been_reviewed: false,
+        };
+        pipeline.db.insert_review_segment(&rev_dto).unwrap();
+
+        let mut session = CameraVisionSession::new(
+            camera,
+            cam_cfg.clone(),
+            pipeline.detector.model_dimensions(),
+        );
+        session.active_review = Some(ActiveReviewState {
+            id: "rev_fp_race_1".to_string(),
+            start_time: 1000.0,
+            last_activity_time: 1001.0,
+            last_backup_time: 1000.0,
+            severity: "alert".to_string(),
+            thumb_path: "/clips/review/thumb-rev_fp_race_1.webp".to_string(),
+            thumb_time: 1000.0,
+            best_score: 0.89,
+            detections: vec!["trk_fp_race_1".to_string()],
+            objects: vec!["person".to_string()],
+            sub_labels: Vec::new(),
+            sub_label_score: None,
+            detected_attributes: Vec::new(),
+            zones: Vec::new(),
+            provenance: None,
+            is_new: false,
+            dirty: true,
+            prev_dto: Some(rev_dto),
+        });
+
+        // Operator marks event false_positive=true and deletes reviewsegment while active_review is still in memory
+        pipeline
+            .db
+            .set_event_false_positive("trk_fp_race_1", true)
+            .unwrap();
+        let prune = pipeline
+            .db
+            .reconcile_reviews_for_event_false_positive("trk_fp_race_1", true)
+            .unwrap();
+        assert_eq!(prune.deleted_reviews.len(), 1);
+        assert!(
+            pipeline
+                .db
+                .get_review_by_id("rev_fp_race_1")
+                .unwrap()
+                .is_none()
+        );
+
+        // Advance past review cutoff (1050.0 >> 1001.0 + cutoff): pipeline must drop active_review WITHOUT re-inserting!
+        let (_, _, frame_len) = sanitize_yuv420p_dimensions(320, 180);
+        let _ = session
+            .step_frame(&pipeline, Arc::new(vec![128u8; frame_len]), 1050.0, 1)
+            .await;
+
+        assert!(
+            session.active_review.is_none(),
+            "active_review with zero surviving non-FP detections must be dropped"
+        );
+        assert!(
+            pipeline
+                .db
+                .get_review_by_id("rev_fp_race_1")
+                .unwrap()
+                .is_none(),
+            "deleted reviewsegment must NEVER be re-inserted on cutoff flush"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

@@ -10,18 +10,19 @@
 //! `sync_all`, atomic rename) and `go2rtc.yaml`, swaps the in-memory config, and
 //! optionally invalidates cached per-camera driver state in `CameraDriverRuntime`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use ninjanvr_config::{DEFAULT_GO2RTC_SHM_PATH, NinjaConfig};
+use ninjanvr_config::{DEFAULT_GO2RTC_SHM_PATH, NinjaConfig, parse_go2rtc_stream_route};
 use ninjanvr_infer::AiDetectorEngine;
 use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 
 use crate::camera_protocols::CameraDriverRuntime;
+use crate::mse_hub::MseStreamHub;
 
 /// Typed error returned by transactional `ConfigCoordinator` commit operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,8 +378,8 @@ pub fn to_scoped_api_config(cfg: &NinjaConfig, allowed_cameras: Option<&[String]
             .and_then(|v| v.as_object_mut())
         {
             streams_obj.retain(|k, _| {
-                let base_cam = k.strip_suffix("_sub").unwrap_or(k);
-                is_cam_permitted(base_cam)
+                cfg.resolve_stream_owner_camera(k)
+                    .is_some_and(is_cam_permitted)
             });
         }
         if let Some(groups_obj) = api_cfg
@@ -445,6 +446,7 @@ pub fn diff_driver_invalidated_cameras(
         match next_cfg.cameras.get(cam) {
             None => changed.push(cam.clone()),
             Some(next_cam) => {
+                let enabled_diff = prev_cam.enabled != next_cam.enabled;
                 let onvif_diff = serde_json::to_value(&prev_cam.onvif).ok()
                     != serde_json::to_value(&next_cam.onvif).ok();
                 let hw_diff = serde_json::to_value(&prev_cam.hardware).ok()
@@ -454,7 +456,23 @@ pub fn diff_driver_invalidated_cameras(
                 let webui_diff = prev_cam.webui_url != next_cam.webui_url;
                 let upstream_diff =
                     prev_cfg.infer_camera_upstream(cam) != next_cfg.infer_camera_upstream(cam);
-                if onvif_diff || hw_diff || ffmpeg_diff || webui_diff || upstream_diff {
+                let stream_keys = [
+                    cam.clone(),
+                    format!("{cam}_sub"),
+                    format!("{cam}_talk"),
+                    format!("{cam}_sub_talk"),
+                ];
+                let go2rtc_streams_diff = stream_keys
+                    .iter()
+                    .any(|k| prev_cfg.go2rtc.streams.get(k) != next_cfg.go2rtc.streams.get(k));
+                if enabled_diff
+                    || onvif_diff
+                    || hw_diff
+                    || ffmpeg_diff
+                    || webui_diff
+                    || upstream_diff
+                    || go2rtc_streams_diff
+                {
                     changed.push(cam.clone());
                 }
             }
@@ -463,6 +481,46 @@ pub fn diff_driver_invalidated_cameras(
     for cam in next_cfg.cameras.keys() {
         if !prev_cfg.cameras.contains_key(cam) && !changed.contains(cam) {
             changed.push(cam.clone());
+        }
+    }
+    changed
+}
+
+/// Computes which cameras require `MseStreamHub` session/cache invalidation when transitioning
+/// from `prev_cfg` to `next_cfg` (including `go2rtc.streams`, `live`, `ffmpeg.inputs`, and `enabled`).
+pub fn diff_stream_invalidated_cameras(
+    prev_cfg: &NinjaConfig,
+    next_cfg: &NinjaConfig,
+) -> Vec<String> {
+    let mut changed = diff_driver_invalidated_cameras(prev_cfg, next_cfg);
+    for (cam, prev_cam) in &prev_cfg.cameras {
+        if let Some(next_cam) = next_cfg.cameras.get(cam) {
+            let live_diff = serde_json::to_value(&prev_cam.live).ok()
+                != serde_json::to_value(&next_cam.live).ok();
+            let enabled_diff = prev_cam.enabled != next_cam.enabled;
+            if (live_diff || enabled_diff) && !changed.contains(cam) {
+                changed.push(cam.clone());
+            }
+        }
+    }
+    let known: BTreeSet<String> = prev_cfg
+        .cameras
+        .keys()
+        .chain(next_cfg.cameras.keys())
+        .cloned()
+        .collect();
+    let all_stream_keys: BTreeSet<&String> = prev_cfg
+        .go2rtc
+        .streams
+        .keys()
+        .chain(next_cfg.go2rtc.streams.keys())
+        .collect();
+    for stream_key in all_stream_keys {
+        if prev_cfg.go2rtc.streams.get(stream_key) != next_cfg.go2rtc.streams.get(stream_key)
+            && let Some(route) = parse_go2rtc_stream_route(stream_key, Some(&known))
+            && !changed.contains(&route.camera)
+        {
+            changed.push(route.camera);
         }
     }
     changed
@@ -567,6 +625,7 @@ pub struct ConfigCoordinator {
     config: Arc<RwLock<NinjaConfig>>,
     commit_lock: Arc<Mutex<()>>,
     go2rtc_config_path: PathBuf,
+    mse_hub: Option<MseStreamHub>,
 }
 
 impl ConfigCoordinator {
@@ -577,7 +636,14 @@ impl ConfigCoordinator {
             config,
             commit_lock: Arc::new(Mutex::new(())),
             go2rtc_config_path: PathBuf::from(DEFAULT_GO2RTC_SHM_PATH),
+            mse_hub: None,
         }
+    }
+
+    /// Attaches an [`MseStreamHub`] so camera stream/driver changes invalidate cached MSE sessions.
+    pub fn with_mse_hub(mut self, mse_hub: MseStreamHub) -> Self {
+        self.mse_hub = Some(mse_hub);
+        self
     }
 
     /// Overrides the target path used when synchronizing `go2rtc.yaml` (useful for
@@ -622,14 +688,15 @@ impl ConfigCoordinator {
     }
 
     /// Atomically validates, restores scrubbed secrets from the previous config, persists
-    /// `config.yml` and `go2rtc.yaml`, reloads `detector`, swaps the active `NinjaConfig`,
-    /// and invalidates any modified cameras in `camera_runtime`.
-    pub async fn commit_raw_yaml(
+    /// `config.yml` and `go2rtc.yaml`, reloads `detector` when detector settings changed,
+    /// swaps the active `NinjaConfig`, and invalidates modified cameras in `camera_runtime`
+    /// and `mse_hub`.
+    pub async fn commit_raw_yaml_full(
         &self,
         raw_yaml: &str,
         detector: Option<&Arc<AiDetectorEngine>>,
         camera_runtime: Option<&CameraDriverRuntime>,
-    ) -> std::result::Result<NinjaConfig, ConfigCommitError> {
+    ) -> std::result::Result<StructuredConfigCommitOutcome, ConfigCommitError> {
         let _commit_guard = self.commit_lock.lock().await;
         let prev_cfg = self.config.read().await.clone();
         let path = prev_cfg.config_path.clone();
@@ -642,20 +709,25 @@ impl ConfigCoordinator {
             .map_err(|msg| ConfigCommitError::Validation(msg.to_string()))?;
 
         let invalidated_cameras = diff_driver_invalidated_cameras(&prev_cfg, &next_cfg);
+        let stream_invalidated_cameras = diff_stream_invalidated_cameras(&prev_cfg, &next_cfg);
         let go2rtc_target = self.go2rtc_config_path.clone();
         let det_opt = detector.cloned();
-        let next_cfg =
-            tokio::task::spawn_blocking(move || -> std::result::Result<NinjaConfig, String> {
+        let prev_for_det = prev_cfg.clone();
+        let (next_cfg, api_config, scrubbed_raw_yaml) = tokio::task::spawn_blocking(
+            move || -> std::result::Result<(NinjaConfig, Value, String), String> {
                 Self::persist_and_sync_go2rtc_with_path(&next_cfg, &go2rtc_target)
                     .map_err(|err| err.to_string())?;
                 if let Some(det) = det_opt {
-                    det.reload(&next_cfg);
+                    det.reload_if_changed(&prev_for_det, &next_cfg);
                 }
-                Ok(next_cfg)
-            })
-            .await
-            .map_err(|e| ConfigCommitError::Persistence(e.to_string()))?
-            .map_err(ConfigCommitError::Persistence)?;
+                let api_cfg = next_cfg.to_api_config();
+                let raw_yaml_out = scrub_raw_yaml_secrets_strict(&next_cfg.raw_yaml, &next_cfg);
+                Ok((next_cfg, api_cfg, raw_yaml_out))
+            },
+        )
+        .await
+        .map_err(|e| ConfigCommitError::Persistence(e.to_string()))?
+        .map_err(ConfigCommitError::Persistence)?;
 
         *self.config.write().await = next_cfg.clone();
         if let Some(rt) = camera_runtime {
@@ -663,12 +735,34 @@ impl ConfigCoordinator {
                 rt.invalidate_camera(cam);
             }
         }
-        Ok(next_cfg)
+        if let Some(ref hub) = self.mse_hub {
+            for cam in &stream_invalidated_cameras {
+                hub.invalidate_camera_streams(cam).await;
+            }
+        }
+        Ok(StructuredConfigCommitOutcome {
+            config: next_cfg,
+            api_config,
+            scrubbed_raw_yaml,
+            invalidated_cameras,
+        })
+    }
+
+    /// Backwards-compatible wrapper around [`Self::commit_raw_yaml_full`] returning the committed [`NinjaConfig`].
+    pub async fn commit_raw_yaml(
+        &self,
+        raw_yaml: &str,
+        detector: Option<&Arc<AiDetectorEngine>>,
+        camera_runtime: Option<&CameraDriverRuntime>,
+    ) -> std::result::Result<NinjaConfig, ConfigCommitError> {
+        self.commit_raw_yaml_full(raw_yaml, detector, camera_runtime)
+            .await
+            .map(|out| out.config)
     }
 
     /// Atomically applies a structured JSON configuration patch, validates labelmap paths,
-    /// persists `config.yml` and `go2rtc.yaml`, reloads `detector`, swaps the active `NinjaConfig`,
-    /// and invalidates any modified cameras in `camera_runtime`.
+    /// persists `config.yml` and `go2rtc.yaml`, reloads `detector` when detector settings changed,
+    /// swaps the active `NinjaConfig`, and invalidates any modified cameras in `camera_runtime` and `mse_hub`.
     pub async fn commit_structured_patch(
         &self,
         patch: &Value,
@@ -685,14 +779,16 @@ impl ConfigCoordinator {
             .map_err(|msg| ConfigCommitError::Validation(msg.to_string()))?;
 
         let invalidated_cameras = diff_driver_invalidated_cameras(&prev_cfg, &next_cfg);
+        let stream_invalidated_cameras = diff_stream_invalidated_cameras(&prev_cfg, &next_cfg);
         let go2rtc_target = self.go2rtc_config_path.clone();
         let det_opt = detector.cloned();
+        let prev_for_det = prev_cfg.clone();
         let (next_cfg, api_config, scrubbed_raw_yaml) = tokio::task::spawn_blocking(
             move || -> std::result::Result<(NinjaConfig, Value, String), String> {
                 Self::persist_and_sync_go2rtc_with_path(&next_cfg, &go2rtc_target)
                     .map_err(|err| err.to_string())?;
                 if let Some(det) = det_opt {
-                    det.reload(&next_cfg);
+                    det.reload_if_changed(&prev_for_det, &next_cfg);
                 }
                 let api_cfg = next_cfg.to_api_config();
                 let raw_yaml = scrub_raw_yaml_secrets_strict(&next_cfg.raw_yaml, &next_cfg);
@@ -709,11 +805,128 @@ impl ConfigCoordinator {
                 rt.invalidate_camera(cam);
             }
         }
+        if let Some(ref hub) = self.mse_hub {
+            for cam in &stream_invalidated_cameras {
+                hub.invalidate_camera_streams(cam).await;
+            }
+        }
         Ok(StructuredConfigCommitOutcome {
             config: next_cfg,
             api_config,
             scrubbed_raw_yaml,
             invalidated_cameras,
+        })
+    }
+
+    /// Publishes validated target model artifacts into `media_dir/models` (and mirrors them into
+    /// `db_path`'s parent `models/`), activates the pre-compiled primary detector candidate
+    /// (`compiled`) plus any default-model named pool entries, and persists `final_patch` to
+    /// `config.yml` — all serialized under `commit_lock` *after* re-verifying rollback safety.
+    #[expect(clippy::too_many_arguments)]
+    pub async fn commit_precompiled_detector_model(
+        &self,
+        bundle: &crate::detector_manager::StagedModelUploadBundle,
+        media_dir: &Path,
+        db_path: &Path,
+        final_patch: &Value,
+        compiled: ninjanvr_infer::CompiledCandidateDetector,
+        final_model_path: String,
+        detector: &Arc<AiDetectorEngine>,
+    ) -> std::result::Result<ModelDeployOutcome, ConfigCommitError> {
+        let _commit_guard = self.commit_lock.lock().await;
+        let prev_cfg = self.config.read().await.clone();
+        let mut next_cfg = prev_cfg.clone();
+        next_cfg
+            .apply_structured_json(final_patch)
+            .map_err(|err| ConfigCommitError::Validation(format!("{err:#}")))?;
+        validate_config_labelmap_paths(&next_cfg)
+            .map_err(|msg| ConfigCommitError::Validation(msg.to_string()))?;
+
+        let now_loaded = compiled.loaded;
+        if should_rollback_model_deploy(detector.is_model_loaded(), now_loaded) {
+            return Ok(ModelDeployOutcome::RolledBack {
+                previous_model_path: prev_cfg.model.path,
+            });
+        }
+
+        crate::atomic_write_within_media_subdir(
+            media_dir,
+            "models",
+            &bundle.safe_filename,
+            &bundle.model_bytes,
+        )
+        .await
+        .map_err(|e| ConfigCommitError::Validation(e.to_string()))?;
+
+        if let (Some(w_bytes), Some(w_final_name)) =
+            (&bundle.weights_bytes, bundle.weights_filename.as_deref())
+        {
+            crate::atomic_write_within_media_subdir(media_dir, "models", w_final_name, w_bytes)
+                .await
+                .map_err(|e| ConfigCommitError::Validation(e.to_string()))?;
+        }
+
+        crate::atomic_write_within_media_subdir(
+            media_dir,
+            "models",
+            &bundle.safe_labelmap_name,
+            bundle.labelmap_text.as_bytes(),
+        )
+        .await
+        .map_err(|e| ConfigCommitError::Validation(e.to_string()))?;
+
+        if let Some(db_parent) = db_path.parent() {
+            let _ = crate::atomic_write_within_media_subdir(
+                db_parent,
+                "models",
+                &bundle.safe_filename,
+                &bundle.model_bytes,
+            )
+            .await;
+            if let (Some(w_bytes), Some(w_final_name)) =
+                (&bundle.weights_bytes, bundle.weights_filename.as_deref())
+            {
+                let _ = crate::atomic_write_within_media_subdir(
+                    db_parent,
+                    "models",
+                    w_final_name,
+                    w_bytes,
+                )
+                .await;
+            }
+            let _ = crate::atomic_write_within_media_subdir(
+                db_parent,
+                "models",
+                &bundle.safe_labelmap_name,
+                bundle.labelmap_text.as_bytes(),
+            )
+            .await;
+        }
+
+        let det_for_act = detector.clone();
+        let go2rtc_target = self.go2rtc_config_path.clone();
+        let cfg_for_persist = next_cfg.clone();
+        let persisted_res = tokio::task::spawn_blocking(move || {
+            det_for_act.activate_compiled_primary(compiled, final_model_path, &cfg_for_persist);
+            Self::persist_and_sync_go2rtc_with_path(&cfg_for_persist, &go2rtc_target)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
+        .and_then(|r| r);
+
+        let persisted = match persisted_res {
+            Ok(()) => true,
+            Err(err) => {
+                warn!("Uploaded model is active but config.yml could not be updated: {err:#}");
+                false
+            }
+        };
+        if persisted || next_cfg.config_path.as_os_str().is_empty() {
+            *self.config.write().await = next_cfg;
+        }
+        Ok(ModelDeployOutcome::Deployed {
+            loaded: now_loaded,
+            persisted,
         })
     }
 
@@ -821,8 +1034,13 @@ impl ConfigCoordinator {
         };
 
         *self.config.write().await = next_cfg;
-        if invalidate_driver && let Some(rt) = camera_runtime {
-            rt.invalidate_camera(camera);
+        if invalidate_driver {
+            if let Some(rt) = camera_runtime {
+                rt.invalidate_camera(camera);
+            }
+            if let Some(ref hub) = self.mse_hub {
+                hub.invalidate_camera_streams(camera).await;
+            }
         }
         Ok(result)
     }
