@@ -1261,4 +1261,62 @@ cameras:
     useNvrStore.getState().setSimulatedFleetCount(0);
     expect(useNvrStore.getState().simulatedFleetCount).toBe(0);
   });
+
+  test("serializes global and per-camera record.preview.quality: off with hybrid active_objects retention", () => {
+    const draft: NinjaConfigResponse = {
+      version: "0.18-0",
+      safe_mode: false,
+      record: {
+        enabled: true,
+        expire_interval: 60,
+        continuous: { days: 3 },
+        motion: { days: 0 },
+        preview: { quality: "off" },
+        alerts: {
+          pre_capture: 15,
+          post_capture: 15,
+          retain: { days: 7, mode: "active_objects" },
+        },
+        detections: {
+          pre_capture: 15,
+          post_capture: 15,
+          retain: { days: 7, mode: "active_objects" },
+        },
+      },
+      cameras: {
+        sala: {
+          name: "sala",
+          enabled: true,
+          ffmpeg: {
+            inputs: [{ path: "rtsp://127.0.0.1:8554/sala", roles: ["record", "detect"] }],
+          },
+          detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+          motion: { enabled: true, threshold: 30, contour_area: 10, mask: {} },
+          zones: {},
+          record: {
+            enabled: true,
+            continuous: { days: 3 },
+            motion: { days: 0 },
+            preview: { quality: "off" },
+            alerts: {
+              pre_capture: 15,
+              post_capture: 15,
+              retain: { days: 7, mode: "active_objects" },
+            },
+            detections: {
+              pre_capture: 15,
+              post_capture: 15,
+              retain: { days: 7, mode: "active_objects" },
+            },
+          },
+          snapshots: { enabled: true, quality: 100 },
+        },
+      },
+    };
+
+    const yamlText = buildCleanYamlFromDraft(draft, "");
+    expect(yamlText).toContain('quality: "off"');
+    expect(yamlText).toContain("mode: active_objects");
+    expect(yamlText).toContain("days: 7");
+  });
 });

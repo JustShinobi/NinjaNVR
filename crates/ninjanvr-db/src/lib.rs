@@ -5658,6 +5658,26 @@ impl NinjaDatabase {
         Ok(val)
     }
 
+    pub fn delete_all_camera_previews(&self, camera: &str) -> Result<Vec<String>> {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let is_safe_path = |p: &str| -> bool { !p.is_empty() && !p.contains("..") };
+        let mut files_to_remove = Vec::new();
+        {
+            let mut stmt = tx.prepare("SELECT path FROM previews WHERE camera = ?1")?;
+            let rows = stmt.query_map(params![camera], |r| r.get::<_, String>(0))?;
+            for r in rows {
+                let ppath = r?;
+                if is_safe_path(&ppath) {
+                    files_to_remove.push(ppath);
+                }
+            }
+        }
+        tx.execute("DELETE FROM previews WHERE camera = ?1", params![camera])?;
+        tx.commit()?;
+        Ok(files_to_remove)
+    }
+
     fn push_expired_review_artifact_paths(
         media_dir: &Path,
         id: &str,

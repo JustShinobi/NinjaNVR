@@ -1290,12 +1290,38 @@ impl Default for RetainPolicyConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordPreviewConfig {
-    #[serde(default = "default_preview_quality")]
+    #[serde(
+        default = "default_preview_quality",
+        deserialize_with = "deserialize_preview_quality"
+    )]
     pub quality: String,
+}
+
+fn deserialize_preview_quality<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = Value::deserialize(deserializer)?;
+    match val {
+        Value::String(s) => Ok(s),
+        Value::Bool(false) | Value::Null => Ok("off".to_string()),
+        Value::Bool(true) => Ok(default_preview_quality()),
+        other => Err(serde::de::Error::custom(format!(
+            "invalid preview quality value: {other}"
+        ))),
+    }
 }
 
 fn default_preview_quality() -> String {
     "medium".to_string()
+}
+
+/// Returns `true` when legacy hourly timeline preview MP4 generation is disabled.
+pub fn is_preview_disabled(quality: &str) -> bool {
+    matches!(
+        quality.trim().to_ascii_lowercase().as_str(),
+        "off" | "disabled" | "none" | "false"
+    )
 }
 
 impl Default for RecordPreviewConfig {
@@ -2272,6 +2298,19 @@ impl NinjaConfig {
                 cam.objects.attribute_labels = cfg.objects.attribute_labels.clone();
             }
             cam.objects.normalize_standalone_tracked_attributes();
+            let has_explicit_cam_preview = raw_doc
+                .get("cameras")
+                .and_then(|c| c.get(cam_name.as_str()))
+                .and_then(|c| c.get("record"))
+                .and_then(|r| r.get("preview"))
+                .and_then(|p| p.get("quality"))
+                .is_some();
+            if !has_explicit_cam_preview
+                && cam.record.preview.quality == default_preview_quality()
+                && cfg.record.preview.quality != default_preview_quality()
+            {
+                cam.record.preview.quality = cfg.record.preview.quality.clone();
+            }
             if !cam.record.alert_backup.enabled && cfg.record.alert_backup.enabled {
                 cam.record.alert_backup = cfg.record.alert_backup.clone();
             }
@@ -10826,5 +10865,73 @@ cameras:
         );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn preview_quality_off_disables_legacy_previews_and_inherits_from_global() {
+        for off_val in ["off", "OFF", " disabled ", "none", "false"] {
+            assert!(
+                is_preview_disabled(off_val),
+                "{off_val} should disable previews"
+            );
+        }
+        for on_val in ["very_low", "low", "medium", "high", "very_high", ""] {
+            assert!(
+                !is_preview_disabled(on_val),
+                "{on_val} should keep previews enabled"
+            );
+        }
+
+        let yaml = r#"
+record:
+  continuous:
+    days: 3
+  preview:
+    quality: off
+cameras:
+  sala:
+    enabled: true
+    record:
+      continuous:
+        days: 3
+      alerts:
+        retain:
+          days: 7
+          mode: active_objects
+      detections:
+        retain:
+          days: 7
+          mode: active_objects
+  escritorio:
+    enabled: true
+    record:
+      continuous:
+        days: 3
+      preview:
+        quality: low
+      alerts:
+        retain:
+          days: 14
+          mode: active_objects
+      detections:
+        retain:
+          days: 14
+          mode: active_objects
+"#;
+        let cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        assert_eq!(cfg.record.preview.quality, "off");
+        assert!(is_preview_disabled(
+            &cfg.cameras["sala"].record.preview.quality
+        ));
+        assert_eq!(cfg.cameras["escritorio"].record.preview.quality, "low");
+        assert!(!is_preview_disabled(
+            &cfg.cameras["escritorio"].record.preview.quality
+        ));
+
+        let bool_yaml = "record:\n  preview:\n    quality: false\ncameras: {}\n";
+        let bool_cfg =
+            NinjaConfig::from_yaml_str(bool_yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        assert_eq!(bool_cfg.record.preview.quality, "off");
+        assert!(is_preview_disabled(&bool_cfg.record.preview.quality));
     }
 }

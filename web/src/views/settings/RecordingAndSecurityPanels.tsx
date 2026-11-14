@@ -298,6 +298,9 @@ export const RecordingReviewSection: React.FC<{
                   })
                 }
               >
+                <option value="off">
+                  {isPt ? "Desativado (0 GB)" : "Off (0 GB)"}
+                </option>
                 <option value="very_low">Very Low</option>
                 <option value="low">Low</option>
                 <option value="medium">Medium</option>

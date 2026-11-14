@@ -434,7 +434,7 @@ export function buildClientFallbackHeuristics(
       detail:
         "Enabled cameras have mixed snapshots.quality (e.g. 95 vs 100) or record.preview.quality (very_high vs medium) settings.",
       recommendation:
-        "Standardize snapshots.quality: 100 and record.preview.quality: very_high across all cameras.",
+        "Standardize snapshots.quality: 100 and record.preview.quality: off across all cameras.",
     });
   }
 

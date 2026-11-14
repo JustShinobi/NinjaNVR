@@ -1296,6 +1296,7 @@ export function buildCleanYamlFromDraft(
         post_capture: 5,
         retain: { days: 14, mode: "motion" },
       },
+      ...(draft.record?.preview ? { preview: draft.record.preview } : {}),
       ...(draft.record?.storage_tiers
         ? { storage_tiers: draft.record.storage_tiers }
         : {}),

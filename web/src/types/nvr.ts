@@ -99,7 +99,7 @@ export interface RecordConfig {
   alerts?: RecordEventRetainConfig;
   detections?: RecordEventRetainConfig;
   preview?: {
-    quality: "very_low" | "low" | "medium" | "high" | "very_high" | string;
+    quality: "off" | "very_low" | "low" | "medium" | "high" | "very_high" | string;
   };
 }
 

@@ -2003,6 +2003,7 @@ impl RecordingEngine {
             compact_codec: String,
             compact_preset: String,
             compact_hwaccel: String,
+            preview_disabled: bool,
         }
         {
             let (expire_interval, camera_retentions, global_quota_gb, global_min_free_gb): (
@@ -2079,6 +2080,8 @@ impl RecordingEngine {
                         let compact_codec = compact_src.codec.clone();
                         let compact_preset = compact_src.preset.clone();
                         let compact_hwaccel = compact_src.hwaccel.clone();
+                        let preview_disabled =
+                            ninjanvr_config::is_preview_disabled(&c.record.preview.quality);
                         CameraRetentionEntry {
                             camera: name.clone(),
                             continuous_days,
@@ -2096,6 +2099,7 @@ impl RecordingEngine {
                             compact_codec,
                             compact_preset,
                             compact_hwaccel,
+                            preview_disabled,
                         }
                     })
                     .collect();
@@ -2125,6 +2129,7 @@ impl RecordingEngine {
                 compact_codec,
                 compact_preset,
                 compact_hwaccel,
+                preview_disabled,
             } in camera_retentions
             {
                 if mode_tiering {
@@ -2239,6 +2244,9 @@ impl RecordingEngine {
                         for cp in clip_paths {
                             let _ = engine_ev.remove_contained_media_file(&cp);
                         }
+                    }
+                    if preview_disabled {
+                        engine_ev.purge_disabled_camera_previews(&cam_ev);
                     }
                 })
                 .await;
@@ -2612,6 +2620,59 @@ impl RecordingEngine {
         std::fs::remove_file(&disk_path).is_ok()
     }
 
+    fn purge_disabled_camera_previews(&self, camera: &str) {
+        if let Ok(preview_paths) = self.db.delete_all_camera_previews(camera) {
+            for cp in preview_paths {
+                let _ = self.remove_contained_media_file(&cp);
+            }
+        }
+        if !is_safe_identifier(camera) {
+            return;
+        }
+        let clips_root = self.media_dir.join("clips");
+        let previews_root = clips_root.join("previews");
+        let cam_preview_dir = previews_root.join(camera);
+        let Ok(dir_meta) = std::fs::symlink_metadata(&cam_preview_dir) else {
+            return;
+        };
+        if !dir_meta.file_type().is_dir() {
+            return;
+        }
+        let (Ok(canon_clips), Ok(canon_cam_dir)) = (
+            std::fs::canonicalize(&clips_root),
+            std::fs::canonicalize(&cam_preview_dir),
+        ) else {
+            return;
+        };
+        if !canon_cam_dir.starts_with(&canon_clips) {
+            return;
+        }
+        if let Ok(entries) = std::fs::read_dir(&cam_preview_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(emeta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if !emeta.file_type().is_file() {
+                    continue;
+                }
+                let fname = entry.file_name().to_string_lossy().into_owned();
+                if fname.starts_with('.')
+                    && (fname.ends_with("_concat.txt") || fname.ends_with(".tmp.mp4"))
+                {
+                    if let Ok(canon_entry) = std::fs::canonicalize(&path)
+                        && canon_entry.parent() == Some(canon_cam_dir.as_path())
+                    {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                } else {
+                    let _ = self.remove_contained_media_file(&path.to_string_lossy());
+                }
+            }
+        }
+        let _ = std::fs::remove_dir(&cam_preview_dir);
+    }
+
     fn prune_expired_share_link_artifacts(&self, now: f64) {
         let expired_or_revoked_targets =
             match self.db.list_expired_or_revoked_share_link_targets(now) {
@@ -2667,7 +2728,11 @@ impl RecordingEngine {
                 let cfg = self.config.read().await;
                 cfg.cameras
                     .iter()
-                    .filter(|(_, c)| c.enabled && c.record.enabled)
+                    .filter(|(_, c)| {
+                        c.enabled
+                            && c.record.enabled
+                            && !ninjanvr_config::is_preview_disabled(&c.record.preview.quality)
+                    })
                     .map(|(n, c)| (n.clone(), c.record.preview.quality.clone()))
                     .collect()
             };
@@ -2798,7 +2863,7 @@ impl RecordingEngine {
                         "-c:v",
                         "libx264",
                         "-preset",
-                        "ultrafast",
+                        "veryfast",
                         "-crf",
                         crf_val,
                         "-an",
@@ -6557,6 +6622,139 @@ cameras:
         assert!(
             db.get_export_by_id("exp_thumb_fail").unwrap().is_none(),
             "export DB row must not be committed when thumbnail rename fails"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn retention_pass_purges_db_and_orphan_previews_when_preview_quality_is_off() {
+        let root = std::env::temp_dir().join(format!(
+            "ninjanvr-preview-off-retention-{}",
+            random_suffix()
+        ));
+        let media_dir = root.join("media");
+        let sala_prev_dir = media_dir.join("clips/previews/sala");
+        let quarto_prev_dir = media_dir.join("clips/previews/quarto");
+        std::fs::create_dir_all(&sala_prev_dir).unwrap();
+        std::fs::create_dir_all(&quarto_prev_dir).unwrap();
+
+        let db = NinjaDatabase::open(root.join("ninjanvr.db")).unwrap();
+        let now = 1_800_000_000.0;
+
+        let sala_tracked_mp4 = sala_prev_dir.join("1799990000-1799993600.mp4");
+        let sala_orphan_mp4 = sala_prev_dir.join("1799986400-1799990000.mp4");
+        let sala_tmp_concat = sala_prev_dir.join(".prev_sala_1799990000_0001_concat.txt");
+        let quarto_tracked_mp4 = quarto_prev_dir.join("1799990000-1799993600.mp4");
+        let event_snap = media_dir.join("clips/sala-ev_keep.webp");
+        for f in [
+            &sala_tracked_mp4,
+            &sala_orphan_mp4,
+            &sala_tmp_concat,
+            &quarto_tracked_mp4,
+            &event_snap,
+        ] {
+            std::fs::write(f, b"preview_bytes").unwrap();
+        }
+
+        db.insert_preview(
+            "sala_1799990000",
+            "sala",
+            "/media/ninjanvr/clips/previews/sala/1799990000-1799993600.mp4",
+            now - 1800.0,
+            now - 100.0,
+            1700.0,
+        )
+        .unwrap();
+        db.insert_preview(
+            "quarto_1799990000",
+            "quarto",
+            "/media/ninjanvr/clips/previews/quarto/1799990000-1799993600.mp4",
+            now - 1800.0,
+            now - 100.0,
+            1700.0,
+        )
+        .unwrap();
+
+        let yaml = r#"
+record:
+  enabled: true
+  expire_interval: 60
+  continuous:
+    days: 3.0
+  motion:
+    days: 0.0
+  preview:
+    quality: off
+cameras:
+  sala:
+    enabled: true
+    record:
+      enabled: true
+      continuous:
+        days: 3.0
+      motion:
+        days: 0.0
+      alerts:
+        retain:
+          days: 7.0
+          mode: active_objects
+      detections:
+        retain:
+          days: 7.0
+          mode: active_objects
+  quarto:
+    enabled: true
+    record:
+      enabled: true
+      continuous:
+        days: 3.0
+      motion:
+        days: 0.0
+      preview:
+        quality: low
+      alerts:
+        retain:
+          days: 14.0
+          mode: active_objects
+      detections:
+        retain:
+          days: 14.0
+          mode: active_objects
+"#;
+        let cfg = Arc::new(RwLock::new(
+            NinjaConfig::from_yaml_str(yaml, root.join("config.yml")).unwrap(),
+        ));
+        let engine =
+            RecordingEngine::new(cfg, db.clone(), media_dir.clone(), new_activity_ledger());
+
+        engine.run_retention_pass_once(now).await;
+
+        assert!(
+            db.query_previews("sala", 0.0, now + 3600.0)
+                .unwrap()
+                .is_empty(),
+            "disabled camera previews must be deleted from SQLite"
+        );
+        assert!(!sala_tracked_mp4.exists());
+        assert!(!sala_orphan_mp4.exists());
+        assert!(!sala_tmp_concat.exists());
+        assert!(
+            !sala_prev_dir.exists(),
+            "empty disabled camera preview dir should be removed"
+        );
+
+        assert_eq!(
+            db.query_previews("quarto", 0.0, now + 3600.0)
+                .unwrap()
+                .len(),
+            1,
+            "camera with preview.quality=low must retain active previews"
+        );
+        assert!(quarto_tracked_mp4.exists());
+        assert!(
+            event_snap.exists(),
+            "event snapshots in clips/ must remain intact"
         );
 
         let _ = std::fs::remove_dir_all(&root);

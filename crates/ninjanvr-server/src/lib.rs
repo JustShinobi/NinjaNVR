@@ -4727,7 +4727,7 @@ pub fn evaluate_system_heuristics(
             target: "snapshots / preview".to_string(),
             title: "Inconsistent snapshot or preview quality across cameras".to_string(),
             detail: "Enabled cameras have mixed snapshots.quality (e.g. 95 vs 100) or record.preview.quality (very_high vs medium) settings.".to_string(),
-            recommendation: "Standardize snapshots.quality: 100 and record.preview.quality: medium across all cameras.".to_string(),
+            recommendation: "Standardize snapshots.quality: 100 and record.preview.quality: off across all cameras.".to_string(),
         });
     }
 
