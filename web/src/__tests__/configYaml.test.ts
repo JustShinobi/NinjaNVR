@@ -4,11 +4,17 @@ import { describe, expect, test } from "bun:test";
 import { NinjaConfigResponse } from "../types/nvr";
 import {
   buildCleanYamlFromDraft,
+  buildGenAiApiKeyPatch,
   buildGenAiProviderChangePatch,
+  buildMqttPasswordPatch,
+  buildSecretFieldPatch,
+  extractOriginalHardwareCloudPasswords,
+  extractOriginalOnvifCloudPasswords,
   formatLicensePlateBadge,
   normalizeDiscoveredGenAiModels,
   normalizeLicensePlate,
   resolveKnownPlateLabel,
+  resolveSecretFieldAction,
   validateLicensePlateFormat,
 } from "../utils/configYaml";
 import {
@@ -1318,5 +1324,330 @@ cameras:
     expect(yamlText).toContain('quality: "off"');
     expect(yamlText).toContain("mode: active_objects");
     expect(yamlText).toContain("days: 7");
+  });
+
+  test("serializes zones.siren, camera hardware (protocol, tokens, auto_reboot_on_rtsp_stall, cloud_password), onvif.cloud_password, top-level profiles, and top-level detect.stationary / min_initialized_night", () => {
+    const rawYaml = `
+mqtt:
+  enabled: true
+  host: 192.0.2.5
+  password: "orig_mqtt_secret#1"
+genai:
+  enabled: true
+  provider: gemini
+  api_key: "orig_genai_key_xyz"
+cameras:
+  tapo_patio:
+    enabled: true
+    onvif:
+      host: 192.0.2.60
+      port: 2020
+      user: tapo_admin
+      password: orig_onvif_device_pw
+      cloud_password: orig_onvif_cloud_pw
+    hardware:
+      protocol: tapo
+      profile_token: profile_1
+      video_source_token: raw_vs_1
+      auto_reboot_on_rtsp_stall: true
+      cloud_password: "orig_tapo_cloud#secret"
+`;
+
+    expect(extractOriginalHardwareCloudPasswords(rawYaml)).toEqual({
+      tapo_patio: "orig_tapo_cloud#secret",
+    });
+    expect(extractOriginalOnvifCloudPasswords(rawYaml)).toEqual({
+      tapo_patio: "orig_onvif_cloud_pw",
+    });
+
+    const draft: NinjaConfigResponse = {
+      version: "0.18-0",
+      safe_mode: false,
+      mqtt: {
+        enabled: true,
+        host: "192.0.2.5",
+        port: 1883,
+        topic_prefix: "ninjanvr",
+        client_id: "ninjanvr",
+        stats_interval: 60,
+        user: "broker_user",
+        password: "***",
+        has_password: true,
+      },
+      genai: {
+        enabled: true,
+        provider: "gemini",
+        api_key: "***",
+        has_api_key: true,
+        api_key_env: "GEMINI_API_KEY",
+        model: "gemini-2.5-flash",
+        verify_ambiguous_alerts: true,
+        ambiguous_score_min: 0.45,
+        ambiguous_score_max: 0.72,
+        auto_suppress_false_positives: true,
+      },
+      detect: {
+        enabled: true,
+        detector: "detector01",
+        width: 1280,
+        height: 720,
+        fps: 6,
+        min_initialized: 3,
+        min_initialized_night: 5,
+        max_disappeared: 30,
+        stationary: {
+          interval: 35,
+          threshold: 42,
+          classifier: false,
+        },
+      },
+      profiles: {
+        armed: {
+          disabled_alerts_cameras: [],
+          disabled_record_cameras: [],
+          cameras: {
+            tapo_patio: {
+              detect: { enabled: true },
+              record: { enabled: true },
+            },
+          },
+        },
+        home: {
+          disabled_alerts_cameras: ["indoor_cam"],
+          cameras: {
+            indoor_cam: {
+              review: {
+                alerts: { enabled: false, required_zones: [], cutoff_time: 40 },
+                detections: { enabled: true, required_zones: [], cutoff_time: 30 },
+              },
+            },
+          },
+        },
+        disarmed: {
+          disabled_alerts_cameras: ["tapo_patio", "indoor_cam"],
+          disabled_record_cameras: ["indoor_cam"],
+        },
+      },
+      cameras: {
+        tapo_patio: {
+          enabled: true,
+          ffmpeg: {
+            inputs: [{ path: "rtsp://192.0.2.60:554/stream1", roles: ["detect", "record"] }],
+          },
+          onvif: {
+            host: "192.0.2.60",
+            port: 2020,
+            user: "tapo_admin",
+            password: "***",
+            has_password: true,
+            cloud_password: "***",
+            has_cloud_password: true,
+            autotracking: true,
+            timeout_sec: 5,
+          },
+          hardware: {
+            protocol: "tapo",
+            profile_token: "profile_1",
+            video_source_token: "raw_vs_1",
+            auto_reboot_on_rtsp_stall: true,
+            cloud_password: "***",
+            has_cloud_password: true,
+            soft_presets: {
+              gate: { name: "Gate", pan: 0.25, tilt: -0.1, zoom: 0 },
+            },
+          },
+          detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+          motion: { enabled: true, threshold: 30, contour_area: 10, mask: {} },
+          zones: {
+            perimeter: {
+              coordinates: "0.1,0.1,0.9,0.1,0.9,0.9,0.1,0.9",
+              objects: ["person"],
+              siren: true,
+            },
+            quiet_porch: {
+              coordinates: "0.2,0.2,0.6,0.2,0.6,0.6,0.2,0.6",
+              objects: ["person"],
+              siren: false,
+            },
+          },
+          record: { enabled: true },
+          snapshots: { enabled: true },
+        },
+      },
+    };
+
+    const yaml = buildCleanYamlFromDraft(draft, rawYaml);
+
+    // 1. zones.<zName>.siren preserved for both true and false
+    expect(yaml).toContain("perimeter:");
+    expect(yaml).toContain("siren: true");
+    expect(yaml).toContain("quiet_porch:");
+    expect(yaml).toContain("siren: false");
+
+    // 2. cameras.<cam>.hardware preserved with original cloud_password restored
+    expect(yaml).toContain("hardware:");
+    expect(yaml).toContain("protocol: tapo");
+    expect(yaml).toContain("profile_token: profile_1");
+    expect(yaml).toContain("video_source_token: raw_vs_1");
+    expect(yaml).toContain("auto_reboot_on_rtsp_stall: true");
+    expect(yaml).toContain('cloud_password: "orig_tapo_cloud#secret"');
+    expect(yaml).toContain("soft_presets:");
+    expect(yaml).toContain("pan: 0.25");
+
+    // 3. cameras.<cam>.onvif.cloud_password & password restored
+    expect(yaml).toContain("password: orig_onvif_device_pw");
+    expect(yaml).toContain("cloud_password: orig_onvif_cloud_pw");
+
+    // 4. Top-level profiles preserved
+    expect(yaml).toContain("profiles:");
+    expect(yaml).toContain("armed:");
+    expect(yaml).toContain("home:");
+    expect(yaml).toContain("disarmed:");
+    expect(yaml).toContain("disabled_alerts_cameras:");
+    expect(yaml).toContain("disabled_record_cameras:");
+    expect(yaml).toContain("- indoor_cam");
+
+    // 5. Top-level detect.min_initialized_night and detect.stationary preserved
+    expect(yaml).toContain("min_initialized_night: 5");
+    expect(yaml).toContain("interval: 35");
+    expect(yaml).toContain("threshold: 42");
+    expect(yaml).toContain("classifier: false");
+
+    // 6. MQTT & GenAI secrets restored without '***'
+    expect(yaml).toContain('password: "orig_mqtt_secret#1"');
+    expect(yaml).toContain("api_key: orig_genai_key_xyz");
+    expect(yaml).not.toContain('cloud_password: "***"');
+    expect(yaml).not.toContain('api_key: "***"');
+  });
+
+  test("unified 3-state secret helpers (resolveSecretFieldAction & buildSecretFieldPatch) handle preserve, replace, and clear consistently", () => {
+    expect(
+      resolveSecretFieldAction({
+        rawInput: "***",
+        hasExistingSecret: true,
+        clearRequested: false,
+      })
+    ).toEqual({ action: "preserve", hasExisting: true });
+
+    expect(
+      resolveSecretFieldAction({
+        rawInput: "new_plain_secret",
+        hasExistingSecret: true,
+        clearRequested: false,
+      })
+    ).toEqual({
+      action: "replace",
+      value: "new_plain_secret",
+      hasExisting: true,
+    });
+
+    expect(
+      resolveSecretFieldAction({
+        rawInput: "ignored",
+        hasExistingSecret: true,
+        clearRequested: true,
+      })
+    ).toEqual({ action: "clear" });
+
+    expect(buildSecretFieldPatch("password", "", true, false)).toEqual({
+      password: "***",
+      has_password: true,
+      clear_password: false,
+    });
+    expect(buildSecretFieldPatch("cloud_password", "tapo_new", true, false)).toEqual({
+      cloud_password: "tapo_new",
+      has_cloud_password: true,
+      clear_cloud_password: false,
+    });
+    expect(buildGenAiApiKeyPatch("  sk-test-key  ", false, false)).toEqual({
+      api_key: "sk-test-key",
+      has_api_key: false,
+      clear_api_key: false,
+    });
+    expect(buildGenAiApiKeyPatch("", true, false)).toEqual({
+      api_key: "***",
+      has_api_key: true,
+      clear_api_key: false,
+    });
+    expect(buildGenAiApiKeyPatch("", true, true)).toEqual({
+      api_key: null,
+      has_api_key: false,
+      clear_api_key: true,
+    });
+    expect(buildMqttPasswordPatch("", true, true)).toEqual({
+      password: "",
+      has_password: false,
+      clear_password: true,
+    });
+
+    // Clearing cloud_password, ONVIF password, GenAI key, and MQTT password omits them from YAML even when originalRawYaml had values
+    const origYaml = `
+mqtt:
+  password: old_mqtt_password
+genai:
+  api_key: old_genai_key
+cameras:
+  cam_a:
+    onvif:
+      host: 192.0.2.77
+      password: old_onvif_password
+      cloud_password: old_onvif_cloud_password
+    hardware:
+      protocol: tapo
+      cloud_password: old_hw_cloud_password
+`;
+    const clearedDraft: NinjaConfigResponse = {
+      version: "0.18-0",
+      safe_mode: false,
+      mqtt: {
+        enabled: true,
+        host: "192.0.2.5",
+        port: 1883,
+        topic_prefix: "ninjanvr",
+        client_id: "ninjanvr",
+        stats_interval: 60,
+        ...buildMqttPasswordPatch("", true, true),
+      },
+      genai: {
+        enabled: true,
+        provider: "gemini",
+        api_key_env: "GEMINI_API_KEY",
+        model: "gemini-2.5-flash",
+        verify_ambiguous_alerts: false,
+        ambiguous_score_min: 0.45,
+        ambiguous_score_max: 0.72,
+        auto_suppress_false_positives: true,
+        ...buildGenAiApiKeyPatch("", true, true),
+      },
+      cameras: {
+        cam_a: {
+          enabled: true,
+          onvif: {
+            host: "192.0.2.77",
+            port: 2020,
+            ...buildSecretFieldPatch("password", "", true, true),
+            ...buildSecretFieldPatch("cloud_password", "", true, true),
+          },
+          hardware: {
+            protocol: "tapo",
+            ...buildSecretFieldPatch("cloud_password", "", true, true),
+          },
+          detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+          motion: { enabled: true, threshold: 30, contour_area: 10, mask: {} },
+          zones: {},
+          record: { enabled: true },
+          snapshots: { enabled: true },
+        },
+      },
+    };
+    const clearedYaml = buildCleanYamlFromDraft(clearedDraft, origYaml);
+    expect(clearedYaml).not.toContain("old_mqtt_password");
+    expect(clearedYaml).not.toContain("old_genai_key");
+    expect(clearedYaml).not.toContain("old_onvif_password");
+    expect(clearedYaml).not.toContain("old_onvif_cloud_password");
+    expect(clearedYaml).not.toContain("old_hw_cloud_password");
+    expect(clearedYaml).not.toContain("cloud_password:");
+    expect(clearedYaml).not.toContain("api_key:");
+    expect(clearedYaml).toContain("protocol: tapo");
   });
 });

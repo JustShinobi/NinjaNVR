@@ -101,68 +101,313 @@ function parseYamlMapKey(rawKeySegment: string): string {
   return trimmed;
 }
 
+export type SecretFieldAction =
+  | { action: "preserve"; hasExisting: boolean }
+  | { action: "clear" }
+  | { action: "replace"; value: string; hasExisting: boolean };
+
+export interface ResolveSecretFieldInput {
+  rawInput?: string | null;
+  hasExistingSecret?: boolean;
+  clearRequested?: boolean;
+  trimValue?: boolean;
+}
+
+export function isSecretMaskSentinel(raw: unknown): boolean {
+  if (typeof raw !== "string") return false;
+  const trimmed = raw.trim();
+  return trimmed === "***" || trimmed === "*";
+}
+
 /**
- * Extracts original camera ONVIF passwords from raw YAML so scrubbed `"***"`
- * passwords in `draft.cameras[cam].onvif.password` can be restored losslessly.
+ * Unified 3-state secret resolution (`preserve` | `clear` | `replace`):
+ * - `clear` when `clearRequested` is true
+ * - `replace` when `rawInput` holds a non-empty, non-sentinel (`***` / `*`) plaintext secret
+ * - `preserve` when `rawInput` is empty or a mask sentinel (`***` / `*`) without an explicit clear
  */
-function extractOriginalOnvifPasswords(rawYaml: string): Record<string, string> {
+export function resolveSecretFieldAction(
+  input: ResolveSecretFieldInput
+): SecretFieldAction {
+  if (input.clearRequested) {
+    return { action: "clear" };
+  }
+  const hasExisting = Boolean(input.hasExistingSecret);
+  const raw = typeof input.rawInput === "string" ? input.rawInput : "";
+  const trimmed = raw.trim();
+  if (trimmed.length > 0 && trimmed !== "***" && trimmed !== "*") {
+    return {
+      action: "replace",
+      value: input.trimValue ? trimmed : raw,
+      hasExisting,
+    };
+  }
+  return {
+    action: "preserve",
+    hasExisting,
+  };
+}
+
+export interface PasswordSecretPatch {
+  password: string;
+  has_password: boolean;
+  clear_password: boolean;
+}
+
+export interface CloudPasswordSecretPatch {
+  cloud_password: string;
+  has_cloud_password: boolean;
+  clear_cloud_password: boolean;
+}
+
+export interface ApiKeySecretPatch {
+  api_key: string | null;
+  has_api_key: boolean;
+  clear_api_key: boolean;
+}
+
+export function buildSecretFieldPatch(
+  kind: "password",
+  rawInput: string,
+  hasExistingSecret?: boolean,
+  clearRequested?: boolean
+): PasswordSecretPatch;
+export function buildSecretFieldPatch(
+  kind: "cloud_password",
+  rawInput: string,
+  hasExistingSecret?: boolean,
+  clearRequested?: boolean
+): CloudPasswordSecretPatch;
+export function buildSecretFieldPatch(
+  kind: "api_key",
+  rawInput: string,
+  hasExistingSecret?: boolean,
+  clearRequested?: boolean
+): ApiKeySecretPatch;
+export function buildSecretFieldPatch(
+  kind: "password" | "cloud_password" | "api_key",
+  rawInput: string,
+  hasExistingSecret?: boolean,
+  clearRequested?: boolean
+): PasswordSecretPatch | CloudPasswordSecretPatch | ApiKeySecretPatch {
+  const resolved = resolveSecretFieldAction({
+    rawInput,
+    hasExistingSecret,
+    clearRequested,
+    trimValue: kind === "api_key",
+  });
+
+  if (kind === "api_key") {
+    if (resolved.action === "clear") {
+      return { api_key: null, has_api_key: false, clear_api_key: true };
+    }
+    if (resolved.action === "replace") {
+      return {
+        api_key: resolved.value,
+        has_api_key: resolved.hasExisting,
+        clear_api_key: false,
+      };
+    }
+    return {
+      api_key: resolved.hasExisting ? "***" : null,
+      has_api_key: resolved.hasExisting,
+      clear_api_key: false,
+    };
+  }
+
+  const secretValue =
+    resolved.action === "clear"
+      ? ""
+      : resolved.action === "replace"
+      ? resolved.value
+      : resolved.hasExisting
+      ? "***"
+      : "";
+  const hasFlag = resolved.action === "clear" ? false : resolved.hasExisting;
+  const clearFlag = resolved.action === "clear";
+
+  if (kind === "cloud_password") {
+    return {
+      cloud_password: secretValue,
+      has_cloud_password: hasFlag,
+      clear_cloud_password: clearFlag,
+    };
+  }
+  return {
+    password: secretValue,
+    has_password: hasFlag,
+    clear_password: clearFlag,
+  };
+}
+
+export function buildGenAiApiKeyPatch(
+  rawInput: string,
+  hasExistingApiKey?: boolean,
+  clearRequested?: boolean
+): ApiKeySecretPatch {
+  return buildSecretFieldPatch(
+    "api_key",
+    rawInput,
+    hasExistingApiKey,
+    clearRequested
+  );
+}
+
+export function buildMqttPasswordPatch(
+  rawInput: string,
+  hasExistingPassword?: boolean,
+  clearRequested?: boolean
+): PasswordSecretPatch {
+  return buildSecretFieldPatch(
+    "password",
+    rawInput,
+    hasExistingPassword,
+    clearRequested
+  );
+}
+
+function resolveYamlSecretScalar(params: {
+  rawValue?: string | null;
+  hasExistingFlag?: boolean;
+  clearRequested?: boolean;
+  originalFromYaml?: string;
+  trimValue?: boolean;
+}): string | undefined {
+  const hasExisting = Boolean(
+    params.hasExistingFlag ||
+      isSecretMaskSentinel(params.rawValue) ||
+      params.originalFromYaml !== undefined
+  );
+  const resolved = resolveSecretFieldAction({
+    rawInput: params.rawValue,
+    hasExistingSecret: hasExisting,
+    clearRequested: params.clearRequested,
+    trimValue: params.trimValue,
+  });
+  if (resolved.action === "clear") {
+    return undefined;
+  }
+  if (resolved.action === "replace") {
+    return resolved.value;
+  }
+  if (params.originalFromYaml !== undefined) {
+    return params.originalFromYaml;
+  }
+  return resolved.hasExisting ? "***" : undefined;
+}
+
+function extractOriginalCameraSectionSecrets(
+  rawYaml: string,
+  sectionName: "onvif" | "hardware",
+  fieldName: "password" | "cloud_password"
+): Record<string, string> {
   const result: Record<string, string> = {};
   const lines = rawYaml.split(/\r?\n/);
+  const sectionRe = new RegExp(
+    `^(?:"${sectionName}"|'${sectionName}'|${sectionName})\\s*:`
+  );
+  const fieldRe = new RegExp(
+    `^(?:"${fieldName}"|'${fieldName}'|${fieldName})\\s*:\\s*(.+)$`
+  );
   let inCameras = false;
   let camIndent: number | null = null;
   let currentCam = "";
-  let inOnvif = false;
-  let onvifIndent: number | null = null;
+  let inSection = false;
+  let sectionIndent: number | null = null;
+  let sectionChildIndent: number | null = null;
 
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
     const indent = line.search(/\S/);
     if (indent === 0) {
-      inCameras = /^cameras\s*:/.test(trimmed);
+      inCameras = /^(?:"cameras"|'cameras'|cameras)\s*:/.test(trimmed);
       camIndent = null;
       currentCam = "";
-      inOnvif = false;
-      onvifIndent = null;
+      inSection = false;
+      sectionIndent = null;
+      sectionChildIndent = null;
       continue;
     }
     if (!inCameras) continue;
 
     if (camIndent === null || indent <= camIndent) {
-      const m = trimmed.match(/^((?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|[a-zA-Z0-9_.-]+))\s*:/);
+      const m = trimmed.match(
+        /^((?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|[a-zA-Z0-9_.-]+))\s*:/
+      );
       if (m) {
         camIndent = indent;
         const parsedKey = parseYamlMapKey(m[1]);
         currentCam = YAML_UNSAFE_OBJECT_KEYS.has(parsedKey) ? "" : parsedKey;
-        inOnvif = false;
-        onvifIndent = null;
+        inSection = false;
+        sectionIndent = null;
+        sectionChildIndent = null;
       }
       continue;
     }
 
-    if (currentCam && (onvifIndent === null || indent <= onvifIndent)) {
-      if (/^onvif\s*:/.test(trimmed)) {
-        inOnvif = true;
-        onvifIndent = indent;
+    if (currentCam && (sectionIndent === null || indent <= sectionIndent)) {
+      if (sectionRe.test(trimmed)) {
+        inSection = true;
+        sectionIndent = indent;
+        sectionChildIndent = null;
         continue;
       }
-      if (onvifIndent !== null && indent <= onvifIndent) {
-        inOnvif = false;
-        onvifIndent = null;
+      if (sectionIndent !== null && indent <= sectionIndent) {
+        inSection = false;
+        sectionIndent = null;
+        sectionChildIndent = null;
       }
     }
 
-    if (currentCam && inOnvif && onvifIndent !== null && indent > onvifIndent) {
-      const pwMatch = trimmed.match(/^password\s*:\s*(.+)$/);
-      if (pwMatch) {
-        const unquoted = parseYamlScalarValue(pwMatch[1]);
-        if (!isUnquotedYamlNullOrMask(pwMatch[1], unquoted)) {
-          result[currentCam] = unquoted;
+    if (currentCam && inSection && sectionIndent !== null && indent > sectionIndent) {
+      if (sectionChildIndent === null || indent < sectionChildIndent) {
+        sectionChildIndent = indent;
+      }
+      if (indent === sectionChildIndent) {
+        const secretMatch = trimmed.match(fieldRe);
+        if (secretMatch) {
+          const unquoted = parseYamlScalarValue(secretMatch[1]);
+          if (!isUnquotedYamlNullOrMask(secretMatch[1], unquoted)) {
+            result[currentCam] = unquoted;
+          }
         }
       }
     }
   }
   return result;
+}
+
+/**
+ * Extracts original camera ONVIF passwords from raw YAML so scrubbed `"***"`
+ * passwords in `draft.cameras[cam].onvif.password` can be restored losslessly.
+ */
+export function extractOriginalOnvifPasswords(
+  rawYaml: string
+): Record<string, string> {
+  return extractOriginalCameraSectionSecrets(rawYaml, "onvif", "password");
+}
+
+/**
+ * Extracts original camera ONVIF `cloud_password` values from raw YAML.
+ */
+export function extractOriginalOnvifCloudPasswords(
+  rawYaml: string
+): Record<string, string> {
+  return extractOriginalCameraSectionSecrets(rawYaml, "onvif", "cloud_password");
+}
+
+/**
+ * Extracts original camera `hardware.cloud_password` values from raw YAML so scrubbed `"***"`
+ * Tapo cloud passwords in `draft.cameras[cam].hardware.cloud_password` can be restored losslessly.
+ */
+export function extractOriginalHardwareCloudPasswords(
+  rawYaml: string
+): Record<string, string> {
+  return extractOriginalCameraSectionSecrets(
+    rawYaml,
+    "hardware",
+    "cloud_password"
+  );
 }
 
 function extractOriginalGenAiApiKey(rawYaml: string): string | undefined {
@@ -707,9 +952,24 @@ function finiteInt(val: number | undefined | null, fallback: number): number {
     : fallback;
 }
 
+function sanitizeYamlRecordTree(val: unknown): unknown {
+  if (val === null || val === undefined || typeof val !== "object") {
+    return val;
+  }
+  if (Array.isArray(val)) {
+    return val.map((item) => sanitizeYamlRecordTree(item));
+  }
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+    if (YAML_UNSAFE_OBJECT_KEYS.has(k) || v === undefined) continue;
+    out[k] = sanitizeYamlRecordTree(v);
+  }
+  return out;
+}
+
 /**
  * Builds a clean, NinjaNVR-compatible `config.yml` string from `draftConfig`,
- * preserving any unscrubbed RTSP URLs from `originalRawYaml`.
+ * preserving any unscrubbed RTSP URLs and masked secrets from `originalRawYaml`.
  */
 export function buildCleanYamlFromDraft(
   draft: NinjaConfigResponse,
@@ -717,6 +977,10 @@ export function buildCleanYamlFromDraft(
 ): string {
   const originals = extractOriginalUrls(originalRawYaml);
   const originalOnvifPasswords = extractOriginalOnvifPasswords(originalRawYaml);
+  const originalOnvifCloudPasswords =
+    extractOriginalOnvifCloudPasswords(originalRawYaml);
+  const originalHardwareCloudPasswords =
+    extractOriginalHardwareCloudPasswords(originalRawYaml);
   const originalGenAiApiKey = extractOriginalGenAiApiKey(originalRawYaml);
   const originalMqttPassword = extractOriginalMqttPassword(originalRawYaml);
 
@@ -914,6 +1178,7 @@ export function buildCleanYamlFromDraft(
               ...(zCfg.max_area !== undefined ? { max_area: zCfg.max_area } : {}),
               ...(zCfg.min_score !== undefined ? { min_score: zCfg.min_score } : {}),
               ...(cleanPreset ? { preset: cleanPreset } : {}),
+              ...(zCfg.siren !== undefined ? { siren: Boolean(zCfg.siren) } : {}),
             },
           ];
         })
@@ -949,6 +1214,10 @@ export function buildCleanYamlFromDraft(
         (cam.onvif.user && cam.onvif.user.trim().length > 0) ||
         Boolean(cam.onvif.has_password) ||
         Boolean(cam.onvif.password && cam.onvif.password.trim().length > 0) ||
+        Boolean(cam.onvif.has_cloud_password) ||
+        Boolean(
+          cam.onvif.cloud_password && cam.onvif.cloud_password.trim().length > 0
+        ) ||
         Boolean(cam.onvif.autotracking) ||
         (cam.onvif.return_preset && cam.onvif.return_preset.trim().length > 0))
         ? (() => {
@@ -958,18 +1227,42 @@ export function buildCleanYamlFromDraft(
             )
               ? originalOnvifPasswords[camName]
               : undefined;
-            const rawPass = cam.onvif.clear_password
-              ? undefined
-              : cam.onvif.password &&
-                cam.onvif.password !== "***" &&
-                cam.onvif.password !== "*"
-              ? cam.onvif.password
-              : origCamOnvifPass ||
-                (cam.onvif.has_password ||
-                cam.onvif.password === "***" ||
-                cam.onvif.password === "*"
-                  ? "***"
-                  : undefined);
+            const origCamOnvifCloudPass = Object.prototype.hasOwnProperty.call(
+              originalOnvifCloudPasswords,
+              camName
+            )
+              ? originalOnvifCloudPasswords[camName]
+              : undefined;
+            const origCamHwCloudPass = Object.prototype.hasOwnProperty.call(
+              originalHardwareCloudPasswords,
+              camName
+            )
+              ? originalHardwareCloudPasswords[camName]
+              : undefined;
+            const rawPass = resolveYamlSecretScalar({
+              rawValue: cam.onvif.password,
+              hasExistingFlag: cam.onvif.has_password,
+              clearRequested: cam.onvif.clear_password,
+              originalFromYaml: origCamOnvifPass,
+            });
+            const hasExplicitOnvifCloudField = Boolean(
+              cam.onvif.has_cloud_password ||
+                (cam.onvif.cloud_password &&
+                  cam.onvif.cloud_password.trim().length > 0) ||
+                origCamOnvifCloudPass !== undefined
+            );
+            const rawOnvifCloudPass = hasExplicitOnvifCloudField
+              ? resolveYamlSecretScalar({
+                  rawValue: cam.onvif.cloud_password,
+                  hasExistingFlag: cam.onvif.has_cloud_password,
+                  clearRequested: Boolean(
+                    cam.onvif.clear_cloud_password ||
+                      cam.hardware?.clear_cloud_password
+                  ),
+                  originalFromYaml:
+                    origCamOnvifCloudPass ?? origCamHwCloudPass,
+                })
+              : undefined;
             return {
               onvif: {
                 ...(cam.onvif.host && cam.onvif.host.trim()
@@ -980,6 +1273,9 @@ export function buildCleanYamlFromDraft(
                   ? { user: cam.onvif.user.trim() }
                   : {}),
                 ...(rawPass ? { password: rawPass } : {}),
+                ...(rawOnvifCloudPass
+                  ? { cloud_password: rawOnvifCloudPass }
+                  : {}),
                 autotracking: Boolean(cam.onvif.autotracking),
                 ...(cam.onvif.return_preset && cam.onvif.return_preset.trim()
                   ? { return_preset: cam.onvif.return_preset.trim() }
@@ -989,6 +1285,109 @@ export function buildCleanYamlFromDraft(
             };
           })()
         : {}),
+      ...(() => {
+        const origCamHwCloudPass = Object.prototype.hasOwnProperty.call(
+          originalHardwareCloudPasswords,
+          camName
+        )
+          ? originalHardwareCloudPasswords[camName]
+          : undefined;
+        const origCamOnvifCloudPass = Object.prototype.hasOwnProperty.call(
+          originalOnvifCloudPasswords,
+          camName
+        )
+          ? originalOnvifCloudPasswords[camName]
+          : undefined;
+        const hwProtocol =
+          (cam.hardware?.protocol && cam.hardware.protocol.trim()) ||
+          (cam.onvif?.protocol && cam.onvif.protocol.trim()) ||
+          undefined;
+        const hwProfileToken =
+          (cam.hardware?.profile_token && cam.hardware.profile_token.trim()) ||
+          (cam.onvif?.profile_token && cam.onvif.profile_token.trim()) ||
+          undefined;
+        const hwVideoSourceToken =
+          (cam.hardware?.video_source_token &&
+            cam.hardware.video_source_token.trim()) ||
+          (cam.onvif?.video_source_token &&
+            cam.onvif.video_source_token.trim()) ||
+          undefined;
+        const hwAutoReboot =
+          cam.hardware?.auto_reboot_on_rtsp_stall !== undefined
+            ? Boolean(cam.hardware.auto_reboot_on_rtsp_stall)
+            : undefined;
+        const hasCloudPassSource = Boolean(
+          cam.hardware?.has_cloud_password ||
+            cam.onvif?.has_cloud_password ||
+            (cam.hardware?.cloud_password &&
+              cam.hardware.cloud_password.trim().length > 0) ||
+            (cam.onvif?.cloud_password &&
+              cam.onvif.cloud_password.trim().length > 0) ||
+            origCamHwCloudPass !== undefined
+        );
+        const rawHwCloudPass = hasCloudPassSource
+          ? resolveYamlSecretScalar({
+              rawValue:
+                cam.hardware?.cloud_password &&
+                !isSecretMaskSentinel(cam.hardware.cloud_password)
+                  ? cam.hardware.cloud_password
+                  : cam.onvif?.cloud_password &&
+                    !isSecretMaskSentinel(cam.onvif.cloud_password)
+                  ? cam.onvif.cloud_password
+                  : cam.hardware?.cloud_password ?? cam.onvif?.cloud_password,
+              hasExistingFlag: Boolean(
+                cam.hardware?.has_cloud_password ||
+                  cam.onvif?.has_cloud_password
+              ),
+              clearRequested: Boolean(
+                cam.hardware?.clear_cloud_password ||
+                  cam.onvif?.clear_cloud_password
+              ),
+              originalFromYaml: origCamHwCloudPass ?? origCamOnvifCloudPass,
+            })
+          : undefined;
+        const hwSoftPresets =
+          cam.hardware?.soft_presets &&
+          typeof cam.hardware.soft_presets === "object" &&
+          Object.keys(cam.hardware.soft_presets).length > 0
+            ? Object.fromEntries(
+                Object.entries(cam.hardware.soft_presets)
+                  .filter(
+                    ([k, v]) =>
+                      !YAML_UNSAFE_OBJECT_KEYS.has(k) &&
+                      Boolean(v) &&
+                      typeof v === "object"
+                  )
+                  .map(([k, v]) => [
+                    k,
+                    {
+                      name: String(v.name || k),
+                      pan: finiteRound(v.pan, 0, 4),
+                      tilt: finiteRound(v.tilt, 0, 4),
+                      zoom: finiteRound(v.zoom, 0, 4),
+                    },
+                  ])
+              )
+            : undefined;
+
+        const hardwareOut: Record<string, unknown> = {
+          ...(hwProtocol ? { protocol: hwProtocol } : {}),
+          ...(hwProfileToken ? { profile_token: hwProfileToken } : {}),
+          ...(hwVideoSourceToken
+            ? { video_source_token: hwVideoSourceToken }
+            : {}),
+          ...(hwAutoReboot !== undefined
+            ? { auto_reboot_on_rtsp_stall: hwAutoReboot }
+            : {}),
+          ...(rawHwCloudPass ? { cloud_password: rawHwCloudPass } : {}),
+          ...(hwSoftPresets && Object.keys(hwSoftPresets).length > 0
+            ? { soft_presets: hwSoftPresets }
+            : {}),
+        };
+        return Object.keys(hardwareOut).length > 0
+          ? { hardware: hardwareOut }
+          : {};
+      })(),
       ...(cam.ui &&
       (cam.ui.order !== undefined ||
         cam.ui.dashboard !== undefined ||
@@ -1028,18 +1427,12 @@ export function buildCleanYamlFromDraft(
     };
   }
 
-  const rawMqttPassword = draft.mqtt?.clear_password
-    ? undefined
-    : draft.mqtt?.password &&
-      draft.mqtt.password !== "***" &&
-      draft.mqtt.password !== "*"
-    ? draft.mqtt.password
-    : originalMqttPassword ||
-      (draft.mqtt?.has_password ||
-      draft.mqtt?.password === "***" ||
-      draft.mqtt?.password === "*"
-        ? "***"
-        : undefined);
+  const rawMqttPassword = resolveYamlSecretScalar({
+    rawValue: draft.mqtt?.password,
+    hasExistingFlag: draft.mqtt?.has_password,
+    clearRequested: draft.mqtt?.clear_password,
+    originalFromYaml: originalMqttPassword,
+  });
 
   const rootObj: Record<string, unknown> = {
     mqtt: {
@@ -1152,19 +1545,13 @@ export function buildCleanYamlFromDraft(
     },
     ...(draft.genai
       ? (() => {
-          const rawApiKey = draft.genai.clear_api_key
-            ? undefined
-            : draft.genai.api_key &&
-              draft.genai.api_key.trim() !== "" &&
-              draft.genai.api_key.trim() !== "***" &&
-              draft.genai.api_key.trim() !== "*"
-            ? draft.genai.api_key.trim()
-            : originalGenAiApiKey ||
-              (draft.genai.has_api_key ||
-              draft.genai.api_key?.trim() === "***" ||
-              draft.genai.api_key?.trim() === "*"
-                ? "***"
-                : undefined);
+          const rawApiKey = resolveYamlSecretScalar({
+            rawValue: draft.genai.api_key,
+            hasExistingFlag: draft.genai.has_api_key,
+            clearRequested: draft.genai.clear_api_key,
+            originalFromYaml: originalGenAiApiKey,
+            trimValue: true,
+          });
           return {
             genai: {
               enabled: draft.genai.enabled ?? false,
@@ -1216,11 +1603,27 @@ export function buildCleanYamlFromDraft(
     ...(draft.review ? { review: draft.review } : {}),
     detect: {
       enabled: draft.detect?.enabled ?? true,
+      ...(draft.detect?.detector ? { detector: draft.detect.detector } : {}),
       width: finiteInt(draft.detect?.width, 1280),
       height: finiteInt(draft.detect?.height, 720),
       fps: finiteInt(draft.detect?.fps, 5),
       min_initialized: finiteInt(draft.detect?.min_initialized, 2),
+      ...(draft.detect?.min_initialized_night !== undefined &&
+      draft.detect?.min_initialized_night !== null &&
+      Number.isFinite(draft.detect.min_initialized_night)
+        ? {
+            min_initialized_night: finiteInt(
+              draft.detect.min_initialized_night,
+              2
+            ),
+          }
+        : {}),
       max_disappeared: finiteInt(draft.detect?.max_disappeared, 25),
+      stationary: {
+        interval: finiteInt(draft.detect?.stationary?.interval, 50),
+        threshold: finiteInt(draft.detect?.stationary?.threshold, 50),
+        classifier: draft.detect?.stationary?.classifier ?? true,
+      },
     },
     objects: {
       track: draft.objects?.track || ["person"],
@@ -1338,6 +1741,13 @@ export function buildCleanYamlFromDraft(
               },
             ])
           ),
+        }
+      : {}),
+    ...(draft.profiles &&
+    typeof draft.profiles === "object" &&
+    Object.keys(draft.profiles).some((k) => !YAML_UNSAFE_OBJECT_KEYS.has(k))
+      ? {
+          profiles: sanitizeYamlRecordTree(draft.profiles),
         }
       : {}),
     ...(draft.camera_groups && Object.keys(draft.camera_groups).length > 0

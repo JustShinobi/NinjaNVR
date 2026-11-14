@@ -193,6 +193,7 @@ export interface CameraHardwareConfig {
   clear_cloud_password?: boolean;
   profile_token?: string | null;
   video_source_token?: string | null;
+  auto_reboot_on_rtsp_stall?: boolean;
   soft_presets?: Record<string, CameraSoftPreset>;
 }
 
@@ -594,6 +595,25 @@ export interface PeerNodeConfig {
   token_env?: string;
 }
 
+export interface ProfileCameraOverride {
+  enabled?: boolean;
+  detect?: Partial<CameraDetectConfig>;
+  motion?: Partial<CameraMotionConfig>;
+  objects?: Partial<ObjectsConfig>;
+  record?: Partial<RecordConfig>;
+  snapshots?: Partial<SnapshotsConfig>;
+  review?: Partial<ReviewConfig>;
+  audio?: Partial<AudioConfig>;
+  [key: string]: unknown;
+}
+
+export interface ProfileOverrideConfig {
+  disabled_alerts_cameras?: string[];
+  disabled_record_cameras?: string[];
+  cameras?: Record<string, ProfileCameraOverride>;
+  [key: string]: unknown;
+}
+
 export interface GenAiConfig {
   enabled: boolean;
   provider: "gemini" | "openai" | "ollama" | string;
@@ -680,6 +700,7 @@ export interface NinjaConfigResponse {
     streams: Record<string, unknown>;
   };
   peers?: Record<string, PeerNodeConfig>;
+  profiles?: Record<string, ProfileOverrideConfig>;
   camera_groups?: Record<string, CameraGroupConfig>;
   ui?: UiConfig;
   cameras: Record<string, CameraConfig>;
