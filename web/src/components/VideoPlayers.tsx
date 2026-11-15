@@ -1758,11 +1758,80 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   );
 };
 
+export interface VodClipPreviewBounds {
+  startSec: number;
+  endSec: number;
+  loop?: boolean;
+}
+
+export const StageTrimOverlay: React.FC<{
+  scrubPreviewUrl?: string | null;
+  trimBadgeLabel?: string | null;
+  rotateTransform?: string;
+}> = ({ scrubPreviewUrl = null, trimBadgeLabel = null, rotateTransform }) => {
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
+  const showScrubImg =
+    Boolean(scrubPreviewUrl) && scrubPreviewUrl !== failedUrl;
+  return (
+    <>
+      {showScrubImg && scrubPreviewUrl && (
+        <img
+          src={scrubPreviewUrl}
+          alt=""
+          aria-hidden="true"
+          onError={() => setFailedUrl(scrubPreviewUrl)}
+          style={{
+            position: "absolute",
+            inset: 0,
+            width: "100%",
+            height: "100%",
+            objectFit: "contain",
+            transform: rotateTransform,
+            background: "var(--video-stage-bg)",
+            zIndex: 8,
+            pointerEvents: "none",
+          }}
+        />
+      )}
+      {trimBadgeLabel && (
+        <div
+          className="mono"
+          style={{
+            position: "absolute",
+            top: 8,
+            left: 8,
+            zIndex: 14,
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            background: "var(--bg-panel)",
+            border: "1px solid var(--signal-accent)",
+            color: "var(--signal-accent-text)",
+            padding: "3px 8px",
+            borderRadius: 3,
+            fontSize: "var(--text-xs)",
+            fontWeight: 700,
+            fontVariantNumeric: "tabular-nums",
+            pointerEvents: "none",
+          }}
+        >
+          {trimBadgeLabel}
+        </div>
+      )}
+    </>
+  );
+};
+
 export interface VodHlsPlayerProps {
   camera: string;
   startTime: number;
   endTime: number;
   playheadTs?: number | null;
+  pauseOnSeek?: boolean;
+  clipBounds?: VodClipPreviewBounds | null;
+  onClipBoundsEnded?: () => void;
+  trimBadgeLabel?: string | null;
+  scrubPreviewUrl?: string | null;
   enableKeyboardStep?: boolean;
   fallbackPreviewId?: string;
   playbackRate?: number;
@@ -1799,6 +1868,11 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
   startTime,
   endTime,
   playheadTs = null,
+  pauseOnSeek = false,
+  clipBounds = null,
+  onClipBoundsEnded,
+  trimBadgeLabel = null,
+  scrubPreviewUrl = null,
   enableKeyboardStep = true,
   fallbackPreviewId,
   playbackRate = 1,
@@ -1812,6 +1886,10 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
   const endedFiredRef = useRef(false);
   const playheadTsRef = useRef<number | null | undefined>(playheadTs);
   playheadTsRef.current = playheadTs;
+  const pauseOnSeekRef = useRef<boolean>(pauseOnSeek);
+  pauseOnSeekRef.current = pauseOnSeek;
+  const autoPlayRef = useRef<boolean>(autoPlay);
+  autoPlayRef.current = autoPlay;
   const configuredCameras = useNvrStore((s) => s.config?.cameras);
   const realCamera = resolveRealCameraSource(camera, configuredCameras);
   const rawVodRotateDeg = useNvrStore(
@@ -1904,7 +1982,9 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
         videoEl.playbackRate = safePlaybackRate;
         videoEl.muted = userMuted;
         applyInitialPlayheadOffset();
-        if (autoPlay) {
+        if (pauseOnSeekRef.current) {
+          videoEl.pause();
+        } else if (autoPlayRef.current) {
           videoEl.play().catch(() => {
             videoEl.muted = true;
             setUserMuted(true);
@@ -1938,11 +2018,14 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
     } else if (videoEl.canPlayType("application/vnd.apple.mpegurl")) {
       onNativeLoadedMetadata = () => {
         applyInitialPlayheadOffset();
+        if (pauseOnSeekRef.current) {
+          videoEl.pause();
+        }
       };
       videoEl.addEventListener("loadedmetadata", onNativeLoadedMetadata);
       videoEl.src = hlsUrl;
       videoEl.playbackRate = safePlaybackRate;
-      if (autoPlay) {
+      if (autoPlayRef.current && !pauseOnSeekRef.current) {
         videoEl.play().catch(() => {});
       }
     }
@@ -1968,7 +2051,16 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
         // ignore
       }
     };
-  }, [hlsUrl, useFallbackMp4, fallbackPreviewId, autoPlay]);
+  }, [hlsUrl, useFallbackMp4, fallbackPreviewId]);
+
+  const hasClipBounds = Boolean(
+    clipBounds &&
+      Number.isFinite(clipBounds.startSec) &&
+      Number.isFinite(clipBounds.endSec) &&
+      clipBounds.endSec > clipBounds.startSec
+  );
+  const clipBoundsStartSec = hasClipBounds ? clipBounds!.startSec : null;
+  const clipBoundsEndSec = hasClipBounds ? clipBounds!.endSec : null;
 
   useEffect(() => {
     if (typeof playheadTs !== "number" || !Number.isFinite(playheadTs)) {
@@ -1984,11 +2076,26 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
       endedFiredRef.current = false;
       try {
         vid.currentTime = Math.max(0, action.offsetSec);
+        if (pauseOnSeek) {
+          vid.pause();
+        } else if ((hasClipBounds || autoPlayRef.current) && vid.paused) {
+          vid.play().catch(() => {});
+        }
       } catch {
         // ignore if media element has not initialized seek range yet
       }
     }
-  }, [playheadTs, realCamera, safeStart, safeEnd, useFallbackMp4]);
+  }, [
+    playheadTs,
+    pauseOnSeek,
+    hasClipBounds,
+    clipBoundsStartSec,
+    clipBoundsEndSec,
+    realCamera,
+    safeStart,
+    safeEnd,
+    useFallbackMp4,
+  ]);
 
   useEffect(() => {
     if (videoRef.current) {
@@ -2095,6 +2202,30 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
 
   const handleTimeUpdateInternal = (curSec: number, durSec: number) => {
     onTimeUpdate?.(curSec);
+    if (
+      clipBounds &&
+      Number.isFinite(clipBounds.endSec) &&
+      clipBounds.endSec > clipBounds.startSec
+    ) {
+      const absSec = safeStart + curSec;
+      if (absSec >= clipBounds.endSec - 0.08) {
+        const vid = videoRef.current;
+        if (vid) {
+          if (clipBounds.loop) {
+            try {
+              vid.currentTime = Math.max(0, clipBounds.startSec - safeStart);
+              vid.play().catch(() => {});
+            } catch {
+              // ignore
+            }
+          } else {
+            vid.pause();
+            onClipBoundsEnded?.();
+          }
+        }
+        return;
+      }
+    }
     if (!onEnded || endedFiredRef.current) return;
     const clipLen = Math.max(4, safeEnd - safeStart);
     if (
@@ -2106,17 +2237,52 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
     }
   };
 
+  const handleVideoNativeEnded = () => {
+    if (
+      clipBounds &&
+      Number.isFinite(clipBounds.endSec) &&
+      clipBounds.endSec > clipBounds.startSec
+    ) {
+      const vid = videoRef.current;
+      if (vid) {
+        if (clipBounds.loop) {
+          try {
+            vid.currentTime = Math.max(0, clipBounds.startSec - safeStart);
+            vid.play().catch(() => {});
+          } catch {
+            // ignore
+          }
+          return;
+        }
+        onClipBoundsEnded?.();
+      }
+    }
+    if (onEnded && !endedFiredRef.current) {
+      endedFiredRef.current = true;
+      onEnded();
+    }
+  };
+
+  const stageTrimOverlay = (
+    <StageTrimOverlay
+      scrubPreviewUrl={scrubPreviewUrl}
+      trimBadgeLabel={trimBadgeLabel}
+      rotateTransform={vodRotateTransform}
+    />
+  );
+
   if (useFallbackMp4 && fallbackPreviewId) {
     return (
       <ZoomableVideoStage extraHud={vodFrameControls}>
+        {stageTrimOverlay}
         <video
           ref={videoRef}
           src={mp4FallbackUrl}
           controls={controls}
-          autoPlay={autoPlay}
+          autoPlay={autoPlay && !pauseOnSeek}
           playsInline
           muted={userMuted}
-          loop={!onEnded}
+          loop={!onEnded && !clipBounds}
           onVolumeChange={(e) => {
             const next = e.currentTarget.muted;
             setUserMuted(next);
@@ -2125,12 +2291,7 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
           onTimeUpdate={(e) =>
             handleTimeUpdateInternal(e.currentTarget.currentTime, e.currentTarget.duration)
           }
-          onEnded={() => {
-            if (onEnded && !endedFiredRef.current) {
-              endedFiredRef.current = true;
-              onEnded();
-            }
-          }}
+          onEnded={handleVideoNativeEnded}
           style={{
             width: "100%",
             height: "100%",
@@ -2145,10 +2306,11 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
 
   return (
     <ZoomableVideoStage extraHud={vodFrameControls}>
+      {stageTrimOverlay}
       <video
         ref={videoRef}
         controls={controls}
-        autoPlay={autoPlay}
+        autoPlay={autoPlay && !pauseOnSeek}
         playsInline
         muted={userMuted}
         onVolumeChange={(e) => {
@@ -2159,12 +2321,7 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
         onTimeUpdate={(e) =>
           handleTimeUpdateInternal(e.currentTarget.currentTime, e.currentTarget.duration)
         }
-        onEnded={() => {
-          if (onEnded && !endedFiredRef.current) {
-            endedFiredRef.current = true;
-            onEnded();
-          }
-        }}
+        onEnded={handleVideoNativeEnded}
         style={{
           width: "100%",
           height: "100%",

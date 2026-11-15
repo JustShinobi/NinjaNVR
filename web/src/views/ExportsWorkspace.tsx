@@ -1,19 +1,32 @@
 import React from "react";
-import { Copy, Download, Link2, ShieldOff, Trash2 } from "lucide-react";
+import {
+  AlertTriangle,
+  Copy,
+  Download,
+  Link2,
+  Loader2,
+  Scissors,
+  ShieldOff,
+  Trash2,
+  X,
+} from "lucide-react";
 import { useI18n } from "../i18n";
 import {
   ExportItem,
+  ExportJobItem,
   NinjaConfigResponse,
   RecordingSegment,
   ReviewItem,
   ShareLinkItem,
 } from "../types/nvr";
-import { formatDateTime } from "../utils/format";
+import { formatDateTime, formatDuration } from "../utils/format";
 import { resolveRealCameraSource } from "../store/useNvrStore";
 import {
   LoadedVodWindow,
   MAX_ARCHIVE_EXPORT_SPAN_SEC,
+  createArchiveMetadataCache,
   resolveVodSeekAction,
+  useArchiveMetadataCache,
   validateArchiveExportRange,
 } from "../utils/archivePlayback";
 import { resolveSafeMediaUrl } from "../utils/mediaUrlPolicy";
@@ -25,8 +38,17 @@ import {
   formatShareLinkRemainingTtl,
   formatShareLinkViews,
 } from "../utils/shareLinks";
-import { LiveMsePlayer, VodHlsPlayer } from "../components/VideoPlayers";
-import { TimelineScrubber } from "../components/TimelineScrubber";
+import {
+  LiveMsePlayer,
+  StageTrimOverlay,
+  VodHlsPlayer,
+} from "../components/VideoPlayers";
+import {
+  TimelineClipRequest,
+  TimelineScrubber,
+  TimelineTrimFeedbackState,
+  sanitizeTimelineThumbUrl,
+} from "../components/TimelineScrubber";
 
 export const MAX_EXPORT_WINDOW_SEC = MAX_ARCHIVE_EXPORT_SPAN_SEC;
 
@@ -62,12 +84,14 @@ interface ExportsWorkspaceProps {
   config: NinjaConfigResponse | null;
   exportsList: ExportItem[];
   setExportsList: React.Dispatch<React.SetStateAction<ExportItem[]>>;
+  exportJobs?: ExportJobItem[];
+  onCancelExportJob?: (jobId: string) => Promise<void> | void;
   exportCam: string;
   setExportCam: (cam: string) => void;
-  exportPresetMin: number;
-  setExportPresetMin: (min: number) => void;
-  exportLabel: string;
-  setExportLabel: (label: string) => void;
+  exportPresetMin?: number;
+  setExportPresetMin?: (min: number) => void;
+  exportLabel?: string;
+  setExportLabel?: (label: string) => void;
   activeExportPreview: ExportItem | null;
   setActiveExportPreview: (item: ExportItem | null) => void;
   timeShiftTs: number | null;
@@ -80,7 +104,7 @@ interface ExportsWorkspaceProps {
     endSec: number,
     label?: string,
     includeAudio?: boolean
-  ) => Promise<{ exportId?: string; videoUrl?: string } | void>;
+  ) => Promise<{ exportId?: string; videoUrl?: string; queued?: boolean } | void>;
   notify: (msg: string) => void;
 }
 
@@ -146,12 +170,10 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
   config,
   exportsList,
   setExportsList,
+  exportJobs = [],
+  onCancelExportJob,
   exportCam,
   setExportCam,
-  exportPresetMin,
-  setExportPresetMin,
-  exportLabel,
-  setExportLabel,
   activeExportPreview,
   setActiveExportPreview,
   timeShiftTs,
@@ -161,14 +183,36 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
   handleQuickExport,
   notify,
 }) => {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
+  const isPt = locale === "pt";
   const [includeAudio, setIncludeAudio] = React.useState(true);
   const [shareTtlSec, setShareTtlSec] = React.useState(86400);
   const [shareMaxViews, setShareMaxViews] = React.useState<number>(0);
   const [showInactiveLinks, setShowInactiveLinks] = React.useState(false);
-  const [deletingExportId, setDeletingExportId] = React.useState<string | null>(null);
+  const [deletingExportId, setDeletingExportId] = React.useState<string | null>(
+    null
+  );
+  const [cancellingJobId, setCancellingJobId] = React.useState<string | null>(
+    null
+  );
+  const [trimFeedback, setTrimFeedback] =
+    React.useState<TimelineTrimFeedbackState | null>(null);
+  const [autoSeedClipRequest, setAutoSeedClipRequest] =
+    React.useState<TimelineClipRequest | null>(null);
+  const [dismissedJobIds, setDismissedJobIds] = React.useState<
+    Record<string, true>
+  >({});
+
+  const contextMetadataCache = useArchiveMetadataCache();
+  const fallbackMetadataCache = React.useMemo(
+    () => createArchiveMetadataCache(),
+    []
+  );
+  const archiveMetadataCache = contextMetadataCache ?? fallbackMetadataCache;
+
   const isMountedRef = React.useRef(true);
   const exportVodWindowRef = React.useRef<LoadedVodWindow | null>(null);
+  const autoSeededCamRef = React.useRef<string | null>(null);
   const notifyRef = React.useRef(notify);
   notifyRef.current = notify;
 
@@ -205,6 +249,63 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
     };
   }, [shareController]);
 
+  // Enter archive VOD mode automatically for `exportCam` on initial open when recordings exist,
+  // verified directly against `realExportCam` (never using a stale previous camera's `focusSegments`)
+  // and aligning `[rangeStart, rangeEnd]` with the seeded archive timestamp.
+  React.useEffect(() => {
+    const cleanCam = (exportCam || "").trim();
+    if (!cleanCam || autoSeededCamRef.current === cleanCam) return;
+    if (activeExportPreview || timeShiftTs !== null) {
+      autoSeededCamRef.current = cleanCam;
+      return;
+    }
+    let cancelled = false;
+    const realCam = resolveRealCameraSource(cleanCam, config?.cameras);
+    const now = Math.floor(Date.now() / 1000);
+    const afterBucket = Math.floor((now - 86400) / 15) * 15;
+    const beforeBucket = Math.ceil((now + 75) / 15) * 15;
+    archiveMetadataCache
+      .getRecordings(
+        realCam,
+        { after: afterBucket, before: beforeBucket },
+        { configuredCameras: config?.cameras }
+      )
+      .then((segs) => {
+        if (cancelled || !isMountedRef.current) return;
+        autoSeededCamRef.current = cleanCam;
+        if (Array.isArray(segs) && segs.length > 0) {
+          const latestSeg = segs[segs.length - 1];
+          if (latestSeg && Number.isFinite(latestSeg.end_time)) {
+            const clipEnd = Math.min(now, Math.ceil(latestSeg.end_time));
+            const clipStart = Math.max(
+              Math.floor(latestSeg.start_time),
+              clipEnd - 45
+            );
+            if (clipEnd > clipStart) {
+              setTimeShiftTs(clipStart);
+              setAutoSeedClipRequest({
+                camera: cleanCam,
+                start: clipStart,
+                end: clipEnd,
+                nonce: Date.now(),
+              });
+            }
+          }
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    exportCam,
+    config?.cameras,
+    archiveMetadataCache,
+    activeExportPreview,
+    timeShiftTs,
+    setTimeShiftTs,
+  ]);
+
   React.useEffect(() => {
     if (timeShiftTs === null || !Number.isFinite(timeShiftTs)) {
       exportVodWindowRef.current = null;
@@ -220,7 +321,10 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
     }
   }, [exportsList, activeExportPreview, setActiveExportPreview]);
 
-  const copyUrlToClipboard = async (fullUrl: string, ttlHoursLabel?: string) => {
+  const copyUrlToClipboard = async (
+    fullUrl: string,
+    ttlHoursLabel?: string
+  ) => {
     shareController.seedState({ generatedShareUrl: fullUrl });
     let copied = false;
     if (
@@ -276,6 +380,41 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
     [shareLinks, showInactiveLinks]
   );
 
+  const visibleJobs = React.useMemo(
+    () =>
+      exportJobs.filter(
+        (j) =>
+          !dismissedJobIds[j.id] &&
+          (j.status === "queued" ||
+            j.status === "running" ||
+            j.status === "failed")
+      ),
+    [exportJobs, dismissedJobIds]
+  );
+
+  const runningJobsCount = React.useMemo(
+    () =>
+      exportJobs.filter(
+        (j) => j.status === "queued" || j.status === "running"
+      ).length,
+    [exportJobs]
+  );
+
+  const completedExports = React.useMemo(
+    () => exportsList.filter((ex) => !ex.in_progress),
+    [exportsList]
+  );
+
+  const handleSelectExportCamera = React.useCallback(
+    (nextCam: string) => {
+      setTrimFeedback(null);
+      setActiveExportPreview(null);
+      setTimeShiftTs(null);
+      setExportCam(nextCam);
+    },
+    [setActiveExportPreview, setTimeShiftTs, setExportCam]
+  );
+
   const renderStatusBadge = (status: ShareLinkStatus) => {
     if (status === "active") {
       return <span className="nvr-badge live">{t.exports.statusActive}</span>;
@@ -284,21 +423,58 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
       return <span className="nvr-badge alert">{t.exports.statusRevoked}</span>;
     }
     if (status === "exhausted") {
-      return <span className="nvr-badge motion">{t.exports.statusExhausted}</span>;
+      return (
+        <span className="nvr-badge motion">{t.exports.statusExhausted}</span>
+      );
     }
     return <span className="nvr-badge">{t.exports.statusExpired}</span>;
   };
 
+  // During active handle drag (`dragging_in` / `dragging_out`), keep `VodHlsPlayer`'s `playheadTs`
+  // parked at `timeShiftTs` so we never thrash HLS manifests at 60Hz while scrubbing!
+  const isSettledOrPreviewTrim =
+    trimFeedback !== null &&
+    (trimFeedback.mode === "settled_in" ||
+      trimFeedback.mode === "settled_out" ||
+      trimFeedback.mode === "preview_clip");
+  const isDraggingTrim =
+    trimFeedback !== null &&
+    (trimFeedback.mode === "dragging_in" ||
+      trimFeedback.mode === "dragging_out");
+  const effectiveVodPlayheadTs =
+    isSettledOrPreviewTrim && Number.isFinite(trimFeedback.targetTs)
+      ? trimFeedback.targetTs
+      : timeShiftTs;
+
   return (
     <>
       <div className="nvr-subbar">
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ fontWeight: 700 }}>{t.exports.createTitle}:</span>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            flexWrap: "wrap",
+          }}
+        >
+          <span
+            className="mono"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 6,
+              fontWeight: 700,
+              color: "var(--signal-accent-text)",
+            }}
+          >
+            <Scissors size={13} />
+            {t.exports.title}
+          </span>
           <select
-            className="nvr-select"
+            className="nvr-select mono"
             aria-label="Select camera channel to export"
             value={exportCam}
-            onChange={(e) => setExportCam(e.target.value)}
+            onChange={(e) => handleSelectExportCamera(e.target.value)}
           >
             {cameraNames.map((c) => (
               <option key={c} value={c}>
@@ -306,91 +482,49 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
               </option>
             ))}
           </select>
-          <select
-            className="nvr-select"
-            aria-label="Select export duration preset"
-            value={exportPresetMin}
-            onChange={(e) => setExportPresetMin(Number(e.target.value))}
-          >
-            <option value={1}>{t.exports.last1m}</option>
-            <option value={5}>{t.exports.last5m}</option>
-            <option value={15}>{t.exports.last15m}</option>
-          </select>
-          <input
-            className="nvr-input"
-            aria-label="Custom export label"
-            placeholder={t.exports.customName}
-            value={exportLabel}
-            onChange={(e) => setExportLabel(e.target.value)}
-          />
-          <label
-            className="mono"
+          <span
+            className="mono nvr-tl-desktop"
             style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 5,
               fontSize: "var(--text-xs)",
-              color: "var(--text-secondary)",
-              cursor: "pointer",
-              userSelect: "none",
+              color: "var(--text-muted)",
             }}
           >
-            <input
-              type="checkbox"
-              checked={includeAudio}
-              onChange={(e) => setIncludeAudio(e.target.checked)}
-              aria-label="Include Audio"
-            />
-            Include Audio
-          </label>
-          <button
-            className="nvr-btn primary"
-            onClick={async () => {
-              const cleanCam = (exportCam || "").trim();
-              if (!cleanCam) {
-                notify("Select a valid camera channel before exporting");
-                return;
-              }
-              const now = Math.floor(Date.now() / 1000);
-              const win = validateExportTimeWindow(
-                now - exportPresetMin * 60,
-                now
-              );
-              if (!win.valid) {
-                notify(win.error || "Invalid export time window");
-                return;
-              }
-              const realExportCam = resolveRealCameraSource(
-                cleanCam,
-                config?.cameras
-              );
-              await handleQuickExport(
-                realExportCam,
-                win.startSec,
-                win.endSec,
-                exportLabel || `${cleanCam}_${exportPresetMin}m`,
-                includeAudio
-              );
-            }}
-          >
-            {t.exports.generateBtn}
-          </button>
+            {isPt
+              ? "[I / O] Marcar IN/OUT · [ [ / ] ] Ver corte · [Shift+Arrastar] Precisão · [Scroll] Navegar sem mover marcador"
+              : "[I / O] Mark IN/OUT · [ [ / ] ] Inspect cut · [Shift+Drag] Fine trim · [Wheel] Pan without moving marker"}
+          </span>
         </div>
 
-        {activeExportPreview && (
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span className="nvr-badge live">
-              PREVIEWING // {activeExportPreview.name}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {runningJobsCount > 0 && (
+            <span className="nvr-badge motion mono">
+              <Loader2 size={11} />
+              {isPt
+                ? `${runningJobsCount} EXPORTAÇÃO EM SEGUNDO PLANO`
+                : `${runningJobsCount} BACKGROUND EXPORT(S)`}
             </span>
-            <button
-              className="nvr-btn"
-              style={{ height: 24, padding: "0 10px", fontSize: "var(--text-xs)" }}
-              onClick={() => setActiveExportPreview(null)}
-            >
-              Close Preview & Return to Live Clipper
-            </button>
-          </div>
-        )}
+          )}
+          {activeExportPreview && (
+            <>
+              <span className="nvr-badge live">
+                PREVIEWING // {activeExportPreview.name}
+              </span>
+              <button
+                className="nvr-btn"
+                style={{
+                  height: 24,
+                  padding: "0 10px",
+                  fontSize: "var(--text-xs)",
+                }}
+                onClick={() => setActiveExportPreview(null)}
+              >
+                {isPt
+                  ? "Fechar Preview e Voltar à Mesa de Corte"
+                  : "Close Preview & Return to Clipper"}
+              </button>
+            </>
+          )}
+        </div>
       </div>
 
       <div className="nvr-workbench">
@@ -406,10 +540,21 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
             }}
           >
             <span>{t.exports.archiveTitle}</span>
-            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                flexWrap: "wrap",
+              }}
+            >
               <select
                 className="nvr-select mono"
-                style={{ height: 22, fontSize: "var(--text-xs)", padding: "0 6px" }}
+                style={{
+                  height: 22,
+                  fontSize: "var(--text-xs)",
+                  padding: "0 6px",
+                }}
                 aria-label="Share link expiration"
                 value={shareTtlSec}
                 onChange={(e) => setShareTtlSec(Number(e.target.value))}
@@ -420,7 +565,11 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
               </select>
               <select
                 className="nvr-select mono"
-                style={{ height: 22, fontSize: "var(--text-xs)", padding: "0 6px" }}
+                style={{
+                  height: 22,
+                  fontSize: "var(--text-xs)",
+                  padding: "0 6px",
+                }}
                 aria-label="Share link maximum views"
                 value={shareMaxViews}
                 onChange={(e) => setShareMaxViews(Number(e.target.value))}
@@ -430,7 +579,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                 <option value={5}>{t.exports.maxViews5}</option>
                 <option value={25}>{t.exports.maxViews25}</option>
               </select>
-              <span className="mono">{exportsList.length}</span>
+              <span className="mono">{completedExports.length}</span>
             </div>
           </div>
           {generatedShareUrl && (
@@ -476,7 +625,11 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
               <button
                 type="button"
                 className="nvr-btn mono"
-                style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                style={{
+                  height: 24,
+                  padding: "0 8px",
+                  fontSize: "var(--text-xs)",
+                }}
                 onClick={() => void copyUrlToClipboard(generatedShareUrl)}
                 title={t.exports.copyLinkBtn}
               >
@@ -485,133 +638,338 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
               </button>
             </div>
           )}
+
           <div className="nvr-scroll-y" style={{ flex: 1, minHeight: 140 }}>
-            {exportsList.map((ex) => (
-              <div
-                key={ex.id}
-                role="button"
-                tabIndex={0}
-                className={`nvr-list-row ${
-                  activeExportPreview?.id === ex.id ? "is-selected" : ""
-                }`}
-                onClick={() => setActiveExportPreview(ex)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    setActiveExportPreview(ex);
-                  }
-                }}
-                style={{
-                  padding: "10px 12px",
-                  justifyContent: "space-between",
-                }}
-              >
-                <div style={{ minWidth: 0, flex: 1 }}>
+            {/* Active & Failed Background Export Jobs Queue */}
+            {visibleJobs.map((job) => {
+              const isFailed = job.status === "failed";
+              const pct = Math.round(
+                Math.max(0, Math.min(100, job.progress_pct))
+              );
+              const dur = Math.max(1, Math.round(job.end_time - job.start_time));
+              return (
+                <div
+                  key={`job-${job.id}`}
+                  className="nvr-list-row"
+                  style={{
+                    padding: "10px 12px",
+                    flexDirection: "column",
+                    alignItems: "stretch",
+                    gap: 6,
+                    background: "var(--bg-subcard)",
+                    borderBottom: "1px solid var(--border-strong)",
+                    cursor: "default",
+                  }}
+                >
                   <div
-                    className="mono"
-                    title={ex.name}
                     style={{
-                      fontWeight: 700,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: 8,
                     }}
                   >
-                    {ex.name}
+                    <div style={{ minWidth: 0, flex: 1 }}>
+                      <div
+                        className="mono"
+                        title={job.name}
+                        style={{
+                          fontWeight: 700,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 6,
+                        }}
+                      >
+                        {isFailed ? (
+                          <AlertTriangle
+                            size={12}
+                            style={{
+                              color: "var(--signal-alert-text)",
+                              flexShrink: 0,
+                            }}
+                          />
+                        ) : (
+                          <Loader2
+                            size={12}
+                            style={{
+                              color: "var(--signal-accent-text)",
+                              flexShrink: 0,
+                            }}
+                          />
+                        )}
+                        <span>{job.name}</span>
+                      </div>
+                      <div
+                        className="mono"
+                        style={{
+                          fontSize: "var(--text-xs)",
+                          color: "var(--text-secondary)",
+                          marginTop: 2,
+                        }}
+                      >
+                        {job.camera.toUpperCase()} · {formatDuration(dur)} ·{" "}
+                        {job.status === "queued"
+                          ? isPt
+                            ? "NA FILA"
+                            : "QUEUED"
+                          : isFailed
+                          ? isPt
+                            ? "FALHOU"
+                            : "FAILED"
+                          : `${pct}%`}
+                      </div>
+                    </div>
+
+                    {isFailed ? (
+                      <button
+                        type="button"
+                        className="nvr-btn sm"
+                        title={isPt ? "Dispensar aviso" : "Dismiss"}
+                        onClick={() =>
+                          setDismissedJobIds((prev) => ({
+                            ...prev,
+                            [job.id]: true,
+                          }))
+                        }
+                      >
+                        <X size={12} />
+                      </button>
+                    ) : (
+                      onCancelExportJob && (
+                        <button
+                          type="button"
+                          className="nvr-btn danger sm mono"
+                          disabled={cancellingJobId === job.id}
+                          title={
+                            isPt
+                              ? "Cancelar exportação em andamento"
+                              : "Cancel running export job"
+                          }
+                          onClick={async () => {
+                            setCancellingJobId(job.id);
+                            try {
+                              await onCancelExportJob(job.id);
+                            } finally {
+                              if (isMountedRef.current) {
+                                setCancellingJobId(null);
+                              }
+                            }
+                          }}
+                        >
+                          <X size={11} />
+                          {isPt ? "Cancelar" : "Cancel"}
+                        </button>
+                      )
+                    )}
                   </div>
-                  <div
-                    className="mono"
-                    style={{
-                      fontSize: "var(--text-xs)",
-                      color: "var(--text-secondary)",
-                      whiteSpace: "nowrap",
-                      marginTop: 2,
-                    }}
-                  >
-                    {ex.camera.toUpperCase()} · {formatDateTime(ex.date)}
-                  </div>
+
+                  {isFailed ? (
+                    <div
+                      className="mono"
+                      style={{
+                        fontSize: "var(--text-xs)",
+                        color: "var(--signal-alert-text)",
+                        wordBreak: "break-word",
+                      }}
+                    >
+                      {job.error ||
+                        (isPt
+                          ? "Falha ao exportar trecho MP4"
+                          : "Failed to export MP4 clip")}
+                    </div>
+                  ) : (
+                    <div
+                      role="progressbar"
+                      aria-valuenow={pct}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      style={{
+                        height: 5,
+                        width: "100%",
+                        background: "var(--bg-deep)",
+                        borderRadius: 2,
+                        overflow: "hidden",
+                        border: "1px solid var(--border-hairline)",
+                      }}
+                    >
+                      <div
+                        style={{
+                          height: "100%",
+                          width: `${Math.max(4, pct)}%`,
+                          background: "var(--signal-accent)",
+                          transition: "width 0.25s ease",
+                        }}
+                      />
+                    </div>
+                  )}
                 </div>
-                <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
-                  <button
-                    className="nvr-btn mono"
-                    style={{ height: 26, padding: "0 7px", fontSize: "var(--text-xs)" }}
-                    title="Copy expiring HMAC-signed shareable link"
-                    disabled={creatingShareId !== null || revokingShareId !== null}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void handleCopyShareLink(ex.id);
-                    }}
-                  >
-                    Share Link
-                  </button>
-                  <a
-                    href={resolveSafeExportVideoUrl(ex.video_path, ex.id)}
-                    download={`${ex.id}.mp4`}
-                    className="nvr-btn"
-                    style={{ textDecoration: "none" }}
-                    aria-label={`Download ${ex.name} MP4`}
-                    title={t.exports.downloadMp4}
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    <Download size={12} />
-                  </a>
-                  <button
-                    className="nvr-btn danger"
-                    aria-label={`Delete export ${ex.name}`}
-                    title={t.exports.deleteBtn}
-                    disabled={deletingExportId === ex.id}
-                    onClick={async (e) => {
-                      e.stopPropagation();
-                      if (deletingExportId !== null) return;
-                      setDeletingExportId(ex.id);
-                      try {
-                        const res = await fetch(
-                          `/api/export/${encodeURIComponent(ex.id)}`,
-                          {
-                            method: "DELETE",
-                            credentials: "include",
-                          }
-                        );
-                        if (!isMountedRef.current) return;
-                        if (res.ok) {
-                          setExportsList((prev) =>
-                            prev.filter((i) => i.id !== ex.id)
-                          );
-                          if (activeExportPreview?.id === ex.id) {
-                            setActiveExportPreview(null);
-                          }
-                          shareController.evictTarget(ex.id, shareLinks);
-                          void shareController.refresh();
-                          notify("Export deleted");
-                        } else {
-                          const data = await res.json().catch(() => ({}));
-                          if (isMountedRef.current) {
-                            notify(
-                              (typeof data?.message === "string" &&
-                                data.message) ||
-                                "Failed to delete export"
-                            );
-                          }
-                        }
-                      } catch {
-                        if (isMountedRef.current) {
-                          notify("Failed to delete export");
-                        }
-                      } finally {
-                        if (isMountedRef.current) {
-                          setDeletingExportId(null);
-                        }
+              );
+            })}
+
+            {/* Saved Completed Exports */}
+            {completedExports.map((ex) => {
+              const safeThumb = ex.thumb_path
+                ? sanitizeTimelineThumbUrl(ex.thumb_path, ex.camera)
+                : "";
+              return (
+                <div
+                  key={ex.id}
+                  role="button"
+                  tabIndex={0}
+                  className={`nvr-list-row ${
+                    activeExportPreview?.id === ex.id ? "is-selected" : ""
+                  }`}
+                  onClick={() => setActiveExportPreview(ex)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      setActiveExportPreview(ex);
+                    }
+                  }}
+                  style={{
+                    padding: "8px 12px",
+                    justifyContent: "space-between",
+                    gap: 10,
+                  }}
+                >
+                  {safeThumb && (
+                    <img
+                      src={safeThumb}
+                      alt=""
+                      width={64}
+                      height={36}
+                      loading="lazy"
+                      style={{
+                        width: 64,
+                        height: 36,
+                        objectFit: "cover",
+                        borderRadius: 2,
+                        background: "var(--bg-deep)",
+                        border: "1px solid var(--border-hairline)",
+                        flexShrink: 0,
+                      }}
+                    />
+                  )}
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div
+                      className="mono"
+                      title={ex.name}
+                      style={{
+                        fontWeight: 700,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {ex.name}
+                    </div>
+                    <div
+                      className="mono"
+                      style={{
+                        fontSize: "var(--text-xs)",
+                        color: "var(--text-secondary)",
+                        whiteSpace: "nowrap",
+                        marginTop: 2,
+                      }}
+                    >
+                      {ex.camera.toUpperCase()} · {formatDateTime(ex.date)}
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                    <button
+                      className="nvr-btn mono"
+                      style={{
+                        height: 26,
+                        padding: "0 7px",
+                        fontSize: "var(--text-xs)",
+                      }}
+                      title="Copy expiring HMAC-signed shareable link"
+                      disabled={
+                        creatingShareId !== null || revokingShareId !== null
                       }
-                    }}
-                  >
-                    <Trash2 size={12} />
-                  </button>
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void handleCopyShareLink(ex.id);
+                      }}
+                    >
+                      Share Link
+                    </button>
+                    <a
+                      href={resolveSafeExportVideoUrl(ex.video_path, ex.id)}
+                      download={`${ex.id}.mp4`}
+                      className="nvr-btn"
+                      style={{ textDecoration: "none" }}
+                      aria-label={`Download ${ex.name} MP4`}
+                      title={t.exports.downloadMp4}
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <Download size={12} />
+                    </a>
+                    <button
+                      className="nvr-btn danger"
+                      aria-label={`Delete export ${ex.name}`}
+                      title={t.exports.deleteBtn}
+                      disabled={deletingExportId === ex.id}
+                      onClick={async (e) => {
+                        e.stopPropagation();
+                        if (deletingExportId !== null) return;
+                        setDeletingExportId(ex.id);
+                        try {
+                          const res = await fetch(
+                            `/api/export/${encodeURIComponent(ex.id)}`,
+                            {
+                              method: "DELETE",
+                              credentials: "include",
+                            }
+                          );
+                          if (!isMountedRef.current) return;
+                          if (res.ok) {
+                            setExportsList((prev) =>
+                              prev.filter((i) => i.id !== ex.id)
+                            );
+                            if (activeExportPreview?.id === ex.id) {
+                              setActiveExportPreview(null);
+                            }
+                            shareController.evictTarget(ex.id, shareLinks);
+                            void shareController.refresh();
+                            notify("Export deleted");
+                          } else {
+                            const data = await res.json().catch(() => ({}));
+                            if (isMountedRef.current) {
+                              notify(
+                                (typeof data?.message === "string" &&
+                                  data.message) ||
+                                  "Failed to delete export"
+                              );
+                            }
+                          }
+                        } catch {
+                          if (isMountedRef.current) {
+                            notify("Failed to delete export");
+                          }
+                        } finally {
+                          if (isMountedRef.current) {
+                            setDeletingExportId(null);
+                          }
+                        }
+                      }}
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </div>
                 </div>
-              </div>
-            ))}
-            {exportsList.length === 0 && (
+              );
+            })}
+            {completedExports.length === 0 && visibleJobs.length === 0 && (
               <div
-                style={{ padding: 24, textAlign: "center", color: "var(--text-muted)" }}
+                style={{
+                  padding: 24,
+                  textAlign: "center",
+                  color: "var(--text-muted)",
+                }}
               >
                 {t.exports.noExports}
               </div>
@@ -668,7 +1026,9 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
             <div className="nvr-scroll-y">
               {visibleShareLinks.map((link) => {
                 const status = computeShareLinkStatus(link);
-                const remainingTtl = formatShareLinkRemainingTtl(link.expires_at);
+                const remainingTtl = formatShareLinkRemainingTtl(
+                  link.expires_at
+                );
                 const viewsStr = formatShareLinkViews(link);
                 return (
                   <div
@@ -736,8 +1096,13 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                                 padding: "0 7px",
                                 fontSize: "var(--text-xs)",
                               }}
-                              disabled={creatingShareId !== null || revokingShareId !== null}
-                              onClick={() => void handleCopyExistingShareLink(link)}
+                              disabled={
+                                creatingShareId !== null ||
+                                revokingShareId !== null
+                              }
+                              onClick={() =>
+                                void handleCopyExistingShareLink(link)
+                              }
                               title={t.exports.copyLinkBtn}
                             >
                               <Copy size={11} />
@@ -751,8 +1116,13 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                                 padding: "0 7px",
                                 fontSize: "var(--text-xs)",
                               }}
-                              disabled={creatingShareId !== null || revokingShareId !== null}
-                              onClick={() => void handleRevokeShareLink(link.id)}
+                              disabled={
+                                creatingShareId !== null ||
+                                revokingShareId !== null
+                              }
+                              onClick={() =>
+                                void handleRevokeShareLink(link.id)
+                              }
                               title={t.exports.revokeBtn}
                             >
                               <ShieldOff size={11} />
@@ -814,21 +1184,36 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                 playsInline
                 style={{ width: "100%", height: "100%", objectFit: "contain" }}
               />
-            ) : timeShiftTs === null || !Number.isFinite(timeShiftTs) ? (
+            ) : effectiveVodPlayheadTs === null ||
+              !Number.isFinite(effectiveVodPlayheadTs) ? (
               (() => {
                 const realExportCam = resolveRealCameraSource(
                   exportCam,
                   config?.cameras
                 );
                 return (
-                  <LiveMsePlayer
-                    camera={exportCam}
-                    useMainStream={true}
-                    cameraConfig={
-                      config?.cameras?.[exportCam] ??
-                      config?.cameras?.[realExportCam]
-                    }
-                  />
+                  <div
+                    style={{
+                      position: "relative",
+                      width: "100%",
+                      height: "100%",
+                    }}
+                  >
+                    <LiveMsePlayer
+                      camera={exportCam}
+                      useMainStream={true}
+                      cameraConfig={
+                        config?.cameras?.[exportCam] ??
+                        config?.cameras?.[realExportCam]
+                      }
+                    />
+                    {isDraggingTrim && (
+                      <StageTrimOverlay
+                        scrubPreviewUrl={trimFeedback?.previewFrameUrl}
+                        trimBadgeLabel={trimFeedback?.badgeLabel}
+                      />
+                    )}
+                  </div>
                 );
               })()
             ) : (
@@ -837,22 +1222,55 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                   exportCam,
                   config?.cameras
                 );
+                const desiredSpanSec =
+                  trimFeedback?.mode === "preview_clip"
+                    ? Math.max(
+                        180,
+                        Math.min(
+                          MAX_EXPORT_WINDOW_SEC,
+                          trimFeedback.rangeEnd - trimFeedback.rangeStart + 12
+                        )
+                      )
+                    : 180;
                 const seekAction = resolveVodSeekAction(
                   exportVodWindowRef.current,
                   {
                     camera: realExportCam,
-                    targetTs: timeShiftTs,
-                    windowSpanSec: 180,
+                    targetTs: effectiveVodPlayheadTs,
+                    requiredEndTs:
+                      trimFeedback?.mode === "preview_clip"
+                        ? trimFeedback.rangeEnd
+                        : undefined,
+                    windowSpanSec: desiredSpanSec,
                     configuredCameras: config?.cameras,
                   }
                 );
                 exportVodWindowRef.current = seekAction.window;
+                const pauseOnSeek =
+                  isDraggingTrim ||
+                  trimFeedback?.mode === "settled_in" ||
+                  trimFeedback?.mode === "settled_out";
+                const scrubPreviewUrl = isDraggingTrim
+                  ? trimFeedback.previewFrameUrl
+                  : null;
                 return (
                   <VodHlsPlayer
                     camera={realExportCam}
                     startTime={seekAction.window.startSec}
                     endTime={seekAction.window.endSec}
-                    playheadTs={timeShiftTs}
+                    playheadTs={effectiveVodPlayheadTs}
+                    pauseOnSeek={pauseOnSeek}
+                    clipBounds={
+                      trimFeedback?.mode === "preview_clip"
+                        ? {
+                            startSec: trimFeedback.rangeStart,
+                            endSec: trimFeedback.rangeEnd,
+                            loop: true,
+                          }
+                        : null
+                    }
+                    scrubPreviewUrl={scrubPreviewUrl}
+                    trimBadgeLabel={trimFeedback?.badgeLabel ?? null}
                   />
                 );
               })()
@@ -862,15 +1280,22 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
           <TimelineScrubber
             camera={exportCam}
             cameras={cameraNames}
-            onSelectCamera={(cam) => setExportCam(cam)}
+            onSelectCamera={handleSelectExportCamera}
             segments={focusSegments}
             reviews={reviews}
             currentTs={timeShiftTs}
+            clipRequest={autoSeedClipRequest}
             onSeek={(ts) => {
               setActiveExportPreview(null);
               setTimeShiftTs(ts);
             }}
-            onExportRange={async (cam, start, end, label) => {
+            includeAudio={includeAudio}
+            onIncludeAudioChange={setIncludeAudio}
+            onTrimFeedback={(state) => {
+              if (state) setActiveExportPreview(null);
+              setTrimFeedback(state);
+            }}
+            onExportRange={async (cam, start, end, label, audioOpt) => {
               const cleanCam = (cam || "").trim();
               if (!cleanCam) {
                 notify("Select a valid camera channel before exporting");
@@ -890,7 +1315,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                 win.startSec,
                 win.endSec,
                 label,
-                includeAudio
+                audioOpt ?? includeAudio
               );
             }}
             titlePrefix="EXPORT CLIPPER"

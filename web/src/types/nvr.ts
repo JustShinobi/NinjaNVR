@@ -948,6 +948,29 @@ export interface RecordingDaySummary {
   hours: RecordingHourSummary[];
 }
 
+export type ExportJobStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface ExportJobItem {
+  id: string;
+  camera: string;
+  name: string;
+  start_time: number;
+  end_time: number;
+  include_audio: boolean;
+  status: ExportJobStatus;
+  progress_pct: number;
+  created_at: number;
+  updated_at: number;
+  video_url?: string | null;
+  thumb_url?: string | null;
+  error?: string | null;
+}
+
 export interface ExportItem {
   id: string;
   camera: string;

@@ -7,6 +7,7 @@ import { countActiveReviewFilters } from "../utils/liveTileHud";
 import {
   LoadedVodWindow,
   resolveReviewArchivePlayback,
+  resolveVodSeekAction,
 } from "../utils/archivePlayback";
 import {
   ReviewMutationPatch,
@@ -23,7 +24,10 @@ import {
 import { WorkspaceTab, findMatchingExport, formatDateTime, formatRelTime } from "../utils/format";
 import { buildSharePublicUrl } from "../utils/shareLinks";
 import { VodHlsPlayer } from "../components/VideoPlayers";
-import { TimelineScrubber } from "../components/TimelineScrubber";
+import {
+  TimelineScrubber,
+  TimelineTrimFeedbackState,
+} from "../components/TimelineScrubber";
 import { RecordingCalendarPopover } from "../components/RecordingCalendarPopover";
 import { validateExportTimeWindow } from "./ExportsWorkspace";
 import {
@@ -100,8 +104,9 @@ interface ReviewWorkspaceProps {
     camera: string,
     startSec: number,
     endSec: number,
-    label?: string
-  ) => Promise<{ exportId?: string; videoUrl?: string } | void>;
+    label?: string,
+    includeAudio?: boolean
+  ) => Promise<{ exportId?: string; videoUrl?: string; queued?: boolean } | void>;
   setSyncMasterTs: (ts: number) => void;
   switchTab: (tab: WorkspaceTab) => void;
   onReconcileReviews?: (
@@ -145,6 +150,14 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     reviewId: string;
     ts: number;
   } | null>(null);
+  const [reviewTrimFeedback, setReviewTrimFeedback] = React.useState<{
+    reviewId: string;
+    state: TimelineTrimFeedbackState;
+  } | null>(null);
+  const activeReviewTrim =
+    activeReview && reviewTrimFeedback?.reviewId === activeReview.id
+      ? reviewTrimFeedback.state
+      : null;
   const loadedVodWindowRef = React.useRef<{
     reviewId: string;
     window: LoadedVodWindow;
@@ -1788,25 +1801,76 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     loadedVodWindowRef.current?.reviewId === activeReview.id
                       ? loadedVodWindowRef.current.window
                       : null;
-                  const reviewPlayback = resolveReviewArchivePlayback(
+                  const isDraggingReviewTrim =
+                    activeReviewTrim?.mode === "dragging_in" ||
+                    activeReviewTrim?.mode === "dragging_out";
+                  const isSettledOrPreviewReviewTrim =
+                    activeReviewTrim?.mode === "settled_in" ||
+                    activeReviewTrim?.mode === "settled_out" ||
+                    activeReviewTrim?.mode === "preview_clip";
+                  const effectiveReviewPlayhead =
+                    isSettledOrPreviewReviewTrim &&
+                    activeReviewTrim &&
+                    Number.isFinite(activeReviewTrim.targetTs)
+                      ? activeReviewTrim.targetTs
+                      : reviewPlayheadTs;
+                  const basePlayback = resolveReviewArchivePlayback(
                     activeReview,
-                    reviewPlayheadTs,
+                    effectiveReviewPlayhead,
                     {
                       currentWindow: currentVodWindow,
                       configuredCameras,
                     }
                   );
+                  const vodWin =
+                    activeReviewTrim?.mode === "preview_clip"
+                      ? resolveVodSeekAction(basePlayback.vodWindow, {
+                          camera: basePlayback.realCamera,
+                          targetTs: activeReviewTrim.rangeStart,
+                          requiredEndTs: activeReviewTrim.rangeEnd,
+                          windowSpanSec: Math.max(
+                            60,
+                            Math.min(
+                              86400,
+                              activeReviewTrim.rangeEnd -
+                                activeReviewTrim.rangeStart +
+                                12
+                            )
+                          ),
+                          configuredCameras,
+                        }).window
+                      : basePlayback.vodWindow;
                   loadedVodWindowRef.current = {
                     reviewId: activeReview.id,
-                    window: reviewPlayback.vodWindow,
+                    window: vodWin,
                   };
                   return (
                     <VodHlsPlayer
                       key={activeReview.id}
-                      camera={reviewPlayback.realCamera}
-                      startTime={reviewPlayback.vodWindow.startSec}
-                      endTime={reviewPlayback.vodWindow.endSec}
-                      playheadTs={reviewPlayheadTs}
+                      camera={basePlayback.realCamera}
+                      startTime={vodWin.startSec}
+                      endTime={vodWin.endSec}
+                      playheadTs={effectiveReviewPlayhead}
+                      pauseOnSeek={
+                        isDraggingReviewTrim ||
+                        activeReviewTrim?.mode === "settled_in" ||
+                        activeReviewTrim?.mode === "settled_out"
+                      }
+                      clipBounds={
+                        activeReviewTrim?.mode === "preview_clip"
+                          ? {
+                              startSec: activeReviewTrim.rangeStart,
+                              endSec: activeReviewTrim.rangeEnd,
+                              loop: true,
+                            }
+                          : null
+                      }
+                      scrubPreviewUrl={
+                        isDraggingReviewTrim
+                          ? activeReviewTrim?.previewFrameUrl
+                          : null
+                      }
+                      trimBadgeLabel={activeReviewTrim?.badgeLabel ?? null}
                       fallbackPreviewId={activeReview.id}
                       playbackRate={briefingActive ? briefingSpeed : playbackSpeed}
                       onEnded={briefingActive ? handleAdvanceBriefing : undefined}
@@ -1952,8 +2016,18 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     setReviewPlayhead(null);
                   }
                 }}
+                onTrimFeedback={(state) => {
+                  if (state) {
+                    setReviewTrimFeedback({
+                      reviewId: activeReview.id,
+                      state,
+                    });
+                  } else {
+                    setReviewTrimFeedback(null);
+                  }
+                }}
                 onOpenExports={() => useNvrStore.getState().setActiveTab("exports")}
-                onExportRange={async (cam, start, end, label) => {
+                onExportRange={async (cam, start, end, label, includeAudio) => {
                   const cleanCam = (cam || "").trim();
                   if (!cleanCam) return;
                   const win = validateExportTimeWindow(start, end);
@@ -1966,7 +2040,8 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     realRangeCam,
                     win.startSec,
                     win.endSec,
-                    label
+                    label,
+                    includeAudio
                   );
                 }}
                 titlePrefix={`REVIEW TIMELINE (${activeReview.camera.toUpperCase()})`}

@@ -174,8 +174,9 @@ interface SyncWorkspaceProps {
     camera: string,
     startSec: number,
     endSec: number,
-    label?: string
-  ) => Promise<{ exportId?: string; videoUrl?: string } | void>;
+    label?: string,
+    includeAudio?: boolean
+  ) => Promise<{ exportId?: string; videoUrl?: string; queued?: boolean } | void>;
 }
 
 export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({

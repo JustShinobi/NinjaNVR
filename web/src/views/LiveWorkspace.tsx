@@ -93,7 +93,12 @@ import {
   resolveEffectiveTheme,
 } from "../utils/format";
 import { resolveCanvasThemePalette } from "../utils/themeTokens";
-import { LiveMsePlayer, PushToTalkButton, VodHlsPlayer } from "../components/VideoPlayers";
+import {
+  LiveMsePlayer,
+  PushToTalkButton,
+  StageTrimOverlay,
+  VodHlsPlayer,
+} from "../components/VideoPlayers";
 import {
   CAMERA_HUD_CONTROL_DESCRIPTORS,
   applyCameraHardwarePatch,
@@ -120,7 +125,11 @@ export {
   resolveCameraPushToTalkCapability,
   resolveCameraZoomSupported,
 };
-import { TimelineScrubber, type TimelineClipRequest } from "../components/TimelineScrubber";
+import {
+  TimelineScrubber,
+  type TimelineClipRequest,
+  type TimelineTrimFeedbackState,
+} from "../components/TimelineScrubber";
 import { ReviewFlipbook } from "../components/ReviewFlipbook";
 import { TacticalCameraPicker } from "../components/TacticalCameraPicker";
 import { CameraDetailsSheet } from "../components/CameraDetailsSheet";
@@ -1089,8 +1098,9 @@ interface LiveWorkspaceProps {
     camera: string,
     startSec: number,
     endSec: number,
-    label?: string
-  ) => Promise<{ exportId?: string; videoUrl?: string } | void>;
+    label?: string,
+    includeAudio?: boolean
+  ) => Promise<{ exportId?: string; videoUrl?: string; queued?: boolean } | void>;
 }
 
 export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
@@ -1106,6 +1116,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const setActiveTab = useNvrStore((s) => s.setActiveTab);
   const [stripNowSec, setStripNowSec] = useState<number>(() => Math.floor(Date.now() / 1000));
   const [clipRequest, setClipRequest] = useState<TimelineClipRequest | null>(null);
+  const [liveTrimFeedback, setLiveTrimFeedback] =
+    useState<TimelineTrimFeedbackState | null>(null);
   const recentEvents = useMemo(() => selectRecentEvents(unreviewedAlerts, 10), [unreviewedAlerts]);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const [stageSize, setStageSize] = useState<{ width: number; height: number } | null>(null);
@@ -2287,13 +2299,52 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   </div>
                 )}
 
-                {descriptor.renderMode === "vod" && timeShiftTs !== null ? (
-                  (() => {
+                {(() => {
+                  const isActiveTrimTile =
+                    descriptor.isTimelineSelected && liveTrimFeedback !== null;
+                  const isSettledOrPreviewTrim =
+                    isActiveTrimTile &&
+                    (liveTrimFeedback?.mode === "settled_in" ||
+                      liveTrimFeedback?.mode === "settled_out" ||
+                      liveTrimFeedback?.mode === "preview_clip");
+                  const isDraggingTrim =
+                    isActiveTrimTile &&
+                    (liveTrimFeedback?.mode === "dragging_in" ||
+                      liveTrimFeedback?.mode === "dragging_out");
+                  const effectiveVodTs =
+                    isSettledOrPreviewTrim &&
+                    liveTrimFeedback &&
+                    Number.isFinite(liveTrimFeedback.targetTs)
+                      ? liveTrimFeedback.targetTs
+                      : timeShiftTs;
+
+                  if (
+                    (descriptor.renderMode === "vod" || isSettledOrPreviewTrim) &&
+                    effectiveVodTs !== null &&
+                    Number.isFinite(effectiveVodTs)
+                  ) {
                     const prevWin = vodWindowsRef.current[realCam] ?? null;
+                    const desiredSpanSec =
+                      isActiveTrimTile && liveTrimFeedback?.mode === "preview_clip"
+                        ? Math.max(
+                            180,
+                            Math.min(
+                              86400,
+                              liveTrimFeedback.rangeEnd -
+                                liveTrimFeedback.rangeStart +
+                                12
+                            )
+                          )
+                        : 180;
                     const seekAction = resolveVodSeekAction(prevWin, {
                       camera: realCam,
-                      targetTs: timeShiftTs,
-                      windowSpanSec: 180,
+                      targetTs: effectiveVodTs,
+                      requiredEndTs:
+                        isActiveTrimTile &&
+                        liveTrimFeedback?.mode === "preview_clip"
+                          ? liveTrimFeedback.rangeEnd
+                          : undefined,
+                      windowSpanSec: desiredSpanSec,
                       configuredCameras: config?.cameras,
                     });
                     vodWindowsRef.current[realCam] = seekAction.window;
@@ -2302,47 +2353,83 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         camera={realCam}
                         startTime={seekAction.window.startSec}
                         endTime={seekAction.window.endSec}
-                        playheadTs={timeShiftTs}
+                        playheadTs={effectiveVodTs}
+                        pauseOnSeek={
+                          isDraggingTrim ||
+                          (isActiveTrimTile &&
+                            (liveTrimFeedback?.mode === "settled_in" ||
+                              liveTrimFeedback?.mode === "settled_out"))
+                        }
+                        clipBounds={
+                          isActiveTrimTile &&
+                          liveTrimFeedback?.mode === "preview_clip"
+                            ? {
+                                startSec: liveTrimFeedback.rangeStart,
+                                endSec: liveTrimFeedback.rangeEnd,
+                                loop: true,
+                              }
+                            : null
+                        }
+                        scrubPreviewUrl={
+                          isDraggingTrim
+                            ? liveTrimFeedback?.previewFrameUrl
+                            : null
+                        }
+                        trimBadgeLabel={
+                          isActiveTrimTile ? liveTrimFeedback?.badgeLabel : null
+                        }
                         playbackRate={playbackSpeed}
                         enableKeyboardStep={descriptor.isTimelineSelected}
                       />
                     );
-                  })()
-                ) : descriptor.renderMode === "snapshot" ? (
-                  <img
-                    className="nvr-cam-poster"
-                    src={`/api/${encodeURIComponent(realCam)}/latest.webp?height=360&cache=${nowTick}`}
-                    alt={`${cam} dock snapshot`}
-                    loading="lazy"
-                    onClick={() => handleTileActivate(false)}
-                  />
-                ) : (
-                  <LiveMsePlayer
-                    camera={cam}
-                    useMainStream={descriptor.useMainStream}
-                    cameraConfig={camCfg}
-                    showVectors={showVectors}
-                    pushToTalkSupported={
-                      resolveCameraPushToTalkCapability(
-                        camCfg,
-                        hardwareInfoByCam[realCam],
-                        config?.go2rtc?.streams,
-                        realCam
-                      ).supported
-                    }
-                    pushToTalkMode={
-                      resolveCameraPushToTalkCapability(
-                        camCfg,
-                        hardwareInfoByCam[realCam],
-                        config?.go2rtc?.streams,
-                        realCam
-                      ).mode
-                    }
-                    onClick={
-                      isHero ? undefined : () => handleTileActivate(false)
-                    }
-                  />
-                )}
+                  }
+                  if (descriptor.renderMode === "snapshot") {
+                    return (
+                      <img
+                        className="nvr-cam-poster"
+                        src={`/api/${encodeURIComponent(realCam)}/latest.webp?height=360&cache=${nowTick}`}
+                        alt={`${cam} dock snapshot`}
+                        loading="lazy"
+                        onClick={() => handleTileActivate(false)}
+                      />
+                    );
+                  }
+                  return (
+                    <>
+                      <LiveMsePlayer
+                        camera={cam}
+                        useMainStream={descriptor.useMainStream}
+                        cameraConfig={camCfg}
+                        showVectors={showVectors}
+                        pushToTalkSupported={
+                          resolveCameraPushToTalkCapability(
+                            camCfg,
+                            hardwareInfoByCam[realCam],
+                            config?.go2rtc?.streams,
+                            realCam
+                          ).supported
+                        }
+                        pushToTalkMode={
+                          resolveCameraPushToTalkCapability(
+                            camCfg,
+                            hardwareInfoByCam[realCam],
+                            config?.go2rtc?.streams,
+                            realCam
+                          ).mode
+                        }
+                        onClick={
+                          isHero ? undefined : () => handleTileActivate(false)
+                        }
+                      />
+                      {isDraggingTrim && (
+                        <StageTrimOverlay
+                          scrubPreviewUrl={liveTrimFeedback?.previewFrameUrl}
+                          trimBadgeLabel={liveTrimFeedback?.badgeLabel}
+                        />
+                      )}
+                    </>
+                  );
+                })()}
 
                 {isDock ? (
                   <div className={`nvr-cam-hud pos-${hudPosition}`}>
@@ -2771,6 +2858,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           onSeek={(ts) => setTimeShiftTs(sanitizeTimeShiftSeek(ts))}
           onExportRange={handleQuickExport}
           clipRequest={clipRequest}
+          onTrimFeedback={setLiveTrimFeedback}
           onOpenExports={() => setActiveTab("exports")}
           titlePrefix="TIMELINE"
         />

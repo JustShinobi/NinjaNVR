@@ -30,6 +30,8 @@ export interface LoadedVodWindow extends VodPlaybackWindow {
 export interface VodSeekRequest {
   camera: string;
   targetTs: number;
+  /** Minimum archive timestamp the VOD manifest must remain loaded through (e.g. `clipBounds.endSec`). */
+  requiredEndTs?: number;
   nowSec?: number;
   windowSpanSec?: number;
   edgeMarginSec?: number;
@@ -128,6 +130,13 @@ export function resolveVodSeekAction(
       ? request.edgeMarginSec
       : DEFAULT_VOD_EDGE_MARGIN_SEC;
 
+  const effectiveRequiredEndTs =
+    typeof request.requiredEndTs === "number" &&
+    Number.isFinite(request.requiredEndTs) &&
+    request.requiredEndTs > 0
+      ? Math.min(safeNow, Math.ceil(request.requiredEndTs))
+      : null;
+
   if (
     currentWindow &&
     Number.isFinite(currentWindow.startSec) &&
@@ -144,10 +153,14 @@ export function resolveVodSeekAction(
       currentWindow.startSec,
       currentWindow.endSec - safeMargin
     );
+    const coversRequiredEnd =
+      effectiveRequiredEndTs === null ||
+      currentWindow.endSec >= effectiveRequiredEndTs;
     if (
       currentRealCamera === realCamera &&
       request.targetTs >= currentWindow.startSec &&
-      request.targetTs <= maxReusableTs
+      request.targetTs <= maxReusableTs &&
+      coversRequiredEnd
     ) {
       const normalizedCurrent: LoadedVodWindow =
         currentWindow.camera === realCamera
@@ -165,8 +178,26 @@ export function resolveVodSeekAction(
     }
   }
 
+  const requiredSpan =
+    effectiveRequiredEndTs !== null &&
+    typeof request.targetTs === "number" &&
+    Number.isFinite(request.targetTs)
+      ? Math.max(
+          MIN_VOD_WINDOW_SEC,
+          Math.ceil(effectiveRequiredEndTs - Math.floor(request.targetTs) + safeMargin)
+        )
+      : 0;
+  const effectiveDurationSec =
+    typeof request.windowSpanSec === "number" &&
+    Number.isFinite(request.windowSpanSec) &&
+    request.windowSpanSec > 0
+      ? Math.max(request.windowSpanSec, requiredSpan)
+      : requiredSpan > 0
+      ? Math.max(DEFAULT_VOD_WINDOW_SEC, requiredSpan)
+      : request.windowSpanSec;
+
   const nextBounds = computeVodPlaybackWindow(request.targetTs, {
-    durationSec: request.windowSpanSec,
+    durationSec: effectiveDurationSec,
     preRollSec: request.preRollSec,
     nowSec: safeNow,
   });

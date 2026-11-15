@@ -17,12 +17,17 @@ import { useI18n } from "./i18n";
 import {
   EventItem,
   ExportItem,
+  ExportJobItem,
   FfprobeItem,
   NinjaConfigResponse,
   RecordingDaySummary,
   RecordingSegment,
   ReviewItem,
 } from "./types/nvr";
+import {
+  parseExportJobPayload,
+  reconcileExportJobList,
+} from "./utils/exportClipFlow";
 import {
   WorkspaceTab,
   applyThemeToDocument,
@@ -268,6 +273,8 @@ export const App: React.FC = () => {
 
   // Exports state
   const [exportsList, setExportsList] = useState<ExportItem[]>([]);
+  const [exportJobs, setExportJobs] = useState<ExportJobItem[]>([]);
+  const notifiedJobTerminalStatusRef = useRef<Map<string, string>>(new Map());
   const [exportCam, setExportCam] = useState<string>("escritorio");
   const [exportPresetMin, setExportPresetMin] = useState<number>(1);
   const [exportLabel, setExportLabel] = useState<string>("");
@@ -507,6 +514,21 @@ export const App: React.FC = () => {
           setExportsList(expJson);
         }
       }
+      fetch("/api/jobs/export", { credentials: "include" })
+        .then((r) => (r.ok ? r.json() : []))
+        .then((jobsArr: unknown) => {
+          if (
+            mySeq === coreFetchSeqRef.current &&
+            !manualLogoutRef.current &&
+            Array.isArray(jobsArr)
+          ) {
+            const parsed = jobsArr
+              .map(parseExportJobPayload)
+              .filter((j): j is ExportJobItem => j !== null);
+            setExportJobs(parsed);
+          }
+        })
+        .catch(() => {});
       if (profRes.ok) {
         const profJson = await profRes.json();
         if (mySeq !== coreFetchSeqRef.current || manualLogoutRef.current) {
@@ -705,6 +727,39 @@ export const App: React.FC = () => {
                 };
               }
             }
+          } else if (msg.topic === "exports" && msg.payload) {
+            const parsed =
+              typeof msg.payload === "string"
+                ? JSON.parse(msg.payload)
+                : msg.payload;
+            const job = parseExportJobPayload(parsed);
+            if (job) {
+              setExportJobs((prev) => reconcileExportJobList(prev, job));
+              const prevSeen = notifiedJobTerminalStatusRef.current.get(job.id);
+              if (job.status === "completed" && prevSeen !== "completed") {
+                notifiedJobTerminalStatusRef.current.set(job.id, "completed");
+                if (notifiedJobTerminalStatusRef.current.size > 128) {
+                  const firstKey = notifiedJobTerminalStatusRef.current
+                    .keys()
+                    .next().value;
+                  if (firstKey) {
+                    notifiedJobTerminalStatusRef.current.delete(firstKey);
+                  }
+                }
+                notify(`MP4 clip ready: ${job.name}`);
+                fetch("/api/exports", { credentials: "include" })
+                  .then((r) => (r.ok ? r.json() : null))
+                  .then((arr: ExportItem[] | null) => {
+                    if (Array.isArray(arr)) {
+                      setExportsList(arr);
+                    }
+                  })
+                  .catch(() => {});
+              } else if (job.status === "failed" && prevSeen !== "failed") {
+                notifiedJobTerminalStatusRef.current.set(job.id, "failed");
+                notify(job.error || `Export failed: ${job.name}`);
+              }
+            }
           }
         } catch {
           // ignore
@@ -833,11 +888,25 @@ export const App: React.FC = () => {
         })
         .catch(() => {});
     } else if (activeTab === "exports") {
-      fetch("/api/exports", { credentials: "include" })
-        .then((r) => (r.ok ? r.json() : []))
-        .then((arr: ExportItem[]) => {
-          if (!cancelled && Array.isArray(arr)) {
+      Promise.all([
+        fetch("/api/exports", { credentials: "include" }).then((r) =>
+          r.ok ? r.json() : []
+        ),
+        fetch("/api/jobs/export", { credentials: "include" }).then((r) =>
+          r.ok ? r.json() : []
+        ),
+      ])
+        .then(([arr, jobsArr]) => {
+          if (cancelled) return;
+          if (Array.isArray(arr)) {
             setExportsList(arr);
+          }
+          if (Array.isArray(jobsArr)) {
+            setExportJobs(
+              jobsArr
+                .map(parseExportJobPayload)
+                .filter((j): j is ExportJobItem => j !== null)
+            );
           }
         })
         .catch(() => {});
@@ -1039,7 +1108,7 @@ export const App: React.FC = () => {
       endSec: number,
       label?: string,
       includeAudio: boolean = true
-    ): Promise<{ exportId?: string; videoUrl?: string } | void> => {
+    ): Promise<{ exportId?: string; videoUrl?: string; queued?: boolean } | void> => {
       const realCam = resolveRealCameraSource(
         camera,
         useNvrStore.getState().config?.cameras
@@ -1051,7 +1120,7 @@ export const App: React.FC = () => {
           : nowFallback - 60;
       const rawEnd =
         typeof endSec === "number" && Number.isFinite(endSec)
-          ? Math.ceil(Math.max(endSec, s + 5))
+          ? Math.ceil(Math.max(endSec, s + 1))
           : s + 30;
       const e = s < nowFallback ? Math.max(s + 1, Math.min(nowFallback, rawEnd)) : rawEnd;
       try {
@@ -1062,10 +1131,25 @@ export const App: React.FC = () => {
           body: JSON.stringify({
             name: label || `${camera} ${formatTs(s)}-${formatTs(e)}`,
             include_audio: includeAudio,
+            async: true,
           }),
         });
         const data = await res.json().catch(() => ({}));
         if (res.ok && data.success !== false) {
+          if (data.queued) {
+            const job = parseExportJobPayload(data.job);
+            if (job) {
+              setExportJobs((prev) => reconcileExportJobList(prev, job));
+            }
+            notify(
+              `Exporting MP4 clip in background for ${camera} (${formatTs(s)} - ${formatTs(e)})`
+            );
+            return {
+              exportId: data.export_id,
+              videoUrl: sanitizeExportVideoUrl(data.video_url, realCam, s, e),
+              queued: true,
+            };
+          }
           notify(`MP4 clip ready for ${camera} (${formatTs(s)} - ${formatTs(e)})`);
           const listRes = await fetch("/api/exports", { credentials: "include" }).catch(
             () => null
@@ -1083,12 +1167,43 @@ export const App: React.FC = () => {
           return {
             exportId: data.export_id,
             videoUrl: sanitizeExportVideoUrl(data.video_url, realCam, s, e),
+            queued: false,
           };
         } else {
           notify(data.message || `Export failed (${res.status})`);
         }
       } catch {
         notify("Network error while exporting MP4 clip");
+      }
+    },
+    [notify]
+  );
+
+  const handleCancelExportJob = useCallback(
+    async (jobId: string) => {
+      try {
+        const res = await fetch(`/api/jobs/export/${encodeURIComponent(jobId)}/cancel`, {
+          method: "POST",
+          credentials: "include",
+        });
+        if (res.ok) {
+          const data = await res.json().catch(() => ({}));
+          const job = parseExportJobPayload(data?.job);
+          if (job) {
+            setExportJobs((prev) => reconcileExportJobList(prev, job));
+          } else {
+            setExportJobs((prev) =>
+              prev.map((j) =>
+                j.id === jobId ? { ...j, status: "cancelled" } : j
+              )
+            );
+          }
+          notify("Export cancelled");
+        } else {
+          notify("Failed to cancel export job");
+        }
+      } catch {
+        notify("Network error while cancelling export job");
       }
     },
     [notify]
@@ -1870,6 +1985,8 @@ export const App: React.FC = () => {
             config={config}
             exportsList={exportsList}
             setExportsList={setExportsList}
+            exportJobs={exportJobs}
+            onCancelExportJob={handleCancelExportJob}
             exportCam={exportCam}
             setExportCam={setExportCam}
             exportPresetMin={exportPresetMin}
