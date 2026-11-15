@@ -21,6 +21,7 @@ import {
   VideoSlotIndex,
 } from "../utils/msePlayerEngine";
 import { resolveVodSeekAction } from "../utils/archivePlayback";
+import type { TrimScrubChannel } from "../utils/exportClipFlow";
 
 export interface PushToTalkTrackLike {
   stop: () => void;
@@ -1767,19 +1768,79 @@ export interface VodClipPreviewBounds {
 export const StageTrimOverlay: React.FC<{
   scrubPreviewUrl?: string | null;
   trimBadgeLabel?: string | null;
+  trimScrubChannel?: TrimScrubChannel | null;
+  hidePreviewWhenTsInRange?: { startSec: number; endSec: number; ready: boolean } | null;
   rotateTransform?: string;
-}> = ({ scrubPreviewUrl = null, trimBadgeLabel = null, rotateTransform }) => {
+}> = ({
+  scrubPreviewUrl = null,
+  trimBadgeLabel = null,
+  trimScrubChannel = null,
+  hidePreviewWhenTsInRange = null,
+  rotateTransform,
+}) => {
+  const [channelSignal, setChannelSignal] = useState(() =>
+    trimScrubChannel ? trimScrubChannel.getCurrent() : null
+  );
+  const badgeTextRef = useRef<HTMLDivElement | null>(null);
   const [failedUrl, setFailedUrl] = useState<string | null>(null);
-  const showScrubImg =
-    Boolean(scrubPreviewUrl) && scrubPreviewUrl !== failedUrl;
+
+  useEffect(() => {
+    if (!trimScrubChannel) {
+      setChannelSignal(null);
+      return;
+    }
+    setChannelSignal(trimScrubChannel.getCurrent());
+    return trimScrubChannel.subscribe((sig) => {
+      // Fast-path: if only the badge timestamp text changed while previewFrameUrl stayed identical,
+      // mutate badge textContent imperatively with ZERO React re-renders!
+      setChannelSignal((prev) => {
+        if (!sig || !prev) return sig;
+        const prevInRange = Boolean(
+          hidePreviewWhenTsInRange?.ready &&
+            prev.targetTs >= hidePreviewWhenTsInRange.startSec &&
+            prev.targetTs <= hidePreviewWhenTsInRange.endSec - 0.25
+        );
+        const nextInRange = Boolean(
+          hidePreviewWhenTsInRange?.ready &&
+            sig.targetTs >= hidePreviewWhenTsInRange.startSec &&
+            sig.targetTs <= hidePreviewWhenTsInRange.endSec - 0.25
+        );
+        if (
+          prev.previewFrameUrl === sig.previewFrameUrl &&
+          prevInRange === nextInRange &&
+          badgeTextRef.current
+        ) {
+          badgeTextRef.current.textContent = sig.badgeLabel;
+          return prev;
+        }
+        return sig;
+      });
+    });
+  }, [
+    trimScrubChannel,
+    hidePreviewWhenTsInRange?.ready,
+    hidePreviewWhenTsInRange?.startSec,
+    hidePreviewWhenTsInRange?.endSec,
+  ]);
+
+  const activeUrl = channelSignal
+    ? hidePreviewWhenTsInRange?.ready &&
+      channelSignal.targetTs >= hidePreviewWhenTsInRange.startSec &&
+      channelSignal.targetTs <= hidePreviewWhenTsInRange.endSec - 0.25
+      ? null
+      : channelSignal.previewFrameUrl
+    : scrubPreviewUrl;
+  const activeBadge = channelSignal ? channelSignal.badgeLabel : trimBadgeLabel;
+  const showScrubImg = Boolean(activeUrl) && activeUrl !== failedUrl;
+
   return (
     <>
-      {showScrubImg && scrubPreviewUrl && (
+      {showScrubImg && activeUrl && (
         <img
-          src={scrubPreviewUrl}
+          src={activeUrl}
           alt=""
           aria-hidden="true"
-          onError={() => setFailedUrl(scrubPreviewUrl)}
+          onError={() => setFailedUrl(activeUrl)}
           style={{
             position: "absolute",
             inset: 0,
@@ -1793,8 +1854,9 @@ export const StageTrimOverlay: React.FC<{
           }}
         />
       )}
-      {trimBadgeLabel && (
+      {activeBadge && (
         <div
+          ref={badgeTextRef}
           className="mono"
           style={{
             position: "absolute",
@@ -1815,7 +1877,7 @@ export const StageTrimOverlay: React.FC<{
             pointerEvents: "none",
           }}
         >
-          {trimBadgeLabel}
+          {activeBadge}
         </div>
       )}
     </>
@@ -1827,6 +1889,10 @@ export interface VodHlsPlayerProps {
   startTime: number;
   endTime: number;
   playheadTs?: number | null;
+  /** Live handle timestamp during active IN/OUT drag for zero-reload hardware-decoded scrubbing. */
+  scrubTargetTs?: number | null;
+  /** Zero-rerender scrub channel for 120–240Hz imperative `<video>` seeking during handle drag. */
+  trimScrubChannel?: TrimScrubChannel | null;
   pauseOnSeek?: boolean;
   clipBounds?: VodClipPreviewBounds | null;
   onClipBoundsEnded?: () => void;
@@ -1868,6 +1934,8 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
   startTime,
   endTime,
   playheadTs = null,
+  scrubTargetTs = null,
+  trimScrubChannel = null,
   pauseOnSeek = false,
   clipBounds = null,
   onClipBoundsEnded,
@@ -1884,6 +1952,8 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const endedFiredRef = useRef(false);
+  const pendingScrubOffsetRef = useRef<number | null>(null);
+  const [vodBufferReady, setVodBufferReady] = useState(false);
   const playheadTsRef = useRef<number | null | undefined>(playheadTs);
   playheadTsRef.current = playheadTs;
   const pauseOnSeekRef = useRef<boolean>(pauseOnSeek);
@@ -1937,6 +2007,8 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
 
   useEffect(() => {
     setUseFallbackMp4(false);
+    setVodBufferReady(false);
+    pendingScrubOffsetRef.current = null;
     endedFiredRef.current = false;
   }, [realCamera, safeStart, safeEnd, fallbackPreviewId]);
 
@@ -2096,6 +2168,72 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
     safeEnd,
     useFallbackMp4,
   ]);
+
+  const applyImperativeScrubTarget = useCallback(
+    (targetTs: number | null | undefined) => {
+      if (
+        typeof targetTs !== "number" ||
+        !Number.isFinite(targetTs) ||
+        targetTs < safeStart ||
+        targetTs > safeEnd - 0.25
+      ) {
+        pendingScrubOffsetRef.current = null;
+        return;
+      }
+      const vid = videoRef.current;
+      if (!vid || useFallbackMp4 || vid.readyState < 1) return;
+      if (!vid.paused) {
+        vid.pause();
+      }
+      const maxOff = Math.max(0, safeEnd - safeStart - 0.05);
+      const targetOffset = Math.max(0, Math.min(maxOff, targetTs - safeStart));
+      if (Math.abs((vid.currentTime || 0) - targetOffset) < 0.025) {
+        return;
+      }
+      if (vid.seeking) {
+        pendingScrubOffsetRef.current = targetOffset;
+        return;
+      }
+      pendingScrubOffsetRef.current = null;
+      try {
+        vid.currentTime = targetOffset;
+      } catch {
+        // ignore if seek range is still initializing
+      }
+    },
+    [safeStart, safeEnd, useFallbackMp4]
+  );
+
+  // Seek-coalesced hardware `<video>` scrubbing via both `trimScrubChannel` (zero React re-render) and `scrubTargetTs`
+  const isScrubInsideLoadedWindow =
+    typeof scrubTargetTs === "number" &&
+    Number.isFinite(scrubTargetTs) &&
+    scrubTargetTs >= safeStart &&
+    scrubTargetTs <= safeEnd - 0.25;
+
+  useEffect(() => {
+    applyImperativeScrubTarget(scrubTargetTs);
+  }, [scrubTargetTs, applyImperativeScrubTarget]);
+
+  useEffect(() => {
+    if (!trimScrubChannel) return;
+    return trimScrubChannel.subscribe((sig) => {
+      applyImperativeScrubTarget(sig?.targetTs ?? null);
+    });
+  }, [trimScrubChannel, applyImperativeScrubTarget]);
+
+  const handleVideoSeeked = () => {
+    const nextOff = pendingScrubOffsetRef.current;
+    if (nextOff === null) return;
+    pendingScrubOffsetRef.current = null;
+    const vid = videoRef.current;
+    if (!vid || vid.seeking) return;
+    try {
+      vid.currentTime = nextOff;
+    } catch {
+      // ignore
+    }
+  };
 
   useEffect(() => {
     if (videoRef.current) {
@@ -2263,10 +2401,19 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
     }
   };
 
+  const effectiveOverlayScrubUrl =
+    isScrubInsideLoadedWindow && vodBufferReady ? null : scrubPreviewUrl;
+
   const stageTrimOverlay = (
     <StageTrimOverlay
-      scrubPreviewUrl={scrubPreviewUrl}
+      scrubPreviewUrl={effectiveOverlayScrubUrl}
       trimBadgeLabel={trimBadgeLabel}
+      trimScrubChannel={trimScrubChannel}
+      hidePreviewWhenTsInRange={{
+        startSec: safeStart,
+        endSec: safeEnd,
+        ready: vodBufferReady,
+      }}
       rotateTransform={vodRotateTransform}
     />
   );
@@ -2283,6 +2430,8 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
           playsInline
           muted={userMuted}
           loop={!onEnded && !clipBounds}
+          onLoadedData={() => setVodBufferReady(true)}
+          onSeeked={handleVideoSeeked}
           onVolumeChange={(e) => {
             const next = e.currentTarget.muted;
             setUserMuted(next);
@@ -2313,6 +2462,8 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
         autoPlay={autoPlay && !pauseOnSeek}
         playsInline
         muted={userMuted}
+        onLoadedData={() => setVodBufferReady(true)}
+        onSeeked={handleVideoSeeked}
         onVolumeChange={(e) => {
           const next = e.currentTarget.muted;
           setUserMuted(next);

@@ -28,6 +28,7 @@ import {
   TimelineScrubber,
   TimelineTrimFeedbackState,
 } from "../components/TimelineScrubber";
+import { createTrimScrubChannel } from "../utils/exportClipFlow";
 import { RecordingCalendarPopover } from "../components/RecordingCalendarPopover";
 import { validateExportTimeWindow } from "./ExportsWorkspace";
 import {
@@ -154,6 +155,10 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     reviewId: string;
     state: TimelineTrimFeedbackState;
   } | null>(null);
+  const reviewTrimScrubChannel = React.useMemo(
+    () => createTrimScrubChannel(),
+    []
+  );
   const activeReviewTrim =
     activeReview && reviewTrimFeedback?.reviewId === activeReview.id
       ? reviewTrimFeedback.state
@@ -1851,6 +1856,12 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                       startTime={vodWin.startSec}
                       endTime={vodWin.endSec}
                       playheadTs={effectiveReviewPlayhead}
+                      scrubTargetTs={
+                        isDraggingReviewTrim ? activeReviewTrim?.targetTs : null
+                      }
+                      trimScrubChannel={
+                        isDraggingReviewTrim ? reviewTrimScrubChannel : null
+                      }
                       pauseOnSeek={
                         isDraggingReviewTrim ||
                         activeReviewTrim?.mode === "settled_in" ||
@@ -2016,6 +2027,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     setReviewPlayhead(null);
                   }
                 }}
+                trimScrubChannel={reviewTrimScrubChannel}
                 onTrimFeedback={(state) => {
                   if (state) {
                     setReviewTrimFeedback({

@@ -130,6 +130,7 @@ import {
   type TimelineClipRequest,
   type TimelineTrimFeedbackState,
 } from "../components/TimelineScrubber";
+import { createTrimScrubChannel } from "../utils/exportClipFlow";
 import { ReviewFlipbook } from "../components/ReviewFlipbook";
 import { TacticalCameraPicker } from "../components/TacticalCameraPicker";
 import { CameraDetailsSheet } from "../components/CameraDetailsSheet";
@@ -1118,6 +1119,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const [clipRequest, setClipRequest] = useState<TimelineClipRequest | null>(null);
   const [liveTrimFeedback, setLiveTrimFeedback] =
     useState<TimelineTrimFeedbackState | null>(null);
+  const liveTrimScrubChannel = useMemo(() => createTrimScrubChannel(), []);
   const recentEvents = useMemo(() => selectRecentEvents(unreviewedAlerts, 10), [unreviewedAlerts]);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const [stageSize, setStageSize] = useState<{ width: number; height: number } | null>(null);
@@ -2354,6 +2356,12 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         startTime={seekAction.window.startSec}
                         endTime={seekAction.window.endSec}
                         playheadTs={effectiveVodTs}
+                        scrubTargetTs={
+                          isDraggingTrim ? liveTrimFeedback?.targetTs : null
+                        }
+                        trimScrubChannel={
+                          isDraggingTrim ? liveTrimScrubChannel : null
+                        }
                         pauseOnSeek={
                           isDraggingTrim ||
                           (isActiveTrimTile &&
@@ -2425,6 +2433,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         <StageTrimOverlay
                           scrubPreviewUrl={liveTrimFeedback?.previewFrameUrl}
                           trimBadgeLabel={liveTrimFeedback?.badgeLabel}
+                          trimScrubChannel={liveTrimScrubChannel}
                         />
                       )}
                     </>
@@ -2858,6 +2867,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           onSeek={(ts) => setTimeShiftTs(sanitizeTimeShiftSeek(ts))}
           onExportRange={handleQuickExport}
           clipRequest={clipRequest}
+          trimScrubChannel={liveTrimScrubChannel}
           onTrimFeedback={setLiveTrimFeedback}
           onOpenExports={() => setActiveTab("exports")}
           titlePrefix="TIMELINE"

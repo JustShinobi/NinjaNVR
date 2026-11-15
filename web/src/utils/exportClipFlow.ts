@@ -302,13 +302,55 @@ export function computeClipOverlayGeometry(
 export interface HandleDragCursorState {
   lastClientX: number;
   currentTs: number;
+  grabOffsetPx?: number;
+  wasShift?: boolean;
+}
+
+export interface LiveTrimScrubSignal {
+  targetTs: number;
+  previewFrameUrl: string | null;
+  badgeLabel: string;
+}
+
+export interface TrimScrubChannel {
+  emit(signal: LiveTrimScrubSignal | null): void;
+  getCurrent(): LiveTrimScrubSignal | null;
+  subscribe(listener: (signal: LiveTrimScrubSignal | null) => void): () => void;
 }
 
 /**
- * Advances a dragged `IN` or `OUT` handle incrementally from `prevState`:
- * - Holding `Shift` scales movement by `0.15x` and preserves `0.25s` quarter-second granularity.
- * - Releasing `Shift` mid-drag resumes `1.0x` sensitivity from the handle's current position
- *   without ever teleporting to raw `clientX`.
+ * Zero-rerender pub/sub channel connecting high-frequency (120–240Hz) handle drag events
+ * directly to `<VodHlsPlayer>` and `<StageTrimOverlay>` without re-rendering parent workspaces.
+ */
+export function createTrimScrubChannel(): TrimScrubChannel {
+  let current: LiveTrimScrubSignal | null = null;
+  const listeners = new Set<(signal: LiveTrimScrubSignal | null) => void>();
+  return {
+    emit(signal) {
+      current = signal;
+      for (const fn of listeners) {
+        fn(signal);
+      }
+    },
+    getCurrent() {
+      return current;
+    },
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+  };
+}
+
+/**
+ * Advances a dragged `IN` or `OUT` handle with NLE-grade cursor lock:
+ * - Normal mode (`!shiftKey`): position-locked 1:1 to `(clientX - rectLeft - grabOffsetPx)`
+ *   so the handle never detaches from the cursor even after touching min/max walls.
+ * - Fine mode (`shiftKey`): `0.15x` incremental velocity preserving sub-millisecond floats.
+ * - Toggling `Shift` on or off mid-drag recalibrates `grabOffsetPx` so sensitivity changes
+ *   smoothly from the handle's exact current position with zero teleportation.
  */
 export function stepHandleDragTs(params: {
   clientX: number;
@@ -323,21 +365,55 @@ export function stepHandleDragTs(params: {
     params;
   const span = Math.max(60, winEnd - winStart);
   const safeWidth = Math.max(1, rectWidth);
+  const relX = clientX - rectLeft;
+
   if (!prevState || !Number.isFinite(prevState.currentTs)) {
-    const frac = Math.max(0, Math.min(1, (clientX - rectLeft) / safeWidth));
+    const frac = Math.max(0, Math.min(1, relX / safeWidth));
     const initTs = winStart + frac * span;
-    const quantized = shiftKey
-      ? Math.round(initTs * 4) / 4
-      : Math.round(initTs);
-    return { lastClientX: clientX, currentTs: quantized };
+    return {
+      lastClientX: clientX,
+      currentTs: initTs,
+      grabOffsetPx: 0,
+      wasShift: shiftKey,
+    };
   }
-  const dx = clientX - prevState.lastClientX;
-  const scale = shiftKey ? 0.15 : 1.0;
-  const rawNext = prevState.currentTs + (dx / safeWidth) * span * scale;
+
+  if (shiftKey) {
+    const dx = clientX - prevState.lastClientX;
+    const rawNext = prevState.currentTs + (dx / safeWidth) * span * 0.15;
+    return {
+      lastClientX: clientX,
+      currentTs: rawNext,
+      grabOffsetPx: prevState.grabOffsetPx,
+      wasShift: true,
+    };
+  }
+
+  // Recompute grabOffsetPx on first pointermove or right when releasing Shift so 1:1 tracking
+  // stays glued to the handle's exact visual position without jumping!
+  const prevHandleX = ((prevState.currentTs - winStart) / span) * safeWidth;
+  const grabOffsetPx =
+    prevState.grabOffsetPx === undefined || prevState.wasShift
+      ? prevState.lastClientX - rectLeft - prevHandleX
+      : prevState.grabOffsetPx;
+
+  const targetHandleX = relX - grabOffsetPx;
+  const rawNext = winStart + (targetHandleX / safeWidth) * span;
   return {
     lastClientX: clientX,
     currentTs: rawNext,
+    grabOffsetPx,
+    wasShift: false,
   };
+}
+
+export function clampSmoothDragBoundaryTs(
+  ts: number,
+  minBoundSec: number,
+  maxBoundSec: number
+): number {
+  const clamped = Math.max(minBoundSec, Math.min(maxBoundSec, ts));
+  return Math.round(clamped * 1000) / 1000;
 }
 
 export function quantizeClipBoundaryTs(
@@ -350,6 +426,142 @@ export function quantizeClipBoundaryTs(
   return fineQuarterSec
     ? Math.round(clamped * 4) / 4
     : Math.round(clamped);
+}
+
+export interface ProgressiveFramePreloader {
+  request(url: string | null): void;
+  getDisplayedUrl(): string | null;
+  reset(): void;
+  dispose(): void;
+}
+
+/**
+ * Single-in-flight progressive frame preloader for live timeline / handle scrubbing:
+ * - Keeps the last decoded image URL visible until the next image finishes decoding (zero flicker).
+ * - Never starves during continuous movement (unlike trailing debounce): as soon as the current
+ *   in-flight frame finishes loading, immediately fetches the newest requested URL, skipping stale
+ *   intermediate timestamps while keeping server concurrency strictly at 1.
+ */
+export function createProgressiveFramePreloader(options: {
+  onResolved: (url: string | null) => void;
+  loadImage?: (url: string, done: (ok: boolean) => void) => () => void;
+}): ProgressiveFramePreloader {
+  let displayedUrl: string | null = null;
+  let inflightUrl: string | null = null;
+  let cancelInflight: (() => void) | null = null;
+  let queuedUrl: string | null = null;
+  const failedUrls = new Map<string, number>();
+  let disposed = false;
+
+  const defaultLoadImage = (
+    url: string,
+    done: (ok: boolean) => void
+  ): (() => void) => {
+    if (typeof Image === "undefined") {
+      done(true);
+      return () => {};
+    }
+    const img = new Image();
+    let active = true;
+    img.onload = () => {
+      img.onload = null;
+      img.onerror = null;
+      if (active) done(true);
+    };
+    img.onerror = () => {
+      img.onload = null;
+      img.onerror = null;
+      if (active) done(false);
+    };
+    img.src = url;
+    return () => {
+      active = false;
+      img.onload = null;
+      img.onerror = null;
+    };
+  };
+
+  const loader = options.loadImage ?? defaultLoadImage;
+
+  const pumpNext = () => {
+    if (disposed || inflightUrl !== null || queuedUrl === null) return;
+    const next = queuedUrl;
+    queuedUrl = null;
+    if (next === displayedUrl) return;
+    const failTs = failedUrls.get(next);
+    if (failTs !== undefined && Date.now() - failTs < 4000) {
+      return;
+    }
+    inflightUrl = next;
+    cancelInflight = loader(next, (ok) => {
+      if (disposed) return;
+      inflightUrl = null;
+      cancelInflight = null;
+      if (ok) {
+        failedUrls.delete(next);
+        displayedUrl = next;
+        options.onResolved(next);
+      } else {
+        if (failedUrls.size > 64) {
+          const oldest = failedUrls.keys().next().value;
+          if (oldest) failedUrls.delete(oldest);
+        }
+        failedUrls.set(next, Date.now());
+      }
+      pumpNext();
+    });
+  };
+
+  return {
+    request(url) {
+      if (disposed) return;
+      if (!url) {
+        queuedUrl = null;
+        if (cancelInflight) {
+          cancelInflight();
+          cancelInflight = null;
+          inflightUrl = null;
+        }
+        if (displayedUrl !== null) {
+          displayedUrl = null;
+          options.onResolved(null);
+        }
+        return;
+      }
+      if (url === displayedUrl && inflightUrl === null) {
+        queuedUrl = null;
+        return;
+      }
+      if (url === inflightUrl) {
+        queuedUrl = null;
+        return;
+      }
+      queuedUrl = url;
+      pumpNext();
+    },
+    getDisplayedUrl() {
+      return displayedUrl;
+    },
+    reset() {
+      queuedUrl = null;
+      if (cancelInflight) {
+        cancelInflight();
+        cancelInflight = null;
+      }
+      inflightUrl = null;
+      displayedUrl = null;
+      failedUrls.clear();
+    },
+    dispose() {
+      disposed = true;
+      queuedUrl = null;
+      if (cancelInflight) {
+        cancelInflight();
+        cancelInflight = null;
+      }
+      inflightUrl = null;
+    },
+  };
 }
 
 /**

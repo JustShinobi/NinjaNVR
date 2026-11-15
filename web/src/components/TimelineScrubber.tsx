@@ -35,10 +35,14 @@ import {
 import { resolveSafeMediaUrl } from "../utils/mediaUrlPolicy";
 import {
   HandleDragCursorState,
+  ProgressiveFramePreloader,
   TimelineFrameIndexEntry,
+  TrimScrubChannel,
+  clampSmoothDragBoundaryTs,
   computeClipOverlayGeometry,
   computeClipPreFlightSummary,
   computePannedWindowEnd,
+  createProgressiveFramePreloader,
   findExactContainingReview,
   formatClipBoundaryInput,
   isSameLocalCalendarDay,
@@ -98,6 +102,8 @@ interface TimelineScrubberProps {
   onIncludeAudioChange?: (includeAudio: boolean) => void;
   /** Real-time trim feedback for the primary video monitor (IN/OUT scrub, pause-on-cut, and clip loop). */
   onTrimFeedback?: (state: TimelineTrimFeedbackState | null) => void;
+  /** Zero-rerender scrub channel for 120–240Hz imperative video scrubbing during handle drag. */
+  trimScrubChannel?: TrimScrubChannel | null;
 }
 
 export interface TimelineClipRequest {
@@ -235,42 +241,80 @@ const ClockInput: React.FC<{
   );
 };
 
+const FMT_HHMM =
+  typeof Intl !== "undefined"
+    ? new Intl.DateTimeFormat([], {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      })
+    : null;
+
+const FMT_HHMMSS =
+  typeof Intl !== "undefined"
+    ? new Intl.DateTimeFormat([], {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      })
+    : null;
+
+const FMT_FULL_DT =
+  typeof Intl !== "undefined"
+    ? new Intl.DateTimeFormat([], {
+        year: "numeric",
+        month: "short",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      })
+    : null;
+
 function formatHHMM(unixSec: number): string {
   if (!Number.isFinite(unixSec)) return "--:--";
   const d = new Date(unixSec * 1000);
   if (Number.isNaN(d.getTime())) return "--:--";
-  return d.toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
+  return FMT_HHMM
+    ? FMT_HHMM.format(d)
+    : d.toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      });
 }
 
 function formatHHMMSS(unixSec: number): string {
   if (!Number.isFinite(unixSec)) return "--:--:--";
   const d = new Date(unixSec * 1000);
   if (Number.isNaN(d.getTime())) return "--:--:--";
-  return d.toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
+  return FMT_HHMMSS
+    ? FMT_HHMMSS.format(d)
+    : d.toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      });
 }
 
 function formatFullDateTime(unixSec: number): string {
   if (!Number.isFinite(unixSec)) return "--:--:--";
   const d = new Date(unixSec * 1000);
   if (Number.isNaN(d.getTime())) return "--:--:--";
-  return d.toLocaleString([], {
-    year: "numeric",
-    month: "short",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
+  return FMT_FULL_DT
+    ? FMT_FULL_DT.format(d)
+    : d.toLocaleString([], {
+        year: "numeric",
+        month: "short",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      });
 }
 
 function parseStrictYmd(dayStr: string): [number, number, number] | null {
@@ -434,13 +478,21 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
   includeAudio: controlledIncludeAudio,
   onIncludeAudioChange,
   onTrimFeedback,
+  trimScrubChannel = null,
 }) => {
   const { t, locale } = useI18n();
   const isPt = locale === "pt";
   const trackRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const rangeOverlayRef = useRef<HTMLDivElement | null>(null);
+  const crosshairRef = useRef<HTMLDivElement | null>(null);
+  const peekerCardRef = useRef<HTMLDivElement | null>(null);
+  const peekerHeaderRef = useRef<HTMLSpanElement | null>(null);
+  const peekerTimeRef = useRef<HTMLSpanElement | null>(null);
   const onTrimFeedbackRef = useRef(onTrimFeedback);
   onTrimFeedbackRef.current = onTrimFeedback;
+  const trimScrubChannelRef = useRef(trimScrubChannel);
+  trimScrubChannelRef.current = trimScrubChannel;
 
   const themeMode = useNvrStore((s) => s.themeMode);
   const highContrast = useNvrStore((s) => s.highContrast);
@@ -487,7 +539,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
   // Hover state on fine timeline track
   const [hoverTs, setHoverTs] = useState<number | null>(null);
   const [hoverX, setHoverX] = useState<number>(0);
-  const [debouncedTier2ThumbUrl, setDebouncedTier2ThumbUrl] = useState<
+  const [preloadedHoverThumbUrl, setPreloadedHoverThumbUrl] = useState<
     string | null
   >(null);
   const [failedThumbUrl, setFailedThumbUrl] = useState<string | null>(null);
@@ -523,9 +575,15 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     startWinEnd: number;
     moved: boolean;
   } | null>(null);
+  const dragTrackRectRef = useRef<{ left: number; width: number }>({
+    left: 0,
+    width: 800,
+  });
   const handleDragCursorRef = useRef<HandleDragCursorState | null>(null);
-  const trimDebounceTimerRef = useRef<number | null>(null);
-  const lastDebouncedScrubUrlRef = useRef<string | null>(null);
+  const dragRafIdRef = useRef<number | null>(null);
+  const peekerPreloaderRef = useRef<ProgressiveFramePreloader | null>(null);
+  const stagePreloaderRef = useRef<ProgressiveFramePreloader | null>(null);
+  const latestTrimPayloadRef = useRef<TimelineTrimFeedbackState | null>(null);
   const activePointerElRef = useRef<HTMLElement | null>(null);
   const activePointerIdRef = useRef<number | null>(null);
   const wheelAnimRef = useRef<{
@@ -588,6 +646,38 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     };
   }, []);
 
+  if (!peekerPreloaderRef.current) {
+    peekerPreloaderRef.current = createProgressiveFramePreloader({
+      onResolved: (url) => setPreloadedHoverThumbUrl(url),
+    });
+  }
+  if (!stagePreloaderRef.current) {
+    stagePreloaderRef.current = createProgressiveFramePreloader({
+      onResolved: (url) => {
+        const cur = latestTrimPayloadRef.current;
+        if (
+          cur &&
+          (cur.mode === "dragging_in" || cur.mode === "dragging_out")
+        ) {
+          const updated: TimelineTrimFeedbackState = {
+            ...cur,
+            previewFrameUrl: url,
+          };
+          latestTrimPayloadRef.current = updated;
+          if (trimScrubChannelRef.current) {
+            trimScrubChannelRef.current.emit({
+              targetTs: updated.targetTs,
+              previewFrameUrl: url,
+              badgeLabel: updated.badgeLabel,
+            });
+          } else {
+            onTrimFeedbackRef.current?.(updated);
+          }
+        }
+      },
+    });
+  }
+
   useEffect(() => {
     return () => {
       if (
@@ -598,10 +688,16 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
         window.cancelAnimationFrame(wheelAnimRef.current.rafId);
         wheelAnimRef.current.rafId = null;
       }
-      if (trimDebounceTimerRef.current !== null && typeof window !== "undefined") {
-        window.clearTimeout(trimDebounceTimerRef.current);
-        trimDebounceTimerRef.current = null;
+      if (
+        dragRafIdRef.current !== null &&
+        typeof window !== "undefined" &&
+        typeof window.cancelAnimationFrame === "function"
+      ) {
+        window.cancelAnimationFrame(dragRafIdRef.current);
+        dragRafIdRef.current = null;
       }
+      peekerPreloaderRef.current?.dispose();
+      stagePreloaderRef.current?.dispose();
       releaseActivePointerCapture();
     };
   }, [releaseActivePointerCapture]);
@@ -611,11 +707,15 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     setIndexedFrames([]);
     setClipRangeSegments([]);
     setFailedThumbUrl(null);
+    setPreloadedHoverThumbUrl(null);
+    peekerPreloaderRef.current?.reset();
+    stagePreloaderRef.current?.reset();
+    latestTrimPayloadRef.current = null;
     setIsPreviewingClip(false);
     setReadyDownloadUrl(null);
     setExportSaved(false);
     setExportQueued(false);
-    lastDebouncedScrubUrlRef.current = null;
+    trimScrubChannelRef.current?.emit(null);
     onTrimFeedbackRef.current?.(null);
   }, [camera, realCamera]);
 
@@ -894,121 +994,270 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       mode: TimelineTrimFeedbackState["mode"] | null,
       targetTs?: number,
       nextStart?: number,
-      nextEnd?: number
+      nextEnd?: number,
+      options?: { isInitialDragStart?: boolean; fineShift?: boolean }
     ) => {
-      if (trimDebounceTimerRef.current !== null && typeof window !== "undefined") {
-        window.clearTimeout(trimDebounceTimerRef.current);
-        trimDebounceTimerRef.current = null;
-      }
       if (!mode || targetTs === undefined) {
-        lastDebouncedScrubUrlRef.current = null;
+        latestTrimPayloadRef.current = null;
+        stagePreloaderRef.current?.reset();
+        trimScrubChannelRef.current?.emit(null);
         onTrimFeedbackRef.current?.(null);
         return;
       }
       const s = nextStart ?? rangeStart;
       const e = nextEnd ?? rangeEnd;
-      const fine = mode !== "preview_clip";
+      const isDragging = mode === "dragging_in" || mode === "dragging_out";
+      const useFineQuarterBucket =
+        mode === "settled_in" ||
+        mode === "settled_out" ||
+        Boolean(options?.fineShift);
       const candidateUrl = resolveTimelineHoverThumbnailUrl(
         realCamera,
         targetTs,
         indexedFrames,
         {
-          fineTrim: fine,
+          fineTrim: useFineQuarterBucket,
           hasRecording: hasRecordingAtTs(targetTs),
         }
       );
+      const durSec = Math.max(1, Math.round(e - s));
       const label =
         mode === "dragging_in" || mode === "settled_in"
           ? `${isPt ? "PONTO IN" : "TRIM IN"} · ${formatHHMMSS(targetTs)} (${formatDuration(
-              Math.max(1, e - s)
+              durSec
             )})`
           : mode === "dragging_out" || mode === "settled_out"
           ? `${isPt ? "PONTO OUT" : "TRIM OUT"} · ${formatHHMMSS(targetTs)} (${formatDuration(
-              Math.max(1, e - s)
+              durSec
             )})`
           : `${isPt ? "PREVIEW CLIPE" : "CLIP PREVIEW"} · ${formatHHMMSS(s)} → ${formatHHMMSS(
               e
-            )} (${formatDuration(Math.max(1, e - s))})`;
+            )} (${formatDuration(durSec)})`;
 
-      const isDragging = mode === "dragging_in" || mode === "dragging_out";
-      const isTier1Immediate = Boolean(candidateUrl?.includes("/frame/"));
-      if (!isDragging || isTier1Immediate || !candidateUrl) {
-        if (candidateUrl) lastDebouncedScrubUrlRef.current = candidateUrl;
-        onTrimFeedbackRef.current?.({
+      if (!isDragging) {
+        stagePreloaderRef.current?.reset();
+        trimScrubChannelRef.current?.emit(null);
+        const payload: TimelineTrimFeedbackState = {
           mode,
           targetTs,
           rangeStart: s,
           rangeEnd: e,
           previewFrameUrl: candidateUrl,
           badgeLabel: label,
-        });
+        };
+        latestTrimPayloadRef.current = payload;
+        onTrimFeedbackRef.current?.(payload);
         return;
       }
 
-      // During rapid handle drag on Tier-2 `/at/` URLs, update badge immediately while debouncing
-      // FFmpeg frame URL switches by 55ms so we never flood the 3-permit extraction semaphore!
-      onTrimFeedbackRef.current?.({
+      stagePreloaderRef.current?.request(candidateUrl);
+      const displayedUrl =
+        stagePreloaderRef.current?.getDisplayedUrl() ??
+        (candidateUrl?.includes("/frame/") ? candidateUrl : null);
+      const payload: TimelineTrimFeedbackState = {
         mode,
         targetTs,
         rangeStart: s,
         rangeEnd: e,
-        previewFrameUrl: lastDebouncedScrubUrlRef.current,
+        previewFrameUrl: displayedUrl,
         badgeLabel: label,
-      });
-      if (typeof window !== "undefined") {
-        trimDebounceTimerRef.current = window.setTimeout(() => {
-          trimDebounceTimerRef.current = null;
-          lastDebouncedScrubUrlRef.current = candidateUrl;
-          onTrimFeedbackRef.current?.({
-            mode,
-            targetTs,
-            rangeStart: s,
-            rangeEnd: e,
-            previewFrameUrl: candidateUrl,
-            badgeLabel: label,
-          });
-        }, 55);
+      };
+      latestTrimPayloadRef.current = payload;
+
+      // When a `trimScrubChannel` is connected, emit 120–240Hz scrub updates imperatively with ZERO
+      // parent workspace React re-renders (only notifying parent state once on drag start!).
+      if (trimScrubChannelRef.current) {
+        trimScrubChannelRef.current.emit({
+          targetTs,
+          previewFrameUrl: displayedUrl,
+          badgeLabel: label,
+        });
+        if (options?.isInitialDragStart) {
+          onTrimFeedbackRef.current?.(payload);
+        }
+      } else {
+        onTrimFeedbackRef.current?.(payload);
       }
     },
     [realCamera, indexedFrames, hasRecordingAtTs, rangeStart, rangeEnd, isPt]
   );
 
-  // Global pointer move / up when panning timeline track OR dragging IN/OUT handles
+  const emitTrimStateRef = useRef(emitTrimState);
+  emitTrimStateRef.current = emitTrimState;
+  const onSeekRef = useRef(onSeek);
+  onSeekRef.current = onSeek;
+  const dragEnvRef = useRef({
+    winStart,
+    winEnd,
+    windowSpanSec,
+    minArchiveSec,
+    nowSec,
+    rangeStart,
+    rangeEnd,
+    trackWidth,
+  });
+  dragEnvRef.current = {
+    winStart,
+    winEnd,
+    windowSpanSec,
+    minArchiveSec,
+    nowSec,
+    rangeStart,
+    rangeEnd,
+    trackWidth,
+  };
+
+  // Global pointer move / up bound ONCE per drag gesture (`[draggingTarget]`) with:
+  // - Synchronous 0.005ms DOM geometry updates at full 120–240Hz native pointer rate
+  // - Zero-rerender `trimScrubChannel` imperative video scrubbing
+  // - Lightweight 60ms throttled React state sync for ClockInput & duration badges
   useEffect(() => {
     if (!draggingTarget) return;
-    let latestStart = rangeStart;
-    let latestEnd = rangeEnd;
+    let latestStart = dragEnvRef.current.rangeStart;
+    let latestEnd = dragEnvRef.current.rangeEnd;
+    let latestShift = false;
+    let lastReactSyncMs = 0;
+    let pendingFrameUpdate: (() => void) | null = null;
+
+    const applyDirectHandleDomPreview = (
+      which: "in" | "out",
+      curStart: number,
+      curEnd: number,
+      shiftHeld: boolean,
+      env: typeof dragEnvRef.current,
+      rectWidth: number
+    ) => {
+      const span = Math.max(1, env.windowSpanSec);
+      const clampedStart = Math.max(env.winStart, Math.min(env.winEnd, curStart));
+      const clampedEnd = Math.max(env.winStart, Math.min(env.winEnd, curEnd));
+      const leftPct = ((clampedStart - env.winStart) / span) * 100;
+      const widthPct = Math.max(0.4, ((clampedEnd - clampedStart) / span) * 100);
+      if (rangeOverlayRef.current) {
+        rangeOverlayRef.current.style.left = `${leftPct}%`;
+        rangeOverlayRef.current.style.width = `${widthPct}%`;
+      }
+      const activeTs = which === "in" ? curStart : curEnd;
+      const nextHoverX = Math.round(
+        Math.max(0, Math.min(1, (activeTs - env.winStart) / span)) * rectWidth
+      );
+      if (crosshairRef.current) {
+        crosshairRef.current.style.left = `${nextHoverX}px`;
+      }
+      if (peekerCardRef.current) {
+        const clampedCardX = Math.max(85, Math.min(rectWidth - 95, nextHoverX));
+        peekerCardRef.current.style.left = `${clampedCardX}px`;
+      }
+      if (peekerHeaderRef.current) {
+        const prefix =
+          which === "in"
+            ? isPt
+              ? "AJUSTANDO INÍCIO"
+              : "TRIMMING IN"
+            : isPt
+            ? "AJUSTANDO FIM"
+            : "TRIMMING OUT";
+        peekerHeaderRef.current.textContent = `${prefix}${
+          shiftHeld ? " · PRECISION (SHIFT)" : ""
+        } · ${formatDuration(Math.max(1, Math.round(curEnd - curStart)))}`;
+      }
+      if (peekerTimeRef.current) {
+        peekerTimeRef.current.textContent = formatFullDateTime(
+          Math.round(activeTs)
+        );
+      }
+      return nextHoverX;
+    };
+
+    const scheduleFrameFlush = (fn: () => void, minIntervalMs = 0) => {
+      pendingFrameUpdate = fn;
+      if (dragRafIdRef.current !== null) return;
+      const nowMs =
+        typeof performance !== "undefined" ? performance.now() : Date.now();
+      if (minIntervalMs > 0 && nowMs - lastReactSyncMs < minIntervalMs) {
+        if (typeof window !== "undefined") {
+          const waitMs = Math.max(8, minIntervalMs - (nowMs - lastReactSyncMs));
+          dragRafIdRef.current = window.setTimeout(() => {
+            dragRafIdRef.current = null;
+            lastReactSyncMs =
+              typeof performance !== "undefined" ? performance.now() : Date.now();
+            const work = pendingFrameUpdate;
+            pendingFrameUpdate = null;
+            work?.();
+          }, waitMs) as unknown as number;
+        }
+        return;
+      }
+      if (
+        typeof window !== "undefined" &&
+        typeof window.requestAnimationFrame === "function"
+      ) {
+        dragRafIdRef.current = window.requestAnimationFrame(() => {
+          dragRafIdRef.current = null;
+          lastReactSyncMs =
+            typeof performance !== "undefined" ? performance.now() : Date.now();
+          const work = pendingFrameUpdate;
+          pendingFrameUpdate = null;
+          work?.();
+        });
+      } else {
+        lastReactSyncMs = nowMs;
+        const work = pendingFrameUpdate;
+        pendingFrameUpdate = null;
+        work?.();
+      }
+    };
+
+    const cancelScheduledFlush = () => {
+      if (dragRafIdRef.current !== null && typeof window !== "undefined") {
+        window.cancelAnimationFrame?.(dragRafIdRef.current);
+        window.clearTimeout(dragRafIdRef.current);
+        dragRafIdRef.current = null;
+      }
+      pendingFrameUpdate = null;
+    };
+
+    if (draggingTarget === "in" || draggingTarget === "out") {
+      setReadyDownloadUrl(null);
+      setExportSaved(false);
+      setExportQueued(false);
+      setIsPreviewingClip(false);
+    }
 
     const onMove = (e: PointerEvent) => {
+      const env = dragEnvRef.current;
+      const rect = dragTrackRectRef.current;
+      const rectWidth = Math.max(1, rect.width || env.trackWidth || 800);
+
       if (draggingTarget === "track" && dragOriginRef.current) {
-        const el = trackRef.current;
-        const width = el?.clientWidth || 800;
         const dx = e.clientX - dragOriginRef.current.startX;
         if (Math.abs(dx) >= 5) {
           dragOriginRef.current.moved = true;
         }
         if (dragOriginRef.current.moved) {
-          // Track drag ONLY pans the viewport — never alters playhead or IN/OUT!
-          const deltaSec = -(dx / Math.max(1, width)) * windowSpanSec;
-          setCustomWinEnd(
-            clampWinEndContinuous(dragOriginRef.current.startWinEnd + deltaSec)
-          );
+          const deltaSec = -(dx / rectWidth) * env.windowSpanSec;
+          const targetWinEnd = dragOriginRef.current.startWinEnd + deltaSec;
+          scheduleFrameFlush(() => {
+            setCustomWinEnd(
+              computePannedWindowEnd({
+                curWinEnd: targetWinEnd,
+                deltaSec: 0,
+                windowSpanSec: dragEnvRef.current.windowSpanSec,
+                minArchiveSec: dragEnvRef.current.minArchiveSec,
+                nowSec: dragEnvRef.current.nowSec,
+              })
+            );
+          });
         }
         return;
       }
 
-      const el = trackRef.current;
-      const rect = el?.getBoundingClientRect();
-      const rectLeft = rect?.left ?? 0;
-      const rectWidth = rect?.width || 800;
-
-      setFineShiftActive(e.shiftKey);
+      latestShift = e.shiftKey;
       const nextCursor = stepHandleDragTs({
         clientX: e.clientX,
-        rectLeft,
+        rectLeft: rect.left,
         rectWidth,
-        winStart,
-        winEnd,
+        winStart: env.winStart,
+        winEnd: env.winEnd,
         shiftKey: e.shiftKey,
         prevState: handleDragCursorRef.current,
       });
@@ -1016,58 +1265,87 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       if (draggingTarget === "in") {
         const maxIn = latestEnd - 1;
         const minIn = Math.max(
-          minArchiveSec,
+          env.minArchiveSec,
           latestEnd - MAX_ARCHIVE_EXPORT_SPAN_SEC
         );
-        const nextIn = quantizeClipBoundaryTs(
+        const smoothIn = clampSmoothDragBoundaryTs(
           nextCursor.currentTs,
-          e.shiftKey,
           minIn,
           maxIn
         );
         handleDragCursorRef.current = {
           lastClientX: e.clientX,
-          currentTs: nextIn,
+          currentTs: smoothIn,
+          grabOffsetPx: nextCursor.grabOffsetPx,
+          wasShift: nextCursor.wasShift,
         };
-        latestStart = nextIn;
-        setRangeStart(nextIn);
-        setReadyDownloadUrl(null);
-        setExportSaved(false);
-        setExportQueued(false);
-        setIsPreviewingClip(false);
-        setHoverTs(nextIn);
-        setHoverX(tsToTrackX(nextIn));
-        emitTrimState("dragging_in", nextIn, nextIn, latestEnd);
+        latestStart = smoothIn;
+
+        // 1. Instant 240Hz DOM geometry + imperative video scrub (0ms latency, 0 workspace re-renders!)
+        const nextHoverX = applyDirectHandleDomPreview(
+          "in",
+          latestStart,
+          latestEnd,
+          latestShift,
+          env,
+          rectWidth
+        );
+        emitTrimStateRef.current("dragging_in", latestStart, latestStart, latestEnd, {
+          fineShift: latestShift,
+        });
+
+        // 2. Throttled ~16fps React sync for ClockInput & peeker thumbnail URL
+        scheduleFrameFlush(() => {
+          setFineShiftActive(latestShift);
+          setRangeStart(latestStart);
+          setHoverTs(latestStart);
+          setHoverX(nextHoverX);
+        }, 55);
       } else if (draggingTarget === "out") {
         const minOut = latestStart + 1;
         const maxOut = Math.min(
-          nowSec,
+          env.nowSec,
           latestStart + MAX_ARCHIVE_EXPORT_SPAN_SEC
         );
-        const nextOut = quantizeClipBoundaryTs(
+        const smoothOut = clampSmoothDragBoundaryTs(
           nextCursor.currentTs,
-          e.shiftKey,
           minOut,
           maxOut
         );
         handleDragCursorRef.current = {
           lastClientX: e.clientX,
-          currentTs: nextOut,
+          currentTs: smoothOut,
+          grabOffsetPx: nextCursor.grabOffsetPx,
+          wasShift: nextCursor.wasShift,
         };
-        latestEnd = nextOut;
-        setRangeEnd(nextOut);
-        setReadyDownloadUrl(null);
-        setExportSaved(false);
-        setExportQueued(false);
-        setIsPreviewingClip(false);
-        setHoverTs(nextOut);
-        setHoverX(tsToTrackX(nextOut));
-        emitTrimState("dragging_out", nextOut, latestStart, nextOut);
+        latestEnd = smoothOut;
+
+        const nextHoverX = applyDirectHandleDomPreview(
+          "out",
+          latestStart,
+          latestEnd,
+          latestShift,
+          env,
+          rectWidth
+        );
+        emitTrimStateRef.current("dragging_out", latestEnd, latestStart, latestEnd, {
+          fineShift: latestShift,
+        });
+
+        scheduleFrameFlush(() => {
+          setFineShiftActive(latestShift);
+          setRangeEnd(latestEnd);
+          setHoverTs(latestEnd);
+          setHoverX(nextHoverX);
+        }, 55);
       }
     };
 
     const onUp = (e: PointerEvent) => {
+      cancelScheduledFlush();
       const endedTarget = draggingTarget;
+      const env = dragEnvRef.current;
+      const rect = dragTrackRectRef.current;
       releaseActivePointerCapture();
       handleDragCursorRef.current = null;
       setFineShiftActive(false);
@@ -1076,61 +1354,96 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
         const origin = dragOriginRef.current;
         dragOriginRef.current = null;
         setDraggingTarget(null);
-        // Only an intentional click (< 5px movement) seeks the playhead; pan drag never moves markers!
         if (!origin.moved) {
-          const ts = clampArchiveTs(clientXToTs(e.clientX));
+          const rawClickTs = computeClientXTimestamp(
+            e.clientX,
+            rect.left,
+            rect.width,
+            env.winStart,
+            env.winEnd
+          );
+          const ts = Math.max(
+            env.minArchiveSec,
+            Math.min(env.nowSec, Math.round(rawClickTs))
+          );
           setIsPreviewingClip(false);
-          emitTrimState(null);
-          onSeek(ts >= nowSec - 3 ? null : ts);
+          emitTrimStateRef.current(null);
+          onSeekRef.current(ts >= env.nowSec - 3 ? null : ts);
         }
         return;
       }
 
       setDraggingTarget(null);
       if (endedTarget === "in") {
-        onSeek(latestStart);
-        emitTrimState("settled_in", latestStart, latestStart, latestEnd);
+        const settledStart = quantizeClipBoundaryTs(
+          latestStart,
+          true,
+          env.minArchiveSec,
+          latestEnd - 1
+        );
+        const settledEnd = quantizeClipBoundaryTs(
+          latestEnd,
+          true,
+          settledStart + 1,
+          env.nowSec
+        );
+        setRangeStart(settledStart);
+        setRangeEnd(settledEnd);
+        setHoverTs(settledStart);
+        onSeekRef.current(settledStart);
+        emitTrimStateRef.current(
+          "settled_in",
+          settledStart,
+          settledStart,
+          settledEnd
+        );
       } else if (endedTarget === "out") {
-        onSeek(latestEnd);
-        emitTrimState("settled_out", latestEnd, latestStart, latestEnd);
+        const settledStart = quantizeClipBoundaryTs(
+          latestStart,
+          true,
+          env.minArchiveSec,
+          env.nowSec - 1
+        );
+        const settledEnd = quantizeClipBoundaryTs(
+          latestEnd,
+          true,
+          settledStart + 1,
+          env.nowSec
+        );
+        setRangeStart(settledStart);
+        setRangeEnd(settledEnd);
+        setHoverTs(settledEnd);
+        onSeekRef.current(settledEnd);
+        emitTrimStateRef.current(
+          "settled_out",
+          settledEnd,
+          settledStart,
+          settledEnd
+        );
       }
     };
 
     const onCancel = () => {
+      cancelScheduledFlush();
       releaseActivePointerCapture();
       dragOriginRef.current = null;
       handleDragCursorRef.current = null;
       setFineShiftActive(false);
       setDraggingTarget(null);
       setHoverTs(null);
-      emitTrimState(null);
+      emitTrimStateRef.current(null);
     };
 
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
     window.addEventListener("pointercancel", onCancel);
     return () => {
+      cancelScheduledFlush();
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onCancel);
     };
-  }, [
-    draggingTarget,
-    clientXToTs,
-    clampArchiveTs,
-    clampWinEndContinuous,
-    emitTrimState,
-    minArchiveSec,
-    nowSec,
-    onSeek,
-    rangeEnd,
-    rangeStart,
-    releaseActivePointerCapture,
-    tsToTrackX,
-    winEnd,
-    winStart,
-    windowSpanSec,
-  ]);
+  }, [draggingTarget, isPt, releaseActivePointerCapture]);
 
   // Mouse-wheel / Trackpad listener:
   // - Ctrl/Alt/Meta + Wheel = Zoom anchored at cursor
@@ -1546,29 +1859,17 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     hoveredSegmentOnTrack,
   ]);
 
-  // Tier-1 indexed `/frame/` URLs resolve at 0ms; Tier-2 `/at/` FFmpeg extractions debounce by 65ms
+  // Stream decoded frames progressively without trailing-debounce starvation!
   useEffect(() => {
-    if (!candidateHoverThumbUrl) {
-      setDebouncedTier2ThumbUrl(null);
-      return;
-    }
-    if (candidateHoverThumbUrl.includes("/frame/")) {
-      setDebouncedTier2ThumbUrl(candidateHoverThumbUrl);
-      return;
-    }
-    const timer = window.setTimeout(
-      () => {
-        setDebouncedTier2ThumbUrl(candidateHoverThumbUrl);
-      },
-      isDraggingTrimHandle ? 45 : 70
-    );
-    return () => window.clearTimeout(timer);
-  }, [candidateHoverThumbUrl, isDraggingTrimHandle]);
+    peekerPreloaderRef.current?.request(candidateHoverThumbUrl);
+  }, [candidateHoverThumbUrl]);
 
-  const effectiveHoverThumbUrl =
-    candidateHoverThumbUrl && candidateHoverThumbUrl.includes("/frame/")
-      ? candidateHoverThumbUrl
-      : debouncedTier2ThumbUrl;
+  const effectiveHoverThumbUrl = candidateHoverThumbUrl
+    ? preloadedHoverThumbUrl ??
+      (candidateHoverThumbUrl.includes("/frame/")
+        ? candidateHoverThumbUrl
+        : null)
+    : null;
 
   const activeDaySummary = useMemo(
     () =>
@@ -1679,10 +1980,25 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     [windowReviews, camera, realCamera, clipAnchorTs, nowSec]
   );
 
+  // Avoid O(N log N) segment sorting on every 60fps handle drag frame; recompute when settled!
+  const settledPreFlightRef = useRef<{ start: number; end: number }>({
+    start: rangeStart,
+    end: rangeEnd,
+  });
+  if (!isDraggingTrimHandle) {
+    settledPreFlightRef.current = { start: rangeStart, end: rangeEnd };
+  }
+  const preFlightStart = settledPreFlightRef.current.start;
+  const preFlightEnd = settledPreFlightRef.current.end;
+
   const preFlight = useMemo(
     () =>
-      computeClipPreFlightSummary(combinedClipSegments, rangeStart, rangeEnd),
-    [combinedClipSegments, rangeStart, rangeEnd]
+      computeClipPreFlightSummary(
+        combinedClipSegments,
+        preFlightStart,
+        preFlightEnd
+      ),
+    [combinedClipSegments, preFlightStart, preFlightEnd]
   );
 
   const clipSpansMultipleDays = !isSameLocalCalendarDay(rangeStart, rangeEnd);
@@ -3087,6 +3403,11 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           }}
           onPointerDown={(e) => {
             if ((e.target as HTMLElement).closest("[data-handle]")) return;
+            const rect = e.currentTarget.getBoundingClientRect();
+            dragTrackRectRef.current = {
+              left: rect.left,
+              width: rect.width || 800,
+            };
             try {
               e.currentTarget.setPointerCapture(e.pointerId);
               activePointerElRef.current = e.currentTarget;
@@ -3244,6 +3565,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           {/* Visual Range Export Overlay (`[ IN ... OUT ]`) with Honest Draggable Handles */}
           {rangeMode && clipGeometry.visible && (
             <div
+              ref={rangeOverlayRef}
               style={{
                 position: "absolute",
                 left: `${clipGeometry.leftPct}%`,
@@ -3268,6 +3590,13 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                   data-handle="in"
                   onPointerDown={(e) => {
                     e.stopPropagation();
+                    const rect = trackRef.current?.getBoundingClientRect();
+                    if (rect) {
+                      dragTrackRectRef.current = {
+                        left: rect.left,
+                        width: rect.width || 800,
+                      };
+                    }
                     try {
                       e.currentTarget.setPointerCapture(e.pointerId);
                       activePointerElRef.current = e.currentTarget;
@@ -3282,7 +3611,10 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                     setDraggingTarget("in");
                     setHoverTs(rangeStart);
                     setHoverX(tsToTrackX(rangeStart));
-                    emitTrimState("dragging_in", rangeStart, rangeStart, rangeEnd);
+                    emitTrimState("dragging_in", rangeStart, rangeStart, rangeEnd, {
+                      isInitialDragStart: true,
+                      fineShift: e.shiftKey,
+                    });
                   }}
                   title={
                     isPt
@@ -3291,27 +3623,36 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                   }
                   style={{
                     position: "absolute",
-                    left: -7,
-                    top: 0,
-                    bottom: 0,
-                    width: 14,
-                    background: "var(--signal-accent)",
+                    left: -13,
+                    top: -4,
+                    bottom: -4,
+                    width: 26,
                     cursor: "ew-resize",
                     touchAction: "none",
                     pointerEvents: "auto",
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "center",
-                    borderRadius: "2px 0 0 2px",
                   }}
                 >
                   <span
                     className="mono"
                     style={{
+                      width: 14,
+                      height: 36,
+                      background: "var(--signal-accent)",
+                      borderRadius: "2px 0 0 2px",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
                       fontSize: 10,
                       fontWeight: 800,
                       color: "#000000",
                       pointerEvents: "none",
+                      boxShadow:
+                        draggingTarget === "in"
+                          ? "0 0 0 2px var(--signal-accent-text)"
+                          : undefined,
                     }}
                   >
                     [
@@ -3324,6 +3665,13 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                   data-handle="out"
                   onPointerDown={(e) => {
                     e.stopPropagation();
+                    const rect = trackRef.current?.getBoundingClientRect();
+                    if (rect) {
+                      dragTrackRectRef.current = {
+                        left: rect.left,
+                        width: rect.width || 800,
+                      };
+                    }
                     try {
                       e.currentTarget.setPointerCapture(e.pointerId);
                       activePointerElRef.current = e.currentTarget;
@@ -3338,7 +3686,10 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                     setDraggingTarget("out");
                     setHoverTs(rangeEnd);
                     setHoverX(tsToTrackX(rangeEnd));
-                    emitTrimState("dragging_out", rangeEnd, rangeStart, rangeEnd);
+                    emitTrimState("dragging_out", rangeEnd, rangeStart, rangeEnd, {
+                      isInitialDragStart: true,
+                      fineShift: e.shiftKey,
+                    });
                   }}
                   title={
                     isPt
@@ -3347,27 +3698,36 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                   }
                   style={{
                     position: "absolute",
-                    right: -7,
-                    top: 0,
-                    bottom: 0,
-                    width: 14,
-                    background: "var(--signal-accent)",
+                    right: -13,
+                    top: -4,
+                    bottom: -4,
+                    width: 26,
                     cursor: "ew-resize",
                     touchAction: "none",
                     pointerEvents: "auto",
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "center",
-                    borderRadius: "0 2px 2px 0",
                   }}
                 >
                   <span
                     className="mono"
                     style={{
+                      width: 14,
+                      height: 36,
+                      background: "var(--signal-accent)",
+                      borderRadius: "0 2px 2px 0",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
                       fontSize: 10,
                       fontWeight: 800,
                       color: "#000000",
                       pointerEvents: "none",
+                      boxShadow:
+                        draggingTarget === "out"
+                          ? "0 0 0 2px var(--signal-accent-text)"
+                          : undefined,
                     }}
                   >
                     ]
@@ -3381,6 +3741,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           {activePeekTs !== null && draggingTarget !== "track" && (
             <>
               <div
+                ref={crosshairRef}
                 style={{
                   position: "absolute",
                   left: `${hoverX}px`,
@@ -3395,6 +3756,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 }}
               />
               <div
+                ref={peekerCardRef}
                 className="mono"
                 style={{
                   position: "absolute",
@@ -3426,6 +3788,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               >
                 {isDraggingTrimHandle && (
                   <span
+                    ref={peekerHeaderRef}
                     style={{
                       color: "var(--signal-accent-text)",
                       fontSize: 10.5,
@@ -3439,7 +3802,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                       ? "AJUSTANDO FIM"
                       : "TRIMMING OUT"}
                     {fineShiftActive ? " · PRECISION (SHIFT)" : ""} ·{" "}
-                    {formatDuration(Math.max(1, rangeEnd - rangeStart))}
+                    {formatDuration(Math.max(1, Math.round(rangeEnd - rangeStart)))}
                   </span>
                 )}
                 {showThumbImg && effectiveHoverThumbUrl && (
@@ -3458,7 +3821,9 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                     }}
                   />
                 )}
-                <span>{formatFullDateTime(Math.round(activePeekTs))}</span>
+                <span ref={peekerTimeRef}>
+                  {formatFullDateTime(Math.round(activePeekTs))}
+                </span>
                 {exactHoveredReview && (
                   <span
                     style={{

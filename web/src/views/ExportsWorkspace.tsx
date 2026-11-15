@@ -49,6 +49,7 @@ import {
   TimelineTrimFeedbackState,
   sanitizeTimelineThumbUrl,
 } from "../components/TimelineScrubber";
+import { createTrimScrubChannel } from "../utils/exportClipFlow";
 
 export const MAX_EXPORT_WINDOW_SEC = MAX_ARCHIVE_EXPORT_SPAN_SEC;
 
@@ -197,6 +198,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
   );
   const [trimFeedback, setTrimFeedback] =
     React.useState<TimelineTrimFeedbackState | null>(null);
+  const trimScrubChannel = React.useMemo(() => createTrimScrubChannel(), []);
   const [autoSeedClipRequest, setAutoSeedClipRequest] =
     React.useState<TimelineClipRequest | null>(null);
   const [dismissedJobIds, setDismissedJobIds] = React.useState<
@@ -1211,6 +1213,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                       <StageTrimOverlay
                         scrubPreviewUrl={trimFeedback?.previewFrameUrl}
                         trimBadgeLabel={trimFeedback?.badgeLabel}
+                        trimScrubChannel={trimScrubChannel}
                       />
                     )}
                   </div>
@@ -1259,6 +1262,10 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                     startTime={seekAction.window.startSec}
                     endTime={seekAction.window.endSec}
                     playheadTs={effectiveVodPlayheadTs}
+                    scrubTargetTs={
+                      isDraggingTrim ? trimFeedback?.targetTs : null
+                    }
+                    trimScrubChannel={isDraggingTrim ? trimScrubChannel : null}
                     pauseOnSeek={pauseOnSeek}
                     clipBounds={
                       trimFeedback?.mode === "preview_clip"
@@ -1291,6 +1298,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
             }}
             includeAudio={includeAudio}
             onIncludeAudioChange={setIncludeAudio}
+            trimScrubChannel={trimScrubChannel}
             onTrimFeedback={(state) => {
               if (state) setActiveExportPreview(null);
               setTrimFeedback(state);

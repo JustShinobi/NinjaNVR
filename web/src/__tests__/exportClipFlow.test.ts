@@ -2,10 +2,13 @@ import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, test } from "bun:test";
 import {
+  clampSmoothDragBoundaryTs,
   computeClipOverlayGeometry,
   computeClipPreFlightSummary,
   computePannedWindowEnd,
   computePrecisionHandleTs,
+  createProgressiveFramePreloader,
+  createTrimScrubChannel,
   findExactContainingReview,
   formatClipBoundaryInput,
   isSameLocalCalendarDay,
@@ -523,5 +526,141 @@ describe("Export Clip Flow — Stage 1 Review Regression Coverage", () => {
     );
     expect(html).not.toContain("rgba(9, 13, 20");
     expect(html).not.toContain("rgba(255, 255, 255, 0.55)");
+  });
+
+  test("sub-pixel 1px-per-tick handle drag at 5m zoom glides continuously without quantization dead-zone", () => {
+    // 5m zoom (300s) across a 1000px track: 1px = 0.30s (< 0.5s!).
+    // Previously, rounding `currentTs` to 1s on each tick wiped out +0.30s so 10 slow 1px moves = 0s!
+    // Now, `clampSmoothDragBoundaryTs` preserves float precision so 10 * 1px moves = +3.00s smoothly!
+    let cursor = { lastClientX: 500, currentTs: 2000 };
+    for (let step = 1; step <= 10; step++) {
+      const next = stepHandleDragTs({
+        clientX: 500 + step,
+        rectLeft: 0,
+        rectWidth: 1000,
+        winStart: 1850,
+        winEnd: 2150,
+        shiftKey: false,
+        prevState: cursor,
+      });
+      const smooth = clampSmoothDragBoundaryTs(next.currentTs, 1000, 3000);
+      cursor = { lastClientX: 500 + step, currentTs: smooth };
+    }
+    expect(cursor.currentTs).toBe(2003);
+
+    // Even with Shift held (0.15x -> 1px = 0.045s), 20 slow 1px moves accumulate +0.90s smoothly!
+    let fineCursor = { lastClientX: 500, currentTs: 2000 };
+    for (let step = 1; step <= 20; step++) {
+      const next = stepHandleDragTs({
+        clientX: 500 + step,
+        rectLeft: 0,
+        rectWidth: 1000,
+        winStart: 1850,
+        winEnd: 2150,
+        shiftKey: true,
+        prevState: fineCursor,
+      });
+      const smooth = clampSmoothDragBoundaryTs(next.currentTs, 1000, 3000);
+      fineCursor = { lastClientX: 500 + step, currentTs: smooth };
+    }
+    expect(fineCursor.currentTs).toBe(2000.9);
+  });
+
+  test("createProgressiveFramePreloader streams frames mid-drag with concurrency=1 and coalesces stale URLs without blanking", () => {
+    const inFlight: Array<{ url: string; done: (ok: boolean) => void }> = [];
+    const resolvedHistory: Array<string | null> = [];
+
+    const preloader = createProgressiveFramePreloader({
+      onResolved: (url) => resolvedHistory.push(url),
+      loadImage: (url, done) => {
+        inFlight.push({ url, done });
+        return () => {};
+      },
+    });
+
+    // Rapid drag requests f1, f2, f3, f4 while f1 is still loading:
+    // Only f1 is in-flight (concurrency = 1); f2 & f3 are skipped; f4 waits in the latest slot!
+    preloader.request("/api/preview/sala/at/1000.jpg");
+    preloader.request("/api/preview/sala/at/1250.jpg");
+    preloader.request("/api/preview/sala/at/1500.jpg");
+    preloader.request("/api/preview/sala/at/1750.jpg");
+    expect(inFlight.length).toBe(1);
+    expect(inFlight[0].url).toBe("/api/preview/sala/at/1000.jpg");
+
+    // f1 finishes -> immediately displayed mid-drag AND f4 starts loading immediately (skipping f2/f3!)
+    inFlight.shift()!.done(true);
+    expect(preloader.getDisplayedUrl()).toBe("/api/preview/sala/at/1000.jpg");
+    expect(inFlight.length).toBe(1);
+    expect(inFlight[0].url).toBe("/api/preview/sala/at/1750.jpg");
+
+    // f4 finishes -> displayedUrl updates smoothly to f4 without ever passing through null!
+    inFlight.shift()!.done(true);
+    expect(preloader.getDisplayedUrl()).toBe("/api/preview/sala/at/1750.jpg");
+    expect(resolvedHistory).toEqual([
+      "/api/preview/sala/at/1000.jpg",
+      "/api/preview/sala/at/1750.jpg",
+    ]);
+    preloader.dispose();
+  });
+
+  test("1:1 position-locked handle drag preserves grabOffsetPx across wall collisions and TrimScrubChannel emits zero-rerender signals", () => {
+    // 1000px track spanning [1000..2000] (1px = 1s). Handle IN is at 1300s (x=300px), OUT is at 1500s (maxIn=1499s).
+    // User grabs IN slightly off-center at clientX=304px (`grabOffsetPx = +4px`).
+    let cursor: {
+      lastClientX: number;
+      currentTs: number;
+      grabOffsetPx?: number;
+      wasShift?: boolean;
+    } = { lastClientX: 304, currentTs: 1300 };
+
+    // Drag way past OUT wall to clientX=704px: clamped at maxIn=1499s, while grabOffsetPx stays +4px!
+    const pastWall = stepHandleDragTs({
+      clientX: 704,
+      rectLeft: 0,
+      rectWidth: 1000,
+      winStart: 1000,
+      winEnd: 2000,
+      shiftKey: false,
+      prevState: cursor,
+    });
+    cursor = {
+      lastClientX: 704,
+      currentTs: clampSmoothDragBoundaryTs(pastWall.currentTs, 1000, 1499),
+      grabOffsetPx: pastWall.grabOffsetPx,
+      wasShift: pastWall.wasShift,
+    };
+    expect(cursor.currentTs).toBe(1499);
+    expect(cursor.grabOffsetPx).toBe(4);
+
+    // Drag back to clientX=404px: handle immediately tracks 1:1 back to 1400s (NOT detached at 1199s!)
+    const backIn = stepHandleDragTs({
+      clientX: 404,
+      rectLeft: 0,
+      rectWidth: 1000,
+      winStart: 1000,
+      winEnd: 2000,
+      shiftKey: false,
+      prevState: cursor,
+    });
+    expect(clampSmoothDragBoundaryTs(backIn.currentTs, 1000, 1499)).toBe(1400);
+
+    // Zero-rerender TrimScrubChannel pub/sub
+    const channel = createTrimScrubChannel();
+    const seen: Array<number | null> = [];
+    const unsub = channel.subscribe((sig) => seen.push(sig ? sig.targetTs : null));
+    channel.emit({
+      targetTs: 1400.5,
+      previewFrameUrl: "/api/preview/sala/frame/1400500.jpg",
+      badgeLabel: "TRIM IN · 12:00:00",
+    });
+    expect(channel.getCurrent()?.targetTs).toBe(1400.5);
+    channel.emit(null);
+    unsub();
+    channel.emit({
+      targetTs: 1410,
+      previewFrameUrl: null,
+      badgeLabel: "ignored",
+    });
+    expect(seen).toEqual([1400.5, null]);
   });
 });
