@@ -194,6 +194,27 @@ impl PreviewFrameStore {
             .is_ok_and(|idx| idx.get(camera).is_some_and(|set| set.contains(&ts_ms)))
     }
 
+    /// Closest stored frame timestamp to `target_ms` within `±max_delta_ms`.
+    pub fn nearest(&self, camera: &str, target_ms: u64, max_delta_ms: u64) -> Option<u64> {
+        let idx = self.index.read().ok()?;
+        let set = idx.get(camera)?;
+        let before = set.range(..=target_ms).next_back().copied();
+        let after = set.range(target_ms..).next().copied();
+        let best = match (before, after) {
+            (Some(b), Some(a)) => {
+                if target_ms.saturating_sub(b) <= a.saturating_sub(target_ms) {
+                    b
+                } else {
+                    a
+                }
+            }
+            (Some(b), None) => b,
+            (None, Some(a)) => a,
+            (None, None) => return None,
+        };
+        (best.abs_diff(target_ms) <= max_delta_ms).then_some(best)
+    }
+
     /// Frame timestamps within `[start_ms, end_ms]`, spread to at most `limit`.
     pub fn range(&self, camera: &str, start_ms: u64, end_ms: u64, limit: usize) -> Vec<u64> {
         if end_ms < start_ms {
@@ -369,6 +390,10 @@ mod tests {
         assert!(store.write_frame("../x", 1, b"jpg").is_err());
 
         assert_eq!(store.range("sala", 1_500, 3_000, 16), vec![2_000, 3_000]);
+        assert_eq!(store.nearest("sala", 1_900, 200), Some(2_000));
+        assert_eq!(store.nearest("sala", 2_500, 500), Some(2_000));
+        assert_eq!(store.nearest("sala", 5_500, 1_000), None);
+        assert_eq!(store.nearest("unknown", 2_000, 1_000), None);
         assert!(store.range("sala", 3_000, 1_000, 16).is_empty());
         assert!(store.range("unknown", 0, u64::MAX, 16).is_empty());
         assert!(store.contains("quarto", 2_500));

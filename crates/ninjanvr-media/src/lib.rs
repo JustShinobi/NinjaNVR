@@ -2770,7 +2770,17 @@ impl RecordingEngine {
                             let end_ts = segs
                                 .last()
                                 .map_or(hour_end.min(now), |s| s.end_time.min(hour_end));
-                            let duration = (end_ts - start_ts).max(1.0);
+                            let mut covered_dur = 0.0f64;
+                            let mut cov_cursor = hour_start;
+                            for seg in &segs {
+                                let s0 = seg.start_time.max(hour_start).max(cov_cursor);
+                                let s1 = seg.end_time.min(hour_end);
+                                if s1 > s0 {
+                                    covered_dur += s1 - s0;
+                                    cov_cursor = s1;
+                                }
+                            }
+                            let duration = covered_dur.max(1.0);
 
                             if std::fs::create_dir_all(&preview_dir_prep).is_err() {
                                 return None;
@@ -3473,6 +3483,335 @@ pub async fn build_mp4_export_with_options(
     .await
 }
 
+/// Parameters for [`build_mp4_export_with_progress`], supporting cold-tier segment resolution,
+/// external cancellation tokens, and real-time FFmpeg progress callbacks.
+pub struct Mp4ExportRequest<'a> {
+    pub db: &'a NinjaDatabase,
+    pub media_dir: &'a Path,
+    pub cold_dir: Option<&'a Path>,
+    pub export_id: &'a str,
+    pub camera: &'a str,
+    pub name: &'a str,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub include_audio: bool,
+    pub privacy_mask: Option<&'a serde_json::Value>,
+    pub cancel_token: Option<Arc<AtomicBool>>,
+    pub on_progress: Option<Arc<dyn Fn(f64) + Send + Sync>>,
+}
+
+/// Checks whether `path` is a regular ISO-BMFF MP4 file containing a top-level `moov` box
+/// (distinguishing real recorded segments from synthetic unit-test `ftyp`-only stubs).
+pub fn mp4_file_has_moov_box(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok((mut file, meta)) = open_regular_file_nofollow(path) else {
+        return false;
+    };
+    let file_len = meta.len();
+    if file_len < 16 {
+        return false;
+    }
+    let mut pos = 0u64;
+    let mut hdr = [0u8; 8];
+    let mut boxes_seen = 0usize;
+    while pos.checked_add(8).is_some_and(|end| end <= file_len) {
+        if boxes_seen >= MAX_MP4_BOXES_PER_LEVEL {
+            return false;
+        }
+        boxes_seen += 1;
+        if file.seek(SeekFrom::Start(pos)).is_err() || file.read_exact(&mut hdr).is_err() {
+            return false;
+        }
+        let size32 = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
+        let btype = [hdr[4], hdr[5], hdr[6], hdr[7]];
+        if boxes_seen == 1 && !is_known_iso_top_level_box(&btype) {
+            return false;
+        }
+        let (box_size, hdr_len) = if size32 == 1 {
+            if pos.checked_add(16).is_none_or(|end| end > file_len) {
+                return false;
+            }
+            let mut ext = [0u8; 8];
+            if file.read_exact(&mut ext).is_err() {
+                return false;
+            }
+            (u64::from_be_bytes(ext), 16u64)
+        } else if size32 == 0 {
+            (file_len - pos, 8u64)
+        } else {
+            (size32, 8u64)
+        };
+        let Some(next_pos) = pos.checked_add(box_size) else {
+            return false;
+        };
+        if box_size < hdr_len || next_pos > file_len {
+            return false;
+        }
+        if &btype == b"moov" && box_size > hdr_len {
+            return true;
+        }
+        pos = next_pos;
+    }
+    false
+}
+
+/// Resolves a database recording segment path across both `media_dir` (hot tier) and optional
+/// `cold_dir` (cold archive tier), rejecting symlinks, path traversal, empty files, and cross-camera paths.
+pub fn resolve_export_segment_path(
+    media_dir: &Path,
+    cold_dir: Option<&Path>,
+    camera: &str,
+    db_path: &str,
+) -> Option<PathBuf> {
+    if db_path.is_empty()
+        || Path::new(db_path)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let verify_contained =
+        |cand: &Path, root_canon: &Path, check_cam_under_rec: Option<&Path>| -> Option<PathBuf> {
+            if !cand
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
+            {
+                return None;
+            }
+            let lmeta = std::fs::symlink_metadata(cand).ok()?;
+            if !lmeta.file_type().is_file() || lmeta.len() < 16 {
+                return None;
+            }
+            let canon_parent = std::fs::canonicalize(cand.parent()?).ok()?;
+            let canon_file = std::fs::canonicalize(cand).ok()?;
+            if canon_file.parent() != Some(canon_parent.as_path())
+                || !canon_file.starts_with(root_canon)
+            {
+                return None;
+            }
+            let cmeta = std::fs::symlink_metadata(&canon_file).ok()?;
+            if !cmeta.file_type().is_file() {
+                return None;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if cmeta.dev() != lmeta.dev() || cmeta.ino() != lmeta.ino() {
+                    return None;
+                }
+            }
+            if let Some(cam_scope_root) = check_cam_under_rec
+                && let Ok(rel) = canon_file.strip_prefix(cam_scope_root)
+                && let Some(parent) = rel.parent()
+                && !parent.as_os_str().is_empty()
+                && !camera.is_empty()
+                && !parent.components().any(|c| c.as_os_str() == camera)
+            {
+                return None;
+            }
+            Some(canon_file)
+        };
+
+    let hot_disk_path = if let Some(rel) = strip_media_root(db_path) {
+        media_dir.join(rel)
+    } else {
+        PathBuf::from(db_path)
+    };
+    if std::fs::symlink_metadata(media_dir).is_ok_and(|m| !m.file_type().is_symlink())
+        && let Ok(canon_media) = std::fs::canonicalize(media_dir)
+    {
+        let canon_rec = std::fs::canonicalize(media_dir.join("recordings")).ok();
+        if let Some(found) = verify_contained(&hot_disk_path, &canon_media, canon_rec.as_deref()) {
+            return Some(found);
+        }
+    }
+
+    let cold_root = cold_dir?;
+    if std::fs::symlink_metadata(cold_root).is_ok_and(|m| m.file_type().is_symlink()) {
+        return None;
+    }
+    let canon_cold = std::fs::canonicalize(cold_root).ok()?;
+    let mut cold_candidates = vec![PathBuf::from(db_path), hot_disk_path];
+    if let Some(rel) = strip_media_root(db_path) {
+        let rel_stripped = rel.strip_prefix("recordings/").unwrap_or(rel);
+        cold_candidates.push(cold_root.join(rel_stripped));
+        cold_candidates.push(cold_root.join(rel));
+    }
+    for cand in cold_candidates {
+        if let Some(found) = verify_contained(&cand, &canon_cold, Some(canon_cold.as_path())) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Checks whether `path` contains a real encoded video sample entry (`avc1`/`hvc1`/`hev1`/`mp4v`/`vp09`/`av01`)
+/// inside its `moov` box (distinguishing real recorded camera segments from synthetic test stubs).
+pub fn mp4_file_has_real_video_codec(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok((mut file, meta)) = open_regular_file_nofollow(path) else {
+        return false;
+    };
+    let file_len = meta.len();
+    if file_len < 32 {
+        return false;
+    }
+    let mut pos = 0u64;
+    let mut hdr = [0u8; 8];
+    let mut boxes_seen = 0usize;
+    while pos.checked_add(8).is_some_and(|end| end <= file_len) {
+        if boxes_seen >= MAX_MP4_BOXES_PER_LEVEL {
+            return false;
+        }
+        boxes_seen += 1;
+        if file.seek(SeekFrom::Start(pos)).is_err() || file.read_exact(&mut hdr).is_err() {
+            return false;
+        }
+        let size32 = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
+        let btype = [hdr[4], hdr[5], hdr[6], hdr[7]];
+        if boxes_seen == 1 && !is_known_iso_top_level_box(&btype) {
+            return false;
+        }
+        let (box_size, hdr_len) = if size32 == 1 {
+            if pos.checked_add(16).is_none_or(|end| end > file_len) {
+                return false;
+            }
+            let mut ext = [0u8; 8];
+            if file.read_exact(&mut ext).is_err() {
+                return false;
+            }
+            (u64::from_be_bytes(ext), 16u64)
+        } else if size32 == 0 {
+            (file_len - pos, 8u64)
+        } else {
+            (size32, 8u64)
+        };
+        let Some(next_pos) = pos.checked_add(box_size) else {
+            return false;
+        };
+        if box_size < hdr_len || next_pos > file_len {
+            return false;
+        }
+        if &btype == b"moov" {
+            let payload_len = box_size - hdr_len;
+            if payload_len > 16 * 1024 * 1024 {
+                return false;
+            }
+            let mut moov = vec![0u8; payload_len as usize];
+            if file.read_exact(&mut moov).is_err() {
+                return false;
+            }
+            return moov.windows(4).any(|w| {
+                matches!(
+                    w,
+                    b"avc1" | b"avc3" | b"hvc1" | b"hev1" | b"mp4v" | b"vp09" | b"av01"
+                )
+            });
+        }
+        pos = next_pos;
+    }
+    false
+}
+
+/// Extracts a single JPEG frame at `offset_sec` from a validated MP4 file (`segment_path`),
+/// scaling to `max_width` (`160..=1280`) while preserving aspect ratio.
+pub async fn extract_historical_frame_jpeg(
+    segment_path: &Path,
+    offset_sec: f64,
+    duration_hint_sec: Option<f64>,
+    max_width: u32,
+) -> Result<Vec<u8>> {
+    const MAX_FRAME_STDOUT_BYTES: usize = 2 * 1024 * 1024;
+    let lmeta = std::fs::symlink_metadata(segment_path)
+        .with_context(|| format!("segment not found: {}", segment_path.display()))?;
+    if !lmeta.file_type().is_file() || lmeta.len() < 64 {
+        anyhow::bail!("segment is not a valid regular file");
+    }
+    let safe_w = max_width.clamp(160, 1280);
+    let safe_offset = if offset_sec.is_finite() && offset_sec > 0.0 {
+        offset_sec.min(86_400.0)
+    } else {
+        0.0
+    };
+    if let Some(dur) = duration_hint_sec.filter(|d| d.is_finite() && *d > 0.0)
+        && safe_offset > dur + 1.0
+    {
+        anyhow::bail!(
+            "requested frame offset +{safe_offset:.2}s exceeds segment duration {dur:.2}s"
+        );
+    }
+    let vf = format!("scale={safe_w}:-2");
+    let ffmpeg_bin = resolve_ffmpeg_bin();
+    let seg_arg = sanitize_ffmpeg_path_arg(segment_path);
+
+    let run_once = |seek_args: Vec<String>| {
+        let ffmpeg_bin = ffmpeg_bin.clone();
+        let seg_arg = seg_arg.clone();
+        let vf = vf.clone();
+        async move {
+            let mut cmd = Command::new(&ffmpeg_bin);
+            cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
+            cmd.args(&seek_args);
+            cmd.arg("-i")
+                .arg(&seg_arg)
+                .args([
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    &vf,
+                    "-q:v",
+                    "5",
+                    "-f",
+                    "image2pipe",
+                    "-vcodec",
+                    "mjpeg",
+                    "pipe:1",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            let out = tokio::time::timeout(std::time::Duration::from_secs(8), cmd.output()).await;
+            match out {
+                Ok(Ok(o))
+                    if o.status.success()
+                        && o.stdout.len() >= 4
+                        && o.stdout.len() <= MAX_FRAME_STDOUT_BYTES
+                        && o.stdout[0] == 0xFF
+                        && o.stdout[1] == 0xD8 =>
+                {
+                    Some(o.stdout)
+                }
+                _ => None,
+            }
+        }
+    };
+
+    let primary_seek = if safe_offset > 0.02 {
+        vec!["-ss".to_string(), format!("{safe_offset:.3}")]
+    } else {
+        Vec::new()
+    };
+    if let Some(bytes) = run_once(primary_seek).await {
+        return Ok(bytes);
+    }
+    // Only fall back to `-sseof -0.5` when `safe_offset` landed right on the tail boundary of a known segment.
+    if let Some(dur) = duration_hint_sec.filter(|d| d.is_finite() && *d > 0.0)
+        && safe_offset >= (dur - 1.5).max(0.0)
+        && safe_offset <= dur + 1.0
+        && let Some(bytes) = run_once(vec!["-sseof".to_string(), "-0.5".to_string()]).await
+    {
+        return Ok(bytes);
+    }
+    anyhow::bail!(
+        "failed to decode frame at +{safe_offset:.2}s from {}",
+        segment_path.display()
+    )
+}
+
 /// Concatenates recording segments in `[start, end]` into a single MP4 export file,
 /// optionally stripping audio and redacting `privacy_mask` regions via FFmpeg `drawbox`.
 // Internal media pipeline helper passing distinct FFmpeg/segment parameters directly
@@ -3488,6 +3827,26 @@ pub async fn build_mp4_export_with_privacy(
     include_audio: bool,
     privacy_mask: Option<&serde_json::Value>,
 ) -> Result<()> {
+    build_mp4_export_with_progress(Mp4ExportRequest {
+        db,
+        media_dir,
+        cold_dir: None,
+        export_id,
+        camera,
+        name,
+        start_time,
+        end_time,
+        include_audio,
+        privacy_mask,
+        cancel_token: None,
+        on_progress: None,
+    })
+    .await
+}
+
+/// Concatenates recording segments into a single MP4 export file with cold-tier support,
+/// external cancellation, and real-time FFmpeg progress callbacks.
+pub async fn build_mp4_export_with_progress(req: Mp4ExportRequest<'_>) -> Result<()> {
     struct ExportCancelGuard {
         db: NinjaDatabase,
         export_id: String,
@@ -3505,25 +3864,29 @@ pub async fn build_mp4_export_with_privacy(
         }
     }
 
-    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled = req
+        .cancel_token
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let mut cancel_guard = ExportCancelGuard {
-        db: db.clone(),
-        export_id: export_id.to_string(),
+        db: req.db.clone(),
+        export_id: req.export_id.to_string(),
         cancelled: cancelled.clone(),
         disarmed: false,
     };
 
     let res = build_mp4_export_inner(
-        db,
-        media_dir,
-        export_id,
-        camera,
-        name,
-        start_time,
-        end_time,
-        include_audio,
-        privacy_mask,
+        req.db,
+        req.media_dir,
+        req.cold_dir,
+        req.export_id,
+        req.camera,
+        req.name,
+        req.start_time,
+        req.end_time,
+        req.include_audio,
+        req.privacy_mask,
         cancelled,
+        req.on_progress,
     )
     .await;
     if res.is_ok() {
@@ -3554,11 +3917,158 @@ pub fn build_export_temp_paths(
     (tmp_out_file, list_file)
 }
 
+async fn run_ffmpeg_export_with_progress(
+    ffmpeg_bin: &Path,
+    ffmpeg_args: &[String],
+    target_dur: f64,
+    cancelled: &Arc<AtomicBool>,
+    on_progress: Option<&Arc<dyn Fn(f64) + Send + Sync>>,
+) -> bool {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    if cancelled.load(Ordering::SeqCst) {
+        return false;
+    }
+    let mut cmd = Command::new(ffmpeg_bin);
+    cmd.args(["-progress", "pipe:1", "-nostats"])
+        .args(ffmpeg_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let Ok(mut child) = cmd.spawn() else {
+        return false;
+    };
+    let stdout_opt = child.stdout.take();
+    let mut lines_opt = stdout_opt.map(|out| BufReader::new(out).lines());
+    let mut poll_tick = tokio::time::interval(std::time::Duration::from_millis(100));
+    poll_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = poll_tick.tick() => {
+                if cancelled.load(Ordering::SeqCst) {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    return false;
+                }
+            }
+            line_res = async {
+                match lines_opt.as_mut() {
+                    Some(lines) => lines.next_line().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match line_res {
+                    Ok(Some(line)) => {
+                        if let Some(cb) = on_progress
+                            && let Some(raw_us) = line
+                                .strip_prefix("out_time_us=")
+                                .or_else(|| line.strip_prefix("out_time_ms="))
+                            && let Ok(us) = raw_us.trim().parse::<i64>()
+                            && us >= 0
+                        {
+                            let sec = us as f64 / 1_000_000.0;
+                            let frac = (sec / target_dur.max(1.0)).clamp(0.0, 0.94);
+                            cb(frac);
+                        }
+                    }
+                    _ => {
+                        lines_opt = None;
+                    }
+                }
+            }
+            status_res = child.wait() => {
+                if cancelled.load(Ordering::SeqCst) {
+                    return false;
+                }
+                return status_res.is_ok_and(|s| s.success());
+            }
+        }
+    }
+}
+
+fn build_mp4_export_transcode_fallback_args(
+    list_file: &Path,
+    trim_offset: f64,
+    target_dur: f64,
+    include_audio: bool,
+    privacy_mask: Option<&serde_json::Value>,
+    out_file: &Path,
+) -> Vec<String> {
+    let safe_trim = if trim_offset.is_finite() && trim_offset > 0.0 {
+        trim_offset
+    } else {
+        0.0
+    };
+    let safe_dur = if target_dur.is_finite() && target_dur > 0.0 {
+        target_dur.clamp(0.1, 86_400.0)
+    } else {
+        3.0
+    };
+    let mut args = vec![
+        "-y".to_string(),
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+    ];
+    if safe_trim > 0.05 {
+        args.push("-ss".to_string());
+        args.push(format!("{safe_trim:.2}"));
+    }
+    args.extend([
+        "-f".to_string(),
+        "concat".to_string(),
+        "-safe".to_string(),
+        "0".to_string(),
+        "-i".to_string(),
+        sanitize_ffmpeg_path_arg(list_file),
+        "-t".to_string(),
+        format!("{safe_dur:.2}"),
+        "-fflags".to_string(),
+        "+genpts+igndts".to_string(),
+        "-avoid_negative_ts".to_string(),
+        "make_zero".to_string(),
+    ]);
+    if let Some(vf) = build_privacy_drawbox_filter(privacy_mask) {
+        args.extend(["-vf".to_string(), vf]);
+    }
+    args.extend([
+        "-c:v".to_string(),
+        "libx264".to_string(),
+        "-preset".to_string(),
+        "veryfast".to_string(),
+        "-crf".to_string(),
+        "23".to_string(),
+        "-pix_fmt".to_string(),
+        "yuv420p".to_string(),
+    ]);
+    if include_audio {
+        args.extend([
+            "-c:a".to_string(),
+            "aac".to_string(),
+            "-b:a".to_string(),
+            "128k".to_string(),
+        ]);
+    } else {
+        args.push("-an".to_string());
+    }
+    args.extend([
+        "-f".to_string(),
+        "mp4".to_string(),
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        sanitize_ffmpeg_path_arg(out_file),
+    ]);
+    args
+}
+
 // Internal media pipeline helper passing distinct FFmpeg/segment parameters directly
 #[expect(clippy::too_many_arguments)]
 async fn build_mp4_export_inner(
     db: &NinjaDatabase,
     media_dir: &Path,
+    cold_dir: Option<&Path>,
     export_id: &str,
     camera: &str,
     name: &str,
@@ -3567,6 +4077,7 @@ async fn build_mp4_export_inner(
     include_audio: bool,
     privacy_mask: Option<&serde_json::Value>,
     cancelled: Arc<AtomicBool>,
+    on_progress: Option<Arc<dyn Fn(f64) + Send + Sync>>,
 ) -> Result<()> {
     struct ExportTempGuard {
         tmp_out_file: PathBuf,
@@ -3622,8 +4133,13 @@ async fn build_mp4_export_inner(
         );
     }
 
+    if let Some(ref cb) = on_progress {
+        cb(0.02);
+    }
+
     let db_prep = db.clone();
     let media_dir_prep = media_dir.to_path_buf();
+    let cold_dir_prep = cold_dir.map(Path::to_path_buf);
     let exports_dir_prep = exports_dir.clone();
     let clips_dir_prep = clips_dir.clone();
     let cam_prep = camera.to_string();
@@ -3632,8 +4148,8 @@ async fn build_mp4_export_inner(
     let tmp_out_prep = tmp_out_file.clone();
     let tmp_thumb_prep = tmp_thumb_file.clone();
     let cancel_prep = cancelled.clone();
-    let (existing_paths, first_seg_start) =
-        tokio::task::spawn_blocking(move || -> Result<(Vec<PathBuf>, Option<f64>)> {
+    let (existing_paths, first_seg_start, any_has_moov, any_has_real_codec) =
+        tokio::task::spawn_blocking(move || -> Result<(Vec<PathBuf>, Option<f64>, bool, bool)> {
             if cancel_prep.load(Ordering::SeqCst) {
                 anyhow::bail!("export {exp_id_prep} cancelled");
             }
@@ -3654,19 +4170,13 @@ async fn build_mp4_export_inner(
             let mut list_content = String::new();
             let mut existing_paths = Vec::new();
             let mut first_seg_start = None;
-            let canon_media_dir = std::fs::canonicalize(&media_dir_prep).ok();
             for seg in &segments {
-                let local_path = if let Some(rel) = strip_media_root(&seg.path) {
-                    media_dir_prep.join(rel)
-                } else {
-                    PathBuf::from(&seg.path)
-                };
-                if std::fs::symlink_metadata(&local_path).is_ok_and(|m| m.file_type().is_file())
-                    && let (Some(root_canon), Ok(seg_canon)) =
-                        (&canon_media_dir, std::fs::canonicalize(&local_path))
-                    && seg_canon.starts_with(root_canon)
-                    && seg_canon.is_file()
-                    && let Some(line) = format_ffmpeg_concat_file_line(&seg_canon)
+                if let Some(seg_canon) = resolve_export_segment_path(
+                    &media_dir_prep,
+                    cold_dir_prep.as_deref(),
+                    &cam_prep,
+                    &seg.path,
+                ) && let Some(line) = format_ffmpeg_concat_file_line(&seg_canon)
                 {
                     if first_seg_start.is_none() {
                         first_seg_start = Some(seg.start_time);
@@ -3682,6 +4192,14 @@ async fn build_mp4_export_inner(
             if cancel_prep.load(Ordering::SeqCst) {
                 anyhow::bail!("export {exp_id_prep} cancelled");
             }
+            let any_has_moov = existing_paths
+                .iter()
+                .take(8)
+                .any(|p| mp4_file_has_moov_box(p));
+            let any_has_real_codec = existing_paths
+                .iter()
+                .take(8)
+                .any(|p| mp4_file_has_real_video_codec(p));
             let mut lf = create_new_file_nofollow(&list_file_prep)?;
             std::io::Write::write_all(&mut lf, list_content.as_bytes())?;
             if cancel_prep.load(Ordering::SeqCst) {
@@ -3690,13 +4208,18 @@ async fn build_mp4_export_inner(
             }
             let _ = std::fs::remove_file(&tmp_out_prep);
             let _ = std::fs::remove_file(&tmp_thumb_prep);
-            Ok((existing_paths, first_seg_start))
+            Ok((
+                existing_paths,
+                first_seg_start,
+                any_has_moov,
+                any_has_real_codec,
+            ))
         })
         .await
         .context("export preparation task panicked")??;
 
     let trim_offset = first_seg_start.map_or(0.0, |s0| (start_time - s0).max(0.0));
-    let target_dur = (end_time - start_time).clamp(3.0, 86_400.0);
+    let target_dur = (end_time - start_time).clamp(0.5, 86_400.0);
 
     let ffmpeg_bin = resolve_ffmpeg_bin();
     let ffmpeg_args = build_mp4_export_ffmpeg_args_with_privacy(
@@ -3707,15 +4230,39 @@ async fn build_mp4_export_inner(
         privacy_mask,
         &tmp_out_file,
     );
-    let mut cmd = Command::new(&ffmpeg_bin);
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let status = cmd.args(&ffmpeg_args).status().await;
+    let mut ff_ok = run_ffmpeg_export_with_progress(
+        &ffmpeg_bin,
+        &ffmpeg_args,
+        target_dur,
+        &cancelled,
+        on_progress.as_ref(),
+    )
+    .await;
 
-    let ff_ok = status.is_ok_and(|s| s.success());
     let mask_configured = privacy_mask_is_configured(privacy_mask);
+    let is_real_encoded_export = any_has_real_codec || (any_has_moov && existing_paths.len() > 1);
+    // If lossless stream-copy failed on real recorded MP4s (e.g. G.711 audio in MP4 or
+    // resolution/SPS/PPS switch across segments in a long export), retry once with libx264+aac.
+    if !ff_ok && !cancelled.load(Ordering::SeqCst) && is_real_encoded_export && !mask_configured {
+        let _ = std::fs::remove_file(&tmp_out_file);
+        let fallback_args = build_mp4_export_transcode_fallback_args(
+            &list_file,
+            trim_offset,
+            target_dur,
+            include_audio,
+            privacy_mask,
+            &tmp_out_file,
+        );
+        ff_ok = run_ffmpeg_export_with_progress(
+            &ffmpeg_bin,
+            &fallback_args,
+            target_dur,
+            &cancelled,
+            on_progress.as_ref(),
+        )
+        .await;
+    }
+
     let list_file_v = list_file.clone();
     let tmp_out_v = tmp_out_file.clone();
     let exp_id_v = export_id.to_string();
@@ -3742,6 +4289,12 @@ async fn build_mp4_export_inner(
                     "failed to strip audio track for export {exp_id_v} on camera {cam_v}"
                 );
             }
+            if is_real_encoded_export {
+                anyhow::bail!(
+                    "failed to remux {} recording segment(s) for export {exp_id_v} on camera {cam_v}",
+                    existing_paths.len()
+                );
+            }
             copy_file_via_nofollow(&existing_paths[0], &tmp_out_v)?;
             if cancel_v.load(Ordering::SeqCst) {
                 let _ = std::fs::remove_file(&tmp_out_v);
@@ -3752,6 +4305,10 @@ async fn build_mp4_export_inner(
     })
     .await
     .context("export segment verification task panicked")??;
+
+    if let Some(ref cb) = on_progress {
+        cb(0.96);
+    }
 
     if export_id.starts_with("share_redacted_") || export_id.starts_with("share_clip_") {
         let tmp_out_share = tmp_out_file.clone();
@@ -3876,6 +4433,9 @@ async fn build_mp4_export_inner(
     .context("export publish task panicked")??;
 
     temp_guard.disarmed = true;
+    if let Some(ref cb) = on_progress {
+        cb(1.0);
+    }
     Ok(())
 }
 
@@ -6538,6 +7098,162 @@ cameras:
             event_snap.exists(),
             "event snapshots in clips/ must remain intact"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn export_resolves_cold_tier_segments_reports_progress_and_refuses_corrupt_multi_segment_truncation()
+     {
+        let root =
+            std::env::temp_dir().join(format!("ninjanvr-export-cold-and-moov-{}", random_suffix()));
+        let media_dir = root.join("media");
+        let cold_dir = root.join("cold");
+        let cold_cam_dir = cold_dir.join("2026-11-01/12/front_door");
+        std::fs::create_dir_all(media_dir.join("recordings")).unwrap();
+        std::fs::create_dir_all(&cold_cam_dir).unwrap();
+
+        let db = NinjaDatabase::open(root.join("ninjanvr.db")).unwrap();
+
+        // 1. Cold-tier synthetic segment resolves cleanly via `cold_dir` and reports progress to 1.0
+        let cold_seg = cold_cam_dir.join("00.00.mp4");
+        let mut stub_mp4 = vec![0u8; 2048];
+        stub_mp4[0..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p']);
+        std::fs::write(&cold_seg, &stub_mp4).unwrap();
+        db.insert_recording(&RecordingRow {
+            id: "cold_seg_1".to_string(),
+            camera: "front_door".to_string(),
+            path: cold_seg.to_string_lossy().into_owned(),
+            start_time: 5000.0,
+            end_time: 5010.0,
+            duration: 10.0,
+            motion: 3,
+            objects: 1,
+            dbfs: 0,
+            segment_size: 0.002,
+            regions: 0,
+            motion_heatmap: None,
+        })
+        .unwrap();
+
+        let progress_vals: Arc<std::sync::Mutex<Vec<f64>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let progress_sink = progress_vals.clone();
+        build_mp4_export_with_progress(Mp4ExportRequest {
+            db: &db,
+            media_dir: &media_dir,
+            cold_dir: Some(&cold_dir),
+            export_id: "exp_cold_ok",
+            camera: "front_door",
+            name: "Cold Tier Clip",
+            start_time: 5000.0,
+            end_time: 5010.0,
+            include_audio: true,
+            privacy_mask: None,
+            cancel_token: None,
+            on_progress: Some(Arc::new(move |p| {
+                progress_sink.lock().unwrap().push(p);
+            })),
+        })
+        .await
+        .expect("cold-tier export must succeed when cold_dir is supplied");
+
+        assert!(media_dir.join("exports/exp_cold_ok.mp4").exists());
+        let recorded_p = progress_vals.lock().unwrap().clone();
+        assert!(
+            recorded_p.last().copied() == Some(1.0),
+            "progress callback must end at 1.0, got {recorded_p:?}"
+        );
+
+        // 2. Multi-segment files containing a real `moov` box whose video bitstream is invalid
+        //    must fail closed instead of silently truncating to `existing_paths[0]` (10s).
+        let hot_cam_dir = media_dir.join("recordings/2026-11-01/13/front_door");
+        std::fs::create_dir_all(&hot_cam_dir).unwrap();
+        let mut corrupt_moov_mp4 = Vec::new();
+        // ftyp (16 bytes) + moov (16 bytes) + mdat (2048 bytes of garbage)
+        corrupt_moov_mp4.extend_from_slice(&16u32.to_be_bytes());
+        corrupt_moov_mp4.extend_from_slice(b"ftypisom\x00\x00\x02\x00");
+        corrupt_moov_mp4.extend_from_slice(&16u32.to_be_bytes());
+        corrupt_moov_mp4.extend_from_slice(b"moov\x00\x00\x00\x08free");
+        corrupt_moov_mp4.extend_from_slice(&2056u32.to_be_bytes());
+        corrupt_moov_mp4.extend_from_slice(b"mdat");
+        corrupt_moov_mp4.extend_from_slice(&vec![0xFFu8; 2048]);
+
+        let seg_a = hot_cam_dir.join("00.00.mp4");
+        let seg_b = hot_cam_dir.join("00.10.mp4");
+        std::fs::write(&seg_a, &corrupt_moov_mp4).unwrap();
+        std::fs::write(&seg_b, &corrupt_moov_mp4).unwrap();
+        assert!(mp4_file_has_moov_box(&seg_a));
+        assert!(!mp4_file_has_moov_box(&cold_seg));
+
+        for (id, p, st) in [("m1", &seg_a, 8000.0), ("m2", &seg_b, 8010.0)] {
+            db.insert_recording(&RecordingRow {
+                id: id.to_string(),
+                camera: "front_door".to_string(),
+                path: p.to_string_lossy().into_owned(),
+                start_time: st,
+                end_time: st + 10.0,
+                duration: 10.0,
+                motion: 1,
+                objects: 0,
+                dbfs: 0,
+                segment_size: 0.002,
+                regions: 0,
+                motion_heatmap: None,
+            })
+            .unwrap();
+        }
+
+        let err_multi = build_mp4_export_with_progress(Mp4ExportRequest {
+            db: &db,
+            media_dir: &media_dir,
+            cold_dir: Some(&cold_dir),
+            export_id: "exp_corrupt_multi",
+            camera: "front_door",
+            name: "Corrupt Multi",
+            start_time: 8000.0,
+            end_time: 8020.0,
+            include_audio: true,
+            privacy_mask: None,
+            cancel_token: None,
+            on_progress: None,
+        })
+        .await;
+        assert!(
+            err_multi.is_err(),
+            "corrupt multi-segment moov export must fail closed instead of silently copying segment 0"
+        );
+        assert!(!media_dir.join("exports/exp_corrupt_multi.mp4").exists());
+
+        // 3. Pre-cancelled `cancel_token` aborts immediately and cleans up `in_progress` row
+        db.insert_export(&ninjanvr_db::ExportRow {
+            id: "exp_pre_cancel".to_string(),
+            camera: "front_door".to_string(),
+            name: "Cancelled Clip".to_string(),
+            date: 5005.0,
+            video_path: "/media/ninjanvr/exports/exp_pre_cancel.mp4".to_string(),
+            thumb_path: "/media/ninjanvr/clips/exp_pre_cancel.webp".to_string(),
+            in_progress: true,
+        })
+        .unwrap();
+        let cancel_tok = Arc::new(AtomicBool::new(true));
+        let err_cancel = build_mp4_export_with_progress(Mp4ExportRequest {
+            db: &db,
+            media_dir: &media_dir,
+            cold_dir: Some(&cold_dir),
+            export_id: "exp_pre_cancel",
+            camera: "front_door",
+            name: "Cancelled Clip",
+            start_time: 5000.0,
+            end_time: 5010.0,
+            include_audio: true,
+            privacy_mask: None,
+            cancel_token: Some(cancel_tok),
+            on_progress: None,
+        })
+        .await;
+        assert!(err_cancel.is_err());
+        assert!(db.get_export_by_id("exp_pre_cancel").unwrap().is_none());
 
         let _ = std::fs::remove_dir_all(&root);
     }

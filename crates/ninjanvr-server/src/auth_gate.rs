@@ -1455,11 +1455,16 @@ pub async fn auth_gate_middleware(
                         | "latest.webp"
                         | "latest.jpg"
                         | "snapshot.jpg"
+                        | "frame"
+                        | "frame.jpg"
                 ) && !(first == "recordings" && after_first == "summary");
                 if is_camera_subroute {
                     Some(first)
                 } else if first == "preview" {
-                    if after_first.contains("/start/") {
+                    if after_first.contains("/start/")
+                        || after_first.contains("/frame/")
+                        || after_first.contains("/at/")
+                    {
                         let p_cam = after_first.split('/').next().unwrap_or("");
                         if p_cam.is_empty() || p_cam == "all" {
                             None
@@ -3741,7 +3746,7 @@ pub fn filter_ws_message_for_allowed_cameras(
             .to_string(),
         );
     }
-    if clean_topic == "events" || clean_topic == "reviews" {
+    if clean_topic == "events" || clean_topic == "reviews" || clean_topic == "exports" {
         let payload_val: Value = match parsed.get("payload") {
             Some(Value::String(s)) => serde_json::from_str(s).ok()?,
             Some(v @ Value::Object(_)) => v.clone(),

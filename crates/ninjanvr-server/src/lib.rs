@@ -8,6 +8,7 @@ pub mod camera_protocols;
 pub mod config_coordinator;
 pub mod dataset_catalog;
 pub mod detector_manager;
+pub mod export_jobs;
 pub mod face_gallery;
 pub mod live_gateway;
 pub mod media_lifecycle;
@@ -64,8 +65,9 @@ use ninjanvr_config::{
 use ninjanvr_db::{CameraScope, EventFilter, ExportRow, NinjaDatabase, ReviewFilter};
 use ninjanvr_infer::AiDetectorEngine;
 use ninjanvr_media::{
-    RecordingEngine, SharedActivityLedger, build_mp4_export_with_privacy, new_activity_ledger,
-    probe_storage_writable,
+    Mp4ExportRequest, RecordingEngine, SharedActivityLedger, build_mp4_export_with_progress,
+    extract_historical_frame_jpeg, new_activity_ledger, probe_storage_writable,
+    resolve_export_segment_path,
 };
 use pipeline::{SharedCameraMetrics, SharedLatestYuvFrames, VisionPipeline};
 use serde::{Deserialize, Serialize};
@@ -99,6 +101,8 @@ pub struct AppState {
     pub latest_frames: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     pub latest_yuv_frames: SharedLatestYuvFrames,
     pub preview_frames: preview_frames::PreviewFrameStore,
+    pub historical_frames: export_jobs::HistoricalFrameCache,
+    pub export_jobs: export_jobs::ExportJobManager,
     pub lazy_snapshot_cache: Arc<RwLock<HashMap<LazySnapshotCacheKey, LazySnapshotCacheValue>>>,
     pub mse_hub: MseStreamHub,
     pub activity_ledger: SharedActivityLedger,
@@ -394,7 +398,8 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/exports/delete", post(api_exports_bulk_delete))
         .route("/share", get(api_share_list).post(api_share_create))
         .route("/share/{id}", delete(api_share_revoke))
-        .route("/jobs/export", get(api_empty_array))
+        .route("/jobs/export", get(api_export_jobs_list))
+        .route("/jobs/export/{id}/cancel", post(api_export_job_cancel))
         .route("/cases", get(api_cases).post(api_case_create))
         .route(
             "/export/{camera}/start/{start}/end/{end}",
@@ -408,8 +413,13 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         )
         .route(
             "/preview/{camera}/start/{start}/end/{end}/frames",
-            get(api_empty_array),
+            get(api_preview_camera_frames),
         )
+        .route(
+            "/preview/{camera}/frame/{frame}",
+            get(api_preview_camera_frame),
+        )
+        .route("/preview/{camera}/at/{target}", get(api_preview_camera_at))
         .route(
             "/preview/{preview_name}/thumbnail.webp",
             get(api_preview_thumbnail),
@@ -457,6 +467,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         )
         .route("/{camera}/latest.webp", get(api_camera_latest_frame))
         .route("/{camera}/latest.jpg", get(api_camera_latest_frame))
+        .route("/{camera}/frame", get(api_camera_historical_frame))
         .route("/{camera}/snapshot.jpg", get(api_camera_snapshot_download))
         .route("/labels", get(api_labels))
         .route("/sub_labels", get(api_sub_labels))
@@ -7639,6 +7650,8 @@ pub struct CreateExportBody {
     pub include_audio: bool,
     #[serde(default)]
     pub strip_audio: bool,
+    #[serde(default, rename = "async")]
+    pub run_async: bool,
 }
 
 impl Default for CreateExportBody {
@@ -7647,8 +7660,94 @@ impl Default for CreateExportBody {
             name: None,
             include_audio: true,
             strip_audio: false,
+            run_async: false,
         }
     }
+}
+
+fn emit_export_job_ws(state: &AppState, job: &export_jobs::ExportJobSnapshot) {
+    if let Ok(payload) = serde_json::to_string(job) {
+        state.comms.publish_ws_only("exports", payload);
+    }
+}
+
+async fn api_export_jobs_list(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Json<Value> {
+    let allowed = state
+        .auth_gate
+        .authenticate_read(&state, &jar, &headers)
+        .await
+        .map_or_else(|_| Some(Vec::new()), |p| p.allowed_cameras);
+    let jobs = state
+        .export_jobs
+        .list_for_allowed_cameras(allowed.as_deref(), unix_now() as f64);
+    Json(json!(jobs))
+}
+
+async fn api_export_job_cancel(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    uri: Uri,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    if let Some(err_resp) = verify_caller_can_mutate(&state, &jar, &headers).await {
+        return err_resp.into_response();
+    }
+    if !is_safe_id(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Invalid export identifier" })),
+        )
+            .into_response();
+    }
+    let existing_job = state.export_jobs.get(&id);
+    let target_cam = existing_job.as_ref().map(|j| j.camera.clone()).or_else(|| {
+        state
+            .db
+            .get_export_by_id(&id)
+            .ok()
+            .flatten()
+            .and_then(|exp| exp["camera"].as_str().map(|s| s.trim().to_string()))
+    });
+    let Some(cam) = target_cam else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": "Export job not found" })),
+        )
+            .into_response();
+    };
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == &cam || a == "*")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Camera is not permitted for this user"
+            })),
+        )
+            .into_response();
+    }
+    let now = unix_now() as f64;
+    if let Some(snap) = state.export_jobs.cancel(&id, now) {
+        emit_export_job_ws(&state, &snap);
+        return Json(json!({ "success": true, "job": snap })).into_response();
+    }
+    Json(json!({ "success": true })).into_response()
 }
 
 struct ExportInProgressGuard {
@@ -7739,9 +7838,18 @@ async fn api_export_create(
         )
             .into_response();
     }
-    let camera_configured = {
+    let (camera_configured, cold_dir_opt, privacy_mask) = {
         let cfg = state.config.read().await;
-        cfg.cameras.contains_key(&camera)
+        let configured = cfg.cameras.contains_key(&camera);
+        let cold_dir = resolve_configured_cold_dir(&cfg);
+        let pmask = cfg.cameras.get(&camera).map(|c| {
+            normalize_privacy_mask_value_for_resolution(
+                &c.privacy_mask,
+                c.detect.width.max(1),
+                c.detect.height.max(1),
+            )
+        });
+        (configured, cold_dir, pmask)
     };
     if !camera_configured {
         return (
@@ -7770,6 +7878,27 @@ async fn api_export_create(
         )
             .into_response();
     }
+    let parsed_body = body.map(|b| b.0).unwrap_or_default();
+    let run_async = parsed_body.run_async;
+    if run_async && !state.export_jobs.has_active_capacity() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "success": false,
+                "message": format!(
+                    "Export job queue is full (maximum {} active exports)",
+                    export_jobs::MAX_ACTIVE_EXPORT_JOBS
+                )
+            })),
+        )
+            .into_response();
+    }
+    let include_audio = parsed_body.include_audio && !parsed_body.strip_audio;
+    let name = parsed_body
+        .name
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("{camera} export"));
+
     let base_id = if start.fract() == 0.0 && end.fract() == 0.0 {
         format!("{camera}_{}_{}", start as u64, end as u64)
     } else {
@@ -7785,53 +7914,85 @@ async fn api_export_create(
     };
     let export_lock = acquire_share_clip_lock(&state, &base_id).await;
     let _export_guard = export_lock.lock().await;
-    let Ok(_sem_permit) = state.share_engine.ffmpeg_semaphore.acquire().await else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "success": false,
-                "message": "Export worker pool unavailable"
-            })),
-        )
-            .into_response();
+    let sync_sem_permit = if !run_async {
+        let Ok(permit) = state.share_engine.ffmpeg_semaphore.acquire().await else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "success": false,
+                    "message": "Export worker pool unavailable"
+                })),
+            )
+                .into_response();
+        };
+        Some(permit)
+    } else {
+        None
     };
-    let parsed_body = body.map(|b| b.0).unwrap_or_default();
-    let include_audio = parsed_body.include_audio && !parsed_body.strip_audio;
-    let name = parsed_body
-        .name
-        .unwrap_or_else(|| format!("{camera} export"));
+
     let now = unix_now() as f64;
     let state_for_reg = state.clone();
     let base_id_owned = base_id.clone();
     let cam_for_reg = camera.clone();
     let name_for_reg = name.clone();
+    let cold_for_reg = cold_dir_opt.clone();
     let reg_res = tokio::task::spawn_blocking(
-        move || -> std::result::Result<(String, String, String), String> {
-            let export_id_exists = |cand_id: &str| -> std::result::Result<bool, String> {
-                let in_db = state_for_reg
+        move || -> std::result::Result<(String, String, String), (StatusCode, String)> {
+            if run_async {
+                let mut segs = state_for_reg
                     .db
-                    .get_export_by_id(cand_id)
-                    .map_err(|e| e.to_string())?
-                    .is_some();
-                if in_db {
-                    return Ok(true);
+                    .query_recordings(&cam_for_reg, start, end)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                if segs.is_empty() {
+                    segs = state_for_reg
+                        .db
+                        .query_recordings(&cam_for_reg, start - 15.0, end + 15.0)
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
                 }
-                let mp4_exists = std::fs::symlink_metadata(
-                    state_for_reg
-                        .media_dir
-                        .join("exports")
-                        .join(format!("{cand_id}.mp4")),
-                )
-                .is_ok();
-                let webp_exists = std::fs::symlink_metadata(
-                    state_for_reg
-                        .media_dir
-                        .join("clips")
-                        .join(format!("{cand_id}.webp")),
-                )
-                .is_ok();
-                Ok(mp4_exists || webp_exists)
-            };
+                let has_any_disk_seg = segs.iter().any(|seg| {
+                    resolve_export_segment_path(
+                        &state_for_reg.media_dir,
+                        cold_for_reg.as_deref(),
+                        &cam_for_reg,
+                        &seg.path,
+                    )
+                    .is_some()
+                });
+                if !has_any_disk_seg {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "Export failed: no recording segments found on disk for {cam_for_reg} in [{start}, {end}]"
+                        ),
+                    ));
+                }
+            }
+            let export_id_exists =
+                |cand_id: &str| -> std::result::Result<bool, (StatusCode, String)> {
+                    let in_db = state_for_reg
+                        .db
+                        .get_export_by_id(cand_id)
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                        .is_some();
+                    if in_db {
+                        return Ok(true);
+                    }
+                    let mp4_exists = std::fs::symlink_metadata(
+                        state_for_reg
+                            .media_dir
+                            .join("exports")
+                            .join(format!("{cand_id}.mp4")),
+                    )
+                    .is_ok();
+                    let webp_exists = std::fs::symlink_metadata(
+                        state_for_reg
+                            .media_dir
+                            .join("clips")
+                            .join(format!("{cand_id}.webp")),
+                    )
+                    .is_ok();
+                    Ok(mp4_exists || webp_exists)
+                };
             let id = if !export_id_exists(&base_id_owned)? {
                 base_id_owned
             } else {
@@ -7844,7 +8005,11 @@ async fn api_export_create(
                     }
                 }
                 resolved_unique.ok_or_else(|| {
-                    "Failed to allocate a unique export identifier after 64 attempts".to_string()
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to allocate a unique export identifier after 64 attempts"
+                            .to_string(),
+                    )
                 })?
             };
             cleanup_share_clip_artifacts(&state_for_reg.media_dir, &id);
@@ -7861,22 +8026,20 @@ async fn api_export_create(
                     thumb_path: thumb_rel.clone(),
                     in_progress: true,
                 })
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to register export in database: {e}"),
+                    )
+                })?;
             Ok((id, video_rel, thumb_rel))
         },
     )
     .await;
     let (id, video_rel, thumb_rel) = match reg_res {
         Ok(Ok(triple)) => triple,
-        Ok(Err(err)) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "success": false,
-                    "message": format!("Failed to register export in database: {err}")
-                })),
-            )
-                .into_response();
+        Ok(Err((code, msg))) => {
+            return (code, Json(json!({ "success": false, "message": msg }))).into_response();
         }
         Err(join_err) => {
             return (
@@ -7898,34 +8061,195 @@ async fn api_export_create(
         armed: true,
     };
 
-    let db_clone = state.db.clone();
-    let media_dir_clone = state.media_dir.clone();
-    let id_clone = id.clone();
-    let privacy_mask = {
-        let cfg = state.config.read().await;
-        cfg.cameras.get(&camera).map(|c| {
-            normalize_privacy_mask_value_for_resolution(
-                &c.privacy_mask,
-                c.detect.width.max(1),
-                c.detect.height.max(1),
-            )
-        })
-    };
-    let export_res = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
-        build_mp4_export_with_privacy(
-            &db_clone,
-            &media_dir_clone,
-            &id_clone,
-            &camera,
-            &name,
+    if run_async {
+        drop(_export_guard);
+        let (queued_snap, cancel_flag) = match state.export_jobs.try_register_queued(
+            id.clone(),
+            camera.clone(),
+            name.clone(),
             start,
             end,
             include_audio,
-            privacy_mask.as_ref(),
-        ),
+            now,
+        ) {
+            Ok(pair) => pair,
+            Err(max_cap) => {
+                drop(in_progress_guard);
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({
+                        "success": false,
+                        "message": format!("Export job queue is full (maximum {max_cap} active exports)")
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        emit_export_job_ws(&state, &queued_snap);
+
+        let bg_state = state.clone();
+        let bg_id = id.clone();
+        let bg_cam = camera.clone();
+        let bg_name = name.clone();
+        let bg_cold = cold_dir_opt.clone();
+        let bg_mask = privacy_mask.clone();
+        tokio::spawn(async move {
+            let mut guard = in_progress_guard;
+            let permit_fut = bg_state
+                .export_jobs
+                .worker_semaphore
+                .clone()
+                .acquire_owned();
+            let mut cancel_poll = tokio::time::interval(Duration::from_millis(100));
+            cancel_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let _worker_permit = tokio::select! {
+                res = permit_fut => {
+                    match res {
+                        Ok(p) => p,
+                        Err(_) => {
+                            if let Some(snap) = bg_state.export_jobs.mark_failed(
+                                &bg_id,
+                                "Export worker pool shut down".to_string(),
+                                unix_now() as f64,
+                            ) {
+                                emit_export_job_ws(&bg_state, &snap);
+                            }
+                            return;
+                        }
+                    }
+                }
+                _ = async {
+                    loop {
+                        cancel_poll.tick().await;
+                        if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                    }
+                } => {
+                    drop(guard);
+                    return;
+                }
+            };
+
+            let Some(running_snap) = bg_state.export_jobs.mark_running(&bg_id, unix_now() as f64)
+            else {
+                drop(guard);
+                return;
+            };
+            emit_export_job_ws(&bg_state, &running_snap);
+
+            let prog_state = bg_state.clone();
+            let prog_id = bg_id.clone();
+            let on_progress: Arc<dyn Fn(f64) + Send + Sync> = Arc::new(move |frac: f64| {
+                if let Some((snap, should_emit)) =
+                    prog_state
+                        .export_jobs
+                        .update_progress(&prog_id, frac, unix_now() as f64)
+                    && should_emit
+                {
+                    emit_export_job_ws(&prog_state, &snap);
+                }
+            });
+
+            let adaptive_timeout_secs = ((end - start).ceil() as u64)
+                .saturating_mul(2)
+                .clamp(600, 7200);
+            let export_res = tokio::time::timeout(
+                Duration::from_secs(adaptive_timeout_secs),
+                build_mp4_export_with_progress(Mp4ExportRequest {
+                    db: &bg_state.db,
+                    media_dir: &bg_state.media_dir,
+                    cold_dir: bg_cold.as_deref(),
+                    export_id: &bg_id,
+                    camera: &bg_cam,
+                    name: &bg_name,
+                    start_time: start,
+                    end_time: end,
+                    include_audio,
+                    privacy_mask: bg_mask.as_ref(),
+                    cancel_token: Some(cancel_flag.clone()),
+                    on_progress: Some(on_progress),
+                }),
+            )
+            .await;
+
+            cleanup_share_clip_artifacts(&bg_state.media_dir, &bg_id);
+
+            match export_res {
+                Ok(Ok(())) => {
+                    if let Some(done_snap) = bg_state.export_jobs.mark_completed(
+                        &bg_id,
+                        format!("/exports/{bg_id}.mp4"),
+                        format!("/clips/{bg_id}.webp"),
+                        unix_now() as f64,
+                    ) {
+                        guard.disarm();
+                        emit_export_job_ws(&bg_state, &done_snap);
+                    } else {
+                        // Job was cancelled or deleted concurrently: keep `guard` armed so DB row and files are cleaned up!
+                        drop(guard);
+                    }
+                }
+                Ok(Err(err)) => {
+                    drop(guard);
+                    if let Some(fail_snap) =
+                        bg_state
+                            .export_jobs
+                            .mark_failed(&bg_id, err.to_string(), unix_now() as f64)
+                    {
+                        emit_export_job_ws(&bg_state, &fail_snap);
+                    }
+                }
+                Err(_) => {
+                    cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    drop(guard);
+                    if let Some(fail_snap) = bg_state.export_jobs.mark_failed(
+                        &bg_id,
+                        "Export timed out while remuxing MP4 segments".to_string(),
+                        unix_now() as f64,
+                    ) {
+                        emit_export_job_ws(&bg_state, &fail_snap);
+                    }
+                }
+            }
+        });
+
+        return (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "success": true,
+                "queued": true,
+                "export_id": id,
+                "video_url": format!("/exports/{id}.mp4"),
+                "thumb_url": format!("/clips/{id}.webp"),
+                "job": queued_snap
+            })),
+        )
+            .into_response();
+    }
+
+    let db_clone = state.db.clone();
+    let media_dir_clone = state.media_dir.clone();
+    let id_clone = id.clone();
+    let export_res = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        build_mp4_export_with_progress(Mp4ExportRequest {
+            db: &db_clone,
+            media_dir: &media_dir_clone,
+            cold_dir: cold_dir_opt.as_deref(),
+            export_id: &id_clone,
+            camera: &camera,
+            name: &name,
+            start_time: start,
+            end_time: end,
+            include_audio,
+            privacy_mask: privacy_mask.as_ref(),
+            cancel_token: None,
+            on_progress: None,
+        }),
     )
     .await;
+    drop(sync_sem_permit);
 
     cleanup_share_clip_artifacts(&state.media_dir, &id);
 
@@ -8104,6 +8428,7 @@ async fn api_export_delete(
         )
             .into_response();
     }
+    state.export_jobs.remove(&id);
     let state_for_del = state.clone();
     let _ = tokio::task::spawn_blocking(move || {
         media_lifecycle::delete_export_with_artifacts(
@@ -8183,6 +8508,7 @@ async fn api_exports_bulk_delete(
             }
         }
         for id in ids {
+            state_for_del.export_jobs.remove(&id);
             if let Err(err) =
                 state_for_del
                     .share_engine
@@ -8255,6 +8581,403 @@ async fn api_previews(
         });
     }
     Json(Value::Array(previews)).into_response()
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct PreviewCameraFramesQuery {
+    pub limit: Option<usize>,
+}
+
+async fn api_preview_camera_frames(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    AxumPath((camera, start, end)): AxumPath<(String, f64, f64)>,
+    Query(q): Query<PreviewCameraFramesQuery>,
+) -> Response {
+    if camera.is_empty()
+        || camera == "all"
+        || !is_safe_id(&camera)
+        || !start.is_finite()
+        || !end.is_finite()
+        || start < 0.0
+        || end < start
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "message": "Invalid preview frames query parameters" })),
+        )
+            .into_response();
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == &camera || a == "*")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "Camera is not permitted for this user" })),
+        )
+            .into_response();
+    }
+    let limit = q.limit.unwrap_or(180).clamp(1, 360);
+    let from_ms = (start * 1000.0).floor().max(0.0) as u64;
+    let to_ms = (end * 1000.0).ceil().max(from_ms as f64) as u64;
+    let frames: Vec<Value> = state
+        .preview_frames
+        .range(&camera, from_ms, to_ms, limit)
+        .into_iter()
+        .map(|ts| {
+            json!({
+                "ts": ts as f64 / 1000.0,
+                "ts_ms": ts,
+                "url": format!("/api/preview/{camera}/frame/{ts}.jpg")
+            })
+        })
+        .collect();
+    (
+        [(header::CACHE_CONTROL, "private, no-store")],
+        Json(Value::Array(frames)),
+    )
+        .into_response()
+}
+
+async fn api_preview_camera_frame(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    AxumPath((camera, frame)): AxumPath<(String, String)>,
+) -> Response {
+    if camera.is_empty() || !is_safe_id(&camera) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(ts) = preview_frames::parse_preview_frame_name(&frame) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == &camera || a == "*")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "Camera is not permitted for this user" })),
+        )
+            .into_response();
+    }
+    if !state.preview_frames.contains(&camera, ts) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(path) = state.preview_frames.frame_path(&camera, ts) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(bytes) = read_bounded_non_symlink_bytes(&path, MAX_SNAPSHOT_FRAME_BYTES as u64).await
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let priv_mask = camera_privacy_mask_value(&state.config, &camera).await;
+    let (bytes, _) = redact_image_bytes_with_privacy_mask_async(bytes, priv_mask, true).await;
+    (
+        [
+            (header::CONTENT_TYPE, "image/jpeg"),
+            (header::CACHE_CONTROL, "private, max-age=86400, immutable"),
+            (
+                header::HeaderName::from_static("x-frame-source"),
+                "preview_store",
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct HistoricalFrameQuery {
+    pub ts: Option<f64>,
+    pub w: Option<u32>,
+}
+
+async fn serve_historical_camera_frame_at_ms(
+    state: AppState,
+    jar: CookieJar,
+    headers: HeaderMap,
+    camera: String,
+    ts_ms: u64,
+    requested_width: u32,
+) -> Response {
+    const MAX_PREVIEW_TS_MS: u64 = 4_102_444_800_000;
+    if camera.is_empty() || !is_safe_id(&camera) || ts_ms > MAX_PREVIEW_TS_MS {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == &camera || a == "*")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "Camera is not permitted for this user" })),
+        )
+            .into_response();
+    }
+    let width = requested_width.clamp(160, 960);
+
+    // Tier 1: Zero-CPU RAM-indexed PreviewFrameStore when within ±1.5s and thumbnail resolution
+    if width <= 360
+        && let Some(near_ts) = state.preview_frames.nearest(&camera, ts_ms, 1_500)
+        && let Some(path) = state.preview_frames.frame_path(&camera, near_ts)
+        && let Some(bytes) =
+            read_bounded_non_symlink_bytes(&path, MAX_SNAPSHOT_FRAME_BYTES as u64).await
+    {
+        let priv_mask = camera_privacy_mask_value(&state.config, &camera).await;
+        let (bytes, _) = redact_image_bytes_with_privacy_mask_async(bytes, priv_mask, true).await;
+        return (
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "private, max-age=3600"),
+                (
+                    header::HeaderName::from_static("x-frame-source"),
+                    "preview_store",
+                ),
+            ],
+            bytes,
+        )
+            .into_response();
+    }
+
+    // Tier 2: Bounded LRU cache + on-demand FFmpeg extraction from covering hot/cold segment or hourly preview
+    let (cold_dir_opt, priv_mask) = {
+        let cfg = state.config.read().await;
+        let cold = resolve_configured_cold_dir(&cfg);
+        let pmask = cfg.cameras.get(&camera).map(|c| {
+            normalize_privacy_mask_value_for_resolution(
+                &c.privacy_mask,
+                c.detect.width.max(1),
+                c.detect.height.max(1),
+            )
+        });
+        (cold, pmask)
+    };
+    let mask_sig = priv_mask
+        .as_ref()
+        .and_then(|v| serde_json::to_string(v).ok())
+        .unwrap_or_default();
+    let bucket_step_ms = if ts_ms.is_multiple_of(1000) {
+        1000u64
+    } else {
+        250u64
+    };
+    let bucket_ms = (ts_ms / bucket_step_ms) * bucket_step_ms;
+    let cache_key = export_jobs::HistoricalFrameKey {
+        camera: camera.clone(),
+        bucket_ms,
+        width,
+        mask_sig,
+    };
+    if let Some((cached_bytes, src_label)) = state.historical_frames.get(&cache_key) {
+        return (
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "private, max-age=3600"),
+                (header::HeaderName::from_static("x-frame-source"), src_label),
+            ],
+            cached_bytes,
+        )
+            .into_response();
+    }
+
+    let ts_sec = bucket_ms as f64 / 1000.0;
+    let state_for_lookup = state.clone();
+    let cam_for_lookup = camera.clone();
+    let cold_for_lookup = cold_dir_opt.clone();
+    let lookup_res = tokio::task::spawn_blocking(
+        move || -> Option<(PathBuf, f64, Option<f64>, &'static str)> {
+            // 1. Covering raw recording segment (hot or cold tier)
+            if let Ok(segs) =
+                state_for_lookup
+                    .db
+                    .query_recordings(&cam_for_lookup, ts_sec - 30.0, ts_sec + 5.0)
+            {
+                let mut best_seg: Option<(f64, PathBuf, f64, f64)> = None;
+                for seg in segs {
+                    let in_span = ts_sec >= seg.start_time - 0.5 && ts_sec <= seg.end_time + 1.0;
+                    let dist = if ts_sec < seg.start_time {
+                        seg.start_time - ts_sec
+                    } else if ts_sec > seg.end_time {
+                        ts_sec - seg.end_time
+                    } else {
+                        0.0
+                    };
+                    if !in_span && dist > 1.5 {
+                        continue;
+                    }
+                    if let Some(safe_path) = media_lifecycle::resolve_contained_recording_segment(
+                        &state_for_lookup.media_dir,
+                        cold_for_lookup.as_deref(),
+                        Some(&cam_for_lookup),
+                        &seg.path,
+                    ) {
+                        let seg_dur = if seg.duration.is_finite() && seg.duration > 0.0 {
+                            seg.duration
+                        } else {
+                            (seg.end_time - seg.start_time).max(1.0)
+                        };
+                        let offset = (ts_sec - seg.start_time).max(0.0);
+                        if best_seg
+                            .as_ref()
+                            .is_none_or(|(b_dist, _, _, _)| dist < *b_dist)
+                        {
+                            best_seg = Some((dist, safe_path, offset, seg_dur));
+                            if dist == 0.0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if let Some((_, safe_path, offset, seg_dur)) = best_seg {
+                    return Some((safe_path, offset, Some(seg_dur), "segment"));
+                }
+            }
+
+            // 2. Fallback to hourly timelapse preview MP4 ONLY when all raw segments for that hour
+            //    were pruned AND the hourly preview covers the span continuously without offline holes.
+            if let Ok(previews) =
+                state_for_lookup
+                    .db
+                    .query_previews(&cam_for_lookup, ts_sec - 3600.0, ts_sec + 60.0)
+            {
+                let previews_root = state_for_lookup
+                    .media_dir
+                    .join("clips")
+                    .join("previews")
+                    .join(&cam_for_lookup);
+                let canon_prev_root = std::fs::canonicalize(&previews_root).ok();
+                for prev in previews {
+                    let p_start = prev["start"]
+                        .as_f64()
+                        .or_else(|| prev["start_time"].as_f64())
+                        .unwrap_or(0.0);
+                    let p_end = prev["end"]
+                        .as_f64()
+                        .or_else(|| prev["end_time"].as_f64())
+                        .unwrap_or(0.0);
+                    let p_dur = prev["duration"].as_f64().unwrap_or(0.0);
+                    if p_end <= p_start || ts_sec < p_start - 1.0 || ts_sec > p_end + 1.0 {
+                        continue;
+                    }
+                    // If raw segments still exist in `[p_start, p_end]`, `ts_sec` is an unrecorded gap!
+                    let raw_still_present = state_for_lookup
+                        .db
+                        .query_recordings(&cam_for_lookup, p_start, p_end)
+                        .is_ok_and(|r| !r.is_empty());
+                    if raw_still_present {
+                        continue;
+                    }
+                    // Skip gappy hourly previews whose recorded duration is >30s shorter than `[p_start, p_end]`
+                    let wall_span = (p_end - p_start).max(0.0);
+                    if p_dur <= 0.0 || wall_span - p_dur > 30.0 {
+                        continue;
+                    }
+                    let Some(raw_p) = prev["src"].as_str().or_else(|| prev["path"].as_str()) else {
+                        continue;
+                    };
+                    let disk_p = if raw_p.starts_with("/clips/") {
+                        state_for_lookup
+                            .media_dir
+                            .join(raw_p.trim_start_matches('/'))
+                    } else {
+                        media_lifecycle::resolve_recording_disk_path(
+                            &state_for_lookup.media_dir,
+                            raw_p,
+                        )
+                    };
+                    if std::fs::symlink_metadata(&disk_p).is_ok_and(|m| m.file_type().is_file())
+                        && let (Some(root_c), Ok(canon_p)) =
+                            (&canon_prev_root, std::fs::canonicalize(&disk_p))
+                        && canon_p.starts_with(root_c)
+                    {
+                        if let Some(probed_dur) = ninjanvr_media::probe_mp4_duration_fast(&canon_p)
+                            && probed_dur > 0.0
+                            && wall_span - probed_dur > 30.0
+                        {
+                            continue;
+                        }
+                        let offset = (ts_sec - p_start).max(0.0);
+                        return Some((canon_p, offset, Some(p_dur), "hourly_preview"));
+                    }
+                }
+            }
+            None
+        },
+    )
+    .await
+    .ok()
+    .flatten();
+
+    let Some((source_path, offset_sec, duration_hint, source_kind)) = lookup_res else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let Ok(Ok(_permit)) = tokio::time::timeout(
+        Duration::from_secs(5),
+        state.historical_frames.extract_semaphore.acquire(),
+    )
+    .await
+    else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
+
+    let Ok(raw_jpeg) =
+        extract_historical_frame_jpeg(&source_path, offset_sec, duration_hint, width).await
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let (redacted_vec, _) =
+        redact_image_bytes_with_privacy_mask_async(raw_jpeg, priv_mask, true).await;
+    let out_bytes = Bytes::from(redacted_vec);
+    state
+        .historical_frames
+        .insert(cache_key, out_bytes.clone(), source_kind);
+
+    (
+        [
+            (header::CONTENT_TYPE, "image/jpeg"),
+            (header::CACHE_CONTROL, "private, max-age=3600"),
+            (
+                header::HeaderName::from_static("x-frame-source"),
+                source_kind,
+            ),
+        ],
+        out_bytes,
+    )
+        .into_response()
+}
+
+async fn api_preview_camera_at(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    AxumPath((camera, target)): AxumPath<(String, String)>,
+    Query(q): Query<HistoricalFrameQuery>,
+) -> Response {
+    let Some(ts_ms) = preview_frames::parse_preview_frame_name(&target) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    serve_historical_camera_frame_at_ms(state, jar, headers, camera, ts_ms, q.w.unwrap_or(320))
+        .await
+}
+
+async fn api_camera_historical_frame(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    AxumPath(camera): AxumPath<String>,
+    Query(q): Query<HistoricalFrameQuery>,
+) -> Response {
+    let Some(ts_sec) = q.ts.filter(|t| t.is_finite() && *t >= 0.0) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "message": "Query parameter 'ts' must be a non-negative finite unix timestamp" })),
+        )
+            .into_response();
+    };
+    let ts_ms = (ts_sec * 1000.0).round() as u64;
+    serve_historical_camera_frame_at_ms(state, jar, headers, camera, ts_ms, q.w.unwrap_or(320))
+        .await
 }
 
 async fn api_preview_thumbnail(
@@ -12605,6 +13328,8 @@ pub async fn new_app_state(
         latest_frames,
         latest_yuv_frames,
         preview_frames: preview_frame_store,
+        historical_frames: export_jobs::HistoricalFrameCache::default(),
+        export_jobs: export_jobs::ExportJobManager::default(),
         lazy_snapshot_cache,
         mse_hub,
         activity_ledger,
@@ -31747,5 +32472,421 @@ cameras:
         assert_eq!(parsed_vs, vec!["VideoSource000".to_string()]);
 
         srv_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn async_export_jobs_and_timeline_preview_frames_enforce_scoping_and_lifecycle() {
+        let ctx = setup_test_app().await;
+        let state = ctx.state.clone();
+        let auth_app = build_router_with_auth(state.clone(), true);
+        let now = unix_now();
+        let mint_jwt = |sub: &str, role: &str, cams: Option<&str>| -> String {
+            jsonwebtoken::encode(
+                &Header::new(Algorithm::HS256),
+                &JwtClaims {
+                    sub: sub.to_string(),
+                    role: role.to_string(),
+                    allowed_cameras: cams.map(str::to_string),
+                    iat: now,
+                    exp: now + 3600,
+                },
+                &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+            )
+            .unwrap()
+        };
+        state
+            .db
+            .create_user_with_cameras("op_front", "pass1234", "operator", "front_door", 1000)
+            .unwrap();
+        let op_front_bearer = format!(
+            "Bearer {}",
+            mint_jwt("op_front", "operator", Some("front_door"))
+        );
+        let admin_bearer = format!("Bearer {}", mint_jwt("admin", "admin", Some("*")));
+
+        // 1. Seed two recent preview frames in PreviewFrameStore for `front_door` and one for `backyard`
+        let base_sec = now.saturating_sub(120);
+        let t1_ms = base_sec * 1000 + 2_000;
+        let t2_ms = base_sec * 1000 + 5_500;
+        let t_back_ms = base_sec * 1000 + 3_000;
+        let mut tiny_rgb = image::RgbImage::new(32, 18);
+        for p in tiny_rgb.pixels_mut() {
+            *p = image::Rgb([40, 120, 200]);
+        }
+        let mut jpeg_buf = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, 75)
+            .encode_image(&tiny_rgb)
+            .unwrap();
+        state
+            .preview_frames
+            .write_frame("front_door", t1_ms, &jpeg_buf)
+            .unwrap();
+        state
+            .preview_frames
+            .write_frame("front_door", t2_ms, &jpeg_buf)
+            .unwrap();
+        state
+            .preview_frames
+            .write_frame("backyard", t_back_ms, &jpeg_buf)
+            .unwrap();
+
+        // List frames for permitted camera -> returns the 2 indexed frames
+        let r_list = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/preview/front_door/start/{base_sec}/end/{}/frames",
+                        base_sec + 10
+                    ))
+                    .header(header::AUTHORIZATION, &op_front_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_list.status(), StatusCode::OK);
+        let list_j: Value =
+            serde_json::from_slice(&to_bytes(r_list.into_body(), 16384).await.unwrap()).unwrap();
+        let frames_arr = list_j.as_array().unwrap();
+        assert_eq!(frames_arr.len(), 2);
+        assert_eq!(
+            frames_arr[0]["url"],
+            format!("/api/preview/front_door/frame/{t1_ms}.jpg")
+        );
+
+        // Fetch exact frame & nearest `/at/` frame -> 200 image/jpeg with x-frame-source: preview_store
+        for ok_uri in [
+            format!("/api/preview/front_door/frame/{t1_ms}.jpg"),
+            format!("/api/preview/front_door/at/{}.jpg", t1_ms + 400),
+            format!(
+                "/api/front_door/frame?ts={:.3}",
+                (t2_ms - 300) as f64 / 1000.0
+            ),
+        ] {
+            let r_img = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&ok_uri)
+                        .header(header::AUTHORIZATION, &op_front_bearer)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r_img.status(), StatusCode::OK, "expected 200 on {ok_uri}");
+            assert_eq!(
+                r_img
+                    .headers()
+                    .get("x-frame-source")
+                    .and_then(|v| v.to_str().ok()),
+                Some("preview_store")
+            );
+        }
+
+        // Unrecorded gap returns 404 (never falls back to live camera snapshot!)
+        let r_gap = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/preview/front_door/at/9000000.jpg")
+                    .header(header::AUTHORIZATION, &op_front_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_gap.status(), StatusCode::NOT_FOUND);
+
+        // Non-permitted camera frame endpoints return 403 Forbidden
+        for denied_uri in [
+            format!("/api/preview/backyard/frame/{t_back_ms}.jpg"),
+            format!("/api/preview/backyard/at/{t_back_ms}.jpg"),
+            format!("/api/backyard/frame?ts={:.3}", t_back_ms as f64 / 1000.0),
+        ] {
+            let r_den = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&denied_uri)
+                        .header(header::AUTHORIZATION, &op_front_bearer)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r_den.status(),
+                StatusCode::FORBIDDEN,
+                "expected 403 on {denied_uri}"
+            );
+        }
+
+        // 2. Async export pre-flight rejects empty unrecorded range immediately with 400 BAD_REQUEST
+        let r_async_empty = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/export/front_door/start/6000/end/6060")
+                    .header(header::AUTHORIZATION, &op_front_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"Empty Range","async":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_async_empty.status(), StatusCode::BAD_REQUEST);
+
+        // 3. Seed a cold-tier segment and run async export -> 202 Accepted -> completes in background
+        let cold_root = state.media_dir.parent().unwrap().join("cold_tier_async");
+        let cold_seg_dir = cold_root.join("2026-11-01/12/front_door");
+        std::fs::create_dir_all(&cold_seg_dir).unwrap();
+        {
+            let mut cfg = state.config.write().await;
+            cfg.record.storage_tiers.enabled = true;
+            cfg.record.storage_tiers.cold_dir = Some(cold_root.clone());
+        }
+        let seg_file = cold_seg_dir.join("00.00.mp4");
+        let mut stub_mp4 = vec![0u8; 2048];
+        stub_mp4[0..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p']);
+        std::fs::write(&seg_file, &stub_mp4).unwrap();
+        state
+            .db
+            .insert_recording(&ninjanvr_db::RecordingRow {
+                id: "async_cold_seg".to_string(),
+                camera: "front_door".to_string(),
+                path: seg_file.to_string_lossy().into_owned(),
+                start_time: 7200.0,
+                end_time: 7215.0,
+                duration: 15.0,
+                motion: 4,
+                objects: 1,
+                dbfs: 0,
+                segment_size: 0.002,
+                regions: 0,
+                motion_heatmap: None,
+            })
+            .unwrap();
+
+        let r_async_ok = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/export/front_door/start/7200/end/7215")
+                    .header(header::AUTHORIZATION, &op_front_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"name":"Async Cold Export","include_audio":true,"async":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_async_ok.status(), StatusCode::ACCEPTED);
+        let async_j: Value =
+            serde_json::from_slice(&to_bytes(r_async_ok.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(async_j["queued"], true);
+        let exp_id = async_j["export_id"].as_str().unwrap().to_string();
+
+        // Wait up to 3s for background completion
+        let mut completed = false;
+        for _ in 0..60 {
+            let r_jobs = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/jobs/export")
+                        .header(header::AUTHORIZATION, &op_front_bearer)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r_jobs.status(), StatusCode::OK);
+            let jobs_arr: Value =
+                serde_json::from_slice(&to_bytes(r_jobs.into_body(), 16384).await.unwrap())
+                    .unwrap();
+            if jobs_arr
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|j| j["id"] == exp_id && j["status"] == "completed")
+            {
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(completed, "async export job must transition to completed");
+        assert!(
+            state
+                .media_dir
+                .join("exports")
+                .join(format!("{exp_id}.mp4"))
+                .exists()
+        );
+
+        // 4. Scoped operator cannot cancel an admin backyard job
+        state.export_jobs.register_queued(
+            "backyard_job_1".to_string(),
+            "backyard".to_string(),
+            "Backyard Job".to_string(),
+            100.0,
+            200.0,
+            true,
+            now as f64,
+        );
+        let r_cancel_denied = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/jobs/export/backyard_job_1/cancel")
+                    .header(header::AUTHORIZATION, &op_front_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_cancel_denied.status(), StatusCode::FORBIDDEN);
+
+        let r_cancel_admin = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/jobs/export/backyard_job_1/cancel")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_cancel_admin.status(), StatusCode::OK);
+        assert_eq!(
+            state.export_jobs.get("backyard_job_1").unwrap().status,
+            export_jobs::ExportJobStatus::Cancelled
+        );
+
+        // 5. Mid-hour offline gap returns 404 even when an hourly preview row exists for that hour
+        let prev_dir = state.media_dir.join("clips/previews/front_door");
+        std::fs::create_dir_all(&prev_dir).unwrap();
+        let gappy_prev = prev_dir.join("7200-10800.mp4");
+        std::fs::write(&gappy_prev, vec![0u8; 256]).unwrap();
+        state
+            .db
+            .insert_preview(
+                "front_door_7200",
+                "front_door",
+                "/media/ninjanvr/clips/previews/front_door/7200-10800.mp4",
+                7200.0,
+                10800.0,
+                600.0, // Only 10m recorded out of 60m hour -> gappy!
+            )
+            .unwrap();
+        let r_mid_hour_gap = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/preview/front_door/at/9000000.jpg")
+                    .header(header::AUTHORIZATION, &op_front_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_mid_hour_gap.status(),
+            StatusCode::NOT_FOUND,
+            "mid-hour unrecorded gap must return 404 even when a gappy hourly preview exists"
+        );
+
+        // 5b. Positive pruned continuous hourly preview returns 200 OK with x-frame-source: hourly_preview
+        let cont_prev_mp4 = prev_dir.join("20000-20004.mp4");
+        let ff_gen = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=navy:s=64x36:r=1:d=4",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&cont_prev_mp4)
+            .status()
+            .await;
+        if ff_gen.is_ok_and(|s| s.success()) {
+            state
+                .db
+                .insert_preview(
+                    "front_door_20000",
+                    "front_door",
+                    "/media/ninjanvr/clips/previews/front_door/20000-20004.mp4",
+                    20_000.0,
+                    20_004.0,
+                    4.0,
+                )
+                .unwrap();
+            let r_cont_prev = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/preview/front_door/at/20002000.jpg")
+                        .header(header::AUTHORIZATION, &op_front_bearer)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r_cont_prev.status(), StatusCode::OK);
+            assert_eq!(
+                r_cont_prev
+                    .headers()
+                    .get("x-frame-source")
+                    .and_then(|v| v.to_str().ok()),
+                Some("hourly_preview")
+            );
+        }
+
+        // 6. Active export job queue cap returns 429 TOO_MANY_REQUESTS when full
+        for i in 0..export_jobs::MAX_ACTIVE_EXPORT_JOBS {
+            state
+                .export_jobs
+                .try_register_queued(
+                    format!("fill_{i}"),
+                    "front_door".to_string(),
+                    format!("Fill {i}"),
+                    7200.0,
+                    7215.0,
+                    true,
+                    now as f64,
+                )
+                .unwrap();
+        }
+        let r_queue_full = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/export/front_door/start/7200/end/7215")
+                    .header(header::AUTHORIZATION, &op_front_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"Overflow","async":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_queue_full.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let _ = std::fs::remove_dir_all(&cold_root);
     }
 }
