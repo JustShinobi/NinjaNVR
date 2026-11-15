@@ -3753,11 +3753,21 @@ pub async fn extract_historical_frame_jpeg(
         let vf = vf.clone();
         async move {
             let mut cmd = Command::new(&ffmpeg_bin);
-            cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
+            cmd.args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-threads",
+                "2",
+            ]);
             cmd.args(&seek_args);
             cmd.arg("-i")
                 .arg(&seg_arg)
                 .args([
+                    "-an",
+                    "-sn",
+                    "-dn",
                     "-frames:v",
                     "1",
                     "-vf",
