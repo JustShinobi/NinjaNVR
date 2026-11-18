@@ -191,6 +191,28 @@ export function resolveReviewLane(severity: string): { y: number; h: number } {
   return severity === "alert" ? { y: 2, h: 5 } : { y: 9, h: 5 };
 }
 
+/**
+ * Keyboard step delta (seconds) for ARIA `role="slider"` controls on `TimelineScrubber`:
+ * - Playhead track: `±5s` (`Shift+Arrow`: `±30s`)
+ * - IN `[` / OUT `]` trim handles: `±1s` (`Shift+Arrow`: `±0.25s`)
+ */
+export function computeTimelineSliderKeyStep(
+  sliderKind: "track" | "in" | "out",
+  key: string,
+  shiftKey = false
+): number | null {
+  const isBack = key === "ArrowLeft" || key === "ArrowDown";
+  const isFwd = key === "ArrowRight" || key === "ArrowUp";
+  if (!isBack && !isFwd) {
+    return null;
+  }
+  const dir = isBack ? -1 : 1;
+  if (sliderKind === "track") {
+    return dir * (shiftKey ? 30 : 5);
+  }
+  return dir * (shiftKey ? 0.25 : 1);
+}
+
 /** Text input that edits a unix timestamp as `HH:MM:SS` or `YYYY-MM-DD HH:MM:SS` for multi-day clips. */
 const ClockInput: React.FC<{
   value: number;
@@ -2355,7 +2377,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 selectedTime={toLocalTimeInputValue(displayAnchorTs)}
                 showTimePicker={true}
                 openUpward={true}
-                buttonLabelPrefix="Calendar"
+                buttonLabelPrefix={t.timeline.calendarPrefix}
                 onSelectDate={(dateStr, dayObj) => {
                   if (dayObj) {
                     handleSelectDay(dayObj);
@@ -2374,8 +2396,11 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               >
                 <Grid size={12} />
                 {showStoryboard
-                  ? "Hide Storyboard"
-                  : `Storyboard Scan (${windowReviews.length})`}
+                  ? t.timeline.hideStoryboard
+                  : t.timeline.showStoryboard.replace(
+                      "{count}",
+                      String(windowReviews.length)
+                    )}
               </button>
               <button
                 className="nvr-btn sm"
@@ -2514,11 +2539,18 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                       rev.camera
                     );
                     const isHov = hoveredStoryboardId === rev.id;
+                    const seekToStoryboardReview = () => {
+                      const ts = Math.floor(rev.start_time);
+                      setCustomWinEnd(
+                        clampWinEndContinuous(
+                          ts + Math.round(windowSpanSec * 0.5)
+                        )
+                      );
+                      onSeek(ts);
+                    };
                     return (
                       <div
                         key={rev.id}
-                        role="button"
-                        tabIndex={0}
                         onPointerEnter={() => setHoveredStoryboardId(rev.id)}
                         onPointerLeave={() =>
                           setHoveredStoryboardId((c) =>
@@ -2530,33 +2562,8 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                             c === rev.id ? null : c
                           )
                         }
-                        onBlur={() =>
-                          setHoveredStoryboardId((c) =>
-                            c === rev.id ? null : c
-                          )
-                        }
-                        onClick={() => {
-                          const ts = Math.floor(rev.start_time);
-                          setCustomWinEnd(
-                            clampWinEndContinuous(
-                              ts + Math.round(windowSpanSec * 0.5)
-                            )
-                          );
-                          onSeek(ts);
-                        }}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter" || e.key === " ") {
-                            e.preventDefault();
-                            const ts = Math.floor(rev.start_time);
-                            setCustomWinEnd(
-                              clampWinEndContinuous(
-                                ts + Math.round(windowSpanSec * 0.5)
-                              )
-                            );
-                            onSeek(ts);
-                          }
-                        }}
                         style={{
+                          position: "relative",
                           width: 148,
                           minWidth: 148,
                           background: "var(--bg-deep)",
@@ -2566,15 +2573,27 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                               : "1px solid var(--border-hairline)",
                           borderRadius: 3,
                           overflow: "hidden",
-                          cursor: "pointer",
                           flexShrink: 0,
                         }}
                       >
+                        <button
+                          type="button"
+                          className="nvr-card-overlay-btn"
+                          aria-label={`${rev.camera} ${formatHHMMSS(rev.start_time)}`}
+                          onFocus={() => setHoveredStoryboardId(rev.id)}
+                          onBlur={() =>
+                            setHoveredStoryboardId((c) =>
+                              c === rev.id ? null : c
+                            )
+                          }
+                          onClick={seekToStoryboardReview}
+                        />
                         <div
                           style={{
                             width: "100%",
                             height: 74,
                             position: "relative",
+                            pointerEvents: "none",
                           }}
                         >
                           {isHov ? (
@@ -2617,11 +2636,14 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                         <div
                           className="mono"
                           style={{
+                            position: "relative",
+                            zIndex: 2,
                             padding: "4px 6px",
                             display: "flex",
                             alignItems: "center",
                             justifyContent: "space-between",
                             fontSize: "var(--text-xs)",
+                            pointerEvents: "none",
                           }}
                         >
                           <span
@@ -2633,7 +2655,9 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                             {formatHHMMSS(rev.start_time)}
                           </span>
                           <button
+                            type="button"
                             className="nvr-btn sm"
+                            style={{ pointerEvents: "auto" }}
                             title="Open Segment Clipper on this exact event"
                             onClick={(e) => {
                               e.stopPropagation();
@@ -2753,7 +2777,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               title="Expand active timeline camera into Focus stage view"
               onClick={() => onFocusCamera(camera)}
             >
-              ⤢ Focus
+              ⤢ {t.live.focusCameraBtn}
             </button>
           )}
 
@@ -2763,7 +2787,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             selectedTime={toLocalTimeInputValue(displayAnchorTs)}
             showTimePicker={true}
             openUpward={true}
-            buttonLabelPrefix="Calendar"
+            buttonLabelPrefix={t.timeline.calendarPrefix}
             onSelectDate={(dateStr, dayObj) => {
               if (dayObj) {
                 handleSelectDay(dayObj);
@@ -2782,8 +2806,11 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           >
             <Grid size={12} />
             {showArchiveDeck
-              ? "Hide 24h Matrix"
-              : `24h Activity Matrix (${daysSummary.length || 1}d)`}
+              ? t.timeline.hide24hMatrix
+              : t.timeline.show24hMatrix.replace(
+                  "{days}",
+                  String(daysSummary.length || 1)
+                )}
           </button>
 
           <span
@@ -2794,7 +2821,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               className={`nvr-dot ${currentTs === null ? "live" : "motion"}`}
             />
             {currentTs === null
-              ? "LIVE EDGE"
+              ? t.timeline.liveEdge
               : formatFullDateTime(Math.round(currentTs))}
           </span>
 
@@ -2804,14 +2831,14 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             title="Jump to previous motion or person event (does not overwrite clip IN/OUT)"
           >
             <SkipBack size={11} />
-            Prev Event
+            {t.timeline.prevEvent}
           </button>
           <button
             className="nvr-btn sm"
             onClick={() => jumpToActivity("next")}
             title="Jump to next motion or person event (does not overwrite clip IN/OUT)"
           >
-            Next Event
+            {t.timeline.nextEvent}
             <SkipForward size={11} />
           </button>
 
@@ -2847,7 +2874,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 onSeek(null);
               }}
             >
-              Return to Live
+              {t.live.returnToLive}
             </button>
           )}
         </div>
@@ -2882,7 +2909,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 marginRight: 2,
               }}
             >
-              Zoom:
+              {t.timeline.zoomLabel}
             </span>
             {(
               [
@@ -3212,7 +3239,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           <button
             type="button"
             className={`nvr-btn sm mono ${effectiveIncludeAudio ? "active" : ""}`}
-            aria-label="Include Audio"
+            aria-label={t.timeline.includeAudioAria}
             aria-pressed={effectiveIncludeAudio}
             title={
               effectiveIncludeAudio
@@ -3364,10 +3391,24 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
         <div
           ref={trackRef}
           className="nvr-timeline-track"
+          role="slider"
+          tabIndex={0}
+          aria-label={t.timeline.sliderPlayheadAria.replace(
+            "{camera}",
+            camera || "camera"
+          )}
+          aria-valuemin={Math.round(winStart)}
+          aria-valuemax={Math.round(winEnd)}
+          aria-valuenow={Math.round(currentTs ?? nowSec)}
+          aria-valuetext={
+            currentTs === null
+              ? t.timeline.liveEdge
+              : formatFullDateTime(Math.round(currentTs))
+          }
           title={
             isPt
-              ? "Scroll = navegar janela · Ctrl+Scroll = Zoom · Clique = posicionar agulha · Shift+Arrastar IN/OUT = ajuste fino"
-              : "Wheel = pan window · Ctrl+Wheel = Zoom · Click = seek playhead · Shift+Drag IN/OUT = fine trim"
+              ? "Scroll = navegar janela · Ctrl+Scroll = Zoom · Clique = posicionar agulha · Setas = ±5s (Shift+Setas = ±30s)"
+              : "Wheel = pan window · Ctrl+Wheel = Zoom · Click = seek playhead · Arrow keys = ±5s (Shift+Arrow = ±30s)"
           }
           style={{
             position: "relative",
@@ -3378,6 +3419,34 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             cursor: draggingTarget === "track" ? "grabbing" : "grab",
             touchAction: "none",
             overflow: "visible",
+          }}
+          onKeyDown={(e) => {
+            if ((e.target as HTMLElement | null)?.closest?.("[data-handle]")) {
+              return;
+            }
+            const step = computeTimelineSliderKeyStep("track", e.key, e.shiftKey);
+            if (step !== null) {
+              e.preventDefault();
+              e.stopPropagation();
+              setIsPreviewingClip(false);
+              emitTrimState(null);
+              const next = clampArchiveTs((currentTs ?? winEnd) + step);
+              onSeek(step > 0 && next >= nowSec - 2 ? null : next);
+              return;
+            }
+            if (e.key === "Home") {
+              e.preventDefault();
+              e.stopPropagation();
+              setIsPreviewingClip(false);
+              emitTrimState(null);
+              onSeek(clampArchiveTs(winStart));
+            } else if (e.key === "End") {
+              e.preventDefault();
+              e.stopPropagation();
+              setIsPreviewingClip(false);
+              emitTrimState(null);
+              onSeek(null);
+            }
           }}
           onPointerMove={(e) => {
             if (draggingTarget === "in" || draggingTarget === "out") return;
@@ -3588,6 +3657,27 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               {clipGeometry.showInHandle && (
                 <div
                   data-handle="in"
+                  className="nvr-trim-handle is-in"
+                  role="slider"
+                  tabIndex={0}
+                  aria-label={t.timeline.sliderTrimInAria.replace(
+                    "{camera}",
+                    camera || "camera"
+                  )}
+                  aria-valuemin={Math.round(
+                    Math.max(minArchiveSec, rangeEnd - MAX_ARCHIVE_EXPORT_SPAN_SEC)
+                  )}
+                  aria-valuemax={Math.round(rangeEnd - 1)}
+                  aria-valuenow={Number(rangeStart.toFixed(2))}
+                  aria-valuetext={formatFullDateTime(Math.round(rangeStart))}
+                  onKeyDown={(e) => {
+                    const step = computeTimelineSliderKeyStep("in", e.key, e.shiftKey);
+                    if (step !== null) {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      nudgeBoundary("in", step);
+                    }
+                  }}
                   onPointerDown={(e) => {
                     e.stopPropagation();
                     const rect = trackRef.current?.getBoundingClientRect();
@@ -3618,22 +3708,9 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                   }}
                   title={
                     isPt
-                      ? "Arraste [ para ajustar INÍCIO (Segure Shift para ajuste fino)"
-                      : "Drag [ to adjust START time (Hold Shift for fine precision)"
+                      ? "Arraste [ ou use Setas (±1s, Shift+Setas ±0.25s) para ajustar INÍCIO"
+                      : "Drag [ or use Arrow keys (±1s, Shift+Arrow ±0.25s) to adjust START time"
                   }
-                  style={{
-                    position: "absolute",
-                    left: -13,
-                    top: -4,
-                    bottom: -4,
-                    width: 26,
-                    cursor: "ew-resize",
-                    touchAction: "none",
-                    pointerEvents: "auto",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                  }}
                 >
                   <span
                     className="mono"
@@ -3663,6 +3740,27 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               {clipGeometry.showOutHandle && (
                 <div
                   data-handle="out"
+                  className="nvr-trim-handle is-out"
+                  role="slider"
+                  tabIndex={0}
+                  aria-label={t.timeline.sliderTrimOutAria.replace(
+                    "{camera}",
+                    camera || "camera"
+                  )}
+                  aria-valuemin={Math.round(rangeStart + 1)}
+                  aria-valuemax={Math.round(
+                    Math.min(nowSec, rangeStart + MAX_ARCHIVE_EXPORT_SPAN_SEC)
+                  )}
+                  aria-valuenow={Number(rangeEnd.toFixed(2))}
+                  aria-valuetext={formatFullDateTime(Math.round(rangeEnd))}
+                  onKeyDown={(e) => {
+                    const step = computeTimelineSliderKeyStep("out", e.key, e.shiftKey);
+                    if (step !== null) {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      nudgeBoundary("out", step);
+                    }
+                  }}
                   onPointerDown={(e) => {
                     e.stopPropagation();
                     const rect = trackRef.current?.getBoundingClientRect();
@@ -3693,22 +3791,9 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                   }}
                   title={
                     isPt
-                      ? "Arraste ] para ajustar FIM (Segure Shift para ajuste fino)"
-                      : "Drag ] to adjust END time (Hold Shift for fine precision)"
+                      ? "Arraste ] ou use Setas (±1s, Shift+Setas ±0.25s) para ajustar FIM"
+                      : "Drag ] or use Arrow keys (±1s, Shift+Arrow ±0.25s) to adjust END time"
                   }
-                  style={{
-                    position: "absolute",
-                    right: -13,
-                    top: -4,
-                    bottom: -4,
-                    width: 26,
-                    cursor: "ew-resize",
-                    touchAction: "none",
-                    pointerEvents: "auto",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                  }}
                 >
                   <span
                     className="mono"

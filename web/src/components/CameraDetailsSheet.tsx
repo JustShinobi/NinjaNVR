@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { useSheetDismiss } from "../utils/useSheetDismiss";
 import { X } from "lucide-react";
 import type { CameraRuntimeFlag, CameraTelemetryRow } from "../utils/liveTileHud";
@@ -23,6 +23,8 @@ export interface CameraDetailsSheetProps {
   onClose: () => void;
   isPt?: boolean;
   canEdit?: boolean;
+  canReboot?: boolean;
+  onRebootCamera?: () => void;
 }
 
 const FLAG_ORDER: CameraRuntimeFlag[] = ["enabled", "detect", "record", "alerts"];
@@ -73,8 +75,20 @@ export const CameraDetailsSheet: React.FC<CameraDetailsSheetProps> = ({
   onClose,
   isPt = false,
   canEdit = true,
+  canReboot = false,
+  onRebootCamera,
 }) => {
   const sheetRef = useSheetDismiss<HTMLElement>(true, onClose);
+  const [confirmReboot, setConfirmReboot] = useState(false);
+  const confirmTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (confirmTimerRef.current !== null && typeof window !== "undefined") {
+        window.clearTimeout(confirmTimerRef.current);
+      }
+    };
+  }, []);
 
   const titleId = `nvr-details-title-${camera}`;
   return (
@@ -162,6 +176,43 @@ export const CameraDetailsSheet: React.FC<CameraDetailsSheetProps> = ({
               testId="flag-vectors"
             />
           </div>
+          {canReboot && onRebootCamera && (
+            <div className="nvr-sheet-row">
+              <span>{isPt ? "Hardware da câmera" : "Camera hardware"}</span>
+              <button
+                type="button"
+                className="nvr-btn danger mono"
+                data-testid={`sheet-reboot-${camera}`}
+                data-confirming={confirmReboot ? "true" : "false"}
+                onClick={() => {
+                  if (confirmReboot) {
+                    if (confirmTimerRef.current !== null && typeof window !== "undefined") {
+                      window.clearTimeout(confirmTimerRef.current);
+                      confirmTimerRef.current = null;
+                    }
+                    setConfirmReboot(false);
+                    onRebootCamera();
+                    return;
+                  }
+                  setConfirmReboot(true);
+                  if (typeof window !== "undefined") {
+                    confirmTimerRef.current = window.setTimeout(() => {
+                      confirmTimerRef.current = null;
+                      setConfirmReboot(false);
+                    }, 3000);
+                  }
+                }}
+              >
+                {confirmReboot
+                  ? isPt
+                    ? "Clique novamente para confirmar"
+                    : "Click again to confirm"
+                  : isPt
+                  ? "Reiniciar Câmera"
+                  : "Reboot Camera"}
+              </button>
+            </div>
+          )}
         </div>
       </section>
     </div>

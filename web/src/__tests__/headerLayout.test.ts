@@ -55,8 +55,8 @@ describe("desktop header collapses instead of scrolling sideways", () => {
     const app = await readSrcFile("../App.tsx");
     expect((app.match(/className="nvr-nav-label"/g) || []).length).toBe(7);
     expect((app.match(/className="nvr-nav-short" aria-hidden="true"/g) || []).length).toBe(7);
-    expect(app).toMatch(/aria-label="Cycle Console Theme \(Dark \/ Light \/ System\)"/);
-    expect(app).toMatch(/aria-label="Log out of NinjaNVR Console"/);
+    expect(app).toMatch(/aria-label=\{t\.theme\.cycleTooltip\}/);
+    expect(app).toMatch(/aria-label=\{t\.auth\.signOutAria\}/);
     expect((app.match(/className="nvr-telemetry-perf"/g) || []).length).toBe(2);
   });
 

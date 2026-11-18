@@ -14,6 +14,8 @@ import {
   RotateCcw,
   Rows2,
   Scissors,
+  Volume2,
+  VolumeX,
 } from "lucide-react";
 import { useI18n } from "../i18n";
 import {
@@ -551,6 +553,85 @@ export function createPtzMoveLifecycle(
   };
 }
 
+export type TwoStepConfirmKey = "delete_preset" | "trigger_siren" | "reboot_camera" | string;
+
+export interface TwoStepConfirmController {
+  getArmedKey: () => TwoStepConfirmKey | null;
+  isArmed: (key: TwoStepConfirmKey) => boolean;
+  /** Returns `true` on the confirming 2nd click within `timeoutMs`, or `false` on the arming 1st click. */
+  triggerOrArm: (key: TwoStepConfirmKey) => boolean;
+  clear: () => void;
+}
+
+export function createTwoStepConfirmController(
+  timeoutMs = 3000,
+  onStateChange?: (armedKey: TwoStepConfirmKey | null) => void,
+  timers?: {
+    setTimeout: (cb: () => void, ms: number) => number;
+    clearTimeout: (id: number) => void;
+  }
+): TwoStepConfirmController {
+  let armedKey: TwoStepConfirmKey | null = null;
+  let timerId: number | null = null;
+  const safeTimeout =
+    typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? Math.floor(timeoutMs)
+      : 3000;
+  const setTimer =
+    timers?.setTimeout ??
+    ((cb: () => void, ms: number) =>
+      typeof window !== "undefined" && typeof window.setTimeout === "function"
+        ? window.setTimeout(cb, ms)
+        : (globalThis.setTimeout(cb, ms) as unknown as number));
+  const clearTimer =
+    timers?.clearTimeout ??
+    ((id: number) => {
+      if (typeof window !== "undefined" && typeof window.clearTimeout === "function") {
+        window.clearTimeout(id);
+      } else {
+        globalThis.clearTimeout(id);
+      }
+    });
+
+  const resetTimer = () => {
+    if (timerId !== null) {
+      clearTimer(timerId);
+      timerId = null;
+    }
+  };
+
+  return {
+    getArmedKey: () => armedKey,
+    isArmed: (key) => armedKey === key,
+    triggerOrArm: (key) => {
+      if (armedKey === key) {
+        resetTimer();
+        armedKey = null;
+        onStateChange?.(null);
+        return true;
+      }
+      resetTimer();
+      armedKey = key;
+      onStateChange?.(key);
+      timerId = setTimer(() => {
+        timerId = null;
+        if (armedKey === key) {
+          armedKey = null;
+          onStateChange?.(null);
+        }
+      }, safeTimeout);
+      return false;
+    },
+    clear: () => {
+      resetTimer();
+      if (armedKey !== null) {
+        armedKey = null;
+        onStateChange?.(null);
+      }
+    },
+  };
+}
+
 export const TacticalPtzHudOverlay: React.FC<{
   camera: string;
   cameraConfig?: CameraConfig;
@@ -566,6 +647,7 @@ export const TacticalPtzHudOverlay: React.FC<{
   onPtzUpdate,
   onHardwareUpdate,
 }) => {
+  const { t } = useI18n();
   const capabilitySnapshot = resolveCameraCapabilitySnapshot({
     camera,
     cameraConfig,
@@ -578,6 +660,13 @@ export const TacticalPtzHudOverlay: React.FC<{
   const [newPresetName, setNewPresetName] = useState("");
   const [showHwDrawer, setShowHwDrawer] = useState(false);
   const [hwBusy, setHwBusy] = useState(false);
+  const [confirmingKey, setConfirmingKey] = useState<TwoStepConfirmKey | null>(null);
+  const confirmCtrlRef = useRef<TwoStepConfirmController | null>(null);
+  if (!confirmCtrlRef.current) {
+    confirmCtrlRef.current = createTwoStepConfirmController(3000, (nextKey) => {
+      setConfirmingKey(nextKey);
+    });
+  }
   const onPtzUpdateRef = useRef(onPtzUpdate);
   onPtzUpdateRef.current = onPtzUpdate;
   const onHardwareUpdateRef = useRef(onHardwareUpdate);
@@ -595,7 +684,14 @@ export const TacticalPtzHudOverlay: React.FC<{
     setNewPresetName("");
     setShowHwDrawer(false);
     setHwBusy(false);
+    confirmCtrlRef.current?.clear();
   }, [camera]);
+
+  useEffect(() => {
+    return () => {
+      confirmCtrlRef.current?.clear();
+    };
+  }, []);
 
   useEffect(() => {
     const cleanCam = (camera || "").trim();
@@ -686,8 +782,7 @@ export const TacticalPtzHudOverlay: React.FC<{
     title: string
   ) => ({
     type: "button" as const,
-    className: "nvr-btn nvr-tile-action mono",
-    style: { height: 20, padding: "0 5px", fontSize: "var(--text-xs)" },
+    className: "nvr-btn nvr-ptz-ctrl nvr-tile-action mono",
     "aria-label": ariaLabel,
     title,
     onPointerDown: (e: React.PointerEvent<HTMLButtonElement>) => {
@@ -931,8 +1026,7 @@ export const TacticalPtzHudOverlay: React.FC<{
             <>
               <button
                 type="button"
-                className="nvr-btn nvr-tile-action mono sm"
-                style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+                className="nvr-btn nvr-ptz-ctrl nvr-tile-action mono sm"
                 aria-label={`Save PTZ Preset ${camera}`}
                 title="Save current camera position as preset"
                 onClick={() => setShowPresetInput((v) => !v)}
@@ -942,21 +1036,35 @@ export const TacticalPtzHudOverlay: React.FC<{
               {activePreset && (
                 <button
                   type="button"
-                  className="nvr-btn danger nvr-tile-action mono sm"
-                  style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
-                  aria-label={`Delete PTZ Preset ${camera}`}
-                  title={`Delete preset '${activePreset}'`}
-                  onClick={() => void handleDeleteActivePreset()}
+                  data-confirming={confirmingKey === "delete_preset" ? "true" : "false"}
+                  className="nvr-btn danger nvr-ptz-ctrl nvr-tile-action mono sm"
+                  aria-label={
+                    confirmingKey === "delete_preset"
+                      ? `${t.live.deletePreset} ${camera} — ${t.live.confirmClickAgain}`
+                      : `${t.live.deletePreset} ${camera}`
+                  }
+                  title={
+                    confirmingKey === "delete_preset"
+                      ? t.live.confirmClickAgain
+                      : `Delete preset '${activePreset}'`
+                  }
+                  onClick={() => {
+                    if (confirmCtrlRef.current?.triggerOrArm("delete_preset")) {
+                      void handleDeleteActivePreset();
+                    }
+                  }}
                 >
-                  ×
+                  {confirmingKey === "delete_preset"
+                    ? `× ${t.live.confirmClickAgain}`
+                    : "×"}
                 </button>
               )}
               {showPresetInput && (
                 <span style={{ display: "inline-flex", alignItems: "center", gap: 2 }}>
                   <input
                     type="text"
-                    className="nvr-input mono sm"
-                    style={{ width: 78, height: 20, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                    className="nvr-input nvr-ptz-ctrl mono sm"
+                    style={{ width: 84 }}
                     placeholder="Preset..."
                     aria-label={`New Preset Name ${camera}`}
                     value={newPresetName}
@@ -970,8 +1078,7 @@ export const TacticalPtzHudOverlay: React.FC<{
                   />
                   <button
                     type="button"
-                    className="nvr-btn primary mono sm"
-                    style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+                    className="nvr-btn primary nvr-ptz-ctrl mono sm"
                     aria-label={`Confirm Save Preset ${camera}`}
                     onClick={() => void handleSaveCurrentPreset()}
                   >
@@ -987,12 +1094,14 @@ export const TacticalPtzHudOverlay: React.FC<{
         <>
           <button
             type="button"
-            className={`nvr-btn nvr-tile-action mono sm ${showHwDrawer ? "active" : ""}`}
-            style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+            className={`nvr-btn nvr-ptz-ctrl nvr-tile-action mono sm ${showHwDrawer ? "active" : ""}`}
             aria-label={`Hardware Controls ${camera}`}
             aria-pressed={showHwDrawer}
             title="Camera Hardware Controls (IR, SmartTrack, LED, Flip/Mirror, Image)"
-            onClick={() => setShowHwDrawer((v) => !v)}
+            onClick={() => {
+              confirmCtrlRef.current?.clear();
+              setShowHwDrawer((v) => !v);
+            }}
           >
             HW
           </button>
@@ -1001,6 +1110,7 @@ export const TacticalPtzHudOverlay: React.FC<{
               style={{
                 display: "inline-flex",
                 alignItems: "center",
+                flexWrap: "wrap",
                 gap: 3,
                 paddingLeft: 3,
                 borderLeft: "1px solid var(--border-strong)",
@@ -1020,8 +1130,7 @@ export const TacticalPtzHudOverlay: React.FC<{
                   return (
                     <select
                       key={desc.id}
-                      className="nvr-select mono sm"
-                      style={{ height: 20, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                      className="nvr-select nvr-ptz-ctrl mono sm"
                       aria-label={desc.ariaLabel(camera)}
                       title={desc.title}
                       disabled={hwBusy}
@@ -1049,10 +1158,9 @@ export const TacticalPtzHudOverlay: React.FC<{
                     disabled={hwBusy}
                     aria-label={desc.ariaLabel(camera)}
                     aria-pressed={isActive}
-                    className={`nvr-btn nvr-tile-action mono sm ${
+                    className={`nvr-btn nvr-ptz-ctrl nvr-tile-action mono sm ${
                       isActive ? "active" : ""
                     }`}
-                    style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
                     title={desc.title}
                     onClick={() =>
                       void handleApplyHardwareField({
@@ -1068,17 +1176,58 @@ export const TacticalPtzHudOverlay: React.FC<{
                 <button
                   type="button"
                   disabled={hwBusy}
-                  aria-label={`Trigger Siren ${camera}`}
-                  className="nvr-btn danger nvr-tile-action mono sm"
-                  style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
-                  title="Trigger 3.5s audible siren on camera speaker"
-                  onClick={() =>
-                    void handleApplyHardwareField({
-                      trigger_siren: true,
-                    })
+                  data-confirming={confirmingKey === "trigger_siren" ? "true" : "false"}
+                  aria-label={
+                    confirmingKey === "trigger_siren"
+                      ? `${t.live.triggerSiren} ${camera} — ${t.live.confirmClickAgain}`
+                      : `${t.live.triggerSiren} ${camera}`
                   }
+                  className="nvr-btn danger nvr-ptz-ctrl nvr-tile-action mono sm"
+                  title={
+                    confirmingKey === "trigger_siren"
+                      ? t.live.confirmClickAgain
+                      : "Trigger 3.5s audible siren on camera speaker"
+                  }
+                  onClick={() => {
+                    if (confirmCtrlRef.current?.triggerOrArm("trigger_siren")) {
+                      void handleApplyHardwareField({
+                        trigger_siren: true,
+                      });
+                    }
+                  }}
                 >
-                  ALM
+                  {confirmingKey === "trigger_siren"
+                    ? `ALM · ${t.live.confirmClickAgain}`
+                    : "ALM"}
+                </button>
+              )}
+              {hardwareInfo.capabilities.reboot && (
+                <button
+                  type="button"
+                  disabled={hwBusy}
+                  data-confirming={confirmingKey === "reboot_camera" ? "true" : "false"}
+                  aria-label={
+                    confirmingKey === "reboot_camera"
+                      ? `${t.live.rebootCamera} ${camera} — ${t.live.confirmClickAgain}`
+                      : `${t.live.rebootCamera} ${camera}`
+                  }
+                  className="nvr-btn danger nvr-ptz-ctrl nvr-tile-action mono sm"
+                  title={
+                    confirmingKey === "reboot_camera"
+                      ? t.live.confirmClickAgain
+                      : t.live.rebootCamera
+                  }
+                  onClick={() => {
+                    if (confirmCtrlRef.current?.triggerOrArm("reboot_camera")) {
+                      void handleApplyHardwareField({
+                        reboot: true,
+                      });
+                    }
+                  }}
+                >
+                  {confirmingKey === "reboot_camera"
+                    ? `RBT · ${t.live.confirmClickAgain}`
+                    : "RBT"}
                 </button>
               )}
             </span>
@@ -1170,6 +1319,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   );
   const selectedCamera = useNvrStore((s) => s.selectedCamera);
   const setSelectedCamera = useNvrStore((s) => s.setSelectedCamera);
+  const unmutedLiveCamera = useNvrStore((s) => s.unmutedLiveCamera);
+  const toggleLiveCameraAudio = useNvrStore((s) => s.toggleLiveCameraAudio);
   const hudPosition = useNvrStore((s) => s.hudPosition);
   const setHudPosition = useNvrStore((s) => s.setHudPosition);
   const useMainStream = useNvrStore((s) => s.useMainStream);
@@ -1200,9 +1351,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
         cameraNames,
         config?.cameras,
         config?.camera_groups,
-        simulatedFleetCount
+        simulatedFleetCount,
+        locale
       ),
-    [cameraNames, config?.cameras, config?.camera_groups, simulatedFleetCount]
+    [cameraNames, config?.cameras, config?.camera_groups, simulatedFleetCount, locale]
   );
   const effectiveCameraNames = fleet.cameraNames;
   const effectiveCamerasConfig = fleet.camerasConfig;
@@ -1622,8 +1774,17 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
         ]
       : groupCams;
 
+  const lastVideoLayoutRef = useRef<Exclude<LiveLayoutMode, "map">>(
+    liveLayout === "map" ? "2x2" : liveLayout
+  );
+  if (liveLayout !== "map") {
+    lastVideoLayoutRef.current = liveLayout;
+  }
+  const effectiveStageLayout: LiveLayoutMode =
+    liveLayout === "map" ? lastVideoLayoutRef.current : liveLayout;
+
   const allStageDescriptors = computeLiveStageDescriptors({
-    liveLayout,
+    liveLayout: effectiveStageLayout,
     visibleMatrixCams,
     groupCams: stageGroupCams,
     selectedCamera,
@@ -1635,7 +1796,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
     maxDockLiveDecoders: MAX_DOCK_LIVE_DECODERS,
   });
   const stageDescriptors = isCompact
-    ? filterCompactStageDescriptors(liveLayout, allStageDescriptors)
+    ? filterCompactStageDescriptors(effectiveStageLayout, allStageDescriptors)
     : allStageDescriptors;
 
   return (
@@ -1780,7 +1941,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 className="nvr-badge mono"
                 style={{ height: 24, padding: "0 8px" }}
               >
-                Page {safePage + 1} / {totalPages}
+                {t.live.pageLabel
+                  .replace("{page}", String(safePage + 1))
+                  .replace("{total}", String(totalPages))}
               </span>
               <button
                 type="button"
@@ -1799,7 +1962,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 title="Auto-Tour carousel across matrix pages"
               >
                 <RefreshCw size={11} />
-                Tour {matrixTourIntervalSec}s
+                {t.live.tourLabel.replace("{sec}", String(matrixTourIntervalSec))}
               </button>
             </>
           )}
@@ -1809,10 +1972,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               <span className="nvr-divider" aria-hidden="true" />
               {(
                 [
-                  ["all_activity", "All Motion"],
-                  ["objects", "Active Objects"],
-                  ["person", "Person Only"],
-                  ["vehicle", "Vehicles"],
+                  ["all_activity", t.live.allMotionFilter],
+                  ["objects", t.live.activeObjectsFilter],
+                  ["person", t.live.personOnlyFilter],
+                  ["vehicle", t.live.vehiclesFilter],
                 ] as Array<[SpotlightFilter, string]>
               ).map(([flt, lbl]) => (
                 <button
@@ -1830,9 +1993,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 onChange={(e) => setSpotlightHoldSec(Number(e.target.value))}
                 title="How long a promoted camera stays on the main stage before returning to standby"
               >
-                <option value={15}>Hold: 15s</option>
-                <option value={30}>Hold: 30s</option>
-                <option value={60}>Hold: 60s</option>
+                <option value={15}>{t.live.holdPrefix}: 15s</option>
+                <option value={30}>{t.live.holdPrefix}: 30s</option>
+                <option value={60}>{t.live.holdPrefix}: 60s</option>
               </select>
               <span className="nvr-divider" aria-hidden="true" />
               <button
@@ -1889,7 +2052,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     marginLeft: 4,
                   }}
                 >
-                  <span>TRAIL:</span>
+                  <span>{t.live.trailLabel}</span>
                   {spotlightTrail.map((item, idx) => {
                     const ago = Math.max(0, nowTick - item.ts);
                     const isCurrent = item.cam === spotlightHeroCam;
@@ -1935,10 +2098,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
             <button
               type="button"
               className="nvr-btn danger mono sm"
-              aria-label={`Exit Simulation (Restore ${cameraNames.filter((c) => !/_sim_\d+$/.test(c)).length || 4} Cameras)`}
+              aria-label={t.live.exitSimulation}
               onClick={() => setSimulatedFleetCount(0)}
             >
-              Exit Simulation ({simulatedFleetCount} Cams → {cameraNames.filter((c) => !/_sim_\d+$/.test(c)).length || 4})
+              {t.live.exitSimulation} ({simulatedFleetCount})
             </button>
           )}
           <select
@@ -1950,11 +2113,11 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
             }}
             title="Configure where camera info badges appear so they never cover camera OSD text"
           >
-            <option value="bottom-right">HUD: Bottom-Right</option>
-            <option value="top-right">HUD: Top-Right</option>
-            <option value="top-left">HUD: Top-Left</option>
-            <option value="bottom-left">HUD: Bottom-Left</option>
-            <option value="hidden">HUD: Hidden</option>
+            <option value="bottom-right">{t.live.hudBottomRight}</option>
+            <option value="top-right">{t.live.hudTopRight}</option>
+            <option value="top-left">{t.live.hudTopLeft}</option>
+            <option value="bottom-left">{t.live.hudBottomLeft}</option>
+            <option value="hidden">{t.live.hudHidden}</option>
           </select>
           <button
             className={`nvr-btn ${useMainStream ? "active" : ""}`}
@@ -2070,10 +2233,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
             return (
               <div
                 key={item.id}
-                role="button"
-                tabIndex={0}
                 className={`nvr-alert-card nvr-event-card severity-${item.severity}`}
-                title={`${item.camera.toUpperCase()} · ${formatTs(item.start_time)} · ${t.live.eventTimeShift}`}
                 onPointerEnter={() => setHoveredAlertId(item.id)}
                 onPointerLeave={() =>
                   setHoveredAlertId((curr) => (curr === item.id ? null : curr))
@@ -2081,17 +2241,18 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 onPointerCancel={() =>
                   setHoveredAlertId((curr) => (curr === item.id ? null : curr))
                 }
-                onBlur={() =>
-                  setHoveredAlertId((curr) => (curr === item.id ? null : curr))
-                }
-                onClick={timeShiftToEvent}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    timeShiftToEvent();
-                  }
-                }}
               >
+                <button
+                  type="button"
+                  className="nvr-card-overlay-btn"
+                  aria-label={`${item.camera.toUpperCase()} · ${formatTs(item.start_time)} · ${t.live.eventTimeShift}`}
+                  title={`${item.camera.toUpperCase()} · ${formatTs(item.start_time)} · ${t.live.eventTimeShift}`}
+                  onFocus={() => setHoveredAlertId(item.id)}
+                  onBlur={() =>
+                    setHoveredAlertId((curr) => (curr === item.id ? null : curr))
+                  }
+                  onClick={timeShiftToEvent}
+                />
                 {isHovered ? (
                   <video
                     src={`/api/review/${encodeURIComponent(item.id)}/preview?format=mp4`}
@@ -2110,7 +2271,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     alt={`${item.camera} ${label} event`}
                   />
                 )}
-                <div className="nvr-alert-card-hud">
+                <div className="nvr-alert-card-hud" style={{ pointerEvents: "none", zIndex: 2 }}>
                   <div className="nvr-event-card-row">
                     <span className="mono nvr-event-card-cam">{item.camera}</span>
                     <span className="mono nvr-event-card-label">{label}</span>
@@ -2119,7 +2280,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     <span className="mono nvr-event-card-ago">
                       {formatRelativeAgo(stripNowSec, item.start_time, locale === "pt")}
                     </span>
-                    <span className="nvr-event-card-actions">
+                    <span className="nvr-event-card-actions" style={{ position: "relative", zIndex: 3 }}>
                       <button
                         type="button"
                         className="nvr-btn sm"
@@ -2141,7 +2302,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         aria-label={`${t.live.markReviewed}: ${item.camera} ${formatTs(item.start_time)}`}
                         onClick={(e) => {
                           e.stopPropagation();
-                          handleMarkReviews([item.id], true);
+                          void handleMarkReviews([item.id], true);
                         }}
                       >
                         <Check size={11} />
@@ -2155,37 +2316,51 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
         </div>
       )}
 
-      {liveLayout !== "map" && (
-        <div
-          className={`nvr-persistent-stage ${
-            liveLayout === "2x2"
-              ? `is-layout-grid nvr-matrix-${matrixDensity}`
-              : liveLayout === "single"
-              ? "is-layout-single nvr-matrix-single"
-              : liveLayout === "spotlight"
-              ? "is-layout-spotlight nvr-focus-layout"
-              : "is-layout-focus nvr-focus-layout"
-          }`}
-          ref={stageRef}
-          style={
-            (isCompact
-              ? resolveCompactStageContainerStyle(liveLayout, compactColumns)
-              : undefined) ??
-            (liveLayout === "2x2"
+      {/* Keep .nvr-persistent-stage mounted (hidden with display: none) during Tactical Map
+          inspection so MSE WebSocket sessions and hardware decoders never tear down! */}
+      <div
+        hidden={liveLayout === "map"}
+        aria-hidden={liveLayout === "map" ? true : undefined}
+        data-testid="live-persistent-stage"
+        className={`nvr-persistent-stage ${
+          effectiveStageLayout === "2x2"
+            ? `is-layout-grid nvr-matrix-${matrixDensity}`
+            : effectiveStageLayout === "single"
+            ? "is-layout-single nvr-matrix-single"
+            : effectiveStageLayout === "spotlight"
+            ? "is-layout-spotlight nvr-focus-layout"
+            : "is-layout-focus nvr-focus-layout"
+        }`}
+        ref={stageRef}
+        style={{
+          ...((isCompact
+            ? resolveCompactStageContainerStyle(effectiveStageLayout, compactColumns)
+            : undefined) ??
+            (effectiveStageLayout === "2x2"
               ? resolveAspectMatrixGridStyle(stageSize, visibleMatrixCams.length)
               : undefined) ??
             resolvePersistentStageContainerStyle(
-              liveLayout,
+              effectiveStageLayout,
               stageDescriptors,
               matrixDensity,
               resolveAdaptiveMatrixGridStyle(
                 visibleMatrixCams.length,
                 matrixDensity
               )
-            )
-          }
-        >
-          {stageDescriptors.map((descriptor) => {
+            )),
+          ...(liveLayout === "map" ? { display: "none" } : undefined),
+        }}
+      >
+        {stageDescriptors.length === 0 ? (
+          <div
+            className="nvr-live-empty-state mono"
+            data-testid="live-empty-state"
+            role="status"
+          >
+            {config === null ? t.live.loadingCameras : t.live.noCamerasConfigured}
+          </div>
+        ) : (
+          stageDescriptors.map((descriptor) => {
             const cam = descriptor.camera;
             const realCam = resolveRealCameraSource(
               cam,
@@ -2409,6 +2584,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         useMainStream={descriptor.useMainStream}
                         cameraConfig={camCfg}
                         showVectors={showVectors}
+                        muted={unmutedLiveCamera !== cam}
                         pushToTalkSupported={
                           resolveCameraPushToTalkCapability(
                             camCfg,
@@ -2621,9 +2797,37 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                           <Scissors size={15} />
                         </button>
                         {!isTimeShifted && (
+                          <button
+                            type="button"
+                            className={`nvr-tile-icon ${
+                              unmutedLiveCamera === cam ? "active" : ""
+                            }`}
+                            data-testid={`tile-audio-${cam}`}
+                            aria-pressed={unmutedLiveCamera === cam}
+                            title={
+                              unmutedLiveCamera === cam
+                                ? t.live.muteAudio
+                                : t.live.unmuteAudio
+                            }
+                            aria-label={`${
+                              unmutedLiveCamera === cam
+                                ? t.live.muteAudio
+                                : t.live.unmuteAudio
+                            }: ${cam}`}
+                            onClick={() => toggleLiveCameraAudio(cam)}
+                          >
+                            {unmutedLiveCamera === cam ? (
+                              <Volume2 size={15} />
+                            ) : (
+                              <VolumeX size={15} />
+                            )}
+                          </button>
+                        )}
+                        {!isTimeShifted && (
                           <PushToTalkButton
                             key={`ptt-${cam}-${realCam}-${pttResetEpoch}`}
                             camera={realCam}
+                            audioTargetCamera={cam}
                             height={28}
                             supported={
                               resolveCameraPushToTalkCapability(
@@ -2691,9 +2895,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 )}
               </div>
             );
-          })}
-        </div>
-      )}
+          })
+        )}
+      </div>
 
       {isCompact &&
         liveLayout !== "2x2" &&
@@ -2712,6 +2916,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           const ptzCapable =
             isCameraPtzEnabled(camCfg, ptzInfoByCam[realCam], hardwareInfoByCam[realCam]) ||
             isCameraHardwareControlsSupported(hardwareInfoByCam[realCam]);
+          const isMobileAudioUnmuted = unmutedLiveCamera === cam;
           return (
             <div className="nvr-cam-actionbar" role="toolbar" aria-label={`${cam} actions`}>
               {timeShiftTs !== null ? (
@@ -2731,6 +2936,29 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 >
                   <RotateCcw size={20} aria-hidden="true" />
                   <span>{t.live.rewind30s}</span>
+                </button>
+              )}
+              {timeShiftTs === null && (
+                <button
+                  type="button"
+                  className={`nvr-cam-action ${isMobileAudioUnmuted ? "active" : ""}`}
+                  data-testid={`action-audio-${cam}`}
+                  aria-pressed={isMobileAudioUnmuted}
+                  aria-label={`${
+                    isMobileAudioUnmuted ? t.live.muteAudio : t.live.unmuteAudio
+                  }: ${cam}`}
+                  onClick={() => toggleLiveCameraAudio(cam)}
+                >
+                  {isMobileAudioUnmuted ? (
+                    <Volume2 size={20} aria-hidden="true" />
+                  ) : (
+                    <VolumeX size={20} aria-hidden="true" />
+                  )}
+                  <span>
+                    {isMobileAudioUnmuted
+                      ? t.live.audioShortOn
+                      : t.live.audioShortMuted}
+                  </span>
                 </button>
               )}
               <a
@@ -2758,6 +2986,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   <PushToTalkButton
                     key={`ptt-bar-${cam}-${realCam}-${pttResetEpoch}`}
                     camera={realCam}
+                    audioTargetCamera={cam}
                     height={44}
                     supported={ptt.supported}
                     mode={ptt.mode}
@@ -2832,6 +3061,14 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               onSetMainStream={setUseMainStream}
               showVectors={showVectors}
               onSetShowVectors={setShowVectors}
+              canReboot={Boolean(hardwareInfoByCam[realCam]?.capabilities?.reboot)}
+              onRebootCamera={() => {
+                void applyCameraHardwarePatch(realCam, { reboot: true }).then((res) => {
+                  if (res.ok && res.hardware && isMountedRef.current) {
+                    handleHardwareUpdate(realCam, res.hardware);
+                  }
+                });
+              }}
               onClose={() => setDetailsCam(null)}
             />
           );

@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState } from "react";
+import React, { createContext, useContext, useEffect, useState } from "react";
 import { en, TranslationDict } from "./en";
 import { pt } from "./pt";
 
@@ -10,10 +10,29 @@ export const locales: Record<SupportedLocale, TranslationDict> = {
   pt,
 };
 
+export function resolveHtmlLang(locale: SupportedLocale): "pt-BR" | "en" {
+  return locale === "pt" ? "pt-BR" : "en";
+}
+
+export function applyLocaleToDocument(locale: SupportedLocale): "pt-BR" | "en" {
+  const htmlLang = resolveHtmlLang(locale);
+  if (typeof document !== "undefined" && document.documentElement) {
+    document.documentElement.lang = htmlLang;
+    if (typeof document.documentElement.setAttribute === "function") {
+      document.documentElement.setAttribute("lang", htmlLang);
+    }
+  }
+  return htmlLang;
+}
+
 export function resolveInitialLocale(): SupportedLocale {
   if (typeof window === "undefined") return "en";
-  const saved = window.localStorage?.getItem("ninjanvr_locale");
-  if (saved === "pt" || saved === "en") return saved;
+  try {
+    const saved = window.localStorage?.getItem("ninjanvr_locale");
+    if (saved === "pt" || saved === "en") return saved;
+  } catch {
+    // ignore storage access errors
+  }
   return "en";
 }
 
@@ -30,12 +49,25 @@ const I18nContext = createContext<I18nContextValue>({
 });
 
 export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [locale, setLocaleState] = useState<SupportedLocale>(resolveInitialLocale);
+  const [locale, setLocaleState] = useState<SupportedLocale>(() => {
+    const initial = resolveInitialLocale();
+    applyLocaleToDocument(initial);
+    return initial;
+  });
+
+  useEffect(() => {
+    applyLocaleToDocument(locale);
+  }, [locale]);
 
   const setLocale = (loc: SupportedLocale) => {
-    if (typeof window !== "undefined") {
-      window.localStorage?.setItem("ninjanvr_locale", loc);
+    try {
+      if (typeof window !== "undefined") {
+        window.localStorage?.setItem("ninjanvr_locale", loc);
+      }
+    } catch {
+      // ignore storage access errors
     }
+    applyLocaleToDocument(loc);
     setLocaleState(loc);
   };
 

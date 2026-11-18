@@ -544,6 +544,7 @@ export function createPushToTalkController(
 
 export interface PushToTalkButtonProps {
   camera: string;
+  audioTargetCamera?: string;
   height?: number;
   supported?: boolean;
   mode?: "webrtc" | "cgi_alaw" | null;
@@ -552,11 +553,13 @@ export interface PushToTalkButtonProps {
 
 export const PushToTalkButton: React.FC<PushToTalkButtonProps> = ({
   camera,
+  audioTargetCamera,
   height = 20,
   supported = true,
   mode = "webrtc",
   onStateChange,
 }) => {
+  const targetAudioCam = (audioTargetCamera || camera || "").trim();
   const [pttState, setPttState] = useState<PushToTalkState>("idle");
   const [pttError, setPttError] = useState<string | null>(null);
   const controllerRef = useRef<PushToTalkController | null>(null);
@@ -569,6 +572,9 @@ export const PushToTalkButton: React.FC<PushToTalkButtonProps> = ({
         controllerRef.current.unmount();
         controllerRef.current = null;
       }
+      if (targetAudioCam) {
+        useNvrStore.getState().endPttAudioReturn(targetAudioCam);
+      }
       setPttState("idle");
       setPttError(null);
       return;
@@ -579,6 +585,13 @@ export const PushToTalkButton: React.FC<PushToTalkButtonProps> = ({
       (nextState, nextErr) => {
         setPttState(nextState);
         setPttError(nextErr);
+        if (targetAudioCam) {
+          if (nextState === "connecting" || nextState === "talking") {
+            useNvrStore.getState().beginPttAudioReturn(targetAudioCam);
+          } else {
+            useNvrStore.getState().endPttAudioReturn(targetAudioCam);
+          }
+        }
         onStateChangeRef.current?.(nextState, nextErr);
       }
     );
@@ -586,8 +599,11 @@ export const PushToTalkButton: React.FC<PushToTalkButtonProps> = ({
     return () => {
       ctrl.unmount();
       controllerRef.current = null;
+      if (targetAudioCam) {
+        useNvrStore.getState().endPttAudioReturn(targetAudioCam);
+      }
     };
-  }, [camera, supported, mode]);
+  }, [camera, targetAudioCam, supported, mode]);
 
   if (!supported) {
     return null;
@@ -1176,6 +1192,46 @@ export function resolveDesiredLiveStreamSrc(
   return subName;
 }
 
+export interface VideoMuteTargetLike {
+  muted: boolean;
+  paused?: boolean;
+  play?: () => Promise<unknown> | void;
+}
+
+/**
+ * Synchronizes `<video>.muted` across both MSE dual-buffer slots (`videoRef0` / `videoRef1`),
+ * ensuring only `activeSlot` is unmuted when `muted === false` and the standby slot is strictly muted.
+ */
+export function syncDualSlotVideoMuteState(
+  slot0: VideoMuteTargetLike | null | undefined,
+  slot1: VideoMuteTargetLike | null | undefined,
+  activeSlot: VideoSlotIndex,
+  muted: boolean,
+  mseReady = false
+): void {
+  const slot0Muted = activeSlot === 0 ? muted : true;
+  const slot1Muted = activeSlot === 1 ? muted : true;
+  if (slot0) {
+    slot0.muted = slot0Muted;
+  }
+  if (slot1) {
+    slot1.muted = slot1Muted;
+  }
+  if (mseReady && !muted) {
+    const activeVideo = activeSlot === 0 ? slot0 : slot1;
+    if (activeVideo && activeVideo.paused && typeof activeVideo.play === "function") {
+      try {
+        const res = activeVideo.play();
+        if (res && typeof (res as Promise<unknown>).catch === "function") {
+          void (res as Promise<unknown>).catch(() => {});
+        }
+      } catch {
+        // ignore autoplay policy restriction
+      }
+    }
+  }
+}
+
 export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   camera,
   useMainStream = false,
@@ -1183,13 +1239,15 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   showVectors = false,
   draftPoints,
   onPlotPoint,
-  muted = true,
+  muted,
   onClick,
   draftColor = "#f59e0b",
   stageOverlay,
   pushToTalkSupported,
   pushToTalkMode,
 }) => {
+  const storeIsUnmuted = useNvrStore((s) => Boolean(camera) && s.unmutedLiveCamera === camera);
+  const resolvedMutedProp = muted !== undefined ? muted : !storeIsUnmuted;
   const containerRef = useRef<HTMLDivElement | null>(null);
   const videoRef0 = useRef<HTMLVideoElement | null>(null);
   const videoRef1 = useRef<HTMLVideoElement | null>(null);
@@ -1420,6 +1478,18 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
     : pttCap.supported;
   const resolvedPttMode =
     pushToTalkMode ?? pttCap.mode ?? "webrtc";
+  const effectiveLiveMuted =
+    pttState === "talking" || pttState === "connecting" ? false : resolvedMutedProp;
+
+  useEffect(() => {
+    syncDualSlotVideoMuteState(
+      videoRef0.current,
+      videoRef1.current,
+      activeSlot,
+      effectiveLiveMuted,
+      mseReady
+    );
+  }, [effectiveLiveMuted, activeSlot, mseReady]);
 
   return (
     <div
@@ -1475,6 +1545,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
           resolvedPttSupported ? (
             <PushToTalkButton
               camera={realCamera}
+              audioTargetCamera={camera}
               height={20}
               supported={resolvedPttSupported}
               mode={resolvedPttMode}
@@ -1565,7 +1636,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
           autoPlay
           playsInline
           disableRemotePlayback
-          muted={activeSlot === 0 ? muted : true}
+          muted={activeSlot === 0 ? effectiveLiveMuted : true}
           style={{
             position: "absolute",
             inset: 0,
@@ -1586,7 +1657,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
           autoPlay
           playsInline
           disableRemotePlayback
-          muted={activeSlot === 1 ? muted : true}
+          muted={activeSlot === 1 ? effectiveLiveMuted : true}
           style={{
             position: "absolute",
             inset: 0,
@@ -1888,12 +1959,17 @@ export interface VodHlsPlayerProps {
   camera: string;
   startTime: number;
   endTime: number;
+  cameraConfig?: CameraConfig;
   playheadTs?: number | null;
   /** Live handle timestamp during active IN/OUT drag for zero-reload hardware-decoded scrubbing. */
   scrubTargetTs?: number | null;
   /** Zero-rerender scrub channel for 120–240Hz imperative `<video>` seeking during handle drag. */
   trimScrubChannel?: TrimScrubChannel | null;
   pauseOnSeek?: boolean;
+  /** Controlled play/pause state (e.g. SyncWorkspace Master Transport). */
+  paused?: boolean;
+  /** Controlled mute state overriding sessionStorage (e.g. SyncWorkspace focused tile audio). */
+  controlledMuted?: boolean;
   clipBounds?: VodClipPreviewBounds | null;
   onClipBoundsEnded?: () => void;
   trimBadgeLabel?: string | null;
@@ -1904,8 +1980,131 @@ export interface VodHlsPlayerProps {
   autoPlay?: boolean;
   muted?: boolean;
   controls?: boolean;
-  onTimeUpdate?: (currentSec: number) => void;
+  onTimeUpdate?: (currentSec: number, absoluteTsSec?: number) => void;
   onEnded?: () => void;
+}
+
+export function resolveVodFrameStepDurationSec(
+  cameraConfig?: CameraConfig | null
+): number {
+  const rawFps = cameraConfig?.detect?.fps;
+  const safeFps =
+    typeof rawFps === "number" && Number.isFinite(rawFps) && rawFps > 0
+      ? Math.min(120, Math.max(1, rawFps))
+      : 15;
+  return 1 / safeFps;
+}
+
+export function quantizeVodWindowBounds(
+  startTime: number,
+  endTime: number,
+  options?: { isTightClip?: boolean; bucketSec?: number }
+): { rawStart: number; rawEnd: number; safeStart: number; safeEnd: number } {
+  const finiteStart =
+    typeof startTime === "number" && Number.isFinite(startTime)
+      ? Math.max(0, startTime)
+      : Math.max(0, Math.floor(Date.now() / 1000) - 60);
+  const finiteEnd =
+    typeof endTime === "number" && Number.isFinite(endTime)
+      ? endTime
+      : finiteStart + 12;
+  const rawStart = Math.floor(finiteStart);
+  const rawEnd = Math.ceil(Math.max(finiteEnd, rawStart + 12));
+  if (options?.isTightClip) {
+    return { rawStart, rawEnd, safeStart: rawStart, safeEnd: rawEnd };
+  }
+  const bucket =
+    typeof options?.bucketSec === "number" &&
+    Number.isFinite(options.bucketSec) &&
+    options.bucketSec >= 10
+      ? Math.floor(options.bucketSec)
+      : 60;
+  const safeStart = Math.floor(rawStart / bucket) * bucket;
+  const snappedEnd = Math.ceil(rawEnd / bucket) * bucket;
+  const safeEnd = Math.max(safeStart + bucket, snappedEnd);
+  return { rawStart, rawEnd, safeStart, safeEnd };
+}
+
+export async function captureVodStillFrame(params: {
+  camera: string;
+  realCamera: string;
+  captureEpochSec: number;
+  videoEl?: HTMLVideoElement | null;
+  fetchImpl?: typeof fetch;
+  doc?: Document;
+}): Promise<{ source: "server" | "canvas" | "none"; url: string; filename: string }> {
+  const safeTs =
+    typeof params.captureEpochSec === "number" &&
+    Number.isFinite(params.captureEpochSec) &&
+    params.captureEpochSec >= 0
+      ? Number(params.captureEpochSec.toFixed(3))
+      : 0;
+  const cleanRealCam = (params.realCamera || params.camera || "").trim();
+  const cleanCam = (params.camera || cleanRealCam || "camera").trim();
+  const fetchFn = params.fetchImpl ?? (typeof fetch === "function" ? fetch : null);
+  const docRef =
+    params.doc ?? (typeof document !== "undefined" ? document : undefined);
+
+  if (fetchFn && cleanRealCam) {
+    const frameApiUrl = `/api/${encodeURIComponent(cleanRealCam)}/frame?ts=${safeTs}`;
+    try {
+      const resp = await fetchFn(frameApiUrl, { credentials: "include" });
+      if (resp.ok) {
+        const blob = await resp.blob();
+        const filename = `${cleanCam}_${Math.floor(safeTs)}.jpg`;
+        const hasBlobUrl =
+          typeof URL !== "undefined" && typeof URL.createObjectURL === "function";
+        const href = hasBlobUrl ? URL.createObjectURL(blob) : frameApiUrl;
+        if (docRef && typeof docRef.createElement === "function") {
+          const link = docRef.createElement("a");
+          link.download = filename;
+          link.href = href;
+          link.click();
+          if (hasBlobUrl && typeof URL.revokeObjectURL === "function") {
+            const revoke = () => {
+              try {
+                URL.revokeObjectURL(href);
+              } catch {
+                // ignore
+              }
+            };
+            if (typeof window !== "undefined" && typeof window.setTimeout === "function") {
+              window.setTimeout(revoke, 5000);
+            } else {
+              revoke();
+            }
+          }
+        }
+        return { source: "server", url: frameApiUrl, filename };
+      }
+    } catch {
+      // fall through to offline canvas fallback
+    }
+  }
+
+  const vid = params.videoEl;
+  if (
+    vid &&
+    vid.videoWidth > 0 &&
+    vid.videoHeight > 0 &&
+    docRef &&
+    typeof docRef.createElement === "function"
+  ) {
+    const canvas = docRef.createElement("canvas");
+    canvas.width = vid.videoWidth;
+    canvas.height = vid.videoHeight;
+    const ctx = canvas.getContext("2d");
+    ctx?.drawImage(vid, 0, 0, canvas.width, canvas.height);
+    const dataUrl = canvas.toDataURL("image/png");
+    const filename = `${cleanCam}_${Math.floor(safeTs)}.png`;
+    const link = docRef.createElement("a");
+    link.download = filename;
+    link.href = dataUrl;
+    link.click();
+    return { source: "canvas", url: dataUrl, filename };
+  }
+
+  return { source: "none", url: "", filename: "" };
 }
 
 function safeSessionStorageGet(key: string): string | null {
@@ -1933,10 +2132,13 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
   camera,
   startTime,
   endTime,
+  cameraConfig,
   playheadTs = null,
   scrubTargetTs = null,
   trimScrubChannel = null,
   pauseOnSeek = false,
+  paused,
+  controlledMuted,
   clipBounds = null,
   onClipBoundsEnded,
   trimBadgeLabel = null,
@@ -1958,10 +2160,14 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
   playheadTsRef.current = playheadTs;
   const pauseOnSeekRef = useRef<boolean>(pauseOnSeek);
   pauseOnSeekRef.current = pauseOnSeek;
+  const pausedRef = useRef<boolean | undefined>(paused);
+  pausedRef.current = paused;
   const autoPlayRef = useRef<boolean>(autoPlay);
   autoPlayRef.current = autoPlay;
   const configuredCameras = useNvrStore((s) => s.config?.cameras);
   const realCamera = resolveRealCameraSource(camera, configuredCameras);
+  const effVodCameraConfig =
+    cameraConfig ?? configuredCameras?.[camera] ?? configuredCameras?.[realCamera];
   const rawVodRotateDeg = useNvrStore(
     (s) =>
       s.config?.cameras?.[camera]?.live?.rotate ||
@@ -1983,6 +2189,19 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
     if (saved === "true") return true;
     return muted;
   });
+  const effectiveVodMuted =
+    typeof controlledMuted === "boolean" ? controlledMuted : userMuted;
+  const effectiveVodMutedRef = useRef<boolean>(effectiveVodMuted);
+  effectiveVodMutedRef.current = effectiveVodMuted;
+
+  const hasClipBounds = Boolean(
+    clipBounds &&
+      Number.isFinite(clipBounds.startSec) &&
+      Number.isFinite(clipBounds.endSec) &&
+      clipBounds.endSec > clipBounds.startSec
+  );
+  const clipBoundsStartSec = hasClipBounds ? clipBounds!.startSec : null;
+  const clipBoundsEndSec = hasClipBounds ? clipBounds!.endSec : null;
 
   const safePlaybackRate =
     typeof playbackRate === "number" &&
@@ -1990,16 +2209,13 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
     playbackRate > 0
       ? Math.min(16, Math.max(0.1, playbackRate))
       : 1;
-  const finiteStart =
-    typeof startTime === "number" && Number.isFinite(startTime)
-      ? startTime
-      : Math.floor(Date.now() / 1000) - 60;
-  const finiteEnd =
-    typeof endTime === "number" && Number.isFinite(endTime)
-      ? endTime
-      : finiteStart + 12;
-  const safeStart = Math.floor(finiteStart);
-  const safeEnd = Math.ceil(Math.max(finiteEnd, finiteStart + 12));
+  const { rawStart, safeStart, safeEnd } = quantizeVodWindowBounds(
+    startTime,
+    endTime,
+    { isTightClip: Boolean(hasClipBounds || onEnded) }
+  );
+  const rawStartRef = useRef<number>(rawStart);
+  rawStartRef.current = rawStart;
   const hlsUrl = `/vod/${encodeURIComponent(realCamera)}/start/${safeStart}/end/${safeEnd}/index.m3u8`;
   const mp4FallbackUrl = fallbackPreviewId
     ? `/api/review/${encodeURIComponent(fallbackPreviewId)}/preview?format=mp4`
@@ -2029,8 +2245,15 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
 
     const applyInitialPlayheadOffset = () => {
       const ph = playheadTsRef.current;
-      if (typeof ph === "number" && Number.isFinite(ph) && ph >= safeStart && ph <= safeEnd) {
-        const offset = Math.max(0, ph - safeStart);
+      const targetTs =
+        typeof ph === "number" && Number.isFinite(ph) ? ph : rawStartRef.current;
+      if (
+        typeof targetTs === "number" &&
+        Number.isFinite(targetTs) &&
+        targetTs >= safeStart &&
+        targetTs <= safeEnd
+      ) {
+        const offset = Math.max(0, targetTs - safeStart);
         if (offset > 0) {
           try {
             videoEl.currentTime = offset;
@@ -2052,14 +2275,16 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
       hls.attachMedia(videoEl);
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         videoEl.playbackRate = safePlaybackRate;
-        videoEl.muted = userMuted;
+        videoEl.muted = effectiveVodMutedRef.current;
         applyInitialPlayheadOffset();
-        if (pauseOnSeekRef.current) {
+        if (pauseOnSeekRef.current || pausedRef.current === true) {
           videoEl.pause();
-        } else if (autoPlayRef.current) {
+        } else if (autoPlayRef.current || pausedRef.current === false) {
           videoEl.play().catch(() => {
             videoEl.muted = true;
-            setUserMuted(true);
+            if (typeof controlledMuted !== "boolean") {
+              setUserMuted(true);
+            }
             videoEl.play().catch(() => {});
           });
         }
@@ -2090,14 +2315,18 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
     } else if (videoEl.canPlayType("application/vnd.apple.mpegurl")) {
       onNativeLoadedMetadata = () => {
         applyInitialPlayheadOffset();
-        if (pauseOnSeekRef.current) {
+        if (pauseOnSeekRef.current || pausedRef.current === true) {
           videoEl.pause();
         }
       };
       videoEl.addEventListener("loadedmetadata", onNativeLoadedMetadata);
       videoEl.src = hlsUrl;
       videoEl.playbackRate = safePlaybackRate;
-      if (autoPlayRef.current && !pauseOnSeekRef.current) {
+      if (
+        (autoPlayRef.current || pausedRef.current === false) &&
+        !pauseOnSeekRef.current &&
+        pausedRef.current !== true
+      ) {
         videoEl.play().catch(() => {});
       }
     }
@@ -2125,32 +2354,36 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
     };
   }, [hlsUrl, useFallbackMp4, fallbackPreviewId]);
 
-  const hasClipBounds = Boolean(
-    clipBounds &&
-      Number.isFinite(clipBounds.startSec) &&
-      Number.isFinite(clipBounds.endSec) &&
-      clipBounds.endSec > clipBounds.startSec
-  );
-  const clipBoundsStartSec = hasClipBounds ? clipBounds!.startSec : null;
-  const clipBoundsEndSec = hasClipBounds ? clipBounds!.endSec : null;
+  const effectiveSeekTargetTs =
+    typeof playheadTs === "number" && Number.isFinite(playheadTs)
+      ? playheadTs
+      : rawStart;
 
   useEffect(() => {
-    if (typeof playheadTs !== "number" || !Number.isFinite(playheadTs)) {
+    if (
+      typeof effectiveSeekTargetTs !== "number" ||
+      !Number.isFinite(effectiveSeekTargetTs)
+    ) {
       return;
     }
     const vid = videoRef.current;
     if (!vid || useFallbackMp4) return;
     const action = resolveVodSeekAction(
       { camera: realCamera, startSec: safeStart, endSec: safeEnd },
-      { camera: realCamera, targetTs: playheadTs, edgeMarginSec: 2 }
+      { camera: realCamera, targetTs: effectiveSeekTargetTs, edgeMarginSec: 2 }
     );
     if (action.kind === "seek_in_window") {
       endedFiredRef.current = false;
       try {
-        vid.currentTime = Math.max(0, action.offsetSec);
-        if (pauseOnSeek) {
+        if (Math.abs((vid.currentTime || 0) - action.offsetSec) > 0.04) {
+          vid.currentTime = Math.max(0, action.offsetSec);
+        }
+        if (pauseOnSeek || pausedRef.current === true) {
           vid.pause();
-        } else if ((hasClipBounds || autoPlayRef.current) && vid.paused) {
+        } else if (
+          (hasClipBounds || autoPlayRef.current || pausedRef.current === false) &&
+          vid.paused
+        ) {
           vid.play().catch(() => {});
         }
       } catch {
@@ -2158,7 +2391,7 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
       }
     }
   }, [
-    playheadTs,
+    effectiveSeekTargetTs,
     pauseOnSeek,
     hasClipBounds,
     clipBoundsStartSec,
@@ -2168,6 +2401,29 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
     safeEnd,
     useFallbackMp4,
   ]);
+
+  useEffect(() => {
+    const vid = videoRef.current;
+    if (!vid) return;
+    vid.muted = effectiveVodMuted;
+  }, [effectiveVodMuted, useFallbackMp4]);
+
+  useEffect(() => {
+    if (typeof paused !== "boolean") return;
+    const vid = videoRef.current;
+    if (!vid) return;
+    if (paused || pauseOnSeek) {
+      vid.pause();
+    } else if (vid.paused) {
+      vid.play().catch(() => {
+        vid.muted = true;
+        if (typeof controlledMuted !== "boolean") {
+          setUserMuted(true);
+        }
+        vid.play().catch(() => {});
+      });
+    }
+  }, [paused, pauseOnSeek, useFallbackMp4, vodBufferReady, controlledMuted]);
 
   const applyImperativeScrubTarget = useCallback(
     (targetTs: number | null | undefined) => {
@@ -2245,7 +2501,7 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
     const vid = videoRef.current;
     if (!vid) return;
     vid.pause();
-    const frameDur = 1 / 15;
+    const frameDur = resolveVodFrameStepDurationSec(effVodCameraConfig);
     const cur = Number.isFinite(vid.currentTime) ? vid.currentTime : 0;
     vid.currentTime = Math.max(0, cur + dir * frameDur);
   };
@@ -2275,17 +2531,14 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
 
   const handleCaptureVodStill = () => {
     const vid = videoRef.current;
-    if (!vid || vid.videoWidth === 0 || vid.videoHeight === 0) return;
-    const canvas = document.createElement("canvas");
-    canvas.width = vid.videoWidth;
-    canvas.height = vid.videoHeight;
-    const ctx = canvas.getContext("2d");
-    ctx?.drawImage(vid, 0, 0, canvas.width, canvas.height);
-    const ts = Math.floor(safeStart + (vid.currentTime || 0));
-    const link = document.createElement("a");
-    link.download = `${camera}_${ts}.png`;
-    link.href = canvas.toDataURL("image/png");
-    link.click();
+    const curOffset = vid && Number.isFinite(vid.currentTime) ? vid.currentTime : 0;
+    const captureEpochSec = safeStart + curOffset;
+    void captureVodStillFrame({
+      camera,
+      realCamera,
+      captureEpochSec,
+      videoEl: vid,
+    });
   };
 
   const { locale } = useI18n();
@@ -2339,13 +2592,13 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
   );
 
   const handleTimeUpdateInternal = (curSec: number, durSec: number) => {
-    onTimeUpdate?.(curSec);
+    const absSec = safeStart + curSec;
+    onTimeUpdate?.(curSec, absSec);
     if (
       clipBounds &&
       Number.isFinite(clipBounds.endSec) &&
       clipBounds.endSec > clipBounds.startSec
     ) {
-      const absSec = safeStart + curSec;
       if (absSec >= clipBounds.endSec - 0.08) {
         const vid = videoRef.current;
         if (vid) {
@@ -2426,13 +2679,14 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
           ref={videoRef}
           src={mp4FallbackUrl}
           controls={controls}
-          autoPlay={autoPlay && !pauseOnSeek}
+          autoPlay={autoPlay && !pauseOnSeek && paused !== true}
           playsInline
-          muted={userMuted}
+          muted={effectiveVodMuted}
           loop={!onEnded && !clipBounds}
           onLoadedData={() => setVodBufferReady(true)}
           onSeeked={handleVideoSeeked}
           onVolumeChange={(e) => {
+            if (typeof controlledMuted === "boolean") return;
             const next = e.currentTarget.muted;
             setUserMuted(next);
             safeSessionStorageSet("ninjanvr_vod_muted", String(next));
@@ -2459,12 +2713,13 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
       <video
         ref={videoRef}
         controls={controls}
-        autoPlay={autoPlay && !pauseOnSeek}
+        autoPlay={autoPlay && !pauseOnSeek && paused !== true}
         playsInline
-        muted={userMuted}
+        muted={effectiveVodMuted}
         onLoadedData={() => setVodBufferReady(true)}
         onSeeked={handleVideoSeeked}
         onVolumeChange={(e) => {
+          if (typeof controlledMuted === "boolean") return;
           const next = e.currentTarget.muted;
           setUserMuted(next);
           safeSessionStorageSet("ninjanvr_vod_muted", String(next));

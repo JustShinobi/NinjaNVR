@@ -1,16 +1,28 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Sparkles } from "lucide-react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ChevronLeft,
+  ChevronRight,
+  Pause,
+  Play,
+  Sparkles,
+  Volume2,
+  VolumeX,
+} from "lucide-react";
 import { useI18n } from "../i18n";
 import { resolveRealCameraSource, useNvrStore } from "../store/useNvrStore";
 import { RecordingSegment, ReviewItem } from "../types/nvr";
 import { formatDateTime, formatTs } from "../utils/format";
-import { VodHlsPlayer } from "../components/VideoPlayers";
+import {
+  VodHlsPlayer,
+  resolveVodFrameStepDurationSec,
+} from "../components/VideoPlayers";
 import { TimelineScrubber } from "../components/TimelineScrubber";
 import { useCompactViewport } from "../utils/useCompactViewport";
 import { resolveSafeMediaUrl } from "../utils/mediaUrlPolicy";
 
 export const MAX_SYNC_QUAD_SLOTS = 4;
 export const SYNC_SEEK_DEBOUNCE_MS = 120;
+export const SYNC_DRIFT_THRESHOLD_SEC = 0.45;
 
 export function clampSyncTimestamp(
   ts: number,
@@ -25,6 +37,57 @@ export function clampSyncTimestamp(
     return Math.max(1, safeNow - 30);
   }
   return Math.max(1, Math.min(maxAllowed, Math.floor(ts)));
+}
+
+/**
+ * Clamps a synchronized master playhead timestamp while preserving sub-second
+ * millisecond precision for frame-by-frame (`±1f`) stepping and smooth clock ticks.
+ */
+export function clampSyncPlayheadTs(
+  ts: number,
+  nowSec: number = Date.now() / 1000
+): number {
+  const safeNow =
+    Number.isFinite(nowSec) && nowSec > 60 ? nowSec : Date.now() / 1000;
+  const maxAllowed = Math.max(1, Math.floor(safeNow) - 5);
+  if (!Number.isFinite(ts) || ts <= 0) {
+    return Math.max(1, Math.floor(safeNow) - 30);
+  }
+  const clamped = Math.max(1, Math.min(maxAllowed, ts));
+  return Math.round(clamped * 1000) / 1000;
+}
+
+export function shouldReconcileSyncDrift(
+  tileAbsTs: number,
+  masterTs: number,
+  thresholdSec: number = SYNC_DRIFT_THRESHOLD_SEC
+): boolean {
+  if (!Number.isFinite(tileAbsTs) || !Number.isFinite(masterTs)) {
+    return false;
+  }
+  const safeThreshold =
+    Number.isFinite(thresholdSec) && thresholdSec > 0
+      ? thresholdSec
+      : SYNC_DRIFT_THRESHOLD_SEC;
+  return Math.abs(tileAbsTs - masterTs) > safeThreshold;
+}
+
+export function advanceSyncClockTick(
+  currentMasterTs: number,
+  elapsedMs: number,
+  playbackSpeed: number,
+  nowSec: number = Date.now() / 1000
+): number {
+  const base = clampSyncPlayheadTs(currentMasterTs, nowSec);
+  if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) {
+    return base;
+  }
+  const safeSpd =
+    Number.isFinite(playbackSpeed) && playbackSpeed > 0
+      ? Math.max(0.25, Math.min(16, playbackSpeed))
+      : 1;
+  const dtSec = Math.min(5, elapsedMs / 1000) * safeSpd;
+  return clampSyncPlayheadTs(base + dtSec, nowSec);
 }
 
 export function computeSyncVodWindow(
@@ -198,13 +261,24 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
   const setSyncQuadCameras = useNvrStore((s) => s.setSyncQuadCameras);
   const config = useNvrStore((s) => s.config);
 
-  const safeMasterTs = clampSyncTimestamp(syncMasterTs);
+  const [syncPaused, setSyncPaused] = useState<boolean>(false);
+  const [syncMuted, setSyncMuted] = useState<boolean>(true);
+  const safeMasterTs = clampSyncPlayheadTs(syncMasterTs);
   const safeSyncSpeed =
     Number.isFinite(syncSpeed) && syncSpeed > 0
       ? Math.max(0.25, Math.min(16, syncSpeed))
       : 1;
-  const [committedVodTs, setCommittedVodTs] = useState<number>(() => safeMasterTs);
+
+  // `committedSeekTs` tracks explicit user/transport seeks so continuous playback `timeupdate`
+  // advances `syncMasterTs` without re-seeking the primary video decoder on every tick.
+  const [committedSeekTs, setCommittedSeekTs] = useState<number>(() => safeMasterTs);
+  const [slotDriftTargets, setSlotDriftTargets] = useState<Record<number, number>>({});
   const seekDebounceTimerRef = useRef<number | null>(null);
+  const masterClockTsRef = useRef<number>(safeMasterTs);
+  const lastPlaybackTickRef = useRef<number>(safeMasterTs);
+  const lastVideoTimeUpdateMsRef = useRef<number>(0);
+  const lastUiClockCommitMsRef = useRef<number>(0);
+  const lastSlotReconcileMsRef = useRef<Record<number, number>>({});
 
   useEffect(() => {
     if (syncMasterTs !== safeMasterTs) {
@@ -212,17 +286,21 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
     }
   }, [syncMasterTs, safeMasterTs, setSyncMasterTs]);
 
+  // Detect external jumps (e.g. "Open in Sync" from Review/Explore) vs smooth playback ticks
   useEffect(() => {
+    if (Math.abs(safeMasterTs - lastPlaybackTickRef.current) <= 0.01) {
+      return;
+    }
+    masterClockTsRef.current = safeMasterTs;
+    lastPlaybackTickRef.current = safeMasterTs;
     if (seekDebounceTimerRef.current !== null) {
       window.clearTimeout(seekDebounceTimerRef.current);
       seekDebounceTimerRef.current = null;
     }
-    if (committedVodTs === safeMasterTs) {
-      return;
-    }
     seekDebounceTimerRef.current = window.setTimeout(() => {
       seekDebounceTimerRef.current = null;
-      setCommittedVodTs(safeMasterTs);
+      setCommittedSeekTs(safeMasterTs);
+      setSlotDriftTargets({});
     }, SYNC_SEEK_DEBOUNCE_MS);
     return () => {
       if (seekDebounceTimerRef.current !== null) {
@@ -230,102 +308,287 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
         seekDebounceTimerRef.current = null;
       }
     };
-  }, [safeMasterTs, committedVodTs]);
+  }, [safeMasterTs]);
 
   const [vodWindow, setVodWindow] = useState<{ startTime: number; endTime: number }>(
-    () => computeSyncVodWindow(committedVodTs, 120)
+    () => computeSyncVodWindow(safeMasterTs, 180)
   );
 
   useEffect(() => {
     setVodWindow((prev) => {
       if (
-        committedVodTs >= prev.startTime &&
-        committedVodTs <= prev.endTime - 2
+        safeMasterTs >= prev.startTime &&
+        safeMasterTs <= prev.endTime - 4
       ) {
         return prev;
       }
-      return computeSyncVodWindow(committedVodTs, 120);
+      return computeSyncVodWindow(safeMasterTs, 180);
     });
-  }, [committedVodTs]);
+  }, [safeMasterTs]);
 
   const activeQuadCameras = useMemo(
     () => resolveSyncQuadCameras(cameraNames, syncQuadCameras),
     [cameraNames, syncQuadCameras]
   );
 
-  const applyBoundedSyncSeek = (nextTs: number) => {
-    const clamped = clampSyncTimestamp(nextTs);
-    setSyncMasterTs(clamped);
-  };
+  const focusedSyncCamera = useMemo(() => {
+    if (selectedCamera && activeQuadCameras.includes(selectedCamera)) {
+      return selectedCamera;
+    }
+    return activeQuadCameras[0] || "";
+  }, [selectedCamera, activeQuadCameras]);
+
+  const focusedRealCamera = useMemo(
+    () => resolveRealCameraSource(focusedSyncCamera, config?.cameras || cameraNames),
+    [focusedSyncCamera, config?.cameras, cameraNames]
+  );
+
+  // Fallback wall-clock master ticker while playing if primary `<video>` has not emitted `timeupdate`
+  // (e.g. during an offline recording gap on slot 0 or non-decoding test environments).
+  useEffect(() => {
+    if (syncPaused || activeQuadCameras.length === 0 || typeof window === "undefined") {
+      return;
+    }
+    let prevWallMs = Date.now();
+    const timer = window.setInterval(() => {
+      const nowMs = Date.now();
+      const dtMs = nowMs - prevWallMs;
+      prevWallMs = nowMs;
+      if (nowMs - lastVideoTimeUpdateMsRef.current <= 650) {
+        return;
+      }
+      const nextTs = advanceSyncClockTick(
+        masterClockTsRef.current,
+        dtMs,
+        safeSyncSpeed,
+        nowMs / 1000
+      );
+      masterClockTsRef.current = nextTs;
+      lastPlaybackTickRef.current = nextTs;
+      setSyncMasterTs(nextTs);
+    }, 300);
+    return () => window.clearInterval(timer);
+  }, [syncPaused, activeQuadCameras.length, safeSyncSpeed, setSyncMasterTs]);
+
+  const applyBoundedSyncSeek = useCallback(
+    (nextTs: number, immediate = false) => {
+      const clamped = clampSyncPlayheadTs(nextTs);
+      masterClockTsRef.current = clamped;
+      lastPlaybackTickRef.current = clamped;
+      setSyncMasterTs(clamped);
+      if (immediate) {
+        if (seekDebounceTimerRef.current !== null) {
+          window.clearTimeout(seekDebounceTimerRef.current);
+          seekDebounceTimerRef.current = null;
+        }
+        setCommittedSeekTs(clamped);
+        setSlotDriftTargets({});
+      } else {
+        // Trigger debounced seek via safeMasterTs effect
+        lastPlaybackTickRef.current = -1;
+      }
+    },
+    [setSyncMasterTs]
+  );
 
   const stepSyncMasterBy = (deltaSec: number) => {
     if (!Number.isFinite(deltaSec)) return;
-    setSyncMasterTs((prev) => clampSyncTimestamp(clampSyncTimestamp(prev) + deltaSec));
+    applyBoundedSyncSeek(clampSyncPlayheadTs(masterClockTsRef.current) + deltaSec, true);
   };
+
+  const stepSyncFrameAll = (dir: -1 | 1) => {
+    setSyncPaused(true);
+    const camCfg =
+      config?.cameras?.[focusedSyncCamera] ?? config?.cameras?.[focusedRealCamera];
+    const frameStepSec = resolveVodFrameStepDurationSec(camCfg);
+    applyBoundedSyncSeek(masterClockTsRef.current + dir * frameStepSec, true);
+  };
+
+  const handleTileTimeUpdate = useCallback(
+    (slotIdx: number, _curSec: number, absTs?: number) => {
+      if (syncPaused || typeof absTs !== "number" || !Number.isFinite(absTs)) {
+        return;
+      }
+      const nowMs = Date.now();
+      if (slotIdx === 0) {
+        lastVideoTimeUpdateMsRef.current = nowMs;
+        const clamped = clampSyncPlayheadTs(absTs, nowMs / 1000);
+        masterClockTsRef.current = clamped;
+        if (nowMs - lastUiClockCommitMsRef.current >= 250) {
+          lastUiClockCommitMsRef.current = nowMs;
+          lastPlaybackTickRef.current = clamped;
+          setSyncMasterTs(clamped);
+        }
+        return;
+      }
+
+      if (
+        shouldReconcileSyncDrift(
+          absTs,
+          masterClockTsRef.current,
+          SYNC_DRIFT_THRESHOLD_SEC
+        )
+      ) {
+        const lastReconcile = lastSlotReconcileMsRef.current[slotIdx] || 0;
+        if (nowMs - lastReconcile >= 800) {
+          lastSlotReconcileMsRef.current[slotIdx] = nowMs;
+          const lockTarget = masterClockTsRef.current;
+          setSlotDriftTargets((prev) => ({
+            ...prev,
+            [slotIdx]: lockTarget,
+          }));
+        }
+      }
+    },
+    [syncPaused, setSyncMasterTs]
+  );
 
   return (
     <>
       <div className="nvr-subbar">
-        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-          {!isCompact && <span className="nvr-badge rewind">{t.sync.syncLocked}</span>}
-          <span className="mono" style={{ fontWeight: 700, color: "var(--text-primary)" }}>
-            {formatDateTime(safeMasterTs)}
+        <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+          {!isCompact && (
+            <span className={`nvr-badge ${syncPaused ? "motion" : "rewind"}`}>
+              {syncPaused ? t.sync.syncPausedBadge : t.sync.syncLocked}
+            </span>
+          )}
+          <span
+            className="mono"
+            data-testid="sync-master-clock"
+            style={{ fontWeight: 700, color: "var(--text-primary)" }}
+          >
+            {formatDateTime(Math.floor(safeMasterTs))}
           </span>
-          <button className="nvr-btn" onClick={() => stepSyncMasterBy(-30)}>
+
+          {/* Master Transport Controls: Play/Pause All, Step -1f/+1f All, Audio Mute/Unmute */}
+          <div
+            className="nvr-segmented mono"
+            role="group"
+            aria-label={t.sync.masterClock}
+          >
+            <button
+              type="button"
+              data-testid="sync-play-pause"
+              className={`nvr-btn ${!syncPaused ? "active" : ""}`}
+              aria-pressed={!syncPaused}
+              aria-label={syncPaused ? t.sync.playAll : t.sync.pauseAll}
+              title={syncPaused ? t.sync.playAll : t.sync.pauseAll}
+              onClick={() => setSyncPaused((p) => !p)}
+            >
+              {syncPaused ? <Play size={12} /> : <Pause size={12} />}
+              {syncPaused ? t.sync.playAll : t.sync.pauseAll}
+            </button>
+            <button
+              type="button"
+              data-testid="sync-step-prev"
+              className="nvr-btn mono"
+              aria-label={t.sync.stepPrevFrame}
+              title={t.sync.stepPrevFrame}
+              onClick={() => stepSyncFrameAll(-1)}
+            >
+              <ChevronLeft size={12} />
+              {t.sync.stepPrevFrame}
+            </button>
+            <button
+              type="button"
+              data-testid="sync-step-next"
+              className="nvr-btn mono"
+              aria-label={t.sync.stepNextFrame}
+              title={t.sync.stepNextFrame}
+              onClick={() => stepSyncFrameAll(1)}
+            >
+              {t.sync.stepNextFrame}
+              <ChevronRight size={12} />
+            </button>
+            <button
+              type="button"
+              data-testid="sync-audio-toggle"
+              className={`nvr-btn mono ${!syncMuted ? "active" : ""}`}
+              aria-pressed={!syncMuted}
+              aria-label={syncMuted ? t.sync.unmuteFocused : t.sync.muteFocused}
+              title={
+                focusedSyncCamera
+                  ? `${syncMuted ? t.sync.unmuteFocused : t.sync.muteFocused} (${focusedSyncCamera.toUpperCase()})`
+                  : syncMuted
+                  ? t.sync.unmuteFocused
+                  : t.sync.muteFocused
+              }
+              onClick={() => setSyncMuted((m) => !m)}
+            >
+              {syncMuted ? <VolumeX size={12} /> : <Volume2 size={12} />}
+              {focusedSyncCamera ? focusedSyncCamera.toUpperCase() : ""}
+            </button>
+          </div>
+
+          <button
+            type="button"
+            className="nvr-btn sm"
+            onClick={() => stepSyncMasterBy(-30)}
+          >
             {t.sync.jumpBack30}
           </button>
-          <button className="nvr-btn" onClick={() => stepSyncMasterBy(-10)}>
+          <button
+            type="button"
+            className="nvr-btn sm"
+            onClick={() => stepSyncMasterBy(-10)}
+          >
             {t.sync.jumpBack10}
           </button>
-          <button className="nvr-btn" onClick={() => stepSyncMasterBy(10)}>
+          <button
+            type="button"
+            className="nvr-btn sm"
+            onClick={() => stepSyncMasterBy(10)}
+          >
             {t.sync.jumpFwd10}
           </button>
-          <button className="nvr-btn" onClick={() => stepSyncMasterBy(30)}>
+          <button
+            type="button"
+            className="nvr-btn sm"
+            onClick={() => stepSyncMasterBy(30)}
+          >
             {t.sync.jumpFwd30}
           </button>
           <span className="nvr-divider" aria-hidden="true" />
           {(() => {
             const slotControls = (
               <>
-          {activeQuadCameras.map((slotCam, slotIdx) => (
-            <select
-              key={`slot-${slotIdx}`}
-              className="nvr-select mono"
-              aria-label={`Sync Quad Slot ${slotIdx + 1}`}
-              style={{ height: 24, fontSize: "var(--text-xs)", padding: "0 6px" }}
-              value={slotCam}
-              onChange={(e) =>
-                setSyncQuadCameras(
-                  assignSyncQuadSlot(
-                    activeQuadCameras,
-                    slotIdx,
-                    e.target.value,
-                    cameraNames
-                  )
-                )
-              }
-            >
-              {cameraNames.map((c) => (
-                <option key={c} value={c}>
-                  S{slotIdx + 1}: {c.toUpperCase()}
-                </option>
-              ))}
-            </select>
-          ))}
-          <button
-            type="button"
-            className="nvr-btn mono"
-            style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
-            onClick={() =>
-              setSyncQuadCameras(
-                autoPickActiveCamerasAtTimestamp(cameraNames, reviews, safeMasterTs)
-              )
-            }
-            title="Automatically select the 4 cameras with active alerts or detections near the current timestamp"
-          >
-            <Sparkles size={11} />
-            Auto-Pick 4 Active @ Timestamp
-          </button>
+                {activeQuadCameras.map((slotCam, slotIdx) => (
+                  <select
+                    key={`slot-${slotIdx}`}
+                    className="nvr-select sm mono"
+                    aria-label={`Sync Quad Slot ${slotIdx + 1}`}
+                    value={slotCam}
+                    onChange={(e) =>
+                      setSyncQuadCameras(
+                        assignSyncQuadSlot(
+                          activeQuadCameras,
+                          slotIdx,
+                          e.target.value,
+                          cameraNames
+                        )
+                      )
+                    }
+                  >
+                    {cameraNames.map((c) => (
+                      <option key={c} value={c}>
+                        S{slotIdx + 1}: {c.toUpperCase()}
+                      </option>
+                    ))}
+                  </select>
+                ))}
+                <button
+                  type="button"
+                  className="nvr-btn sm mono"
+                  onClick={() =>
+                    setSyncQuadCameras(
+                      autoPickActiveCamerasAtTimestamp(cameraNames, reviews, safeMasterTs)
+                    )
+                  }
+                  title={t.sync.autoPickHint}
+                >
+                  <Sparkles size={11} />
+                  {t.sync.autoPickBtn}
+                </button>
               </>
             );
             return isCompact ? (
@@ -344,7 +607,8 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
           {[1, 2, 4].map((spd) => (
             <button
               key={spd}
-              className={`nvr-btn mono ${syncSpeed === spd ? "active" : ""}`}
+              type="button"
+              className={`nvr-btn sm mono ${syncSpeed === spd ? "active" : ""}`}
               onClick={() => setSyncSpeed(spd)}
             >
               {spd}x
@@ -367,18 +631,13 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
                 rev.camera
               );
               return (
-                <div
+                <button
                   key={rev.id}
-                  role="button"
-                  tabIndex={0}
-                  className={`nvr-list-row ${isSelected ? "is-selected" : ""}`}
-                  onClick={() => applyBoundedSyncSeek(Math.floor(rev.start_time))}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      applyBoundedSyncSeek(Math.floor(rev.start_time));
-                    }
-                  }}
+                  type="button"
+                  className={`nvr-list-row nvr-list-row-btn ${
+                    isSelected ? "is-selected" : ""
+                  }`}
+                  onClick={() => applyBoundedSyncSeek(Math.floor(rev.start_time), true)}
                 >
                   <img
                     src={thumbSrc}
@@ -394,7 +653,7 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
                       border: "1px solid var(--border-hairline)",
                     }}
                   />
-                  <div style={{ flex: 1 }}>
+                  <div style={{ flex: 1, textAlign: "left", minWidth: 0 }}>
                     <div
                       style={{
                         display: "flex",
@@ -420,71 +679,114 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
                       {(rev.data?.objects || ["motion"]).join(", ")} · {rev.severity}
                     </div>
                   </div>
-                </div>
+                </button>
               );
             })}
           </div>
         </div>
 
         <div className="nvr-matrix-2x2">
-          {activeQuadCameras.map((cam, slotIdx) => {
-            const realCam = resolveRealCameraSource(
-              cam,
-              config?.cameras || cameraNames
-            );
-            const isFocusedTile =
-              cam === selectedCamera ||
-              (!activeQuadCameras.includes(selectedCamera) && slotIdx === 0);
-            return (
-              <div key={`${cam}-${slotIdx}`} className="nvr-cam-tile">
-                <VodHlsPlayer
-                  camera={realCam}
-                  startTime={vodWindow.startTime}
-                  endTime={vodWindow.endTime}
-                  playheadTs={committedVodTs}
-                  enableKeyboardStep={isFocusedTile}
-                  playbackRate={safeSyncSpeed}
-                  controls={false}
-                />
-                <div className={`nvr-cam-hud pos-${hudPosition}`}>
-                  <span className="nvr-badge rewind">
-                    S{slotIdx + 1} · {cam.toUpperCase()}
-                    <span className="nvr-sync-badge-ts"> // SYNC @ {formatTs(safeMasterTs)}</span>
-                  </span>
-                  <button
-                    className="nvr-btn nvr-tile-action"
-                    style={{
-                      height: 22,
-                      padding: "0 8px",
-                      fontSize: "var(--text-xs)",
-                      pointerEvents: "auto",
-                    }}
-                    onClick={() =>
-                      handleQuickExport(realCam, safeMasterTs, safeMasterTs + 60)
+          {activeQuadCameras.length === 0 ? (
+            <div
+              className="mono"
+              style={{
+                gridColumn: "1 / -1",
+                gridRow: "1 / -1",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                color: "var(--text-muted)",
+                background: "var(--video-stage-bg)",
+                padding: 24,
+              }}
+            >
+              {t.sync.emptyCameras}
+            </div>
+          ) : (
+            activeQuadCameras.map((cam, slotIdx) => {
+              const realCam = resolveRealCameraSource(
+                cam,
+                config?.cameras || cameraNames
+              );
+              const isFocusedTile = cam === focusedSyncCamera;
+              const tilePlayheadTarget =
+                slotIdx === 0
+                  ? committedSeekTs
+                  : slotDriftTargets[slotIdx] ?? committedSeekTs;
+              return (
+                <div
+                  key={`${cam}-${slotIdx}`}
+                  className={`nvr-cam-tile ${
+                    isFocusedTile ? "is-timeline-focused" : ""
+                  }`}
+                  onClick={() => setSelectedCamera(cam)}
+                >
+                  <VodHlsPlayer
+                    camera={realCam}
+                    cameraConfig={
+                      config?.cameras?.[cam] ?? config?.cameras?.[realCam]
                     }
-                  >
-                    {t.live.export60s}
-                  </button>
+                    startTime={vodWindow.startTime}
+                    endTime={vodWindow.endTime}
+                    playheadTs={tilePlayheadTarget}
+                    paused={syncPaused}
+                    controlledMuted={isFocusedTile ? syncMuted : true}
+                    enableKeyboardStep={isFocusedTile}
+                    playbackRate={safeSyncSpeed}
+                    controls={false}
+                    onTimeUpdate={(curSec, absSec) =>
+                      handleTileTimeUpdate(slotIdx, curSec, absSec)
+                    }
+                  />
+                  <div className={`nvr-cam-hud pos-${hudPosition}`}>
+                    <span className="nvr-badge rewind">
+                      S{slotIdx + 1} · {cam.toUpperCase()}
+                      <span className="nvr-sync-badge-ts">
+                        {" "}
+                        // SYNC @ {formatTs(Math.floor(safeMasterTs))}
+                      </span>
+                    </span>
+                    <button
+                      type="button"
+                      className="nvr-btn sm nvr-tile-action"
+                      style={{
+                        pointerEvents: "auto",
+                      }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void handleQuickExport(
+                          realCam,
+                          Math.floor(safeMasterTs),
+                          Math.floor(safeMasterTs) + 60
+                        );
+                      }}
+                    >
+                      {t.live.export60s}
+                    </button>
+                  </div>
                 </div>
-              </div>
-            );
-          })}
+              );
+            })
+          )}
         </div>
       </div>
 
       <TimelineScrubber
-        camera={selectedCamera}
+        camera={focusedSyncCamera || selectedCamera}
         cameras={cameraNames}
         onSelectCamera={(cam) => setSelectedCamera(cam)}
         segments={focusSegments}
         reviews={reviews}
-        currentTs={safeMasterTs}
+        currentTs={Math.floor(safeMasterTs)}
         onSeek={(ts) =>
-          applyBoundedSyncSeek(ts ?? Math.floor(Date.now() / 1000) - 30)
+          applyBoundedSyncSeek(
+            ts ?? Math.floor(Date.now() / 1000) - 30,
+            false
+          )
         }
         onOpenExports={() => useNvrStore.getState().setActiveTab("exports")}
         onExportRange={handleQuickExport}
-        titlePrefix="4-CH SYNC TIMELINE"
+        titlePrefix={t.sync.timelineTitle}
       />
     </>
   );

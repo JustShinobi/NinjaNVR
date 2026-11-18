@@ -37,7 +37,55 @@ export const en = {
     signIn: "Authenticate",
     signingIn: "Verifying...",
     signOut: "Sign Out",
+    signOutAria: "Log out of NinjaNVR Console",
+    signedInTooltip: "Signed in as {user} ({role}) — Click to log out",
+    ssoSignIn: "Sign in with {provider} (OIDC)",
     invalidCredentials: "Authentication failed. Check username and password.",
+  },
+  security: {
+    profileLabel: "Operational Security Profile",
+    profilePillAria: "Security profile: {profile}",
+    armed: "ARMED",
+    home: "HOME",
+    disarmed: "DISARMED",
+    switchedToast: "Operational security profile switched to {profile}",
+  },
+  header: {
+    primaryNavAria: "Primary Workspace Navigation",
+    mobileNavAria: "Primary Workspace Navigation (mobile)",
+    nodeSelectorAria: "Federated NVR Node Selector",
+    nodeSelectorHint: "Switch between local NVR node and federated peer NVR nodes",
+    nodeAll: "NODE: ALL FEDERATED",
+    nodeLocal: "NODE: LOCAL (PRIMARY)",
+    nodePeerPrefix: "NODE",
+    nodeSwitchedToast: "Active NVR node scope: {node}",
+    storageDegraded: "STORAGE DEGRADED",
+    storageDegradedHint:
+      "Recordings storage mount is unavailable or read-only; Live Wall remains active",
+  },
+  common: {
+    loadingWorkspace: "Loading workspace...",
+    telemetryError: "Unable to refresh telemetry or event feeds from the server.",
+    retry: "Retry",
+    dismiss: "Dismiss",
+    confirmAgain: "Click again to confirm",
+    markedReviewedToast: "Marked {count} review item(s) as reviewed",
+    markReviewedErrorToast: "Network error while marking review items",
+    deletedReviewsToast: "Deleted {count} review segment(s)",
+    deleteReviewsErrorToast: "Network error while deleting review segments",
+    exportBackgroundToast: "Exporting MP4 clip in background for {camera} ({range})",
+    exportReadyToast: "MP4 clip ready for {camera} ({range})",
+    exportReadyNamedToast: "MP4 clip ready: {name}",
+    exportFailedNamedToast: "Export failed: {name}",
+    exportNetworkErrorToast: "Network error while exporting MP4 clip",
+    exportCancelledToast: "Export cancelled",
+    exportCancelFailedToast: "Failed to cancel export job",
+    exportCancelNetworkErrorToast: "Network error while cancelling export job",
+    eventRetainedToast: "Event retained indefinitely",
+    eventUnretainedToast: "Event retention lock removed",
+    eventRetainErrorToast: "Network error while updating event retention",
+    eventDeletedToast: "Deleted event record",
+    eventDeleteErrorToast: "Network error while deleting event record",
   },
   live: {
     grid2x2: "2x2 Matrix",
@@ -89,17 +137,99 @@ export const en = {
     exportThisEvent: "Export this event as a clip",
     clipLast30s: "Clip 30s",
     clipLast30sHint: "Export the last 30 seconds of this camera",
+    muteAudio: "Mute live audio",
+    unmuteAudio: "Unmute live audio",
+    audioShortOn: "Audio On",
+    audioShortMuted: "Muted",
+    simulationBanner: "SIMULATED FLEET ACTIVE ({sim} VIRTUAL CHANNELS)",
+    exitSimulation: "Exit Simulation",
+    loadingCameras: "Connecting to NinjaNVR camera matrix...",
+    noCamerasConfigured: "No enabled cameras configured yet. Open Settings & Studio to add a camera.",
+    confirmClickAgain: "Click again to confirm",
+    triggerSiren: "Trigger Siren",
+    rebootCamera: "Reboot Camera",
+    deletePreset: "Delete PTZ Preset",
+    allMotionFilter: "All Motion",
+    activeObjectsFilter: "Active Objects",
+    personOnlyFilter: "Person Only",
+    vehiclesFilter: "Vehicles",
+    holdPrefix: "Hold",
+    trailLabel: "TRAIL:",
+    pageLabel: "Page {page} / {total}",
+    tourLabel: "Tour {sec}s",
+    hudBottomRight: "HUD: Bottom-Right",
+    hudTopRight: "HUD: Top-Right",
+    hudTopLeft: "HUD: Top-Left",
+    hudBottomLeft: "HUD: Bottom-Left",
+    hudHidden: "HUD: Hidden",
   },
   sync: {
     title: "MULTI-CAMERA SYNCHRONIZED TIME MACHINE",
     subtitle: "Simultaneous 4-channel playback locked to a shared master clock for cross-room incident tracking",
     masterClock: "Master Timestamp",
+    playAll: "Play All",
+    pauseAll: "Pause All",
+    stepPrevFrame: "-1f All",
+    stepNextFrame: "+1f All",
+    muteFocused: "Mute Sync Audio",
+    unmuteFocused: "Unmute Focused Tile",
     jumpBack30: "-30s All",
     jumpBack10: "-10s All",
     jumpFwd10: "+10s All",
     jumpFwd30: "+30s All",
+    autoPickBtn: "Auto-Pick 4 Active @ Timestamp",
+    autoPickHint: "Automatically select the 4 cameras with active alerts or detections near the current timestamp",
     recentIncidents: "Recent Incident Jump Points",
     syncLocked: "4 CHANNELS LOCKED",
+    syncPausedBadge: "4 CHANNELS PAUSED",
+    timelineTitle: "4-CH SYNC TIMELINE",
+    emptyCameras: "No cameras available for synchronized playback.",
+  },
+  timeline: {
+    liveEdge: "LIVE EDGE",
+    prevEvent: "Prev Event",
+    nextEvent: "Next Event",
+    zoomLabel: "Zoom:",
+    includeAudioAria: "Include Audio",
+    calendarPrefix: "Calendar",
+    hide24hMatrix: "Hide 24h Matrix",
+    show24hMatrix: "24h Activity Matrix ({days}d)",
+    hideStoryboard: "Hide Storyboard",
+    showStoryboard: "Storyboard Scan ({count})",
+    sliderPlayheadAria: "Timeline playhead for {camera}",
+    sliderTrimInAria: "Clip start (IN) trim handle for {camera}",
+    sliderTrimOutAria: "Clip end (OUT) trim handle for {camera}",
+  },
+  calendar: {
+    allDates: "All Dates",
+    jumpToDate: "Jump to Date",
+    dialogAria: "Recording Calendar",
+    openTooltip: "Open recording calendar (highlights days with recorded video and events)",
+    prevMonth: "Previous Month",
+    nextMonth: "Next Month",
+    closeCalendar: "Close calendar",
+    eventsLegend: "Events",
+    recordedLegend: "Recorded",
+    daysOnDisk: "{n}d on disk",
+    timeLabel: "Time:",
+    jumpToTime: "Jump to Time",
+    showAllDates: "Show All Recorded Dates",
+    eventsRecordedTooltip: "{date}: {count} events recorded",
+    noRecordingsTooltip: "{date}: No recordings on disk",
+  },
+  picker: {
+    defaultAria: "Camera selector",
+    prevCamera: "Previous camera",
+    nextCamera: "Next camera",
+    dialogAria: "Searchable camera selector",
+    searchPlaceholder: "Search {n} cameras...",
+    searchAria: "Search cameras",
+    filterAll: "All",
+    filterAlert: "Alert/Motion",
+    filterOffline: "Offline",
+    allGroups: "ALL GROUPS",
+    optionsAria: "Camera options",
+    noMatchingCameras: "No matching cameras",
   },
   review: {
     filtersShort: "Filters",
@@ -191,6 +321,9 @@ export const en = {
     dark: "Tactical Dark",
     light: "Daylight / Light",
     system: "System Auto",
+    shortDark: "DARK",
+    shortLight: "LIGHT",
+    shortAuto: "AUTO",
     highContrast: "High-Contrast Monitor Boost",
     highContrastDesc:
       "Strengthens structural borders (+15%), promotes muted text to >= 7:1 AAA contrast, and applies 1.5px border weight.",
@@ -198,202 +331,4 @@ export const en = {
   },
 };
 
-export interface TranslationDict {
-  brand: {
-    name: string;
-    release: string;
-    engine: string;
-  };
-  nav: {
-    live: string;
-    sync: string;
-    review: string;
-    explore: string;
-    exports: string;
-    zones: string;
-    system: string;
-  };
-  /** Short tab names the desktop header switches to when the window is too narrow. */
-  navShort: {
-    live: string;
-    sync: string;
-    review: string;
-    explore: string;
-    exports: string;
-    zones: string;
-    system: string;
-  };
-  navMobile: {
-    live: string;
-    sync: string;
-    review: string;
-    exports: string;
-    more: string;
-  };
-  auth: {
-    title: string;
-    subtitle: string;
-    username: string;
-    password: string;
-    signIn: string;
-    signingIn: string;
-    signOut: string;
-    invalidCredentials: string;
-  };
-  live: {
-    grid2x2: string;
-    focusStage: string;
-    singleFull: string;
-    allCameras: string;
-    unreviewedAlerts: string;
-    hoverToPreview: string;
-    markReviewed: string;
-    markAllReviewed: string;
-    noPendingAlerts: string;
-    liveBadge: string;
-    timeShiftBadge: string;
-    returnToLive: string;
-    rewind10s: string;
-    rewind30s: string;
-    rewind2m: string;
-    export60s: string;
-    snapshot: string;
-    snapshotHint: string;
-    cameraDetails: string;
-    gridColumns: string;
-    detailsShort: string;
-    modeShortGrid: string;
-    modeShortCamera: string;
-    modeShortSpotlight: string;
-    zonesOverlay: string;
-    hdStream: string;
-    subStream: string;
-    motionActive: string;
-    idleState: string;
-    spotlightTimelineReactive: string;
-    spotlightTimelineWall: string;
-    spotlightPausedBadge: string;
-    resumeSpotlight: string;
-    focusCameraBtn: string;
-    matrixMode: string;
-    spotlightMode: string;
-    tacticalMap: string;
-    viewMode: string;
-    density: string;
-    densityNeedsMore: string;
-    densityAuto: string;
-    unreviewedShort: string;
-    openReview: string;
-    recentEvents: string;
-    eventTimeShift: string;
-    exportClip: string;
-    exportThisEvent: string;
-    clipLast30s: string;
-    clipLast30sHint: string;
-  };
-  sync: {
-    title: string;
-    subtitle: string;
-    masterClock: string;
-    jumpBack30: string;
-    jumpBack10: string;
-    jumpFwd10: string;
-    jumpFwd30: string;
-    recentIncidents: string;
-    syncLocked: string;
-  };
-  review: {
-    filtersShort: string;
-    title: string;
-    alerts: string;
-    detections: string;
-    allSeverities: string;
-    unreviewedOnly: string;
-    reviewedOnly: string;
-    allStatuses: string;
-    markSelectedReviewed: string;
-    deleteSelected: string;
-    exportClip: string;
-    keyboardHint: string;
-    emptyState: string;
-    shareLinkBtn: string;
-    shareCopiedBtn: string;
-    shareError: string;
-    shareManualCopyHint: string;
-  };
-  explore: {
-    title: string;
-    searchPlaceholder: string;
-    allLabels: string;
-    favoritesOnly: string;
-    topScore: string;
-    duration: string;
-    inProgress: string;
-    retainToggle: string;
-    falsePositive: string;
-    viewSnapshot: string;
-    playClip: string;
-  };
-  exports: {
-    title: string;
-    createTitle: string;
-    camera: string;
-    rangePreset: string;
-    last1m: string;
-    last5m: string;
-    last15m: string;
-    customName: string;
-    generateBtn: string;
-    archiveTitle: string;
-    downloadMp4: string;
-    renameBtn: string;
-    deleteBtn: string;
-    noExports: string;
-    activeShareLinks: string;
-    noShareLinks: string;
-    showInactiveLinks: string;
-    maxViewsUnlimited: string;
-    maxViews1: string;
-    maxViews5: string;
-    maxViews25: string;
-    copyLinkBtn: string;
-    revokeBtn: string;
-    statusActive: string;
-    statusRevoked: string;
-    statusExpired: string;
-    statusExhausted: string;
-    generatedUrlLabel: string;
-  };
-  zones: {
-    title: string;
-    visualTab: string;
-    yamlTab: string;
-    motionMasks: string;
-    detectionZones: string;
-    streamProbe: string;
-    saveOnly: string;
-    saveAndRestart: string;
-    copyYaml: string;
-  };
-  system: {
-    title: string;
-    detectorLatency: string;
-    cpuLoad: string;
-    memoryRss: string;
-    storageVolumes: string;
-    cameraHealth: string;
-    liveLogs: string;
-    pauseStream: string;
-    resumeStream: string;
-    copyLogs: string;
-  };
-  theme: {
-    label: string;
-    dark: string;
-    light: string;
-    system: string;
-    highContrast: string;
-    highContrastDesc: string;
-    cycleTooltip: string;
-  };
-}
+export type TranslationDict = typeof en;

@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Calendar, ChevronDown, ChevronLeft, ChevronRight, Clock, X } from "lucide-react";
+import { useI18n } from "../i18n";
 import { useNvrStore } from "../store/useNvrStore";
 import { RecordingDaySummary } from "../types/nvr";
 
@@ -16,8 +17,10 @@ interface RecordingCalendarPopoverProps {
   onClear?: () => void;
 }
 
-const WEEKDAYS_SUN = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
-const WEEKDAYS_MON = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
+const WEEKDAYS_SUN_EN = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+const WEEKDAYS_MON_EN = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
+const WEEKDAYS_SUN_PT = ["Do", "Se", "Te", "Qa", "Qi", "Sx", "Sá"];
+const WEEKDAYS_MON_PT = ["Se", "Te", "Qa", "Qi", "Sx", "Sá", "Do"];
 
 function parseValidCalendarDate(dateStr: string): [number, number, number] | null {
   const m = (dateStr || "").trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
@@ -48,12 +51,16 @@ function parseValidCalendarDate(dateStr: string): [number, number, number] | nul
   return [year, month, day];
 }
 
-export function formatReadableDate(dateStr: string): string {
-  if (!dateStr) return "All Dates";
+export function formatReadableDate(
+  dateStr: string,
+  allDatesLabel = "All Dates",
+  localeTag?: string
+): string {
+  if (!dateStr) return allDatesLabel;
   const parsed = parseValidCalendarDate(dateStr);
   if (!parsed) return dateStr;
   const d = new Date(parsed[0], parsed[1] - 1, parsed[2]);
-  return d.toLocaleDateString([], {
+  return d.toLocaleDateString(localeTag ? [localeTag] : [], {
     month: "short",
     day: "2-digit",
     year: "numeric",
@@ -66,16 +73,27 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
   selectedTime = "12:00:00",
   showTimePicker = false,
   allowClear = false,
-  buttonLabelPrefix = "Jump to Date",
+  buttonLabelPrefix,
   openUpward = true,
   onSelectDate,
   onSelectDateTime,
   onClear,
 }) => {
+  const { t, locale } = useI18n();
+  const isPt = locale === "pt";
+  const localeTag = isPt ? "pt-BR" : "en-US";
+  const effectiveButtonPrefix = buttonLabelPrefix ?? t.calendar.jumpToDate;
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const [isOpen, setIsOpen] = useState(false);
   const firstWeekday = useNvrStore((s) => s.firstWeekday);
-  const weekdayLabels = firstWeekday === "monday" ? WEEKDAYS_MON : WEEKDAYS_SUN;
+  const weekdayLabels =
+    firstWeekday === "monday"
+      ? isPt
+        ? WEEKDAYS_MON_PT
+        : WEEKDAYS_MON_EN
+      : isPt
+      ? WEEKDAYS_SUN_PT
+      : WEEKDAYS_SUN_EN;
 
   // Month being viewed in the calendar grid
   const initialDate = useMemo(() => {
@@ -170,11 +188,11 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
   }, [viewYear, viewMonth, dayMap, firstWeekday]);
 
   const monthTitle = useMemo(() => {
-    return new Date(viewYear, viewMonth, 1).toLocaleDateString([], {
+    return new Date(viewYear, viewMonth, 1).toLocaleDateString([localeTag], {
       month: "long",
       year: "numeric",
     });
-  }, [viewYear, viewMonth]);
+  }, [viewYear, viewMonth, localeTag]);
 
   const stepMonth = (delta: number) => {
     const next = new Date(viewYear, viewMonth + delta, 1);
@@ -189,26 +207,25 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
       {/* Calendar Trigger Button: neutral when closed, accent only when open or actively filtering */}
       <button
         type="button"
-        className={`nvr-btn ${isFilteredActive ? "active" : ""}`}
+        className={`nvr-btn sm ${isFilteredActive ? "active" : ""}`}
         aria-expanded={isOpen}
         aria-haspopup="dialog"
         onClick={() => setIsOpen((v) => !v)}
         style={{
-          height: 26,
           padding: "0 10px",
           fontSize: "var(--text-xs)",
           display: "inline-flex",
           alignItems: "center",
           gap: 6,
         }}
-        title="Open recording calendar (highlights days with recorded video and events)"
+        title={t.calendar.openTooltip}
       >
         <Calendar size={13} color="var(--text-secondary)" />
         <span style={{ color: "var(--text-secondary)", fontWeight: 500 }}>
-          {buttonLabelPrefix}:
+          {effectiveButtonPrefix}:
         </span>
         <span className="mono" style={{ color: "var(--text-primary)", fontWeight: 700 }}>
-          {formatReadableDate(selectedDate)}
+          {formatReadableDate(selectedDate, t.calendar.allDates, localeTag)}
         </span>
         {showTimePicker && selectedTime && (
           <span className="mono" style={{ color: "var(--text-secondary)" }}>
@@ -222,13 +239,14 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
       {isOpen && (
         <div
           role="dialog"
-          aria-label="Recording Calendar"
+          aria-label={t.calendar.dialogAria}
           className="nvr-calendar-popover"
           style={{
             position: "absolute",
             ...(openUpward ? { bottom: 32 } : { top: 32 }),
             left: 0,
             width: 316,
+            maxWidth: "calc(100vw - 24px)",
             background: "var(--bg-panel)",
             border: "1px solid var(--signal-accent)",
             borderRadius: 4,
@@ -250,11 +268,11 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
           >
             <button
               type="button"
-              className="nvr-btn"
-              style={{ height: 24, padding: "0 6px" }}
+              className="nvr-btn sm"
+              style={{ padding: "0 6px" }}
               onClick={() => stepMonth(-1)}
-              aria-label="Previous Month"
-              title="Previous Month"
+              aria-label={t.calendar.prevMonth}
+              title={t.calendar.prevMonth}
             >
               <ChevronLeft size={13} />
             </button>
@@ -263,6 +281,7 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
                 fontSize: "var(--text-sm)",
                 fontWeight: 700,
                 color: "var(--text-primary)",
+                textTransform: "capitalize",
               }}
             >
               {monthTitle}
@@ -270,21 +289,21 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
             <div style={{ display: "flex", gap: 4 }}>
               <button
                 type="button"
-                className="nvr-btn"
-                style={{ height: 24, padding: "0 6px" }}
+                className="nvr-btn sm"
+                style={{ padding: "0 6px" }}
                 onClick={() => stepMonth(1)}
-                aria-label="Next Month"
-                title="Next Month"
+                aria-label={t.calendar.nextMonth}
+                title={t.calendar.nextMonth}
               >
                 <ChevronRight size={13} />
               </button>
               <button
                 type="button"
-                className="nvr-btn"
-                style={{ height: 24, padding: "0 5px" }}
+                className="nvr-btn sm"
+                style={{ padding: "0 5px" }}
                 onClick={() => setIsOpen(false)}
-                aria-label="Close calendar"
-                title="Close calendar"
+                aria-label={t.calendar.closeCalendar}
+                title={t.calendar.closeCalendar}
               >
                 <X size={12} />
               </button>
@@ -315,7 +334,7 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
                   display: "inline-block",
                 }}
               />
-              Events
+              {t.calendar.eventsLegend}
             </span>
             <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
               <span
@@ -327,10 +346,10 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
                   display: "inline-block",
                 }}
               />
-              Recorded
+              {t.calendar.recordedLegend}
             </span>
             <span className="mono" style={{ color: "var(--text-muted)" }}>
-              {daysSummary.length}d on disk
+              {t.calendar.daysOnDisk.replace("{n}", String(daysSummary.length))}
             </span>
           </div>
 
@@ -347,8 +366,8 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
               fontWeight: 600,
             }}
           >
-            {weekdayLabels.map((w) => (
-              <div key={w}>{w}</div>
+            {weekdayLabels.map((w, wIdx) => (
+              <div key={`${w}-${wIdx}`}>{w}</div>
             ))}
           </div>
 
@@ -381,12 +400,14 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
                   }}
                   title={
                     hasRec
-                      ? `${cell.dateStr}: ${evCount} events recorded`
-                      : `${cell.dateStr}: No recordings on disk`
+                      ? t.calendar.eventsRecordedTooltip
+                          .replace("{date}", cell.dateStr)
+                          .replace("{count}", String(evCount))
+                      : t.calendar.noRecordingsTooltip.replace("{date}", cell.dateStr)
                   }
                   className="mono"
                   style={{
-                    height: 38,
+                    minHeight: 38,
                     borderRadius: 3,
                     border: isSelected
                       ? "1.5px solid var(--signal-accent-text)"
@@ -464,22 +485,21 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
                   htmlFor="nvr-calendar-time-input"
                   style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
                 >
-                  Time:
+                  {t.calendar.timeLabel}
                 </label>
                 <input
                   id="nvr-calendar-time-input"
                   type="time"
                   step="1"
-                  className="nvr-input mono"
-                  style={{ height: 24, fontSize: "var(--text-xs)", padding: "0 6px" }}
+                  className="nvr-input sm mono"
+                  style={{ fontSize: "var(--text-xs)", padding: "0 6px" }}
                   value={timeInput}
                   onChange={(e) => setTimeInput(e.target.value)}
                 />
               </div>
               <button
                 type="button"
-                className="nvr-btn primary"
-                style={{ height: 24, fontSize: "var(--text-xs)" }}
+                className="nvr-btn primary sm"
                 onClick={() => {
                   const now = new Date();
                   const localToday = `${now.getFullYear()}-${String(
@@ -492,7 +512,7 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
                   setIsOpen(false);
                 }}
               >
-                Jump to Time
+                {t.calendar.jumpToTime}
               </button>
             </div>
           )}
@@ -500,14 +520,14 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
           {allowClear && selectedDate && (
             <button
               type="button"
-              className="nvr-btn"
-              style={{ height: 24, fontSize: "var(--text-xs)", width: "100%" }}
+              className="nvr-btn sm"
+              style={{ width: "100%" }}
               onClick={() => {
                 onClear?.();
                 setIsOpen(false);
               }}
             >
-              Show All Recorded Dates
+              {t.calendar.showAllDates}
             </button>
           )}
         </div>

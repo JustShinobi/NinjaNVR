@@ -63,6 +63,19 @@ function safeStorageRemove(key: string): void {
   }
 }
 
+export function stableSerializeConfigValue(val: unknown): string {
+  if (val === null || val === undefined) return "null";
+  if (typeof val !== "object") return JSON.stringify(val);
+  if (Array.isArray(val)) {
+    return `[${val.map((item) => stableSerializeConfigValue(item)).join(",")}]`;
+  }
+  const obj = val as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return `{${keys
+    .map((k) => `${JSON.stringify(k)}:${stableSerializeConfigValue(obj[k])}`)
+    .join(",")}}`;
+}
+
 function sanitizeCameraActivityMap(
   raw: Record<string, CameraLiveActivity> | null | undefined
 ): Record<string, CameraLiveActivity> {
@@ -96,6 +109,20 @@ export const SIMULATED_FLEET_GROUPS = [
   "Estacionamento",
 ] as const;
 
+export const SIMULATED_FLEET_GROUPS_EN = [
+  "Indoor",
+  "Perimeter",
+  "Floor 1",
+  "Parking",
+] as const;
+
+export const SIMULATED_EMPTY_BASE_CAMERAS = [
+  "cam_01",
+  "cam_02",
+  "cam_03",
+  "cam_04",
+] as const;
+
 export function resolveInitialSimulatedFleetCount(): SimulatedFleetCount {
   const raw = Number(safeStorageGet("ninjanvr_simulated_fleet_count") || "0");
   if (raw === 12 || raw === 36 || raw === 100) {
@@ -105,9 +132,9 @@ export function resolveInitialSimulatedFleetCount(): SimulatedFleetCount {
 }
 
 /**
- * Resolves a simulated camera clone name (e.g. `escritorio_sim_01`, `sala_sim_02`)
- * back to its underlying real physical camera so `<LiveMsePlayer>` and snapshot URLs
- * (`/api/:cam/latest.webp`) stream real live MSE video and snapshots without touching `config.yml`.
+ * Resolves a simulated camera clone name (e.g. `cam_01_sim_01`) back to its underlying
+ * real physical camera so `<LiveMsePlayer>` and snapshot URLs (`/api/:cam/latest.webp`)
+ * stream real live MSE video and snapshots without touching `config.yml`.
  */
 export function resolveRealCameraSource(
   cameraName: string,
@@ -121,7 +148,7 @@ export function resolveRealCameraSource(
 
   const clean = (cameraName || "").trim();
   if (!clean) {
-    return realList[0] || "escritorio";
+    return realList[0] || "";
   }
   if (realList.includes(clean)) {
     return clean;
@@ -154,20 +181,17 @@ export interface ExpandedSimulatedFleet {
 
 /**
  * Dynamically expands the real configured cameras into `simulatedFleetCount` virtual channels
- * (e.g. `escritorio_sim_01`, `sala_sim_02`, ...) and populates tactical `camera_groups`
- * (`Interno`, `Perímetro`, `Andar 1`, `Estacionamento`) in memory.
+ * and populates localized tactical `camera_groups` in memory without inventing cameras when
+ * simulation is disabled (`simulatedFleetCount === 0`).
  */
 export function expandSimulatedFleet(
   realCameraNames: string[],
   camerasConfig?: Record<string, CameraConfig> | null,
   cameraGroups?: Record<string, CameraGroupConfig> | null,
-  simulatedFleetCount: SimulatedFleetCount = 0
+  simulatedFleetCount: SimulatedFleetCount = 0,
+  locale?: "en" | "pt"
 ): ExpandedSimulatedFleet {
-  const nonSimCams = realCameraNames.filter((c) => !/_sim_\d+$/.test(c));
-  const baseCams =
-    nonSimCams.length > 0
-      ? nonSimCams
-      : ["escritorio", "sala", "quarto", "cozinha"];
+  const nonSimCams = realCameraNames.filter((c) => Boolean(c) && !/_sim_\d+$/.test(c));
   const baseCfgMap: Record<string, CameraConfig> = { ...(camerasConfig || {}) };
   const baseGroups: Record<string, CameraGroupConfig> = {
     ...(cameraGroups || {}),
@@ -175,12 +199,14 @@ export function expandSimulatedFleet(
 
   if (!simulatedFleetCount || simulatedFleetCount <= 0) {
     return {
-      cameraNames: baseCams,
+      cameraNames: nonSimCams,
       camerasConfig: baseCfgMap,
       cameraGroups: baseGroups,
     };
   }
 
+  const baseCams =
+    nonSimCams.length > 0 ? nonSimCams : [...SIMULATED_EMPTY_BASE_CAMERAS];
   const expandedNames: string[] = [];
   const expandedCfg: Record<string, CameraConfig> = { ...baseCfgMap };
 
@@ -207,10 +233,12 @@ export function expandSimulatedFleet(
     }
   }
 
+  const groupLabels =
+    locale === "en" ? SIMULATED_FLEET_GROUPS_EN : SIMULATED_FLEET_GROUPS;
   const expandedGroups: Record<string, CameraGroupConfig> = { ...baseGroups };
-  SIMULATED_FLEET_GROUPS.forEach((groupName, gIdx) => {
+  groupLabels.forEach((groupName, gIdx) => {
     const groupCams = expandedNames.filter(
-      (_, idx) => idx % SIMULATED_FLEET_GROUPS.length === gIdx
+      (_, idx) => idx % groupLabels.length === gIdx
     );
     expandedGroups[groupName] = {
       order: gIdx + 1,
@@ -228,8 +256,8 @@ export function expandSimulatedFleet(
 
 /**
  * Validates and reconciles `selectedCamera` against `configuredCameras` (preferring enabled cameras)
- * and `simulatedFleetCount` so the store never stays stuck on a non-existent default camera name
- * (e.g. `"escritorio"`) when the loaded configuration uses different camera keys.
+ * and `simulatedFleetCount`, returning `""` when no camera is configured yet rather than a hardcoded
+ * non-existent camera name.
  */
 export function resolveValidCameraSelection(
   selectedCamera: string,
@@ -238,11 +266,21 @@ export function resolveValidCameraSelection(
 ): string {
   const clean = (selectedCamera || "").trim();
   if (!configuredCameras || typeof configuredCameras !== "object") {
-    return clean || "escritorio";
+    if (simulatedFleetCount > 0) {
+      const expanded = expandSimulatedFleet([], null, null, simulatedFleetCount).cameraNames;
+      if (clean && expanded.includes(clean)) return clean;
+      return expanded[0] || "";
+    }
+    return clean;
   }
   const allCams = Object.keys(configuredCameras);
   if (allCams.length === 0) {
-    return clean || "escritorio";
+    if (simulatedFleetCount > 0) {
+      const expanded = expandSimulatedFleet([], configuredCameras, null, simulatedFleetCount).cameraNames;
+      if (clean && expanded.includes(clean)) return clean;
+      return expanded[0] || "";
+    }
+    return clean;
   }
   const enabledCams = allCams.filter((k) => configuredCameras[k]?.enabled !== false);
   const validRealCams = enabledCams.length > 0 ? enabledCams : allCams;
@@ -257,13 +295,18 @@ export function resolveValidCameraSelection(
     if (clean && expanded.includes(clean)) {
       return clean;
     }
-    return expanded[0] || validRealCams[0] || "escritorio";
+    return expanded[0] || validRealCams[0] || "";
   }
 
   if (clean && validRealCams.includes(clean)) {
     return clean;
   }
-  return validRealCams[0] || "escritorio";
+  return validRealCams[0] || "";
+}
+
+export interface PttAudioReturnOverride {
+  pttCamera: string;
+  priorCamera: string | null;
 }
 
 interface NvrRealtimeState {
@@ -280,6 +323,8 @@ interface NvrRealtimeState {
   spotlightTimelineMode: SpotlightTimelineMode;
   securityProfile: "armed" | "home" | "disarmed";
   selectedCamera: string;
+  unmutedLiveCamera: string | null;
+  pttAudioOverride: PttAudioReturnOverride | null;
   hudPosition: HudPosition;
   useMainStream: boolean;
   showVectors: boolean;
@@ -296,6 +341,7 @@ interface NvrRealtimeState {
   lastDeletedFaceProfile: { name: string; ts: number } | null;
   subLabelsRefreshTick: number;
   wsOnline: boolean;
+  coreDataError: string | null;
   config: NinjaConfigResponse | null;
   stats: NinjaStatsResponse | null;
   statsHistory: NinjaStatsResponse[];
@@ -316,6 +362,10 @@ interface NvrRealtimeState {
   setSpotlightTimelineMode: (mode: SpotlightTimelineMode) => void;
   setSecurityProfile: (profile: "armed" | "home" | "disarmed") => void;
   setSelectedCamera: (camera: string) => void;
+  setUnmutedLiveCamera: (camera: string | null) => void;
+  toggleLiveCameraAudio: (camera: string) => void;
+  beginPttAudioReturn: (camera: string) => void;
+  endPttAudioReturn: (camera: string) => void;
   setHudPosition: (pos: HudPosition) => void;
   setUseMainStream: (fnOrVal: boolean | ((prev: boolean) => boolean)) => void;
   setShowVectors: (fnOrVal: boolean | ((prev: boolean) => boolean)) => void;
@@ -333,8 +383,10 @@ interface NvrRealtimeState {
   bumpSubLabelsRefresh: () => void;
   resetUiPreferences: () => void;
   setWsOnline: (online: boolean) => void;
+  setCoreDataError: (err: string | null) => void;
   setConfig: (config: NinjaConfigResponse | null) => void;
   setStats: (stats: NinjaStatsResponse | null) => void;
+  appendStatsSample: (sample: NinjaStatsResponse) => void;
   setStatsHistory: (history: NinjaStatsResponse[]) => void;
   setCameraActivity: (activity: Record<string, CameraLiveActivity>) => void;
 }
@@ -352,7 +404,9 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
   spotlightHoldSec: 15,
   spotlightTimelineMode: resolveInitialSpotlightTimelineMode(),
   securityProfile: "armed",
-  selectedCamera: "escritorio",
+  selectedCamera: "",
+  unmutedLiveCamera: null,
+  pttAudioOverride: null,
   hudPosition: resolveInitialHudPosition(),
   useMainStream: resolveInitialBool("ninjanvr_use_main_stream", false),
   showVectors: resolveInitialBool("ninjanvr_show_vectors", false),
@@ -369,6 +423,7 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
   lastDeletedFaceProfile: null,
   subLabelsRefreshTick: 0,
   wsOnline: false,
+  coreDataError: null,
   config: null,
   stats: null,
   statsHistory: [],
@@ -429,9 +484,51 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
   },
   setSecurityProfile: (securityProfile) => set({ securityProfile }),
   setSelectedCamera: (selectedCamera) =>
+    set({ selectedCamera: (selectedCamera || "").trim() }),
+  setUnmutedLiveCamera: (camera) =>
+    set({
+      unmutedLiveCamera: (camera || "").trim() || null,
+      pttAudioOverride: null,
+    }),
+  toggleLiveCameraAudio: (camera) =>
     set((s) => {
-      const clean = (selectedCamera || "").trim();
-      return { selectedCamera: clean || s.selectedCamera || "escritorio" };
+      const clean = (camera || "").trim();
+      if (!clean) {
+        return { unmutedLiveCamera: null, pttAudioOverride: null };
+      }
+      const next = s.unmutedLiveCamera === clean ? null : clean;
+      return {
+        unmutedLiveCamera: next,
+        pttAudioOverride: null,
+      };
+    }),
+  beginPttAudioReturn: (camera) =>
+    set((s) => {
+      const clean = (camera || "").trim();
+      if (!clean) return s;
+      if (s.pttAudioOverride && s.pttAudioOverride.pttCamera === clean) {
+        return s.unmutedLiveCamera === clean
+          ? s
+          : { unmutedLiveCamera: clean };
+      }
+      return {
+        pttAudioOverride: {
+          pttCamera: clean,
+          priorCamera: s.unmutedLiveCamera,
+        },
+        unmutedLiveCamera: clean,
+      };
+    }),
+  endPttAudioReturn: (camera) =>
+    set((s) => {
+      const clean = (camera || "").trim();
+      if (!s.pttAudioOverride || s.pttAudioOverride.pttCamera !== clean) {
+        return s;
+      }
+      return {
+        unmutedLiveCamera: s.pttAudioOverride.priorCamera,
+        pttAudioOverride: null,
+      };
     }),
   setHudPosition: (hudPosition) => {
     safeStorageSet("ninjanvr_hud_position", hudPosition);
@@ -517,7 +614,11 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
       const nextSelected =
         simulatedFleetCount === 0
           ? resolveRealCameraSource(s.selectedCamera, s.config?.cameras)
-          : s.selectedCamera;
+          : resolveValidCameraSelection(
+              s.selectedCamera,
+              s.config?.cameras,
+              simulatedFleetCount
+            );
       const nextGroup =
         simulatedFleetCount === 0 &&
         s.activeCameraGroup !== "all" &&
@@ -577,6 +678,8 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
       matrixTourIntervalSec: 15,
       syncQuadCameras: [],
       spotlightTimelineMode: "reactive",
+      unmutedLiveCamera: null,
+      pttAudioOverride: null,
       hudPosition: "bottom-right",
       useMainStream: false,
       showVectors: false,
@@ -592,6 +695,7 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
     });
   },
   setWsOnline: (wsOnline) => set({ wsOnline }),
+  setCoreDataError: (coreDataError) => set({ coreDataError }),
   setConfig: (config) =>
     set((s) => {
       let nextThemeMode = s.themeMode;
@@ -615,14 +719,43 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
         config?.cameras,
         s.simulatedFleetCount
       );
+
+      let nextConfig: NinjaConfigResponse | null = config;
+      if (s.config && config) {
+        if (stableSerializeConfigValue(s.config) === stableSerializeConfigValue(config)) {
+          nextConfig = s.config;
+        } else if (
+          s.config.cameras &&
+          config.cameras &&
+          stableSerializeConfigValue(s.config.cameras) ===
+            stableSerializeConfigValue(config.cameras)
+        ) {
+          nextConfig = { ...config, cameras: s.config.cameras };
+        }
+      }
+
+      if (
+        nextConfig === s.config &&
+        nextSelectedCamera === s.selectedCamera &&
+        nextThemeMode === s.themeMode &&
+        nextHighContrast === s.highContrast
+      ) {
+        return s;
+      }
+
       return {
-        config,
+        config: nextConfig,
         selectedCamera: nextSelectedCamera,
         themeMode: nextThemeMode,
         highContrast: nextHighContrast,
       };
     }),
   setStats: (stats) => set({ stats }),
+  appendStatsSample: (sample) =>
+    set((s) => ({
+      stats: sample,
+      statsHistory: [...s.statsHistory, sample].slice(-MAX_STATS_HISTORY_SAMPLES),
+    })),
   setStatsHistory: (statsHistory) =>
     set({
       statsHistory: Array.isArray(statsHistory)

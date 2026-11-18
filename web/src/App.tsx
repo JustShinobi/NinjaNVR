@@ -1,5 +1,6 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  AlertTriangle,
   Clock,
   Download,
   LayoutGrid,
@@ -8,7 +9,9 @@ import {
   Monitor,
   Moon,
   MoreHorizontal,
+  RefreshCw,
   Sun,
+  X,
 } from "lucide-react";
 import { formatBadgeCount, resolveMobileNavTabs } from "./utils/liveTileHud";
 import { useCompactViewport } from "./utils/useCompactViewport";
@@ -20,6 +23,7 @@ import {
   ExportJobItem,
   FfprobeItem,
   NinjaConfigResponse,
+  NinjaStatsResponse,
   RecordingDaySummary,
   RecordingSegment,
   ReviewItem,
@@ -35,6 +39,7 @@ import {
   formatDisplayVersion,
   formatTs,
   resolveHeaderTelemetryMeta,
+  resolveInitialTab,
 } from "./utils/format";
 import {
   expandSimulatedFleet,
@@ -44,12 +49,6 @@ import {
 } from "./store/useNvrStore";
 import { formatMeasured, parseMeasured, resolvePrimaryInferenceMs } from "./utils/detectorTelemetry";
 import { LiveWorkspace } from "./views/LiveWorkspace";
-import { SyncWorkspace } from "./views/SyncWorkspace";
-import { ReviewWorkspace } from "./views/ReviewWorkspace";
-import { ExploreWorkspace } from "./views/ExploreWorkspace";
-import { ExportsWorkspace } from "./views/ExportsWorkspace";
-import { ZonesWorkspace } from "./views/ZonesWorkspace";
-import { SystemWorkspace } from "./views/SystemWorkspace";
 import {
   type ConfigWorkbenchSession,
   ConfigWorkbenchProvider,
@@ -75,8 +74,67 @@ import {
   reconcileReviewMutation,
 } from "./utils/operationalFeed";
 
+const SyncWorkspace = React.lazy(() =>
+  import("./views/SyncWorkspace").then((m) => ({ default: m.SyncWorkspace }))
+);
+const ReviewWorkspace = React.lazy(() =>
+  import("./views/ReviewWorkspace").then((m) => ({ default: m.ReviewWorkspace }))
+);
+const ExploreWorkspace = React.lazy(() =>
+  import("./views/ExploreWorkspace").then((m) => ({ default: m.ExploreWorkspace }))
+);
+const ExportsWorkspace = React.lazy(() =>
+  import("./views/ExportsWorkspace").then((m) => ({ default: m.ExportsWorkspace }))
+);
+const ZonesWorkspace = React.lazy(() =>
+  import("./views/ZonesWorkspace").then((m) => ({ default: m.ZonesWorkspace }))
+);
+const SystemWorkspace = React.lazy(() =>
+  import("./views/SystemWorkspace").then((m) => ({ default: m.SystemWorkspace }))
+);
+
 export const MAX_LIVE_EVENTS = 250;
 export const MAX_LIVE_REVIEWS = 300;
+export const WS_HEALTHY_HEARTBEAT_MS = 60_000;
+export const WS_FALLBACK_POLL_MS = 10_000;
+
+export const WORKSPACE_TAB_URL_MAP: Record<WorkspaceTab, string> = {
+  live: "/",
+  sync: "/sync",
+  review: "/review",
+  explore: "/explore",
+  exports: "/export",
+  zones: "/config",
+  system: "/system",
+};
+
+export function isWorkspaceTab(val: unknown): val is WorkspaceTab {
+  return (
+    val === "live" ||
+    val === "sync" ||
+    val === "review" ||
+    val === "explore" ||
+    val === "exports" ||
+    val === "zones" ||
+    val === "system"
+  );
+}
+
+export function normalizeWsTopic(rawTopic: unknown): string {
+  if (typeof rawTopic !== "string") return "";
+  const clean = rawTopic.trim();
+  return clean.startsWith("ninjanvr/") ? clean.slice("ninjanvr/".length) : clean;
+}
+
+export function resolveCoreDataPollIntervalMs(
+  wsOnline: boolean,
+  hasActiveExportJobs: boolean
+): number {
+  if (!wsOnline || hasActiveExportJobs) {
+    return WS_FALLBACK_POLL_MS;
+  }
+  return WS_HEALTHY_HEARTBEAT_MS;
+}
 
 export function upsertBoundedEventList(
   prev: EventItem[],
@@ -87,7 +145,7 @@ export function upsertBoundedEventList(
   const idx = prev.findIndex((x) => x.id === incoming.id);
   if (idx >= 0) {
     const copy = [...prev];
-    copy[idx] = incoming;
+    copy[idx] = { ...prev[idx], ...incoming };
     return copy.slice(0, cap);
   }
   return [incoming, ...prev].slice(0, cap);
@@ -101,6 +159,27 @@ export function prependBoundedReviewAlert(
   const cap = Math.max(1, Math.floor(maxItems));
   if (prev.some((r) => r.id === incoming.id)) {
     return prev.slice(0, cap);
+  }
+  return [incoming, ...prev].slice(0, cap);
+}
+
+export function upsertBoundedReviewList(
+  prev: ReviewItem[],
+  incoming: ReviewItem,
+  maxItems = MAX_LIVE_REVIEWS
+): ReviewItem[] {
+  const cap = Math.max(1, Math.floor(maxItems));
+  const idx = prev.findIndex((r) => r.id === incoming.id);
+  if (idx >= 0) {
+    const copy = [...prev];
+    copy[idx] = {
+      ...prev[idx],
+      ...incoming,
+      data: incoming.data
+        ? { ...(prev[idx].data || {}), ...incoming.data }
+        : prev[idx].data,
+    };
+    return copy.slice(0, cap);
   }
   return [incoming, ...prev].slice(0, cap);
 }
@@ -191,7 +270,7 @@ export function playTacticalAlertChime(): void {
 }
 
 export const App: React.FC = () => {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const activeTab = useNvrStore((s) => s.activeTab);
   const isCompact = useCompactViewport();
   const [mobileMoreOpen, setMobileMoreOpen] = useState(false);
@@ -205,8 +284,6 @@ export const App: React.FC = () => {
   const setActiveTab = useNvrStore((s) => s.setActiveTab);
   const securityProfile = useNvrStore((s) => s.securityProfile);
   const setSecurityProfile = useNvrStore((s) => s.setSecurityProfile);
-  const audibleAlertChime = useNvrStore((s) => s.audibleAlertChime);
-  const browserNotifications = useNvrStore((s) => s.browserNotifications);
   const themeMode = useNvrStore((s) => s.themeMode);
   const setThemeMode = useNvrStore((s) => s.setThemeMode);
   const highContrast = useNvrStore((s) => s.highContrast);
@@ -214,15 +291,19 @@ export const App: React.FC = () => {
   const setSelectedCamera = useNvrStore((s) => s.setSelectedCamera);
   const timeShiftTs = useNvrStore((s) => s.timeShiftTs);
   const setTimeShiftTs = useNvrStore((s) => s.setTimeShiftTs);
-  const setPlaybackSpeed = useNvrStore((s) => s.setPlaybackSpeed);
   const wsOnline = useNvrStore((s) => s.wsOnline);
   const setWsOnline = useNvrStore((s) => s.setWsOnline);
+  const coreDataError = useNvrStore((s) => s.coreDataError);
+  const setCoreDataError = useNvrStore((s) => s.setCoreDataError);
   const config = useNvrStore((s) => s.config);
   const setConfig = useNvrStore((s) => s.setConfig);
   const stats = useNvrStore((s) => s.stats);
   const setStats = useNvrStore((s) => s.setStats);
+  const appendStatsSample = useNvrStore((s) => s.appendStatsSample);
   const setStatsHistory = useNvrStore((s) => s.setStatsHistory);
   const setCameraActivity = useNvrStore((s) => s.setCameraActivity);
+  const simulatedFleetCount = useNvrStore((s) => s.simulatedFleetCount);
+  const setSimulatedFleetCount = useNvrStore((s) => s.setSimulatedFleetCount);
   const lastDeletedFaceProfile = useNvrStore((s) => s.lastDeletedFaceProfile);
   const subLabelsRefreshTick = useNvrStore((s) => s.subLabelsRefreshTick);
 
@@ -233,6 +314,8 @@ export const App: React.FC = () => {
   const [username, setUsername] = useState("admin");
   const [loginUser, setLoginUser] = useState("admin");
   const [userRole, setUserRole] = useState<string>("admin");
+  const userRoleRef = useRef<string>(userRole);
+  userRoleRef.current = userRole;
   const [selectedNode, setSelectedNode] = useState<string>("local");
   const [authProviders, setAuthProviders] = useState<{
     local_login_enabled: boolean;
@@ -275,14 +358,14 @@ export const App: React.FC = () => {
   const [exportsList, setExportsList] = useState<ExportItem[]>([]);
   const [exportJobs, setExportJobs] = useState<ExportJobItem[]>([]);
   const notifiedJobTerminalStatusRef = useRef<Map<string, string>>(new Map());
-  const [exportCam, setExportCam] = useState<string>("escritorio");
+  const [exportCam, setExportCam] = useState<string>("");
   const [exportPresetMin, setExportPresetMin] = useState<number>(1);
   const [exportLabel, setExportLabel] = useState<string>("");
   const [activeExportPreview, setActiveExportPreview] = useState<ExportItem | null>(null);
 
   // Zones & Config Studio state
   const [zonesSubTab, setZonesSubTab] = useState<"visual" | "yaml">("visual");
-  const [inspectorCam, setInspectorCam] = useState<string>("escritorio");
+  const [inspectorCam, setInspectorCam] = useState<string>("");
   const workbenchSessionRef = useRef<ConfigWorkbenchSession | null>(null);
   if (!workbenchSessionRef.current) {
     workbenchSessionRef.current = createConfigWorkbenchSession(
@@ -321,6 +404,22 @@ export const App: React.FC = () => {
       workbenchSession.hydrateFromServer(config);
     }
   }, [config, workbenchSession]);
+
+  // Reconcile exportCam & inspectorCam automatically whenever config.cameras loads or changes
+  useEffect(() => {
+    const cams = config?.cameras;
+    if (!cams) return;
+    const allCams = Object.keys(cams);
+    if (allCams.length === 0) return;
+    const enabledCams = allCams.filter((k) => cams[k]?.enabled !== false);
+    const validCams = enabledCams.length > 0 ? enabledCams : allCams;
+    setInspectorCam((curr) =>
+      !curr || !allCams.includes(curr) ? validCams[0] : curr
+    );
+    setExportCam((curr) =>
+      !curr || !validCams.includes(curr) ? validCams[0] : curr
+    );
+  }, [config?.cameras]);
 
   // System & Logs state
   const [logService, setLogService] = useState<"ninjanvr" | "go2rtc" | "nginx" | "cameras">("ninjanvr");
@@ -372,46 +471,96 @@ export const App: React.FC = () => {
     }
   }, [themeMode, highContrast]);
 
-  const simulatedFleetCount = useNvrStore((s) => s.simulatedFleetCount);
+  // Update document.title dynamically on workspace transitions
+  useEffect(() => {
+    if (typeof document !== "undefined") {
+      document.title = `${t.nav[activeTab]} | ${t.brand.name}`;
+    }
+  }, [activeTab, t]);
+
   const cameraNames = useMemo(() => {
-    const base = !config?.cameras
-      ? ["escritorio", "sala", "quarto", "cozinha"]
-      : Object.keys(config.cameras).filter((k) => config.cameras[k].enabled);
+    if (!config?.cameras) {
+      return simulatedFleetCount > 0
+        ? expandSimulatedFleet([], null, null, simulatedFleetCount, locale).cameraNames
+        : [];
+    }
+    const base = Object.keys(config.cameras).filter((k) => config.cameras[k]?.enabled !== false);
     if (simulatedFleetCount > 0) {
       return expandSimulatedFleet(
         base,
-        config?.cameras,
-        config?.camera_groups,
-        simulatedFleetCount
+        config.cameras,
+        config.camera_groups,
+        simulatedFleetCount,
+        locale
       ).cameraNames;
     }
     return base;
-  }, [config, simulatedFleetCount]);
+  }, [config, simulatedFleetCount, locale]);
+
+  const enabledPeers = useMemo(
+    () =>
+      Object.entries(config?.peers || {}).filter(([, p]) =>
+        Boolean(p && p.enabled && typeof p.url === "string" && p.url.trim())
+      ),
+    [config?.peers]
+  );
 
   const unreviewedAlerts = useMemo(
     () => reviews.filter((r) => !r.has_been_reviewed),
     [reviews]
   );
 
-  // Navigate tab + update browser URL cleanly
+  // Navigate tab + push browser history entry so Browser/Mobile Back returns to previous workspace
   const switchTab = useCallback(
-    (tab: WorkspaceTab) => {
+    (tab: WorkspaceTab, options?: { replace?: boolean }) => {
       setActiveTab(tab);
-      const urlMap: Record<WorkspaceTab, string> = {
-        live: "/",
-        sync: "/sync",
-        review: "/review",
-        explore: "/explore",
-        exports: "/export",
-        zones: "/config",
-        system: "/system",
-      };
-      window.history.replaceState(null, "", urlMap[tab]);
+      if (typeof window === "undefined" || !window.history) return;
+      const targetUrl = WORKSPACE_TAB_URL_MAP[tab];
+      try {
+        if (options?.replace) {
+          window.history.replaceState?.({ tab }, "", targetUrl);
+        } else if (window.location?.pathname !== targetUrl) {
+          window.history.pushState?.({ tab }, "", targetUrl);
+        }
+      } catch {
+        // ignore synthetic history errors
+      }
     },
     [setActiveTab]
   );
 
-  // Fetch core bootstrap data
+  // Browser Back / Forward (`popstate`) synchronization
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const initialTab = useNvrStore.getState().activeTab;
+      window.history?.replaceState?.(
+        { tab: initialTab },
+        "",
+        WORKSPACE_TAB_URL_MAP[initialTab]
+      );
+    } catch {
+      // ignore
+    }
+    const onPopState = (ev: PopStateEvent) => {
+      const stateTab =
+        ev.state && typeof ev.state === "object" ? (ev.state as { tab?: unknown }).tab : null;
+      let nextTab: WorkspaceTab = isWorkspaceTab(stateTab)
+        ? stateTab
+        : resolveInitialTab();
+      if (
+        userRoleRef.current !== "admin" &&
+        (nextTab === "zones" || nextTab === "system")
+      ) {
+        nextTab = "live";
+      }
+      setActiveTab(nextTab);
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, [setActiveTab]);
+
+  // Fetch core bootstrap & reconciliation data
   const fetchCoreData = useCallback(async () => {
     const mySeq = ++coreFetchSeqRef.current;
     try {
@@ -463,10 +612,14 @@ export const App: React.FC = () => {
           setSelectedCamera(nextSelected);
         }
         setInspectorCam((curr) =>
-          validCams.length > 0 && !validCams.includes(curr) ? validCams[0] : curr
+          validCams.length > 0 && (!curr || !allCams.includes(curr))
+            ? validCams[0]
+            : curr
         );
         setExportCam((curr) =>
-          validCams.length > 0 && !validCams.includes(curr) ? validCams[0] : curr
+          validCams.length > 0 && (!curr || !validCams.includes(curr))
+            ? validCams[0]
+            : curr
         );
       }
       if (statsRes.ok) {
@@ -492,6 +645,7 @@ export const App: React.FC = () => {
           !manualLogoutRef.current &&
           Array.isArray(revJson)
         ) {
+          setCoreDataError(null);
           setReviews(revJson.slice(0, MAX_LIVE_REVIEWS));
           if (revJson.length > 0) {
             setActiveReview((curr) => {
@@ -503,6 +657,8 @@ export const App: React.FC = () => {
             });
           }
         }
+      } else {
+        setCoreDataError(`HTTP ${revRes.status} (/api/review)`);
       }
       if (expRes.ok) {
         const expJson: ExportItem[] = await expRes.json();
@@ -542,7 +698,7 @@ export const App: React.FC = () => {
           setUserRole(nextRole);
           const curTab = useNvrStore.getState().activeTab;
           if (nextRole !== "admin" && (curTab === "zones" || curTab === "system")) {
-            switchTab("live");
+            switchTab("live", { replace: true });
           }
         }
         if (profJson && typeof profJson.active_profile === "string") {
@@ -552,17 +708,23 @@ export const App: React.FC = () => {
           }
         }
       }
-    } catch {
-      // network retry on next tick
+    } catch (err) {
+      if (mySeq === coreFetchSeqRef.current && !manualLogoutRef.current) {
+        setAuthChecked(true);
+        const detail = err instanceof Error ? err.message : "Network error";
+        setCoreDataError(detail);
+      }
     }
   }, [
     reviewDateFilter,
     setConfig,
+    setCoreDataError,
     setSelectedCamera,
     setStats,
     setStatsHistory,
     setSecurityProfile,
     switchTab,
+    workbenchSession,
   ]);
 
   const fetchCoreDataRef = useRef(fetchCoreData);
@@ -603,14 +765,48 @@ export const App: React.FC = () => {
     };
   }, [authNeeded]);
 
+  // Initial bootstrap + filter reconciliation
   useEffect(() => {
     if (authNeeded) return;
     void fetchCoreData();
-    const timer = window.setInterval(fetchCoreData, 5000);
-    return () => window.clearInterval(timer);
   }, [fetchCoreData, authNeeded]);
 
-  // Connect to /ws for real-time camera_activity and stats (with auto-reconnect on disconnect)
+  // Event-driven `/ws` first: 60s safety heartbeat when `/ws` is healthy,
+  // 10s fallback polling ONLY when `/ws` is disconnected or export jobs are running.
+  const hasActiveExportJobs = useMemo(
+    () =>
+      exportJobs.some((j) => j.status === "queued" || j.status === "running"),
+    [exportJobs]
+  );
+  const pollIntervalMs = resolveCoreDataPollIntervalMs(
+    wsOnline,
+    hasActiveExportJobs
+  );
+
+  useEffect(() => {
+    if (authNeeded) return;
+    const timer = window.setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        return;
+      }
+      void fetchCoreDataRef.current();
+    }, pollIntervalMs);
+    return () => window.clearInterval(timer);
+  }, [authNeeded, pollIntervalMs]);
+
+  // Reconcile immediately when operator returns to a backgrounded tab
+  useEffect(() => {
+    if (authNeeded || typeof document === "undefined") return;
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void fetchCoreDataRef.current();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
+  }, [authNeeded]);
+
+  // Connect to /ws for real-time camera_activity, stats, reviews, events, config, and exports
   useEffect(() => {
     if (!authChecked || authNeeded) return;
     let closed = false;
@@ -665,69 +861,113 @@ export const App: React.FC = () => {
         if (closed || ws !== currentWs || typeof ev.data !== "string") return;
         try {
           const msg = JSON.parse(ev.data);
-          if (msg.topic === "camera_activity" && msg.payload) {
+          const topic = normalizeWsTopic(msg?.topic);
+          if (topic === "camera_activity" && msg.payload) {
             const parsed =
               typeof msg.payload === "string" ? JSON.parse(msg.payload) : msg.payload;
             setCameraActivity(parsed);
-          } else if (msg.topic === "profile/state" && typeof msg.payload === "string") {
+          } else if (topic === "stats" && msg.payload) {
+            const parsedStats: NinjaStatsResponse =
+              typeof msg.payload === "string" ? JSON.parse(msg.payload) : msg.payload;
+            if (
+              parsedStats &&
+              typeof parsedStats === "object" &&
+              typeof parsedStats.cameras === "object"
+            ) {
+              appendStatsSample(parsedStats);
+            }
+          } else if (
+            (topic === "profile/state" || topic === "profile") &&
+            typeof msg.payload === "string"
+          ) {
             const p = msg.payload.trim().toLowerCase();
             if (p === "armed" || p === "home" || p === "disarmed") {
               setSecurityProfile(p);
             }
-          } else if (msg.topic === "events" && msg.payload) {
+          } else if (topic === "config") {
+            fetch("/api/config", { credentials: "include" })
+              .then((r) => (r.ok ? r.json() : null))
+              .then((cfgJson: NinjaConfigResponse | null) => {
+                if (!closed && cfgJson && typeof cfgJson === "object") {
+                  setConfig(cfgJson);
+                  workbenchSession.hydrateFromServer(cfgJson);
+                }
+              })
+              .catch(() => {});
+          } else if (topic === "events" && msg.payload) {
             const parsed =
               typeof msg.payload === "string" ? JSON.parse(msg.payload) : msg.payload;
             if (
-              (parsed?.type === "new" || parsed?.type === "update") &&
+              (parsed?.type === "new" ||
+                parsed?.type === "update" ||
+                parsed?.type === "end") &&
               typeof parsed?.after?.id === "string" &&
               typeof parsed?.after?.camera === "string"
             ) {
               const evItem: EventItem = parsed.after;
               setEvents((prev) => upsertBoundedEventList(prev, evItem));
+              setSelectedEvent((curr) =>
+                curr && curr.id === evItem.id ? { ...curr, ...evItem } : curr
+              );
             }
-          } else if (msg.topic === "reviews" && msg.payload) {
+          } else if (topic === "reviews" && msg.payload) {
             const parsed =
               typeof msg.payload === "string" ? JSON.parse(msg.payload) : msg.payload;
             if (
-              parsed?.type === "new" &&
-              parsed?.after?.severity === "alert" &&
+              (parsed?.type === "new" ||
+                parsed?.type === "update" ||
+                parsed?.type === "end") &&
               typeof parsed?.after?.id === "string" &&
               typeof parsed?.after?.camera === "string"
             ) {
-              const alertItem: ReviewItem = parsed.after;
-              setReviews((prev) => prependBoundedReviewAlert(prev, alertItem));
-              if (useNvrStore.getState().audibleAlertChime) {
-                playTacticalAlertChime();
-              }
-              if (
-                useNvrStore.getState().browserNotifications &&
-                "Notification" in window &&
-                Notification.permission === "granted"
-              ) {
-                const rawObjs = alertItem.data?.objects;
-                const objList =
-                  Array.isArray(rawObjs) && rawObjs.length > 0 ? rawObjs : ["person"];
-                const objs = objList.join(", ").toUpperCase();
-                const rawCam = (alertItem.camera || "camera").trim();
-                const safeCam =
-                  !rawCam || rawCam === "." || rawCam === ".." || rawCam.includes("..")
-                    ? "camera"
-                    : rawCam;
-                const n = new Notification(
-                  `NinjaNVR Alert // ${safeCam.toUpperCase()}`,
-                  {
-                    body: `Detected ${objs}`,
-                    icon: `/api/${encodeURIComponent(safeCam)}/latest.jpg`,
-                  }
-                );
-                n.onclick = () => {
-                  window.focus();
-                  setActiveReview(alertItem);
-                  switchTab("review");
-                };
+              const revItem: ReviewItem = parsed.after;
+              setReviews((prev) => upsertBoundedReviewList(prev, revItem));
+              setActiveReview((curr) =>
+                curr && curr.id === revItem.id
+                  ? {
+                      ...curr,
+                      ...revItem,
+                      data: revItem.data
+                        ? { ...(curr.data || {}), ...revItem.data }
+                        : curr.data,
+                    }
+                  : curr
+              );
+
+              if (parsed.type === "new" && revItem.severity === "alert") {
+                if (useNvrStore.getState().audibleAlertChime) {
+                  playTacticalAlertChime();
+                }
+                if (
+                  useNvrStore.getState().browserNotifications &&
+                  "Notification" in window &&
+                  Notification.permission === "granted"
+                ) {
+                  const rawObjs = revItem.data?.objects;
+                  const objList =
+                    Array.isArray(rawObjs) && rawObjs.length > 0 ? rawObjs : ["person"];
+                  const objs = objList.join(", ").toUpperCase();
+                  const rawCam = (revItem.camera || "camera").trim();
+                  const safeCam =
+                    !rawCam || rawCam === "." || rawCam === ".." || rawCam.includes("..")
+                      ? "camera"
+                      : rawCam;
+                  const n = new Notification(
+                    `NinjaNVR Alert // ${safeCam.toUpperCase()}`,
+                    {
+                      body: `Detected ${objs}`,
+                      icon: `/api/${encodeURIComponent(safeCam)}/latest.jpg`,
+                    }
+                  );
+                  n.onclick = () => {
+                    window.focus();
+                    setActiveReview(revItem);
+                    switchTab("review");
+                  };
+                }
               }
             }
-          } else if (msg.topic === "exports" && msg.payload) {
+          } else if (topic === "exports" && msg.payload) {
             const parsed =
               typeof msg.payload === "string"
                 ? JSON.parse(msg.payload)
@@ -746,7 +986,7 @@ export const App: React.FC = () => {
                     notifiedJobTerminalStatusRef.current.delete(firstKey);
                   }
                 }
-                notify(`MP4 clip ready: ${job.name}`);
+                notify(t.common.exportReadyNamedToast.replace("{name}", job.name));
                 fetch("/api/exports", { credentials: "include" })
                   .then((r) => (r.ok ? r.json() : null))
                   .then((arr: ExportItem[] | null) => {
@@ -757,12 +997,15 @@ export const App: React.FC = () => {
                   .catch(() => {});
               } else if (job.status === "failed" && prevSeen !== "failed") {
                 notifiedJobTerminalStatusRef.current.set(job.id, "failed");
-                notify(job.error || `Export failed: ${job.name}`);
+                notify(
+                  job.error ||
+                    t.common.exportFailedNamedToast.replace("{name}", job.name)
+                );
               }
             }
           }
         } catch {
-          // ignore
+          // ignore malformed ws frame
         }
       };
     };
@@ -798,10 +1041,16 @@ export const App: React.FC = () => {
   }, [
     authChecked,
     authNeeded,
-    setWsOnline,
+    appendStatsSample,
+    notify,
     setCameraActivity,
+    setConfig,
     setSecurityProfile,
+    setWsOnline,
     switchTab,
+    t.common.exportFailedNamedToast,
+    t.common.exportReadyNamedToast,
+    workbenchSession,
   ]);
 
   // Fetch 24h recordings for the active timeline camera
@@ -843,22 +1092,33 @@ export const App: React.FC = () => {
     timelineCam,
     config?.cameras,
     archiveMetadataCache,
-    stats?.service?.last_updated,
   ]);
 
   // Fetch review feed on tab / date filter / auth / sub-label transitions
-  // (5s refresh is already handled by fetchCoreData without duplicating on stats.service.last_updated)
   useEffect(() => {
     if (!authChecked || authNeeded || activeTab !== "review") return;
     let cancelled = false;
     fetch(buildReviewFeedUrl(reviewDateFilter), { credentials: "include" })
-      .then((r) => (r.ok ? r.json() : null))
+      .then(async (r) => {
+        if (!r.ok) {
+          if (r.status !== 401 && !cancelled) {
+            setCoreDataError(`HTTP ${r.status} (/api/review)`);
+          }
+          return null;
+        }
+        return r.json();
+      })
       .then((revJson: ReviewItem[] | null) => {
         if (!cancelled && Array.isArray(revJson)) {
+          setCoreDataError(null);
           setReviews(revJson.slice(0, MAX_LIVE_REVIEWS));
         }
       })
-      .catch(() => {});
+      .catch((err) => {
+        if (!cancelled) {
+          setCoreDataError(err instanceof Error ? err.message : "Network error (/api/review)");
+        }
+      });
     return () => {
       cancelled = true;
     };
@@ -868,25 +1128,42 @@ export const App: React.FC = () => {
     activeTab,
     reviewDateFilter,
     subLabelsRefreshTick,
+    setCoreDataError,
   ]);
 
-  // Tab-specific data loaders
+  // Tab-specific data loaders (decoupled from stats.service.last_updated so editing Settings never re-fetches /api/config/raw & /api/ffprobe!)
+  const [exploreRetryTick, setExploreRetryTick] = useState(0);
   useEffect(() => {
-    if (!authChecked || authNeeded || activeTab === "review") return;
+    if (!authChecked || authNeeded) return;
     let cancelled = false;
     if (activeTab === "explore") {
       const evUrl = buildEventsFeedUrl(reviewDateFilter);
       fetch(evUrl, { credentials: "include" })
-        .then((r) => (r.ok ? r.json() : []))
-        .then((arr: EventItem[]) => {
+        .then(async (r) => {
+          if (!r.ok) {
+            if (r.status !== 401 && !cancelled) {
+              setCoreDataError(`HTTP ${r.status} (/api/events)`);
+            }
+            return null;
+          }
+          return r.json();
+        })
+        .then((arr: EventItem[] | null) => {
           if (!cancelled && Array.isArray(arr)) {
+            setCoreDataError(null);
             setEvents(arr.slice(0, MAX_LIVE_EVENTS));
             if (arr.length > 0) {
               setSelectedEvent((curr) => curr ?? arr[0]);
             }
           }
         })
-        .catch(() => {});
+        .catch((err) => {
+          if (!cancelled) {
+            setCoreDataError(
+              err instanceof Error ? err.message : "Network error (/api/events)"
+            );
+          }
+        });
     } else if (activeTab === "exports") {
       Promise.all([
         fetch("/api/exports", { credentials: "include" }).then((r) =>
@@ -928,23 +1205,16 @@ export const App: React.FC = () => {
           }
         })
         .catch(() => {});
-      fetch(`/api/ffprobe?paths=camera:${encodeURIComponent(inspectorCam)}`, {
-        credentials: "include",
-      })
-        .then((r) => (r.ok ? r.json() : null))
-        .then((info) => {
-          if (!cancelled && Array.isArray(info)) setFfprobeInfo(info);
+      if (inspectorCam) {
+        fetch(`/api/ffprobe?paths=camera:${encodeURIComponent(inspectorCam)}`, {
+          credentials: "include",
         })
-        .catch(() => {});
-    } else if (activeTab === "system" && userRole === "admin" && !logPaused) {
-      fetch(`/api/logs/${encodeURIComponent(logService)}?start=-120`, {
-        credentials: "include",
-      })
-        .then((r) => (r.ok ? r.json() : { lines: [] }))
-        .then((d) => {
-          if (!cancelled && Array.isArray(d.lines)) setLogLines(d.lines);
-        })
-        .catch(() => {});
+          .then((r) => (r.ok ? r.json() : null))
+          .then((info) => {
+            if (!cancelled && Array.isArray(info)) setFfprobeInfo(info);
+          })
+          .catch(() => {});
+      }
     }
     return () => {
       cancelled = true;
@@ -955,10 +1225,37 @@ export const App: React.FC = () => {
     activeTab,
     userRole,
     inspectorCam,
-    logService,
-    logPaused,
     reviewDateFilter,
     subLabelsRefreshTick,
+    exploreRetryTick,
+    setCoreDataError,
+    workbenchSession,
+  ]);
+
+  // System logs refresh only while viewing System tab
+  useEffect(() => {
+    if (!authChecked || authNeeded || activeTab !== "system" || userRole !== "admin" || logPaused) {
+      return;
+    }
+    let cancelled = false;
+    fetch(`/api/logs/${encodeURIComponent(logService)}?start=-120`, {
+      credentials: "include",
+    })
+      .then((r) => (r.ok ? r.json() : { lines: [] }))
+      .then((d) => {
+        if (!cancelled && Array.isArray(d.lines)) setLogLines(d.lines);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    authChecked,
+    authNeeded,
+    activeTab,
+    userRole,
+    logService,
+    logPaused,
     stats?.service?.last_updated,
   ]);
 
@@ -1019,7 +1316,7 @@ export const App: React.FC = () => {
         setUsername(loginUser.trim() || "admin");
         setAuthNeeded(false);
         setLoginPass("");
-        fetchCoreData();
+        void fetchCoreData();
       } else {
         setLoginError(t.auth.invalidCredentials);
       }
@@ -1073,12 +1370,12 @@ export const App: React.FC = () => {
           body: JSON.stringify({ ids, reviewed }),
         });
         handleReconcileReviews(ids, { hasBeenReviewed: reviewed });
-        notify(`Marked ${ids.length} review item(s) as reviewed`);
+        notify(t.common.markedReviewedToast.replace("{count}", String(ids.length)));
       } catch {
-        notify("Network error while marking review items");
+        notify(t.common.markReviewedErrorToast);
       }
     },
-    [notify, handleReconcileReviews]
+    [notify, handleReconcileReviews, t.common.markedReviewedToast, t.common.markReviewedErrorToast]
   );
 
   const handleDeleteReviews = useCallback(
@@ -1093,12 +1390,12 @@ export const App: React.FC = () => {
         });
         setReviews((prev) => prev.filter((r) => !ids.includes(r.id)));
         setActiveReview((curr) => (curr && ids.includes(curr.id) ? null : curr));
-        notify(`Deleted ${ids.length} review segment(s)`);
+        notify(t.common.deletedReviewsToast.replace("{count}", String(ids.length)));
       } catch {
-        notify("Network error while deleting review segments");
+        notify(t.common.deleteReviewsErrorToast);
       }
     },
-    [notify]
+    [notify, t.common.deletedReviewsToast, t.common.deleteReviewsErrorToast]
   );
 
   const handleQuickExport = useCallback(
@@ -1113,6 +1410,7 @@ export const App: React.FC = () => {
         camera,
         useNvrStore.getState().config?.cameras
       );
+      if (!realCam) return;
       const nowFallback = Math.floor(Date.now() / 1000);
       const s =
         typeof startSec === "number" && Number.isFinite(startSec) && startSec > 0
@@ -1123,6 +1421,7 @@ export const App: React.FC = () => {
           ? Math.ceil(Math.max(endSec, s + 1))
           : s + 30;
       const e = s < nowFallback ? Math.max(s + 1, Math.min(nowFallback, rawEnd)) : rawEnd;
+      const rangeStr = `${formatTs(s)} - ${formatTs(e)}`;
       try {
         const res = await fetch(`/api/export/${encodeURIComponent(realCam)}/start/${s}/end/${e}`, {
           method: "POST",
@@ -1142,7 +1441,9 @@ export const App: React.FC = () => {
               setExportJobs((prev) => reconcileExportJobList(prev, job));
             }
             notify(
-              `Exporting MP4 clip in background for ${camera} (${formatTs(s)} - ${formatTs(e)})`
+              t.common.exportBackgroundToast
+                .replace("{camera}", camera)
+                .replace("{range}", rangeStr)
             );
             return {
               exportId: data.export_id,
@@ -1150,7 +1451,11 @@ export const App: React.FC = () => {
               queued: true,
             };
           }
-          notify(`MP4 clip ready for ${camera} (${formatTs(s)} - ${formatTs(e)})`);
+          notify(
+            t.common.exportReadyToast
+              .replace("{camera}", camera)
+              .replace("{range}", rangeStr)
+          );
           const listRes = await fetch("/api/exports", { credentials: "include" }).catch(
             () => null
           );
@@ -1173,10 +1478,15 @@ export const App: React.FC = () => {
           notify(data.message || `Export failed (${res.status})`);
         }
       } catch {
-        notify("Network error while exporting MP4 clip");
+        notify(t.common.exportNetworkErrorToast);
       }
     },
-    [notify]
+    [
+      notify,
+      t.common.exportBackgroundToast,
+      t.common.exportReadyToast,
+      t.common.exportNetworkErrorToast,
+    ]
   );
 
   const handleCancelExportJob = useCallback(
@@ -1198,15 +1508,20 @@ export const App: React.FC = () => {
               )
             );
           }
-          notify("Export cancelled");
+          notify(t.common.exportCancelledToast);
         } else {
-          notify("Failed to cancel export job");
+          notify(t.common.exportCancelFailedToast);
         }
       } catch {
-        notify("Network error while cancelling export job");
+        notify(t.common.exportCancelNetworkErrorToast);
       }
     },
-    [notify]
+    [
+      notify,
+      t.common.exportCancelledToast,
+      t.common.exportCancelFailedToast,
+      t.common.exportCancelNetworkErrorToast,
+    ]
   );
 
   const handleEventRetain = async (ev: EventItem) => {
@@ -1217,9 +1532,9 @@ export const App: React.FC = () => {
         credentials: "include",
       });
       handleReconcileEvents(ev.id, { retainIndefinitely: next });
-      notify(next ? "Event retained indefinitely" : "Event retention lock removed");
+      notify(next ? t.common.eventRetainedToast : t.common.eventUnretainedToast);
     } catch {
-      notify("Network error while updating event retention");
+      notify(t.common.eventRetainErrorToast);
     }
   };
 
@@ -1231,9 +1546,9 @@ export const App: React.FC = () => {
       });
       setEvents((prev) => prev.filter((x) => x.id !== id));
       if (selectedEvent?.id === id) setSelectedEvent(null);
-      notify("Deleted event record");
+      notify(t.common.eventDeletedToast);
     } catch {
-      notify("Network error while deleting event record");
+      notify(t.common.eventDeleteErrorToast);
     }
   };
 
@@ -1247,7 +1562,7 @@ export const App: React.FC = () => {
     }
   };
 
-  // Filtered Review items (virtualized window of 40 items)
+  // Filtered Review items
   const filteredReviews = useMemo(() => {
     const dateBounds = reviewDateFilter
       ? parseOperationalDateBoundsSec(reviewDateFilter)
@@ -1314,50 +1629,20 @@ export const App: React.FC = () => {
     exploreQuery,
   ]);
 
-  // Global keyboard shortcuts (1-7 tabs, J/K/R/E in Review)
+  // Global keyboard shortcuts (1-7 tabs; Review [J/K/R/E] is owned directly by ReviewWorkspace)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement | null)?.tagName?.toLowerCase();
-      if (tag === "input" || tag === "textarea" || tag === "select") return;
-      if (e.ctrlKey || e.metaKey || e.altKey) return;
-
-      if (activeTab === "review") {
-        const key = e.key.toLowerCase();
-        if (key === "j" || key === "k") {
-          const idx = filteredReviews.findIndex((r) => r.id === activeReview?.id);
-          const nextIdx =
-            key === "j"
-              ? Math.min(filteredReviews.length - 1, Math.max(0, idx + 1))
-              : Math.max(0, idx - 1);
-          if (filteredReviews[nextIdx]) setActiveReview(filteredReviews[nextIdx]);
-          return;
-        }
-        if (key === "r" && activeReview) {
-          handleMarkReviews([activeReview.id], true);
-          return;
-        }
-        if (key === "e" && activeReview) {
-          handleQuickExport(
-            activeReview.camera,
-            activeReview.start_time - 5,
-            (activeReview.end_time || activeReview.start_time + 20) + 5,
-            `${activeReview.camera}_${activeReview.id}`
-          );
-          return;
-        }
-        if (key === "1") {
-          setPlaybackSpeed(1);
-          return;
-        }
-        if (key === "2") {
-          setPlaybackSpeed(2);
-          return;
-        }
-        if (key === "4") {
-          setPlaybackSpeed(4);
-          return;
-        }
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName?.toLowerCase();
+      if (
+        tag === "input" ||
+        tag === "textarea" ||
+        tag === "select" ||
+        target?.isContentEditable
+      ) {
+        return;
       }
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
 
       if (e.key === "1") switchTab("live");
       else if (e.key === "2") switchTab("sync");
@@ -1369,16 +1654,7 @@ export const App: React.FC = () => {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [
-    activeTab,
-    activeReview,
-    filteredReviews,
-    switchTab,
-    handleMarkReviews,
-    handleQuickExport,
-    setPlaybackSpeed,
-    userRole,
-  ]);
+  }, [switchTab, userRole]);
 
   // Telemetry summary values
   const sysCpu = formatMeasured(parseMeasured(stats?.cpu_usages?.["ninjanvr.full_system"]?.cpu), 1, "%");
@@ -1387,6 +1663,12 @@ export const App: React.FC = () => {
   const totalFps = formatMeasured(parseMeasured(stats?.camera_fps), 1, " FPS");
   const displayVersion = formatDisplayVersion(stats?.service?.version, t.brand.release);
   const headerTelemetry = resolveHeaderTelemetryMeta(wsOnline, cameraNames.length);
+  const securityProfileLabel = (prof: "armed" | "home" | "disarmed"): string =>
+    prof === "armed"
+      ? t.security.armed
+      : prof === "home"
+      ? t.security.home
+      : t.security.disarmed;
 
   if (!authChecked) {
     return <div className="nvr-shell" />;
@@ -1432,6 +1714,7 @@ export const App: React.FC = () => {
           <div style={{ color: "var(--text-secondary)", fontSize: 12 }}>{t.auth.subtitle}</div>
           {loginError && (
             <div
+              role="alert"
               style={{
                 padding: "8px 10px",
                 background: "rgba(239, 68, 68, 0.14)",
@@ -1484,7 +1767,7 @@ export const App: React.FC = () => {
           <button
             type="submit"
             className="nvr-btn primary"
-            style={{ height: 34 }}
+            style={{ minHeight: 34 }}
             disabled={loginBusy || !authProviders.local_login_enabled}
           >
             {loginBusy ? t.auth.signingIn : t.auth.signIn}
@@ -1494,7 +1777,7 @@ export const App: React.FC = () => {
               href="/api/auth/oidc/login"
               className="nvr-btn mono"
               style={{
-                height: 34,
+                minHeight: 34,
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
@@ -1503,7 +1786,10 @@ export const App: React.FC = () => {
                 color: "var(--signal-accent-text)",
               }}
             >
-              Sign in with {authProviders.oidc.provider_name || "SSO"} (OIDC)
+              {t.auth.ssoSignIn.replace(
+                "{provider}",
+                authProviders.oidc.provider_name || "SSO"
+              )}
             </a>
           )}
           <div style={{ display: "flex", justifyContent: "flex-end", paddingTop: 6 }}>
@@ -1525,47 +1811,50 @@ export const App: React.FC = () => {
         credentials: "include",
         body: JSON.stringify({ profile: prof }),
       });
-      notify(`Operational security profile switched to ${prof.toUpperCase()}`);
+      notify(
+        t.security.switchedToast.replace("{profile}", securityProfileLabel(prof))
+      );
     } catch {
       // ignore
     }
   };
 
   const handleLogout = async () => {
-          manualLogoutRef.current = true;
-          coreFetchSeqRef.current += 1;
-          try {
-            await fetch("/api/logout", {
-              method: "POST",
-              credentials: "include",
-            });
-          } catch {
-            // ignore
-          }
-          coreFetchSeqRef.current += 1;
-          setConfig(null);
-          setStats(null);
-          setStatsHistory([]);
-          setCameraActivity({});
-          setFocusSegments([]);
-          setGlobalDaysSummary([]);
-          archiveMetadataCache.clear();
-          setFfprobeInfo(null);
-          setDraftPoints([]);
-          workbenchSession.hydrateFromServer(null, "");
-          setEvents([]);
-          setReviews([]);
-          setExportsList([]);
-          setLogLines([]);
-          setActiveReview(null);
-          setSelectedEvent(null);
-          setActiveExportPreview(null);
-          setUserRole("viewer");
-          setWsOnline(false);
-          if (activeTab === "zones" || activeTab === "system") {
-            switchTab("live");
-          }
-          setAuthNeeded(true);
+    manualLogoutRef.current = true;
+    coreFetchSeqRef.current += 1;
+    try {
+      await fetch("/api/logout", {
+        method: "POST",
+        credentials: "include",
+      });
+    } catch {
+      // ignore
+    }
+    coreFetchSeqRef.current += 1;
+    setConfig(null);
+    setStats(null);
+    setStatsHistory([]);
+    setCameraActivity({});
+    setCoreDataError(null);
+    setFocusSegments([]);
+    setGlobalDaysSummary([]);
+    archiveMetadataCache.clear();
+    setFfprobeInfo(null);
+    setDraftPoints([]);
+    workbenchSession.hydrateFromServer(null, "");
+    setEvents([]);
+    setReviews([]);
+    setExportsList([]);
+    setLogLines([]);
+    setActiveReview(null);
+    setSelectedEvent(null);
+    setActiveExportPreview(null);
+    setUserRole("viewer");
+    setWsOnline(false);
+    if (activeTab === "zones" || activeTab === "system") {
+      switchTab("live", { replace: true });
+    }
+    setAuthNeeded(true);
   };
 
   const mobileNav = resolveMobileNavTabs(userRole);
@@ -1596,7 +1885,7 @@ export const App: React.FC = () => {
           <span className="nvr-brand-version mono">{displayVersion}</span>
         </div>
 
-        <nav className="nvr-nav" aria-label="Primary Workspace Navigation">
+        <nav className="nvr-nav" aria-label={t.header.primaryNavAria}>
           <button
             className={`nvr-nav-btn ${activeTab === "live" ? "active" : ""}`}
             onClick={() => switchTab("live")}
@@ -1689,24 +1978,30 @@ export const App: React.FC = () => {
         </nav>
 
         <div className="nvr-header-right">
-          {config?.peers && Object.keys(config.peers).length > 0 && (
+          {enabledPeers.length > 0 && (
             <select
-              className="nvr-select mono"
-              aria-label="Federated NVR Node Selector"
-              style={{ height: 26, fontSize: "var(--text-xs)" }}
+              className="nvr-select sm mono"
+              aria-label={t.header.nodeSelectorAria}
               value={selectedNode}
-              onChange={(e) => setSelectedNode(e.target.value)}
-              title="Switch between local NVR node and federated peer NVR nodes"
+              onChange={(e) => {
+                const nextNode = e.target.value;
+                setSelectedNode(nextNode);
+                notify(
+                  t.header.nodeSwitchedToast.replace(
+                    "{node}",
+                    nextNode.toUpperCase()
+                  )
+                );
+              }}
+              title={t.header.nodeSelectorHint}
             >
-              <option value="all">NODE: ALL FEDERATED</option>
-              <option value="local">NODE: LOCAL (PRIMARY)</option>
-              {Object.entries(config.peers)
-                .filter(([, p]) => p.enabled)
-                .map(([peerId]) => (
-                  <option key={peerId} value={peerId}>
-                    NODE: {peerId.toUpperCase()}
-                  </option>
-                ))}
+              <option value="all">{t.header.nodeAll}</option>
+              <option value="local">{t.header.nodeLocal}</option>
+              {enabledPeers.map(([peerId]) => (
+                <option key={peerId} value={peerId}>
+                  {t.header.nodePeerPrefix}: {peerId.toUpperCase()}
+                </option>
+              ))}
             </select>
           )}
           <button
@@ -1714,12 +2009,15 @@ export const App: React.FC = () => {
             data-testid="profile-pill"
             className={`nvr-profile-pill mono is-${securityProfile}`}
             aria-haspopup="dialog"
-            aria-label={`Security profile: ${securityProfile}`}
+            aria-label={t.security.profilePillAria.replace(
+              "{profile}",
+              securityProfileLabel(securityProfile)
+            )}
             disabled={userRole === "viewer"}
             onClick={() => setProfileSheetOpen(true)}
           >
             <span className="nvr-profile-pill-dot" aria-hidden="true" />
-            {securityProfile.toUpperCase()}
+            {securityProfileLabel(securityProfile)}
           </button>
           <div
             style={{
@@ -1731,7 +2029,7 @@ export const App: React.FC = () => {
               borderRadius: 3,
               padding: 2,
             }}
-            aria-label="Operational Security Profile"
+            aria-label={t.security.profileLabel}
             className="mono nvr-profile-seg"
           >
             {(["armed", "home", "disarmed"] as const).map((prof) => {
@@ -1741,11 +2039,9 @@ export const App: React.FC = () => {
                   key={prof}
                   type="button"
                   disabled={userRole === "viewer"}
-                  className={`nvr-btn mono ${isAct ? "active" : ""}`}
+                  className={`nvr-btn sm mono ${isAct ? "active" : ""}`}
                   style={{
-                    height: 22,
                     padding: "0 6px",
-                    fontSize: "var(--text-xs)",
                     color:
                       isAct && prof === "armed"
                         ? "var(--signal-alert-text)"
@@ -1755,7 +2051,7 @@ export const App: React.FC = () => {
                   }}
                   onClick={() => void applySecurityProfile(prof)}
                 >
-                  {prof.toUpperCase()}
+                  {securityProfileLabel(prof)}
                 </button>
               );
             })}
@@ -1765,8 +2061,7 @@ export const App: React.FC = () => {
               className="nvr-badge alert mono"
               onClick={() => switchTab("system")}
               title={
-                stats.service.storage_error ||
-                "Recordings storage mount is unavailable or read-only; Live Wall remains active"
+                stats.service.storage_error || t.header.storageDegradedHint
               }
               style={{
                 cursor: "pointer",
@@ -1775,7 +2070,7 @@ export const App: React.FC = () => {
                 fontWeight: 700,
               }}
             >
-              STORAGE DEGRADED
+              {t.header.storageDegraded}
             </button>
           )}
           <button
@@ -1797,23 +2092,15 @@ export const App: React.FC = () => {
           <button
             type="button"
             data-testid="topbar-theme-toggle"
-            className="nvr-btn mono nvr-header-aux nvr-header-btn"
-            style={{
-              height: 26,
-              padding: "0 8px",
-              fontSize: "var(--text-xs)",
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 4,
-            }}
-            title={`${t.theme.cycleTooltip} — Current: ${
+            className="nvr-btn sm mono nvr-header-aux nvr-header-btn"
+            title={`${t.theme.cycleTooltip} — ${
               themeMode === "dark"
                 ? t.theme.dark
                 : themeMode === "light"
                 ? t.theme.light
                 : t.theme.system
-            }${highContrast ? " (High-Contrast Boost)" : ""}`}
-            aria-label="Cycle Console Theme (Dark / Light / System)"
+            }${highContrast ? ` (${t.theme.highContrast})` : ""}`}
+            aria-label={t.theme.cycleTooltip}
             onClick={() => {
               const nextMode = cycleThemeMode(themeMode);
               setThemeMode(nextMode);
@@ -1835,33 +2122,92 @@ export const App: React.FC = () => {
             )}
             <span className="nvr-header-label">
               {themeMode === "dark"
-                ? "DARK"
+                ? t.theme.shortDark
                 : themeMode === "light"
-                ? "LIGHT"
-                : "AUTO"}
+                ? t.theme.shortLight
+                : t.theme.shortAuto}
             </span>
           </button>
           <button
             type="button"
-            className="nvr-btn mono nvr-header-btn"
-            style={{
-              height: 26,
-              padding: "0 8px",
-              fontSize: "var(--text-xs)",
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 4,
-            }}
-            title={`Signed in as ${username} (${userRole}) — Click to log out`}
+            className="nvr-btn sm mono nvr-header-btn"
+            title={t.auth.signedInTooltip
+              .replace("{user}", username)
+              .replace("{role}", userRole)}
             data-testid="topbar-logout"
-            aria-label="Log out of NinjaNVR Console"
+            aria-label={t.auth.signOutAria}
             onClick={handleLogout}
           >
             <LogOut size={12} />
-            <span className="nvr-header-label">Logout</span>
+            <span className="nvr-header-label">{t.auth.signOut}</span>
           </button>
         </div>
       </header>
+
+      {/* Global Simulated Fleet Banner (visible on both Desktop and Mobile across all workspaces) */}
+      {simulatedFleetCount > 0 && (
+        <div
+          className="nvr-sim-banner mono"
+          role="status"
+          data-testid="global-sim-banner"
+        >
+          <span>
+            {t.live.simulationBanner.replace(
+              "{sim}",
+              String(simulatedFleetCount)
+            )}
+          </span>
+          <button
+            type="button"
+            data-testid="exit-simulation-btn"
+            className="nvr-btn danger sm mono"
+            onClick={() => setSimulatedFleetCount(0)}
+          >
+            {t.live.exitSimulation}
+          </button>
+        </div>
+      )}
+
+      {/* Non-intrusive retryable warning banner when /api/review or /api/events fails */}
+      {coreDataError && (
+        <div
+          className="nvr-error-banner mono"
+          role="alert"
+          data-testid="core-data-error-banner"
+        >
+          <span className="nvr-error-banner-msg">
+            <AlertTriangle size={13} aria-hidden="true" />
+            <span>
+              {t.common.telemetryError} ({coreDataError})
+            </span>
+          </span>
+          <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <button
+              type="button"
+              className="nvr-btn sm mono"
+              onClick={() => {
+                setCoreDataError(null);
+                void fetchCoreData();
+                if (activeTab === "explore") {
+                  setExploreRetryTick((n) => n + 1);
+                }
+              }}
+            >
+              <RefreshCw size={11} />
+              {t.common.retry}
+            </button>
+            <button
+              type="button"
+              className="nvr-btn sm"
+              aria-label={t.common.dismiss}
+              title={t.common.dismiss}
+              onClick={() => setCoreDataError(null)}
+            >
+              <X size={12} />
+            </button>
+          </div>
+        </div>
+      )}
 
       {toastMsg && (
         <div
@@ -1888,161 +2234,171 @@ export const App: React.FC = () => {
 
       <ConfigWorkbenchProvider session={workbenchSession}>
         <ArchiveMetadataCacheProvider cache={archiveMetadataCache}>
-        <main className="nvr-main">
-        {activeTab === "live" && (
-          <LiveWorkspace
-            cameraNames={cameraNames}
-            reviews={reviews}
-            unreviewedAlerts={unreviewedAlerts}
-            focusSegments={focusSegments}
-            handleMarkReviews={handleMarkReviews}
-            handleQuickExport={handleQuickExport}
-          />
-        )}
+          <main className="nvr-main">
+            {activeTab === "live" && (
+              <LiveWorkspace
+                cameraNames={cameraNames}
+                reviews={reviews}
+                unreviewedAlerts={unreviewedAlerts}
+                focusSegments={focusSegments}
+                handleMarkReviews={handleMarkReviews}
+                handleQuickExport={handleQuickExport}
+              />
+            )}
 
-        {activeTab === "sync" && (
-          <SyncWorkspace
-            cameraNames={cameraNames}
-            syncMasterTs={syncMasterTs}
-            setSyncMasterTs={setSyncMasterTs}
-            syncSpeed={syncSpeed}
-            setSyncSpeed={setSyncSpeed}
-            reviews={reviews}
-            focusSegments={focusSegments}
-            handleQuickExport={handleQuickExport}
-          />
-        )}
+            {activeTab !== "live" && (
+              <Suspense
+                fallback={
+                  <div className="nvr-workspace-loading mono" role="status">
+                    {t.common.loadingWorkspace}
+                  </div>
+                }
+              >
+                {activeTab === "sync" && (
+                  <SyncWorkspace
+                    cameraNames={cameraNames}
+                    syncMasterTs={syncMasterTs}
+                    setSyncMasterTs={setSyncMasterTs}
+                    syncSpeed={syncSpeed}
+                    setSyncSpeed={setSyncSpeed}
+                    reviews={reviews}
+                    focusSegments={focusSegments}
+                    handleQuickExport={handleQuickExport}
+                  />
+                )}
 
-        {activeTab === "review" && (
-          <ReviewWorkspace
-            cameraNames={cameraNames}
-            reviews={reviews}
-            filteredReviews={filteredReviews}
-            exportsList={exportsList}
-            onOpenExport={(ex) => {
-              setActiveExportPreview(ex);
-              switchTab("exports");
-            }}
-            reviewCameraFilter={reviewCameraFilter}
-            setReviewCameraFilter={setReviewCameraFilter}
-            reviewSeverityFilter={reviewSeverityFilter}
-            setReviewSeverityFilter={setReviewSeverityFilter}
-            reviewObjectFilter={reviewObjectFilter}
-            setReviewObjectFilter={setReviewObjectFilter}
-            reviewStatusFilter={reviewStatusFilter}
-            setReviewStatusFilter={setReviewStatusFilter}
-            reviewDateFilter={reviewDateFilter}
-            setReviewDateFilter={setReviewDateFilter}
-            globalDaysSummary={globalDaysSummary}
-            activeReview={activeReview}
-            setActiveReview={setActiveReview}
-            focusSegments={focusSegments}
-            handleMarkReviews={handleMarkReviews}
-            handleDeleteReviews={handleDeleteReviews}
-            handleQuickExport={handleQuickExport}
-            setSyncMasterTs={setSyncMasterTs}
-            switchTab={switchTab}
-            onReconcileReviews={handleReconcileReviews}
-          />
-        )}
+                {activeTab === "review" && (
+                  <ReviewWorkspace
+                    cameraNames={cameraNames}
+                    reviews={reviews}
+                    filteredReviews={filteredReviews}
+                    exportsList={exportsList}
+                    onOpenExport={(ex) => {
+                      setActiveExportPreview(ex);
+                      switchTab("exports");
+                    }}
+                    reviewCameraFilter={reviewCameraFilter}
+                    setReviewCameraFilter={setReviewCameraFilter}
+                    reviewSeverityFilter={reviewSeverityFilter}
+                    setReviewSeverityFilter={setReviewSeverityFilter}
+                    reviewObjectFilter={reviewObjectFilter}
+                    setReviewObjectFilter={setReviewObjectFilter}
+                    reviewStatusFilter={reviewStatusFilter}
+                    setReviewStatusFilter={setReviewStatusFilter}
+                    reviewDateFilter={reviewDateFilter}
+                    setReviewDateFilter={setReviewDateFilter}
+                    globalDaysSummary={globalDaysSummary}
+                    activeReview={activeReview}
+                    setActiveReview={setActiveReview}
+                    focusSegments={focusSegments}
+                    handleMarkReviews={handleMarkReviews}
+                    handleDeleteReviews={handleDeleteReviews}
+                    handleQuickExport={handleQuickExport}
+                    setSyncMasterTs={setSyncMasterTs}
+                    switchTab={switchTab}
+                    onReconcileReviews={handleReconcileReviews}
+                  />
+                )}
 
-        {activeTab === "explore" && (
-          <ExploreWorkspace
-            cameraNames={cameraNames}
-            filteredEvents={filteredEvents}
-            exportsList={exportsList}
-            onOpenExport={(ex) => {
-              setActiveExportPreview(ex);
-              switchTab("exports");
-            }}
-            exploreQuery={exploreQuery}
-            setExploreQuery={setExploreQuery}
-            exploreCamera={exploreCamera}
-            setExploreCamera={setExploreCamera}
-            exploreLabel={exploreLabel}
-            setExploreLabel={setExploreLabel}
-            exploreRetainedOnly={exploreRetainedOnly}
-            setExploreRetainedOnly={setExploreRetainedOnly}
-            globalDaysSummary={globalDaysSummary}
-            reviewDateFilter={reviewDateFilter}
-            setReviewDateFilter={setReviewDateFilter}
-            selectedEvent={selectedEvent}
-            setSelectedEvent={setSelectedEvent}
-            eventViewMode={eventViewMode}
-            setEventViewMode={setEventViewMode}
-            handleEventRetain={handleEventRetain}
-            handleEventDelete={handleEventDelete}
-            setSyncMasterTs={setSyncMasterTs}
-            switchTab={switchTab}
-            notify={notify}
-            onReconcileEvents={handleReconcileEvents}
-          />
-        )}
+                {activeTab === "explore" && (
+                  <ExploreWorkspace
+                    cameraNames={cameraNames}
+                    filteredEvents={filteredEvents}
+                    exportsList={exportsList}
+                    onOpenExport={(ex) => {
+                      setActiveExportPreview(ex);
+                      switchTab("exports");
+                    }}
+                    exploreQuery={exploreQuery}
+                    setExploreQuery={setExploreQuery}
+                    exploreCamera={exploreCamera}
+                    setExploreCamera={setExploreCamera}
+                    exploreLabel={exploreLabel}
+                    setExploreLabel={setExploreLabel}
+                    exploreRetainedOnly={exploreRetainedOnly}
+                    setExploreRetainedOnly={setExploreRetainedOnly}
+                    globalDaysSummary={globalDaysSummary}
+                    reviewDateFilter={reviewDateFilter}
+                    setReviewDateFilter={setReviewDateFilter}
+                    selectedEvent={selectedEvent}
+                    setSelectedEvent={setSelectedEvent}
+                    eventViewMode={eventViewMode}
+                    setEventViewMode={setEventViewMode}
+                    handleEventRetain={handleEventRetain}
+                    handleEventDelete={handleEventDelete}
+                    setSyncMasterTs={setSyncMasterTs}
+                    switchTab={switchTab}
+                    notify={notify}
+                    onReconcileEvents={handleReconcileEvents}
+                  />
+                )}
 
-        {activeTab === "exports" && (
-          <ExportsWorkspace
-            cameraNames={cameraNames}
-            config={config}
-            exportsList={exportsList}
-            setExportsList={setExportsList}
-            exportJobs={exportJobs}
-            onCancelExportJob={handleCancelExportJob}
-            exportCam={exportCam}
-            setExportCam={setExportCam}
-            exportPresetMin={exportPresetMin}
-            setExportPresetMin={setExportPresetMin}
-            exportLabel={exportLabel}
-            setExportLabel={setExportLabel}
-            activeExportPreview={activeExportPreview}
-            setActiveExportPreview={setActiveExportPreview}
-            timeShiftTs={timeShiftTs}
-            setTimeShiftTs={setTimeShiftTs}
-            focusSegments={focusSegments}
-            reviews={reviews}
-            handleQuickExport={handleQuickExport}
-            notify={notify}
-          />
-        )}
+                {activeTab === "exports" && (
+                  <ExportsWorkspace
+                    cameraNames={cameraNames}
+                    config={config}
+                    exportsList={exportsList}
+                    setExportsList={setExportsList}
+                    exportJobs={exportJobs}
+                    onCancelExportJob={handleCancelExportJob}
+                    exportCam={exportCam}
+                    setExportCam={setExportCam}
+                    exportPresetMin={exportPresetMin}
+                    setExportPresetMin={setExportPresetMin}
+                    exportLabel={exportLabel}
+                    setExportLabel={setExportLabel}
+                    activeExportPreview={activeExportPreview}
+                    setActiveExportPreview={setActiveExportPreview}
+                    timeShiftTs={timeShiftTs}
+                    setTimeShiftTs={setTimeShiftTs}
+                    focusSegments={focusSegments}
+                    reviews={reviews}
+                    handleQuickExport={handleQuickExport}
+                    notify={notify}
+                  />
+                )}
 
-        {activeTab === "zones" && userRole === "admin" && (
-          <ZonesWorkspace
-            cameraNames={cameraNames}
-            config={config}
-            setConfig={setConfig}
-            zonesSubTab={zonesSubTab}
-            setZonesSubTab={setZonesSubTab}
-            inspectorCam={inspectorCam}
-            setInspectorCam={setInspectorCam}
-            rawYaml={rawYaml}
-            setRawYaml={setRawYaml}
-            draftPoints={draftPoints}
-            setDraftPoints={setDraftPoints}
-            ffprobeInfo={ffprobeInfo}
-            handleSaveConfig={handleSaveConfig}
-            notify={notify}
-            workbenchSession={workbenchSession}
-          />
-        )}
+                {activeTab === "zones" && userRole === "admin" && (
+                  <ZonesWorkspace
+                    cameraNames={cameraNames}
+                    config={config}
+                    setConfig={setConfig}
+                    zonesSubTab={zonesSubTab}
+                    setZonesSubTab={setZonesSubTab}
+                    inspectorCam={inspectorCam}
+                    setInspectorCam={setInspectorCam}
+                    rawYaml={rawYaml}
+                    setRawYaml={setRawYaml}
+                    draftPoints={draftPoints}
+                    setDraftPoints={setDraftPoints}
+                    ffprobeInfo={ffprobeInfo}
+                    handleSaveConfig={handleSaveConfig}
+                    notify={notify}
+                    workbenchSession={workbenchSession}
+                  />
+                )}
 
-        {activeTab === "system" && userRole === "admin" && (
-          <SystemWorkspace
-            cameraNames={cameraNames}
-            logService={logService}
-            setLogService={setLogService}
-            logLines={logLines}
-            logSearch={logSearch}
-            setLogSearch={setLogSearch}
-            logPaused={logPaused}
-            setLogPaused={setLogPaused}
-            notify={notify}
-          />
-        )}
-        </main>
+                {activeTab === "system" && userRole === "admin" && (
+                  <SystemWorkspace
+                    cameraNames={cameraNames}
+                    logService={logService}
+                    setLogService={setLogService}
+                    logLines={logLines}
+                    logSearch={logSearch}
+                    setLogSearch={setLogSearch}
+                    logPaused={logPaused}
+                    setLogPaused={setLogPaused}
+                    notify={notify}
+                  />
+                )}
+              </Suspense>
+            )}
+          </main>
         </ArchiveMetadataCacheProvider>
       </ConfigWorkbenchProvider>
 
       {isCompact && (
-        <nav className="nvr-tabbar" aria-label="Primary Workspace Navigation (mobile)">
+        <nav className="nvr-tabbar" aria-label={t.header.mobileNavAria}>
           {mobileNav.primary.map((tab) => {
             const badge = tab === "review" ? formatBadgeCount(unreviewedAlerts.length) : "";
             return (
@@ -2090,7 +2446,7 @@ export const App: React.FC = () => {
             className="nvr-sheet nvr-more-sheet"
             role="dialog"
             aria-modal="true"
-            aria-label="Security profile"
+            aria-label={t.security.profileLabel}
             ref={profileSheetRef}
             onClick={(e) => e.stopPropagation()}
           >
@@ -2110,7 +2466,7 @@ export const App: React.FC = () => {
                 }}
               >
                 <span className="nvr-profile-pill-dot" aria-hidden="true" />
-                <span className="mono">{prof.toUpperCase()}</span>
+                <span className="mono">{securityProfileLabel(prof)}</span>
               </button>
             ))}
           </section>
@@ -2165,7 +2521,7 @@ export const App: React.FC = () => {
                 void handleLogout();
               }}
             >
-              <LogOut size={16} aria-hidden="true" /> Logout ({username})
+              <LogOut size={16} aria-hidden="true" /> {t.auth.signOut} ({username})
             </button>
           </section>
         </div>

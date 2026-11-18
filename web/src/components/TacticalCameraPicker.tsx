@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronLeft, ChevronRight, Search, Video } from "lucide-react";
+import { useI18n } from "../i18n";
 import {
   CameraGroupConfig,
   CameraLiveActivity,
@@ -133,9 +134,11 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
   cameraGroups,
   cameraStats,
   cameraActivity,
-  ariaLabel = "Camera selector",
+  ariaLabel,
   openUpward = false,
 }) => {
+  const { t } = useI18n();
+  const effectiveAriaLabel = ariaLabel ?? t.picker.defaultAria;
   const mode = resolvePickerMode(cameras.length, threshold);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -190,18 +193,15 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
       <div
         className="nvr-picker-inline"
         role="group"
-        aria-label={ariaLabel}
+        aria-label={effectiveAriaLabel}
         style={{ display: "inline-flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}
       >
         {cameras.map((cam) => (
           <button
             key={cam}
             type="button"
-            className={`nvr-btn mono ${selectedCamera === cam ? "active" : ""}`}
+            className={`nvr-btn sm mono ${selectedCamera === cam ? "active" : ""}`}
             style={{
-              height: 24,
-              padding: "0 8px",
-              fontSize: "var(--text-xs)",
               textTransform: "uppercase",
             }}
             onClick={() => onSelect(cam)}
@@ -240,13 +240,13 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
     : [];
 
   return (
-    <div ref={rootRef} className="nvr-picker-combobox" aria-label={ariaLabel}>
+    <div ref={rootRef} className="nvr-picker-combobox" aria-label={effectiveAriaLabel}>
       <button
         type="button"
-        className="nvr-btn mono"
-        style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
-        aria-label="Previous camera"
-        title="Previous camera"
+        className="nvr-btn sm mono"
+        style={{ padding: "0 6px" }}
+        aria-label={t.picker.prevCamera}
+        title={t.picker.prevCamera}
         onClick={() => onSelect(stepPickerCamera(cameras, selectedCamera, "prev"))}
       >
         <ChevronLeft size={12} />
@@ -254,8 +254,7 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
 
       <button
         type="button"
-        className={`nvr-btn mono nvr-picker-trigger ${open ? "active" : ""}`}
-        style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+        className={`nvr-btn sm mono nvr-picker-trigger ${open ? "active" : ""}`}
         aria-haspopup="listbox"
         aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
@@ -270,10 +269,10 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
 
       <button
         type="button"
-        className="nvr-btn mono"
-        style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
-        aria-label="Next camera"
-        title="Next camera"
+        className="nvr-btn sm mono"
+        style={{ padding: "0 6px" }}
+        aria-label={t.picker.nextCamera}
+        title={t.picker.nextCamera}
         onClick={() => onSelect(stepPickerCamera(cameras, selectedCamera, "next"))}
       >
         <ChevronRight size={12} />
@@ -283,7 +282,7 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
         <div
           className="nvr-picker-popover"
           role="dialog"
-          aria-label="Searchable camera selector"
+          aria-label={t.picker.dialogAria}
           style={
             openUpward
               ? { top: "auto", bottom: "calc(100% + 4px)" }
@@ -320,10 +319,10 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
             <input
               ref={searchInputRef}
               type="text"
-              className="nvr-input mono"
-              style={{ flex: 1, height: 24, fontSize: "var(--text-xs)" }}
-              placeholder={`Search ${cameras.length} cameras...`}
-              aria-label="Search cameras"
+              className="nvr-input sm mono"
+              style={{ flex: 1 }}
+              placeholder={t.picker.searchPlaceholder.replace("{n}", String(cameras.length))}
+              aria-label={t.picker.searchAria}
               value={query}
               onChange={(e) => setQuery(e.target.value)}
             />
@@ -332,16 +331,16 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
           <div className="nvr-picker-filter-row">
             {(
               [
-                ["all", "All"],
-                ["alert", "Alert/Motion"],
-                ["offline", "Offline"],
+                ["all", t.picker.filterAll],
+                ["alert", t.picker.filterAlert],
+                ["offline", t.picker.filterOffline],
               ] as Array<[PickerStatusFilter, string]>
             ).map(([flt, label]) => (
               <button
                 key={flt}
                 type="button"
-                className={`nvr-btn mono ${statusFilter === flt ? "active" : ""}`}
-                style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                className={`nvr-btn sm mono ${statusFilter === flt ? "active" : ""}`}
+                style={{ padding: "0 7px" }}
                 onClick={() => setStatusFilter(flt)}
               >
                 {label}
@@ -353,21 +352,19 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
             <div className="nvr-picker-filter-row">
               <button
                 type="button"
-                className={`nvr-btn mono ${groupFilter === "all" ? "active" : ""}`}
-                style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                className={`nvr-btn sm mono ${groupFilter === "all" ? "active" : ""}`}
+                style={{ padding: "0 6px" }}
                 onClick={() => setGroupFilter("all")}
               >
-                ALL GROUPS
+                {t.picker.allGroups}
               </button>
               {groupEntries.map(([gName]) => (
                 <button
                   key={gName}
                   type="button"
-                  className={`nvr-btn mono ${groupFilter === gName ? "active" : ""}`}
+                  className={`nvr-btn sm mono ${groupFilter === gName ? "active" : ""}`}
                   style={{
-                    height: 22,
                     padding: "0 6px",
-                    fontSize: "var(--text-xs)",
                     textTransform: "uppercase",
                   }}
                   onClick={() => setGroupFilter(gName)}
@@ -378,7 +375,7 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
             </div>
           )}
 
-          <div className="nvr-picker-list" role="listbox" aria-label="Camera options">
+          <div className="nvr-picker-list" role="listbox" aria-label={t.picker.optionsAria}>
             {filteredCameras.length === 0 ? (
               <div
                 className="mono"
@@ -389,7 +386,7 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
                   textAlign: "center",
                 }}
               >
-                No matching cameras
+                {t.picker.noMatchingCameras}
               </div>
             ) : (
               filteredCameras.map((cam, idx) => {

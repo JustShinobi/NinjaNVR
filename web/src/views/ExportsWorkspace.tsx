@@ -8,6 +8,8 @@ import {
   Scissors,
   ShieldOff,
   Trash2,
+  Volume2,
+  VolumeX,
   X,
 } from "lucide-react";
 import { useI18n } from "../i18n";
@@ -20,7 +22,7 @@ import {
   ShareLinkItem,
 } from "../types/nvr";
 import { formatDateTime, formatDuration } from "../utils/format";
-import { resolveRealCameraSource } from "../store/useNvrStore";
+import { resolveRealCameraSource, useNvrStore } from "../store/useNvrStore";
 import {
   LoadedVodWindow,
   MAX_ARCHIVE_EXPORT_SPAN_SEC,
@@ -186,6 +188,8 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
 }) => {
   const { t, locale } = useI18n();
   const isPt = locale === "pt";
+  const unmutedLiveCamera = useNvrStore((s) => s.unmutedLiveCamera);
+  const toggleLiveCameraAudio = useNvrStore((s) => s.toggleLiveCameraAudio);
   const [includeAudio, setIncludeAudio] = React.useState(true);
   const [shareTtlSec, setShareTtlSec] = React.useState(86400);
   const [shareMaxViews, setShareMaxViews] = React.useState<number>(0);
@@ -816,107 +820,101 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
               const safeThumb = ex.thumb_path
                 ? sanitizeTimelineThumbUrl(ex.thumb_path, ex.camera)
                 : "";
+              const isPreviewSelected = activeExportPreview?.id === ex.id;
               return (
                 <div
                   key={ex.id}
-                  role="button"
-                  tabIndex={0}
                   className={`nvr-list-row ${
-                    activeExportPreview?.id === ex.id ? "is-selected" : ""
+                    isPreviewSelected ? "is-selected" : ""
                   }`}
-                  onClick={() => setActiveExportPreview(ex)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      setActiveExportPreview(ex);
-                    }
-                  }}
                   style={{
                     padding: "8px 12px",
                     justifyContent: "space-between",
                     gap: 10,
+                    cursor: "default",
                   }}
                 >
-                  {safeThumb && (
-                    <img
-                      src={safeThumb}
-                      alt=""
-                      width={64}
-                      height={36}
-                      loading="lazy"
-                      style={{
-                        width: 64,
-                        height: 36,
-                        objectFit: "cover",
-                        borderRadius: 2,
-                        background: "var(--bg-deep)",
-                        border: "1px solid var(--border-hairline)",
-                        flexShrink: 0,
-                      }}
-                    />
-                  )}
-                  <div style={{ minWidth: 0, flex: 1 }}>
-                    <div
-                      className="mono"
-                      title={ex.name}
-                      style={{
-                        fontWeight: 700,
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      {ex.name}
+                  <button
+                    type="button"
+                    className="nvr-row-primary-btn"
+                    aria-pressed={isPreviewSelected}
+                    onClick={() => setActiveExportPreview(ex)}
+                  >
+                    {safeThumb && (
+                      <img
+                        src={safeThumb}
+                        alt=""
+                        width={64}
+                        height={36}
+                        loading="lazy"
+                        style={{
+                          width: 64,
+                          height: 36,
+                          objectFit: "cover",
+                          borderRadius: 2,
+                          background: "var(--bg-deep)",
+                          border: "1px solid var(--border-hairline)",
+                          flexShrink: 0,
+                        }}
+                      />
+                    )}
+                    <div style={{ minWidth: 0, flex: 1, textAlign: "left" }}>
+                      <div
+                        className="mono"
+                        title={ex.name}
+                        style={{
+                          fontWeight: 700,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {ex.name}
+                      </div>
+                      <div
+                        className="mono"
+                        style={{
+                          fontSize: "var(--text-xs)",
+                          color: "var(--text-secondary)",
+                          whiteSpace: "nowrap",
+                          marginTop: 2,
+                        }}
+                      >
+                        {ex.camera.toUpperCase()} · {formatDateTime(ex.date)}
+                      </div>
                     </div>
-                    <div
-                      className="mono"
-                      style={{
-                        fontSize: "var(--text-xs)",
-                        color: "var(--text-secondary)",
-                        whiteSpace: "nowrap",
-                        marginTop: 2,
-                      }}
-                    >
-                      {ex.camera.toUpperCase()} · {formatDateTime(ex.date)}
-                    </div>
-                  </div>
+                  </button>
                   <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
                     <button
-                      className="nvr-btn mono"
-                      style={{
-                        height: 26,
-                        padding: "0 7px",
-                        fontSize: "var(--text-xs)",
-                      }}
+                      type="button"
+                      className="nvr-btn sm mono"
                       title="Copy expiring HMAC-signed shareable link"
                       disabled={
                         creatingShareId !== null || revokingShareId !== null
                       }
-                      onClick={(e) => {
-                        e.stopPropagation();
+                      onClick={() => {
                         void handleCopyShareLink(ex.id);
                       }}
                     >
-                      Share Link
+                      {t.review.shareLinkBtn}
                     </button>
                     <a
                       href={resolveSafeExportVideoUrl(ex.video_path, ex.id)}
                       download={`${ex.id}.mp4`}
-                      className="nvr-btn"
+                      className="nvr-btn sm"
                       style={{ textDecoration: "none" }}
                       aria-label={`Download ${ex.name} MP4`}
                       title={t.exports.downloadMp4}
-                      onClick={(e) => e.stopPropagation()}
                     >
                       <Download size={12} />
                     </a>
                     <button
-                      className="nvr-btn danger"
+                      type="button"
+                      className="nvr-btn sm danger"
                       aria-label={`Delete export ${ex.name}`}
                       title={t.exports.deleteBtn}
                       disabled={deletingExportId === ex.id}
-                      onClick={async (e) => {
-                        e.stopPropagation();
+                      onClick={async () => {
                         if (deletingExportId !== null) return;
                         setDeletingExportId(ex.id);
                         try {
@@ -1186,6 +1184,19 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                 playsInline
                 style={{ width: "100%", height: "100%", objectFit: "contain" }}
               />
+            ) : !exportCam ? (
+              <div
+                className="mono"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  color: "var(--text-muted)",
+                  padding: 24,
+                }}
+              >
+                {t.live.noCamerasConfigured}
+              </div>
             ) : effectiveVodPlayheadTs === null ||
               !Number.isFinite(effectiveVodPlayheadTs) ? (
               (() => {
@@ -1193,6 +1204,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                   exportCam,
                   config?.cameras
                 );
+                const isExportLiveUnmuted = unmutedLiveCamera === exportCam;
                 return (
                   <div
                     style={{
@@ -1204,11 +1216,40 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                     <LiveMsePlayer
                       camera={exportCam}
                       useMainStream={true}
+                      muted={!isExportLiveUnmuted}
                       cameraConfig={
                         config?.cameras?.[exportCam] ??
                         config?.cameras?.[realExportCam]
                       }
                     />
+                    {!isDraggingTrim && (
+                      <div className="nvr-cam-hud pos-bottom-right">
+                        <button
+                          type="button"
+                          className={`nvr-tile-icon ${
+                            isExportLiveUnmuted ? "active" : ""
+                          }`}
+                          aria-pressed={isExportLiveUnmuted}
+                          aria-label={`${
+                            isExportLiveUnmuted
+                              ? t.live.muteAudio
+                              : t.live.unmuteAudio
+                          }: ${exportCam}`}
+                          title={
+                            isExportLiveUnmuted
+                              ? t.live.muteAudio
+                              : t.live.unmuteAudio
+                          }
+                          onClick={() => toggleLiveCameraAudio(exportCam)}
+                        >
+                          {isExportLiveUnmuted ? (
+                            <Volume2 size={15} />
+                          ) : (
+                            <VolumeX size={15} />
+                          )}
+                        </button>
+                      </div>
+                    )}
                     {isDraggingTrim && (
                       <StageTrimOverlay
                         scrubPreviewUrl={trimFeedback?.previewFrameUrl}
