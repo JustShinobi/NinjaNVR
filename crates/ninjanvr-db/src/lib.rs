@@ -182,9 +182,64 @@ pub enum DbValidationError {
     NonFiniteShareTimestamps,
 }
 
+const READ_POOL_SIZE: usize = 4;
+
+struct ReadConnPool {
+    idle: Mutex<Vec<Connection>>,
+    available: std::sync::Condvar,
+    capacity: usize,
+}
+
+impl ReadConnPool {
+    fn new(conns: Vec<Connection>) -> Self {
+        let capacity = conns.len();
+        Self {
+            idle: Mutex::new(conns),
+            available: std::sync::Condvar::new(),
+            capacity,
+        }
+    }
+}
+
+enum ReadConnGuard<'a> {
+    Pooled {
+        pool: &'a ReadConnPool,
+        conn: Option<Connection>,
+    },
+    WriterFallback(std::sync::MutexGuard<'a, Connection>),
+}
+
+impl std::ops::Deref for ReadConnGuard<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Pooled { conn: Some(c), .. } => c,
+            Self::Pooled { conn: None, .. } => unreachable!("pooled read connection held"),
+            Self::WriterFallback(g) => g,
+        }
+    }
+}
+
+impl Drop for ReadConnGuard<'_> {
+    fn drop(&mut self) {
+        if let Self::Pooled { pool, conn } = self
+            && let Some(c) = conn.take()
+        {
+            let mut idle = pool
+                .idle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            idle.push(c);
+            pool.available.notify_one();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct NinjaDatabase {
     conn: Arc<Mutex<Connection>>,
+    read_pool: Option<Arc<ReadConnPool>>,
     path: PathBuf,
     recordings_mutation_seq: Arc<std::sync::atomic::AtomicU64>,
     storage_usage_cache: Arc<Mutex<Option<(std::time::Instant, u64, Value)>>>,
@@ -198,6 +253,8 @@ pub struct DbUser {
     #[serde(default = "default_wildcard_cameras")]
     pub allowed_cameras: String,
     pub notification_tokens: Value,
+    #[serde(default)]
+    pub password_changed_at_epoch: Option<i64>,
 }
 
 fn default_wildcard_cameras() -> String {
@@ -710,11 +767,108 @@ fn sanitize_annotation_boxes(boxes: &[DatasetAnnotationBox]) -> Vec<DatasetAnnot
         .collect()
 }
 
+fn parse_password_changed_at_epoch(val: &rusqlite::types::ValueRef<'_>) -> Option<i64> {
+    match val {
+        rusqlite::types::ValueRef::Null => None,
+        rusqlite::types::ValueRef::Integer(i) => Some(*i),
+        rusqlite::types::ValueRef::Real(f) if f.is_finite() => Some(f.floor() as i64),
+        rusqlite::types::ValueRef::Text(bytes) => {
+            let s = std::str::from_utf8(bytes).ok()?.trim();
+            if s.is_empty() {
+                return None;
+            }
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                return Some(dt.timestamp());
+            }
+            if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+                return Some(ndt.and_utc().timestamp());
+            }
+            s.parse::<f64>()
+                .ok()
+                .filter(|f| f.is_finite())
+                .map(|f| f.floor() as i64)
+        }
+        _ => None,
+    }
+}
+
 impl NinjaDatabase {
     fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn read_conn(&self) -> ReadConnGuard<'_> {
+        if let Some(ref pool) = self.read_pool {
+            let mut idle = pool
+                .idle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while idle.is_empty() {
+                idle = pool
+                    .available
+                    .wait(idle)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            let conn = idle.pop();
+            return ReadConnGuard::Pooled {
+                pool: pool.as_ref(),
+                conn,
+            };
+        }
+        ReadConnGuard::WriterFallback(self.lock_conn())
+    }
+
+    /// Executes a read-only SQLite query closure on the bounded WAL read connection pool
+    /// (falling back transparently to the primary connection for `:memory:` databases).
+    pub fn with_read_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let conn = self.read_conn();
+        f(&conn)
+    }
+
+    /// Returns the number of dedicated read-only WAL connections in the pool (`0` for `:memory:`).
+    pub fn read_pool_size(&self) -> usize {
+        self.read_pool.as_ref().map_or(0, |p| p.capacity)
+    }
+
+    fn init_read_pool(path: &Path, count: usize) -> Option<Arc<ReadConnPool>> {
+        let flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let mut conns = Vec::with_capacity(count);
+        for _ in 0..count {
+            match Connection::open_with_flags(path, flags) {
+                Ok(ro_conn) => {
+                    if let Err(err) = ro_conn.execute_batch(
+                        r#"
+                        PRAGMA query_only = ON;
+                        PRAGMA busy_timeout = 30000;
+                        PRAGMA cache_size = -8000;
+                        PRAGMA temp_store = MEMORY;
+                        "#,
+                    ) {
+                        warn!(
+                            "Failed to configure read-only SQLite connection at {}: {err}",
+                            path.display()
+                        );
+                        break;
+                    }
+                    conns.push(ro_conn);
+                }
+                Err(err) => {
+                    warn!(
+                        "Failed to open read-only SQLite pool connection at {}: {err}",
+                        path.display()
+                    );
+                    break;
+                }
+            }
+        }
+        if conns.is_empty() {
+            None
+        } else {
+            Some(Arc::new(ReadConnPool::new(conns)))
+        }
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -771,7 +925,7 @@ impl NinjaDatabase {
             r#"
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
-            PRAGMA cache_size = -2000;
+            PRAGMA cache_size = -16000;
             PRAGMA mmap_size = 0;
             PRAGMA temp_store = MEMORY;
             PRAGMA busy_timeout = 30000;
@@ -779,13 +933,17 @@ impl NinjaDatabase {
             "#,
         )?;
 
-        let db = Self {
+        let mut db = Self {
             conn: Arc::new(Mutex::new(conn)),
+            read_pool: None,
             path,
             recordings_mutation_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             storage_usage_cache: Arc::new(Mutex::new(None)),
         };
         db.init_schema()?;
+        if !is_in_memory {
+            db.read_pool = Self::init_read_pool(&db.path, READ_POOL_SIZE);
+        }
         Ok(db)
     }
 
@@ -930,6 +1088,9 @@ impl NinjaDatabase {
             CREATE INDEX IF NOT EXISTS "recordings_camera_end_time" ON "recordings" ("camera", "end_time" ASC);
             CREATE INDEX IF NOT EXISTS "recordings_camera_storage_agg" ON "recordings" ("camera", "start_time", "segment_size", "duration");
             CREATE UNIQUE INDEX IF NOT EXISTS "recordings_path" ON "recordings" ("path");
+            CREATE INDEX IF NOT EXISTS "idx_timeline_camera_ts" ON "timeline" ("camera", "timestamp");
+            CREATE INDEX IF NOT EXISTS "idx_timeline_source_id_ts" ON "timeline" ("source_id", "timestamp");
+            CREATE INDEX IF NOT EXISTS "idx_previews_camera_end_time" ON "previews" ("camera", "end_time");
             CREATE INDEX IF NOT EXISTS "review_segment_camera" ON "reviewsegment" ("camera");
             CREATE INDEX IF NOT EXISTS "review_segment_start_time_end_time" ON "reviewsegment" ("start_time" DESC, "end_time" DESC);
             CREATE INDEX IF NOT EXISTS "review_segment_camera_start_time_end_time" ON "reviewsegment" ("camera", "start_time" ASC, "end_time" ASC);
@@ -1061,7 +1222,7 @@ impl NinjaDatabase {
             return Ok(Vec::new());
         }
         let capped_limit = limit.min(10_000) as i64;
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, path FROM recordings WHERE dbfs = ?1 ORDER BY start_time DESC LIMIT ?2",
         )?;
@@ -1150,7 +1311,7 @@ impl NinjaDatabase {
 
     pub fn ensure_default_admin(&self, iterations: u32) -> Result<Option<String>> {
         {
-            let conn = self.lock_conn();
+            let conn = self.read_conn();
             let existing: Option<(String, String)> = conn
                 .query_row(
                     "SELECT username, password_hash FROM user WHERE username = 'admin' COLLATE NOCASE",
@@ -1211,20 +1372,22 @@ impl NinjaDatabase {
 
     pub fn get_user(&self, username: &str) -> Result<Option<DbUser>> {
         let target = username.trim();
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let row = conn
             .query_row(
-                "SELECT username, password_hash, role, notification_tokens, COALESCE(allowed_cameras, '*') FROM user WHERE username = ?1 COLLATE NOCASE",
+                "SELECT username, password_hash, role, notification_tokens, COALESCE(allowed_cameras, '*'), password_changed_at FROM user WHERE username = ?1 COLLATE NOCASE",
                 params![target],
                 |r| {
                     let tokens_raw: Option<String> = r.get(3).ok();
                     let allowed_cameras: String = r.get::<_, Option<String>>(4)?.unwrap_or_else(|| "*".to_string());
+                    let password_changed_at_epoch = parse_password_changed_at_epoch(&r.get_ref(5)?);
                     Ok(DbUser {
                         username: r.get(0)?,
                         password_hash: r.get(1)?,
                         role: r.get::<_, Option<String>>(2)?.unwrap_or_else(|| "admin".to_string()),
                         allowed_cameras,
                         notification_tokens: parse_json_or(tokens_raw, json!([])),
+                        password_changed_at_epoch,
                     })
                 },
             )
@@ -1232,8 +1395,27 @@ impl NinjaDatabase {
         Ok(row)
     }
 
+    /// Returns the Unix epoch timestamp (seconds) of the user's last password change, if recorded.
+    pub fn get_user_password_changed_at_epoch(&self, username: &str) -> Result<Option<i64>> {
+        let target = username.trim();
+        if target.is_empty() {
+            return Ok(None);
+        }
+        self.with_read_conn(|conn| {
+            let epoch = conn
+                .query_row(
+                    "SELECT password_changed_at FROM user WHERE username = ?1 COLLATE NOCASE",
+                    params![target],
+                    |r| Ok(parse_password_changed_at_epoch(&r.get_ref(0)?)),
+                )
+                .optional()?
+                .flatten();
+            Ok(epoch)
+        })
+    }
+
     pub fn list_users(&self) -> Result<Vec<Value>> {
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT username, role, password_changed_at, COALESCE(allowed_cameras, '*') FROM user ORDER BY username",
         )?;
@@ -1555,7 +1737,7 @@ impl NinjaDatabase {
     }
 
     pub fn list_api_tokens(&self) -> Result<Vec<Value>> {
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, name, prefix, scope, created_at, last_used_at, expires_at FROM api_token ORDER BY created_at DESC",
         )?;
@@ -1615,7 +1797,7 @@ impl NinjaDatabase {
         if target.is_empty() || !now_ts.is_finite() {
             return Ok(false);
         }
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             r#"
             SELECT scope, expires_at
@@ -1666,9 +1848,9 @@ impl NinjaDatabase {
         let hash_bytes = Sha256::digest(raw_token.as_bytes());
         let token_hash: String = hash_bytes.iter().map(|b| format!("{b:02x}")).collect();
 
-        let conn = self.lock_conn();
-        let row: Option<(String, String, String, Option<f64>, bool)> = conn
-            .query_row(
+        let row: Option<(String, String, String, Option<f64>, bool)> = {
+            let conn = self.read_conn();
+            conn.query_row(
                 "SELECT id, name, scope, expires_at FROM api_token WHERE token_hash = ?1",
                 params![token_hash],
                 |r| {
@@ -1683,7 +1865,8 @@ impl NinjaDatabase {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, exp_val, exp_invalid))
                 },
             )
-            .optional()?;
+            .optional()?
+        };
 
         let Some((id, name, scope, expires_at, exp_invalid)) = row else {
             return Ok(None);
@@ -1702,7 +1885,7 @@ impl NinjaDatabase {
         {
             return Ok(None);
         }
-        let _ = conn.execute(
+        let _ = self.lock_conn().execute(
             "UPDATE api_token SET last_used_at = ?1 WHERE id = ?2",
             params![now_ts, id],
         );
@@ -1778,7 +1961,7 @@ impl NinjaDatabase {
             .filter(|z| !z.is_empty() && !z.iter().any(|x| x == "all"))
             .map(|z| z.iter().take(MAX_SQL_FILTER_ITEMS).cloned().collect());
 
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut sql = String::from(
             r#"
             SELECT
@@ -1970,7 +2153,7 @@ impl NinjaDatabase {
     }
 
     pub fn get_review_by_id(&self, id: &str) -> Result<Option<ReviewItemDto>> {
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let row = conn
             .query_row(
                 r#"
@@ -2009,7 +2192,7 @@ impl NinjaDatabase {
         if trimmed_event_id.is_empty() || trimmed_event_id.contains('"') {
             return Ok(None);
         }
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let like_pattern = format!("%\"{}\"%", escape_sql_like(trimmed_event_id));
         let mut stmt = conn.prepare(
             r#"
@@ -2074,7 +2257,7 @@ impl NinjaDatabase {
     }
 
     pub fn query_review_summary(&self, cameras: Option<&[String]>) -> Result<Value> {
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let now = Utc::now().timestamp() as f64;
         let last_24h = now - 86400.0;
         let last_30d = now - 86400.0 * 30.0;
@@ -2383,7 +2566,7 @@ impl NinjaDatabase {
             .filter(|z| !z.is_empty() && !z.iter().any(|x| x == "all"))
             .map(|z| z.iter().take(MAX_SQL_FILTER_ITEMS).cloned().collect());
 
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut sql = String::from(
             r#"
             SELECT
@@ -2660,7 +2843,7 @@ impl NinjaDatabase {
             "#
         );
 
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(bind_vals.iter()), |row| {
             let start_time = value_to_f64(&row.get_ref(4)?).unwrap_or(0.0);
@@ -2744,7 +2927,7 @@ impl NinjaDatabase {
         let sql = format!(
             "SELECT camera, label, sub_label, zones, start_time FROM event {where_clause} ORDER BY start_time DESC LIMIT 5000"
         );
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(bind_vals.iter()), |r| {
             let cam: String = r.get(0)?;
@@ -2801,7 +2984,7 @@ impl NinjaDatabase {
                 "unreviewed_alerts": []
             }));
         }
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut bind_vals: Vec<rusqlite::types::Value> = vec![
             rusqlite::types::Value::Real(after),
             rusqlite::types::Value::Real(before),
@@ -2956,7 +3139,7 @@ impl NinjaDatabase {
     }
 
     pub fn get_event(&self, id: &str) -> Result<Option<Value>> {
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let row = conn
             .query_row(
                 r#"
@@ -3133,7 +3316,7 @@ impl NinjaDatabase {
         if det_ids.is_empty() {
             return Ok(summary);
         }
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         for det_id in det_ids {
             let ev_meta: Option<ReviewDetectionEventRow> = conn
                 .query_row(
@@ -3614,7 +3797,7 @@ impl NinjaDatabase {
         if clean_id.is_empty() || clean_id.contains('"') {
             return Ok(Vec::new());
         }
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let like_pattern = format!("%\"{}\"%", escape_sql_like(clean_id));
         let mut stmt = conn.prepare(
             r#"
@@ -3684,81 +3867,83 @@ impl NinjaDatabase {
         if !norm_box.iter().all(|v| v.is_finite()) {
             return Ok(None);
         }
-        let conn = self.lock_conn();
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT
-                id, camera, label, norm_x1, norm_y1, norm_x2, norm_y2,
-                dhash64, dominant_color, hit_count, source_event_id,
-                reason, created_at, last_seen_at
-            FROM false_positive_signature
-            WHERE camera = ?1 AND label = ?2
-            ORDER BY id DESC
-            "#,
-        )?;
-        type SigRow = (
-            i64,
-            String,
-            String,
-            f64,
-            f64,
-            f64,
-            f64,
-            Option<i64>,
-            Option<String>,
-            i64,
-            Option<String>,
-            Option<String>,
-            f64,
-            f64,
-        );
-        let rows = stmt.query_map(params![camera, label], |r| -> rusqlite::Result<SigRow> {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                value_to_f64(&r.get_ref(3)?).unwrap_or(0.0),
-                value_to_f64(&r.get_ref(4)?).unwrap_or(0.0),
-                value_to_f64(&r.get_ref(5)?).unwrap_or(0.0),
-                value_to_f64(&r.get_ref(6)?).unwrap_or(0.0),
-                r.get::<_, Option<i64>>(7).ok().flatten(),
-                r.get::<_, Option<String>>(8).ok().flatten(),
-                r.get::<_, i64>(9).unwrap_or(1),
-                r.get::<_, Option<String>>(10).ok().flatten(),
-                r.get::<_, Option<String>>(11).ok().flatten(),
-                value_to_f64(&r.get_ref(12)?).unwrap_or(0.0),
-                value_to_f64(&r.get_ref(13)?).unwrap_or(0.0),
-            ))
-        })?;
+        let matched = {
+            let conn = self.read_conn();
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT
+                    id, camera, label, norm_x1, norm_y1, norm_x2, norm_y2,
+                    dhash64, dominant_color, hit_count, source_event_id,
+                    reason, created_at, last_seen_at
+                FROM false_positive_signature
+                WHERE camera = ?1 AND label = ?2
+                ORDER BY id DESC
+                "#,
+            )?;
+            type SigRow = (
+                i64,
+                String,
+                String,
+                f64,
+                f64,
+                f64,
+                f64,
+                Option<i64>,
+                Option<String>,
+                i64,
+                Option<String>,
+                Option<String>,
+                f64,
+                f64,
+            );
+            let rows = stmt.query_map(params![camera, label], |r| -> rusqlite::Result<SigRow> {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    value_to_f64(&r.get_ref(3)?).unwrap_or(0.0),
+                    value_to_f64(&r.get_ref(4)?).unwrap_or(0.0),
+                    value_to_f64(&r.get_ref(5)?).unwrap_or(0.0),
+                    value_to_f64(&r.get_ref(6)?).unwrap_or(0.0),
+                    r.get::<_, Option<i64>>(7).ok().flatten(),
+                    r.get::<_, Option<String>>(8).ok().flatten(),
+                    r.get::<_, i64>(9).unwrap_or(1),
+                    r.get::<_, Option<String>>(10).ok().flatten(),
+                    r.get::<_, Option<String>>(11).ok().flatten(),
+                    value_to_f64(&r.get_ref(12)?).unwrap_or(0.0),
+                    value_to_f64(&r.get_ref(13)?).unwrap_or(0.0),
+                ))
+            })?;
 
-        let mut matched: Option<(SigRow, f64, Option<u32>)> = None;
-        for row_res in rows {
-            let row = row_res?;
-            let sig_box = [row.3, row.4, row.5, row.6];
-            let iou = compute_norm_box_iou(sig_box, norm_box);
-            if iou < 0.72 {
-                continue;
-            }
-            let sig_hash = row.7.map(|v| v as u64);
-            let hamming = match (sig_hash, dhash64) {
-                (Some(sh), Some(ch)) => {
-                    let dist = (sh ^ ch).count_ones();
-                    if dist > 12 {
-                        continue;
-                    }
-                    Some(dist)
+            let mut found: Option<(SigRow, f64, Option<u32>)> = None;
+            for row_res in rows {
+                let row = row_res?;
+                let sig_box = [row.3, row.4, row.5, row.6];
+                let iou = compute_norm_box_iou(sig_box, norm_box);
+                if iou < 0.72 {
+                    continue;
                 }
-                _ => None,
-            };
-            matched = Some((row, iou, hamming));
-            break;
-        }
-        drop(stmt);
+                let sig_hash = row.7.map(|v| v as u64);
+                let hamming = match (sig_hash, dhash64) {
+                    (Some(sh), Some(ch)) => {
+                        let dist = (sh ^ ch).count_ones();
+                        if dist > 12 {
+                            continue;
+                        }
+                        Some(dist)
+                    }
+                    _ => None,
+                };
+                found = Some((row, iou, hamming));
+                break;
+            }
+            found
+        };
 
         if let Some((row, iou, hamming)) = matched {
             let new_hits = row.9.max(0).saturating_add(1);
             let now = Utc::now().timestamp_millis() as f64 / 1000.0;
-            conn.execute(
+            self.lock_conn().execute(
                 "UPDATE false_positive_signature SET hit_count = ?2, last_seen_at = ?3 WHERE id = ?1",
                 params![row.0, new_hits, now],
             )?;
@@ -3835,7 +4020,7 @@ impl NinjaDatabase {
             "#
         );
 
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(&sql)?;
         let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<Value> {
             let nx1 = value_to_f64(&r.get_ref(3)?).unwrap_or(0.0);
@@ -4096,7 +4281,7 @@ impl NinjaDatabase {
     }
 
     pub fn list_distinct_sub_labels(&self) -> Result<Vec<String>> {
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT DISTINCT sub_label FROM event WHERE sub_label IS NOT NULL AND TRIM(sub_label) != '' ORDER BY sub_label ASC",
         )?;
@@ -4376,7 +4561,7 @@ impl NinjaDatabase {
 
     /// Returns a sorted list of distinct non-empty `recognized_license_plate` values stored in `event.data`.
     pub fn query_recognized_license_plates(&self) -> Result<Vec<String>> {
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT data FROM event WHERE data LIKE '%recognized_license_plate%' ORDER BY start_time DESC LIMIT 5000",
         )?;
@@ -4408,17 +4593,17 @@ impl NinjaDatabase {
         )?)
     }
 
-    /// Executes SQLite query-planner optimization and bounded WAL checkpointing (`PRAGMA optimize`
-    /// and `PRAGMA wal_checkpoint(TRUNCATE)`).
+    /// Executes SQLite query-planner optimization and non-blocking WAL checkpointing (`PRAGMA optimize`
+    /// and `PRAGMA wal_checkpoint(PASSIVE)`).
     pub fn run_maintenance(&self) -> Result<()> {
         let conn = self.lock_conn();
-        conn.execute_batch("PRAGMA optimize; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        conn.execute_batch("PRAGMA optimize; PRAGMA wal_checkpoint(PASSIVE);")?;
         Ok(())
     }
 
     /// Returns total event counts grouped by `(camera, label)` for Prometheus `/api/metrics`.
     pub fn query_event_counts_by_camera_and_label(&self) -> Result<Vec<(String, String, i64)>> {
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT camera, label, COUNT(*) FROM event GROUP BY camera, label ORDER BY camera, label",
         )?;
@@ -4660,7 +4845,7 @@ impl NinjaDatabase {
         if !after.is_finite() || !before.is_finite() {
             return Ok(Vec::new());
         }
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             r#"
             SELECT
@@ -4705,7 +4890,7 @@ impl NinjaDatabase {
     }
 
     pub fn query_all_recordings_summary(&self) -> Result<Value> {
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let cutoff = (Utc::now().timestamp() - 86400 * 60) as f64;
         let max_valid_ts = 253_402_300_800.0f64;
         let mut stmt = conn.prepare(
@@ -4739,7 +4924,7 @@ impl NinjaDatabase {
             return Ok(cached_val.clone());
         }
 
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let cutoff = (Utc::now().timestamp() - 86400) as f64;
         let mut stmt = conn.prepare(
             r#"
@@ -4826,7 +5011,7 @@ impl NinjaDatabase {
         if !after.is_finite() || !before.is_finite() {
             return Ok(Vec::new());
         }
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut bind_vals: Vec<rusqlite::types::Value> = vec![
             rusqlite::types::Value::Real(after),
             rusqlite::types::Value::Real(before),
@@ -4868,7 +5053,7 @@ impl NinjaDatabase {
     }
 
     pub fn query_recordings_summary(&self, camera: &str) -> Result<Vec<Value>> {
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let cutoff = (Utc::now().timestamp() - 86400 * 30) as f64;
         let mut stmt = conn.prepare(
             r#"
@@ -5214,7 +5399,7 @@ impl NinjaDatabase {
         let pre_sec = pre_capture_sec.max(0.0);
         let post_sec = post_capture_sec.max(0.0);
         let capped_limit = limit.min(10_000) as i64;
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let sql = if idle_only {
             r#"
             SELECT r.id, r.path
@@ -5382,7 +5567,7 @@ impl NinjaDatabase {
             return Ok(Vec::new());
         }
         let capped_limit = limit.min(10_000) as i64;
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             r#"
             SELECT id, path
@@ -5568,7 +5753,7 @@ impl NinjaDatabase {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut sql = String::from(
             "SELECT timestamp, camera, source, source_id, class_type, data FROM timeline WHERE 1=1",
         );
@@ -5646,7 +5831,7 @@ impl NinjaDatabase {
     }
 
     pub fn query_exports(&self) -> Result<Vec<Value>> {
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, camera, name, date, video_path, thumb_path, in_progress, export_case_id FROM export ORDER BY date DESC LIMIT 5000",
         )?;
@@ -5675,7 +5860,7 @@ impl NinjaDatabase {
     }
 
     pub fn get_export(&self, id: &str) -> Result<Option<Value>> {
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let row = conn
             .query_row(
                 "SELECT id, camera, name, date, video_path, thumb_path, in_progress, export_case_id FROM export WHERE id = ?1",
@@ -5787,7 +5972,7 @@ impl NinjaDatabase {
     }
 
     pub fn get_share_link(&self, id: &str) -> Result<Option<Value>> {
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let row = conn
             .query_row(
                 r#"
@@ -5804,7 +5989,7 @@ impl NinjaDatabase {
     }
 
     pub fn list_share_links(&self) -> Result<Vec<Value>> {
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             r#"
             SELECT id, kind, target_id, camera, created_by, created_at, expires_at,
@@ -5885,7 +6070,7 @@ impl NinjaDatabase {
         if !before_ts.is_finite() {
             return Ok(Vec::new());
         }
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             r#"
             SELECT DISTINCT target_id
@@ -5916,7 +6101,7 @@ impl NinjaDatabase {
         if !now_ts.is_finite() {
             return Ok(false);
         }
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let count: i64 = conn.query_row(
             r#"
             SELECT COUNT(*)
@@ -5942,7 +6127,7 @@ impl NinjaDatabase {
         if !now_ts.is_finite() || !grace_sec.is_finite() || grace_sec <= 0.0 {
             return Ok(false);
         }
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let count: i64 = conn.query_row(
             r#"
             SELECT COUNT(*)
@@ -6007,7 +6192,7 @@ impl NinjaDatabase {
     }
 
     pub fn is_share_link_revoked(&self, id: &str) -> Result<bool> {
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let revoked: Option<i64> = conn
             .query_row(
                 "SELECT revoked FROM share_link WHERE id = ?1",
@@ -6022,7 +6207,7 @@ impl NinjaDatabase {
         if !now_ts.is_finite() {
             return Ok(false);
         }
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let count: i64 = conn.query_row(
             r#"
             SELECT COUNT(*)
@@ -6156,7 +6341,7 @@ impl NinjaDatabase {
     }
 
     pub fn query_cases(&self) -> Result<Vec<Value>> {
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, name, description, created_at, updated_at, COALESCE(event_ids, '[]'), COALESCE(export_ids, '[]') FROM exportcase ORDER BY created_at DESC LIMIT 1000",
         )?;
@@ -6185,7 +6370,7 @@ impl NinjaDatabase {
     }
 
     pub fn get_case(&self, id: &str) -> Result<Option<Value>> {
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let row = conn
             .query_row(
                 "SELECT id, name, description, created_at, updated_at, COALESCE(event_ids, '[]'), COALESCE(export_ids, '[]') FROM exportcase WHERE id = ?1",
@@ -6212,7 +6397,7 @@ impl NinjaDatabase {
         if !after.is_finite() || !before.is_finite() {
             return Ok(Vec::new());
         }
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             r#"
             SELECT camera, path, start_time, end_time, duration
@@ -6283,7 +6468,7 @@ impl NinjaDatabase {
     }
 
     pub fn last_preview_end_time(&self, camera: &str) -> Result<Option<f64>> {
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let val: Option<f64> = conn
             .query_row(
                 "SELECT MAX(end_time) FROM previews WHERE camera = ?1",
@@ -6368,6 +6553,24 @@ impl NinjaDatabase {
                 .to_string_lossy()
                 .into_owned(),
         );
+        files_to_remove.push(
+            clips_dir
+                .join(format!("{id}-clean.jpg"))
+                .to_string_lossy()
+                .into_owned(),
+        );
+        files_to_remove.push(
+            clips_dir
+                .join(format!("{id}.webp"))
+                .to_string_lossy()
+                .into_owned(),
+        );
+        files_to_remove.push(
+            clips_dir
+                .join(format!("{id}-clean.webp"))
+                .to_string_lossy()
+                .into_owned(),
+        );
         if safe_camera {
             files_to_remove.push(
                 clips_dir
@@ -6383,6 +6586,37 @@ impl NinjaDatabase {
             );
         }
         Self::push_expired_review_artifact_paths(media_dir, id, files_to_remove);
+    }
+
+    /// Closes any orphaned `event` or `reviewsegment` rows whose `end_time IS NULL`
+    /// (for example after an abrupt crash or restart) by setting
+    /// `end_time = MAX(start_time, MIN(now_ts, start_time + fallback_duration_sec))`.
+    /// Returns `(closed_events, closed_reviews)`.
+    pub fn close_orphaned_open_events_and_reviews(
+        &self,
+        now_ts: f64,
+        fallback_duration_sec: f64,
+    ) -> Result<(usize, usize)> {
+        if !now_ts.is_finite() {
+            return Ok((0, 0));
+        }
+        let safe_dur = if fallback_duration_sec.is_finite() && fallback_duration_sec >= 0.0 {
+            fallback_duration_sec
+        } else {
+            300.0
+        };
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let closed_events = tx.execute(
+            "UPDATE event SET end_time = MAX(start_time, MIN(?1, start_time + ?2)) WHERE end_time IS NULL",
+            params![now_ts, safe_dur],
+        )?;
+        let closed_reviews = tx.execute(
+            "UPDATE reviewsegment SET end_time = MAX(start_time, MIN(?1, start_time + ?2)) WHERE end_time IS NULL",
+            params![now_ts, safe_dur],
+        )?;
+        tx.commit()?;
+        Ok((closed_events, closed_reviews))
     }
 
     pub fn cleanup_expired_events_and_reviews(
@@ -6426,17 +6660,16 @@ impl NinjaDatabase {
         let is_safe_path = |p: &str| -> bool { !p.is_empty() && !p.contains("..") };
         let safe_camera = is_safe_id(camera);
 
-        // 1. Expired review segments
+        // 1. Expired review segments (including orphaned end_time IS NULL rows older than retention + 5m grace)
         {
             let mut stmt = tx.prepare(
                 r#"
                 SELECT id, thumb_path
                 FROM reviewsegment
                 WHERE camera = ?1
-                  AND end_time IS NOT NULL
                   AND (
-                    (severity = 'alert' AND end_time < ?2)
-                    OR (severity != 'alert' AND end_time < ?3)
+                    (severity = 'alert' AND COALESCE(end_time, start_time + 300.0) < ?2)
+                    OR (severity != 'alert' AND COALESCE(end_time, start_time + 300.0) < ?3)
                   )
                 LIMIT 500
                 "#,
@@ -6480,10 +6713,9 @@ impl NinjaDatabase {
                 FROM event
                 WHERE camera = ?1
                   AND COALESCE(retain_indefinitely, 0) = 0
-                  AND end_time IS NOT NULL
                   AND (
-                    (COALESCE(json_extract(CASE WHEN json_valid(data) AND json_type(data) = 'object' THEN data ELSE '{}' END, '$.max_severity'), 'alert') = 'alert' AND end_time < ?2)
-                    OR (COALESCE(json_extract(CASE WHEN json_valid(data) AND json_type(data) = 'object' THEN data ELSE '{}' END, '$.max_severity'), 'alert') != 'alert' AND end_time < ?3)
+                    (COALESCE(json_extract(CASE WHEN json_valid(data) AND json_type(data) = 'object' THEN data ELSE '{}' END, '$.max_severity'), 'alert') = 'alert' AND COALESCE(end_time, start_time + 300.0) < ?2)
+                    OR (COALESCE(json_extract(CASE WHEN json_valid(data) AND json_type(data) = 'object' THEN data ELSE '{}' END, '$.max_severity'), 'alert') != 'alert' AND COALESCE(end_time, start_time + 300.0) < ?3)
                   )
                 LIMIT 500
                 "#,
@@ -6805,7 +7037,7 @@ impl NinjaDatabase {
         sample_kind: Option<&str>,
         verified: Option<bool>,
     ) -> Result<Vec<DatasetSampleDto>> {
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let mut sql = String::from(
             r#"
             SELECT
@@ -6843,7 +7075,7 @@ impl NinjaDatabase {
     }
 
     pub fn get_dataset_sample(&self, id: &str) -> Result<Option<DatasetSampleDto>> {
-        let conn = self.lock_conn();
+        let conn = self.read_conn();
         let sample = conn
             .query_row(
                 r#"
@@ -12770,6 +13002,228 @@ mod tests {
             restored.thumb_path,
             "/media/ninjanvr/clips/driveway-ev_car_fp.webp"
         );
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn wal_read_pool_executes_concurrent_reads_while_writer_lock_held_and_indexes_orphans_work() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr-db-wal-pool-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let db_path = tmp_dir.join("ninjanvr.db");
+        let db = NinjaDatabase::open(&db_path).unwrap();
+        assert_eq!(db.read_pool_size(), READ_POOL_SIZE);
+
+        // 1. Verify required indexes exist in sqlite_master and cache_size = -16000 on writer
+        {
+            let writer = db.lock_conn();
+            let cache_sz: i64 = writer
+                .query_row("PRAGMA cache_size;", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(cache_sz, -16000);
+        }
+        let indexes: Vec<String> = db
+            .with_read_conn(|ro| {
+                let mut stmt = ro
+                    .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")?;
+                let names = stmt
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(names)
+            })
+            .unwrap();
+        for expected_idx in [
+            "idx_timeline_camera_ts",
+            "idx_timeline_source_id_ts",
+            "idx_previews_camera_end_time",
+        ] {
+            assert!(
+                indexes.iter().any(|n| n == expected_idx),
+                "expected index {expected_idx} in {indexes:?}"
+            );
+        }
+
+        // 2. Seed users, events, timeline, and verify password_changed_at_epoch
+        db.create_user("alice", "init_pass_123", "operator", 1_000)
+            .unwrap();
+        let u1 = db.get_user("alice").unwrap().unwrap();
+        assert!(u1.password_changed_at_epoch.is_some());
+        let ep1 = db.get_user_password_changed_at_epoch("alice").unwrap();
+        assert_eq!(ep1, u1.password_changed_at_epoch);
+
+        db.update_user_password("alice", "new_pass_456", 1_000)
+            .unwrap();
+        let ep2 = db
+            .get_user_password_changed_at_epoch("alice")
+            .unwrap()
+            .unwrap();
+        assert!(ep2 >= ep1.unwrap());
+
+        db.upsert_event(&EventDto {
+            id: "ev_orphan_old".to_string(),
+            camera: "front_door".to_string(),
+            label: "person".to_string(),
+            zones: json!([]),
+            start_time: 1000.0,
+            end_time: None,
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.9),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({"max_severity": "alert"}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.9),
+            stationary: false,
+        })
+        .unwrap();
+        db.insert_review_segment(&ReviewItemDto {
+            id: "rev_orphan_old".to_string(),
+            camera: "front_door".to_string(),
+            start_time: 1000.0,
+            end_time: None,
+            severity: "alert".to_string(),
+            thumb_path: "/media/ninjanvr/clips/review/thumb-rev_orphan_old.webp".to_string(),
+            data: json!({"detections": ["ev_orphan_old"], "objects": ["person"]}),
+            has_been_reviewed: false,
+        })
+        .unwrap();
+        db.insert_timeline_entry(
+            1005.0,
+            "front_door",
+            "tracked_object",
+            Some("ev_orphan_old"),
+            "entered_zone",
+            &json!({}),
+        )
+        .unwrap();
+
+        // 3. Prove 4 concurrent readers proceed in parallel WITHOUT blocking on self.conn writer mutex!
+        let writer_guard = db.lock_conn();
+        let barrier = Arc::new(std::sync::Barrier::new(READ_POOL_SIZE));
+        let mut handles = Vec::new();
+        for _ in 0..READ_POOL_SIZE {
+            let db_clone = db.clone();
+            let bar = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                db_clone
+                    .with_read_conn(|ro| {
+                        // All 4 read connections hold their read handle simultaneously at this barrier
+                        // while `writer_guard` holds `self.conn`!
+                        bar.wait();
+                        let cnt: i64 =
+                            ro.query_row("SELECT COUNT(*) FROM event", [], |r| r.get(0))?;
+                        Ok(cnt)
+                    })
+                    .unwrap()
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.join().unwrap(), 1);
+        }
+        // High-level read helpers also succeed while writer_guard is held
+        assert!(db.get_user("alice").unwrap().is_some());
+        assert_eq!(db.query_events(&EventFilter::default()).unwrap().len(), 1);
+        assert_eq!(
+            db.query_timeline(Some("front_door"), Some("ev_orphan_old"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(writer_guard);
+
+        // 4. Orphan cleanup: within 5m grace (cutoff = 1200.0 < 1000.0 + 300.0), orphan survives;
+        //    past retention + 5m grace (cutoff = 1400.0 > 1300.0), orphan is purged AND
+        //    {id}-clean.jpg / {id}.webp / {id}-clean.webp are returned in files_to_remove!
+        let media_dir = tmp_dir.join("media");
+        let (ev_kept, rev_kept, _) = db
+            .cleanup_camera_expired_events_and_reviews_in_dir(
+                &media_dir,
+                "front_door",
+                1200.0,
+                1200.0,
+            )
+            .unwrap();
+        assert_eq!((ev_kept, rev_kept), (0, 0));
+
+        let (ev_purged, rev_purged, files_to_remove) = db
+            .cleanup_camera_expired_events_and_reviews_in_dir(
+                &media_dir,
+                "front_door",
+                1400.0,
+                1400.0,
+            )
+            .unwrap();
+        assert_eq!((ev_purged, rev_purged), (1, 1));
+        for expected_suffix in [
+            "clips/ev_orphan_old.jpg",
+            "clips/ev_orphan_old-clean.jpg",
+            "clips/ev_orphan_old.webp",
+            "clips/ev_orphan_old-clean.webp",
+            "clips/front_door-ev_orphan_old.webp",
+            "clips/front_door-ev_orphan_old-clean.webp",
+        ] {
+            assert!(
+                files_to_remove.iter().any(|p| p.ends_with(expected_suffix)),
+                "expected artifact '{expected_suffix}' in {files_to_remove:?}"
+            );
+        }
+
+        // 5. close_orphaned_open_events_and_reviews closes open rows on startup
+        db.upsert_event(&EventDto {
+            id: "ev_startup_open".to_string(),
+            camera: "front_door".to_string(),
+            label: "car".to_string(),
+            zones: json!([]),
+            start_time: 2000.0,
+            end_time: None,
+            has_clip: false,
+            has_snapshot: false,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.8),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.8),
+            stationary: false,
+        })
+        .unwrap();
+        db.insert_review_segment(&ReviewItemDto {
+            id: "rev_startup_open".to_string(),
+            camera: "front_door".to_string(),
+            start_time: 2000.0,
+            end_time: None,
+            severity: "detection".to_string(),
+            thumb_path: "/media/ninjanvr/clips/review/thumb-rev_startup_open.webp".to_string(),
+            data: json!({"detections": ["ev_startup_open"], "objects": ["car"]}),
+            has_been_reviewed: false,
+        })
+        .unwrap();
+        let (closed_ev, closed_rev) = db
+            .close_orphaned_open_events_and_reviews(2500.0, 120.0)
+            .unwrap();
+        assert_eq!((closed_ev, closed_rev), (1, 1));
+        let closed_event = db.get_event("ev_startup_open").unwrap().unwrap();
+        assert_eq!(closed_event["end_time"], json!(2120.0));
+        let closed_review = db.get_review_by_id("rev_startup_open").unwrap().unwrap();
+        assert_eq!(closed_review.end_time, Some(2120.0));
+
+        // 6. run_maintenance executes PASSIVE WAL checkpoint even while a read guard is active
+        let held_ro = db.read_conn();
+        db.run_maintenance().unwrap();
+        drop(held_ro);
 
         drop(db);
         let _ = std::fs::remove_dir_all(&tmp_dir);

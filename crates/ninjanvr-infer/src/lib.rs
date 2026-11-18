@@ -253,21 +253,74 @@ const ORT_TENSOR_ELEMENT_DATA_TYPE_FLOAT: c_int = 1;
 const ORT_TENSOR_ELEMENT_DATA_TYPE_UINT8: c_int = 2;
 const ORT_GRAPH_OPT_ENABLE_ALL: c_int = 99;
 
-/// OpenVINO C-API runtime context.
-/// Fields are ordered in strict reverse creation order (`output_tensor` -> `input_tensor` ->
-/// `infer_req` -> `compiled_model` -> `core` -> `_lib_handle`), and `Drop` explicitly releases
-/// child handles before parent handles.
-struct OpenVinoCContext {
+const DEFAULT_OV_INFER_SLOTS: usize = 4;
+const FACE_GALLERY_SYNC_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+struct OvInferSlot {
+    slot_idx: usize,
     output_tensor: *mut c_void,
     input_tensor: *mut c_void,
     infer_req: *mut c_void,
-    compiled_model: *mut c_void,
-    core: *mut c_void,
-    _lib_handle: *mut c_void,
     in_ptr: *mut u8,
     in_bytes: usize,
     out_ptr: *const f32,
     out_floats: usize,
+}
+
+// SAFETY: Each `OvInferSlot` owns an independent OpenVINO `ov_infer_request_t` and its input/output
+// `ov_tensor_t` handles. Exclusive checkout via `OpenVinoShared::slots` ensures no `OvInferSlot`
+// is ever accessed concurrently by two threads.
+unsafe impl Send for OvInferSlot {}
+
+impl OvInferSlot {
+    /// Releases child tensor handles before the parent `infer_req` handle.
+    ///
+    /// # Safety
+    ///
+    /// Must only be called once when this slot is being permanently destroyed while its parent
+    /// `compiled_model` is still live.
+    unsafe fn free_handles(
+        &mut self,
+        tensor_free_fn: Option<OvFreeFn>,
+        infer_req_free_fn: Option<OvFreeFn>,
+    ) {
+        // SAFETY: Handles were allocated by OpenVINO C-API for this slot and are freed at most once
+        // in strict reverse creation order (`output_tensor` -> `input_tensor` -> `infer_req`).
+        unsafe {
+            if !self.output_tensor.is_null() {
+                if let Some(free_fn) = tensor_free_fn {
+                    free_fn(self.output_tensor);
+                }
+                if self.input_tensor == self.output_tensor {
+                    self.input_tensor = std::ptr::null_mut();
+                }
+                self.output_tensor = std::ptr::null_mut();
+            }
+            if !self.input_tensor.is_null() {
+                if let Some(free_fn) = tensor_free_fn {
+                    free_fn(self.input_tensor);
+                }
+                self.input_tensor = std::ptr::null_mut();
+            }
+            if !self.infer_req.is_null() {
+                if let Some(free_fn) = infer_req_free_fn {
+                    free_fn(self.infer_req);
+                }
+                self.infer_req = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
+struct OpenVinoShared {
+    slots: Mutex<Vec<OvInferSlot>>,
+    slot_cv: std::sync::Condvar,
+    slot_count: usize,
+    compiled_model: *mut c_void,
+    core: *mut c_void,
+    _lib_handle: *mut c_void,
+    in_bytes: usize,
+    out_floats: std::sync::atomic::AtomicUsize,
     infer_fn: OvInferReqInferFn,
     tensor_data_fn: OvTensorDataFn,
     tensor_byte_size_fn: OvTensorGetByteSizeFn,
@@ -277,36 +330,28 @@ struct OpenVinoCContext {
     core_free_fn: Option<OvFreeFn>,
 }
 
-// SAFETY: OpenVinoCContext owns its OpenVINO C-API handles and raw tensor pointers exclusively,
-// and all access across threads is serialized through `AiDetectorEngine::inner: Mutex<DetectorRuntimeState>`.
-unsafe impl Send for OpenVinoCContext {}
+// SAFETY: `OpenVinoShared` serializes checkout of individual `OvInferSlot`s through `slots` +
+// `slot_cv`, while `compiled_model` and `core` remain immutable after construction and are freed
+// only in `Drop` after all checked-out `Arc<OpenVinoShared>` references complete.
+unsafe impl Send for OpenVinoShared {}
+// SAFETY: Shared references `&OpenVinoShared` only access immutable function pointers, atomics,
+// and the `Mutex`/`Condvar`-synchronized `slots` pool.
+unsafe impl Sync for OpenVinoShared {}
 
-impl Drop for OpenVinoCContext {
+impl Drop for OpenVinoShared {
     fn drop(&mut self) {
-        // SAFETY: Each non-null handle was allocated by the loaded OpenVINO C library and is
-        // released at most once in reverse creation order (tensors -> infer_req -> compiled_model -> core).
+        let slots = self
+            .slots
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        slots.sort_by_key(|s| s.slot_idx);
+        // SAFETY: Every slot is drained and freed in reverse creation order before releasing
+        // `compiled_model` and `core`.
         unsafe {
-            if !self.output_tensor.is_null() {
-                if let Some(free_fn) = self.tensor_free_fn {
-                    free_fn(self.output_tensor);
-                }
-                if self.input_tensor == self.output_tensor {
-                    self.input_tensor = std::ptr::null_mut();
-                }
-                self.output_tensor = std::ptr::null_mut();
+            for slot in slots.iter_mut() {
+                slot.free_handles(self.tensor_free_fn, self.infer_req_free_fn);
             }
-            if !self.input_tensor.is_null() {
-                if let Some(free_fn) = self.tensor_free_fn {
-                    free_fn(self.input_tensor);
-                }
-                self.input_tensor = std::ptr::null_mut();
-            }
-            if !self.infer_req.is_null() {
-                if let Some(free_fn) = self.infer_req_free_fn {
-                    free_fn(self.infer_req);
-                }
-                self.infer_req = std::ptr::null_mut();
-            }
+            slots.clear();
             if !self.compiled_model.is_null() {
                 if let Some(free_fn) = self.compiled_model_free_fn {
                     free_fn(self.compiled_model);
@@ -323,11 +368,72 @@ impl Drop for OpenVinoCContext {
     }
 }
 
-/// ONNX Runtime C-API runtime context.
+struct OvSlotCheckout<'a> {
+    shared: &'a OpenVinoShared,
+    slot: Option<OvInferSlot>,
+}
+
+impl<'a> OvSlotCheckout<'a> {
+    fn acquire(shared: &'a OpenVinoShared) -> Option<Self> {
+        let mut guard = lock_unpoisoned(&shared.slots);
+        if shared.slot_count == 0 {
+            return None;
+        }
+        while guard.is_empty() {
+            guard = shared
+                .slot_cv
+                .wait(guard)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        let slot = guard.pop()?;
+        Some(Self {
+            shared,
+            slot: Some(slot),
+        })
+    }
+
+    fn slot_mut(&mut self) -> &mut OvInferSlot {
+        self.slot.as_mut().expect("checked-out OvInferSlot present")
+    }
+}
+
+impl Drop for OvSlotCheckout<'_> {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            let mut guard = lock_unpoisoned(&self.shared.slots);
+            guard.push(slot);
+            self.shared.slot_cv.notify_one();
+        }
+    }
+}
+
+/// Multi-slot OpenVINO C-API runtime context (`Arc`-shared across concurrent `detect_region` calls).
+#[derive(Clone)]
+struct OpenVinoCContext {
+    shared: Arc<OpenVinoShared>,
+}
+
+impl OpenVinoCContext {
+    fn in_bytes(&self) -> usize {
+        self.shared.in_bytes
+    }
+
+    fn out_floats(&self) -> usize {
+        self.shared
+            .out_floats
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn slot_count(&self) -> usize {
+        self.shared.slot_count
+    }
+}
+
+/// ONNX Runtime C-API shared session state.
 /// Fields are ordered in strict reverse creation order (`mem_info` -> `session` ->
 /// `session_opts` -> `env` -> `vtable` -> `_lib_handle`), and `Drop` explicitly releases
 /// child handles before parent handles.
-struct OrtCContext {
+struct OrtShared {
     mem_info: *mut c_void,
     session: *mut c_void,
     session_opts: *mut c_void,
@@ -337,17 +443,19 @@ struct OrtCContext {
     input_name: CString,
     output_name: CString,
     input_is_u8: bool,
-    in_f32_buf: Vec<f32>,
-    in_u8_buf: Vec<u8>,
     in_bytes: usize,
-    out_floats: usize,
+    out_floats: std::sync::atomic::AtomicUsize,
 }
 
-// SAFETY: OrtCContext owns its ONNX Runtime C-API handles and buffers exclusively,
-// and all access across threads is serialized through `AiDetectorEngine::inner: Mutex<DetectorRuntimeState>`.
-unsafe impl Send for OrtCContext {}
+// SAFETY: `OrtShared` owns its ONNX Runtime handles and releases them only when the final `Arc`
+// reference drops; `OrtApi::Run` on an initialized `OrtSession*` with per-call `OrtValue*`
+// tensors and read-only `OrtMemoryInfo*` is thread-safe in the ONNX Runtime C-API.
+unsafe impl Send for OrtShared {}
+// SAFETY: Concurrent callers only read immutable handles/names, update `out_floats` atomically,
+// and allocate/release call-scoped `OrtValue*` tensors.
+unsafe impl Sync for OrtShared {}
 
-impl Drop for OrtCContext {
+impl Drop for OrtShared {
     fn drop(&mut self) {
         if self.vtable.is_null() {
             return;
@@ -372,9 +480,37 @@ impl Drop for OrtCContext {
     }
 }
 
+#[derive(Clone)]
+struct OrtCContext {
+    shared: Arc<OrtShared>,
+}
+
+impl OrtCContext {
+    fn in_bytes(&self) -> usize {
+        self.shared.in_bytes
+    }
+
+    fn out_floats(&self) -> usize {
+        self.shared
+            .out_floats
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[derive(Clone)]
 enum InferenceRuntimeBackend {
     OpenVino(OpenVinoCContext),
     OnnxRuntime(OrtCContext),
+}
+
+#[derive(Clone)]
+struct DecodeMetadata {
+    model_w: u32,
+    model_h: u32,
+    nchw_layout: bool,
+    is_yolo: bool,
+    labelmap: Arc<BTreeMap<i32, String>>,
+    backend: Option<InferenceRuntimeBackend>,
 }
 
 struct DetectorRuntimeState {
@@ -386,8 +522,21 @@ struct DetectorRuntimeState {
     active_backend: String,
     active_device: String,
     active_model_path: String,
-    labelmap: BTreeMap<i32, String>,
+    labelmap: Arc<BTreeMap<i32, String>>,
     backend: Option<InferenceRuntimeBackend>,
+}
+
+impl DetectorRuntimeState {
+    fn snapshot_decode_metadata(&self) -> DecodeMetadata {
+        DecodeMetadata {
+            model_w: self.model_w,
+            model_h: self.model_h,
+            nchw_layout: self.nchw_layout,
+            is_yolo: self.is_yolo,
+            labelmap: Arc::clone(&self.labelmap),
+            backend: self.backend.clone(),
+        }
+    }
 }
 
 pub struct AiDetectorEngine {
@@ -621,9 +770,17 @@ const YOLO_COCO_80: [&str; 80] = [
 impl AiDetectorEngine {
     pub fn new(config: &NinjaConfig) -> Self {
         let state = Self::build_runtime_state(config, None);
+        let shared_gallery = Arc::new(Mutex::new(FaceGallery::new()));
         let mut pool_map = BTreeMap::new();
         for (name, entry) in &config.detectors {
-            pool_map.insert(name.clone(), Arc::new(Self::new_for_entry(config, entry)));
+            pool_map.insert(
+                name.clone(),
+                Arc::new(Self::new_for_entry_with_gallery(
+                    config,
+                    entry,
+                    Arc::clone(&shared_gallery),
+                )),
+            );
         }
         Self {
             inner: Mutex::new(state),
@@ -631,12 +788,20 @@ impl AiDetectorEngine {
             inference_samples: AtomicU64::new(0),
             cumulative_infer_us: AtomicU64::new(0),
             pool: Mutex::new(pool_map),
-            face_gallery: Arc::new(Mutex::new(FaceGallery::new())),
+            face_gallery: shared_gallery,
             lpr_voter: Mutex::new(LprTrackVoter::new(12)),
         }
     }
 
     pub fn new_for_entry(config: &NinjaConfig, entry: &DetectorEntryConfig) -> Self {
+        Self::new_for_entry_with_gallery(config, entry, Arc::new(Mutex::new(FaceGallery::new())))
+    }
+
+    fn new_for_entry_with_gallery(
+        config: &NinjaConfig,
+        entry: &DetectorEntryConfig,
+        face_gallery: Arc<Mutex<FaceGallery>>,
+    ) -> Self {
         let state = Self::build_runtime_state(config, Some(entry));
         Self {
             inner: Mutex::new(state),
@@ -644,7 +809,7 @@ impl AiDetectorEngine {
             inference_samples: AtomicU64::new(0),
             cumulative_infer_us: AtomicU64::new(0),
             pool: Mutex::new(BTreeMap::new()),
-            face_gallery: Arc::new(Mutex::new(FaceGallery::new())),
+            face_gallery,
             lpr_voter: Mutex::new(LprTrackVoter::new(12)),
         }
     }
@@ -658,7 +823,14 @@ impl AiDetectorEngine {
         self.inference_samples.store(0, Ordering::Relaxed);
         let mut pool_map = BTreeMap::new();
         for (name, entry) in &config.detectors {
-            pool_map.insert(name.clone(), Arc::new(Self::new_for_entry(config, entry)));
+            pool_map.insert(
+                name.clone(),
+                Arc::new(Self::new_for_entry_with_gallery(
+                    config,
+                    entry,
+                    Arc::clone(&self.face_gallery),
+                )),
+            );
         }
         *lock_unpoisoned(&self.pool) = pool_map;
     }
@@ -687,7 +859,14 @@ impl AiDetectorEngine {
                 if entry_unchanged && let Some(existing) = existing_pool.get(name) {
                     next_pool.insert(name.clone(), existing.clone());
                 } else {
-                    next_pool.insert(name.clone(), Arc::new(Self::new_for_entry(next_cfg, entry)));
+                    next_pool.insert(
+                        name.clone(),
+                        Arc::new(Self::new_for_entry_with_gallery(
+                            next_cfg,
+                            entry,
+                            Arc::clone(&self.face_gallery),
+                        )),
+                    );
                 }
             }
             *lock_unpoisoned(&self.pool) = next_pool;
@@ -704,7 +883,7 @@ impl AiDetectorEngine {
         if let Some(lm) = labelmap_override
             && !lm.is_empty()
         {
-            state.labelmap = lm;
+            state.labelmap = Arc::new(lm);
         }
         let loaded = state.backend.is_some();
         CompiledCandidateDetector { state, loaded }
@@ -719,7 +898,7 @@ impl AiDetectorEngine {
         final_model_path: String,
         updated_cfg: &NinjaConfig,
     ) {
-        let new_labelmap = compiled.state.labelmap.clone();
+        let new_labelmap = Arc::clone(&compiled.state.labelmap);
         compiled.state.active_model_path = final_model_path;
         *lock_unpoisoned(&self.inner) = compiled.state;
         *lock_unpoisoned(&self.last_inference_ms) = 0.0;
@@ -734,9 +913,13 @@ impl AiDetectorEngine {
                 {
                     next_pool.insert(name.clone(), existing.clone());
                 } else {
-                    let rebuilt = Self::new_for_entry(updated_cfg, entry);
+                    let rebuilt = Self::new_for_entry_with_gallery(
+                        updated_cfg,
+                        entry,
+                        Arc::clone(&self.face_gallery),
+                    );
                     if entry.model.is_none() && !new_labelmap.is_empty() {
-                        rebuilt.set_labelmap(new_labelmap.clone());
+                        rebuilt.set_labelmap((*new_labelmap).clone());
                     }
                     next_pool.insert(name.clone(), Arc::new(rebuilt));
                 }
@@ -803,8 +986,20 @@ impl AiDetectorEngine {
         guard.list_profiles(Some(faces_dir))
     }
 
+    /// Invalidates the in-memory `FaceGallery` directory freshness timestamp so the next
+    /// `match_face_crop` call re-synchronizes with `{faces_dir}` on disk.
+    pub fn invalidate_face_gallery_cache(&self) {
+        lock_unpoisoned(&self.face_gallery).invalidate_cache();
+        let named: Vec<Arc<AiDetectorEngine>> =
+            lock_unpoisoned(&self.pool).values().cloned().collect();
+        for det in named {
+            lock_unpoisoned(&det.face_gallery).invalidate_cache();
+        }
+    }
+
     /// Extracts a 512-d L2-normalized embedding from `crop_bytes` and matches it against
-    /// enrolled profiles in `face_gallery`.
+    /// enrolled profiles in `face_gallery` (synchronizing lazily from `faces_dir` on first use
+    /// or after the 60s freshness TTL / explicit invalidation).
     pub fn match_face_crop(
         &self,
         faces_dir: &Path,
@@ -812,14 +1007,15 @@ impl AiDetectorEngine {
         similarity_threshold: f32,
         unknown_alert: bool,
     ) -> Option<FaceMatchResult> {
+        let query_emb = extract_face_embedding(crop_bytes);
         let mut guard = lock_unpoisoned(&self.face_gallery);
-        if let Err(e) = guard.sync_from_dir(faces_dir) {
+        if let Err(e) = guard.sync_from_dir_if_stale(faces_dir, FACE_GALLERY_SYNC_TTL) {
             warn!(
                 "Failed to sync face gallery from {}: {e:#}",
                 faces_dir.display()
             );
         }
-        guard.match_face_bytes(crop_bytes, similarity_threshold, unknown_alert)
+        guard.match_embedding(&query_emb, similarity_threshold, unknown_alert)
     }
 
     fn build_runtime_state(
@@ -876,7 +1072,9 @@ impl AiDetectorEngine {
                 Ok((ort_ctx, actual_dev)) => {
                     info!(
                         "Initialized native ONNX Runtime C-API detector (model={}, device={actual_dev}, in_bytes={}, out_floats={})",
-                        effective_model.path, ort_ctx.in_bytes, ort_ctx.out_floats
+                        effective_model.path,
+                        ort_ctx.in_bytes(),
+                        ort_ctx.out_floats()
                     );
                     active_device = actual_dev;
                     Some(InferenceRuntimeBackend::OnnxRuntime(ort_ctx))
@@ -912,8 +1110,11 @@ impl AiDetectorEngine {
             match Self::try_init_openvino(&effective_model.path, requested_device) {
                 Ok((ctx, actual_dev)) => {
                     info!(
-                        "Initialized native OpenVINO C-API detector (model={}, device={actual_dev}, in_bytes={}, out_floats={})",
-                        effective_model.path, ctx.in_bytes, ctx.out_floats
+                        "Initialized native OpenVINO C-API detector (model={}, device={actual_dev}, slots={}, in_bytes={}, out_floats={})",
+                        effective_model.path,
+                        ctx.slot_count(),
+                        ctx.in_bytes(),
+                        ctx.out_floats()
                     );
                     active_device = actual_dev;
                     Some(InferenceRuntimeBackend::OpenVino(ctx))
@@ -938,8 +1139,8 @@ impl AiDetectorEngine {
             let (rec_w, rec_h) = Self::reconcile_openvino_dimensions(
                 model_w,
                 model_h,
-                ctx.in_bytes,
-                ctx.out_floats,
+                ctx.in_bytes(),
+                ctx.out_floats(),
                 is_yolo,
                 nchw_layout,
                 &effective_model.path,
@@ -947,7 +1148,11 @@ impl AiDetectorEngine {
             if (rec_w, rec_h) != (model_w, model_h) {
                 info!(
                     "Reconciled model input dimensions from {}x{} to compiled tensor {}x{} (in_bytes={})",
-                    model_w, model_h, rec_w, rec_h, ctx.in_bytes
+                    model_w,
+                    model_h,
+                    rec_w,
+                    rec_h,
+                    ctx.in_bytes()
                 );
                 model_w = rec_w;
                 model_h = rec_h;
@@ -965,7 +1170,7 @@ impl AiDetectorEngine {
             active_backend,
             active_device,
             active_model_path: effective_model.path.clone(),
-            labelmap,
+            labelmap: Arc::new(labelmap),
             backend,
         }
     }
@@ -1110,8 +1315,8 @@ impl AiDetectorEngine {
         let (loaded, active_backend, active_dev, active_path, mw, mh, in_bytes, out_floats) = {
             let g = lock_unpoisoned(&self.inner);
             let (ib, of) = match g.backend.as_ref() {
-                Some(InferenceRuntimeBackend::OpenVino(c)) => (c.in_bytes, c.out_floats),
-                Some(InferenceRuntimeBackend::OnnxRuntime(c)) => (c.in_bytes, c.out_floats),
+                Some(InferenceRuntimeBackend::OpenVino(c)) => (c.in_bytes(), c.out_floats()),
+                Some(InferenceRuntimeBackend::OnnxRuntime(c)) => (c.in_bytes(), c.out_floats()),
                 None => (0, 0),
             };
             (
@@ -1488,9 +1693,9 @@ impl AiDetectorEngine {
             let release_type_info: OrtReleaseFn =
                 std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[98]);
 
-            // Construct OrtCContext upfront so its Drop implementation automatically releases
+            // Construct OrtShared upfront so its Drop implementation automatically releases
             // any created handles (mem_info -> session -> session_opts -> env) if an early error occurs.
-            let mut ctx = OrtCContext {
+            let mut ctx = OrtShared {
                 mem_info: std::ptr::null_mut(),
                 session: std::ptr::null_mut(),
                 session_opts: std::ptr::null_mut(),
@@ -1500,10 +1705,8 @@ impl AiDetectorEngine {
                 input_name: c"images".to_owned(),
                 output_name: c"output0".to_owned(),
                 input_is_u8: false,
-                in_f32_buf: Vec::new(),
-                in_u8_buf: Vec::new(),
                 in_bytes: 0,
-                out_floats: 84 * 8400,
+                out_floats: std::sync::atomic::AtomicUsize::new(84 * 8400),
             };
 
             let env_st = create_env(2, c"ninjanvr".as_ptr(), &mut ctx.env);
@@ -1699,11 +1902,14 @@ impl AiDetectorEngine {
                     .checked_mul(std::mem::size_of::<f32>())
                     .ok_or_else(|| anyhow!("input tensor byte size overflows usize"))?
             };
-            ctx.in_f32_buf = vec![0.0f32; num_elems];
-            ctx.in_u8_buf = vec![0u8; num_elems];
             ctx.in_bytes = in_bytes;
 
-            Ok((ctx, actual_device))
+            Ok((
+                OrtCContext {
+                    shared: Arc::new(ctx),
+                },
+                actual_device,
+            ))
         }
     }
 
@@ -1809,26 +2015,41 @@ impl AiDetectorEngine {
     ///
     /// `fns` must contain valid OpenVINO C-API function pointers matching the `Ov*Fn` C ABI
     /// signatures that remain valid for the lifetime of the returned `OpenVinoCContext`.
+    #[cfg_attr(not(test), allow(dead_code))]
     unsafe fn init_ov_context_from_fns(
         handle: *mut c_void,
         fns: OvCFunctionTable,
         model_path: &Path,
         device: &str,
     ) -> Result<(OpenVinoCContext, String)> {
+        // SAFETY: Forwards caller-guaranteed OpenVINO C-API function table with a single slot.
+        unsafe { Self::init_ov_context_from_fns_with_slots(handle, fns, model_path, device, 1) }
+    }
+
+    /// # Safety
+    ///
+    /// `fns` must contain valid OpenVINO C-API function pointers matching the `Ov*Fn` C ABI
+    /// signatures that remain valid for the lifetime of the returned `OpenVinoCContext`.
+    unsafe fn init_ov_context_from_fns_with_slots(
+        handle: *mut c_void,
+        fns: OvCFunctionTable,
+        model_path: &Path,
+        device: &str,
+        desired_slots: usize,
+    ) -> Result<(OpenVinoCContext, String)> {
+        let target_slots = desired_slots.clamp(1, 8);
         // SAFETY: Caller guarantees `fns` entries follow the OpenVINO C ABI; all output pointers
         // and tensor byte sizes are checked for null, alignment, and bounds before use.
         unsafe {
-            let mut ctx = OpenVinoCContext {
-                output_tensor: std::ptr::null_mut(),
-                input_tensor: std::ptr::null_mut(),
-                infer_req: std::ptr::null_mut(),
+            let mut shared = OpenVinoShared {
+                slots: Mutex::new(Vec::with_capacity(target_slots)),
+                slot_cv: std::sync::Condvar::new(),
+                slot_count: 0,
                 compiled_model: std::ptr::null_mut(),
                 core: std::ptr::null_mut(),
                 _lib_handle: handle,
-                in_ptr: std::ptr::null_mut(),
                 in_bytes: 0,
-                out_ptr: std::ptr::null(),
-                out_floats: 0,
+                out_floats: std::sync::atomic::AtomicUsize::new(0),
                 infer_fn: fns.infer_fn,
                 tensor_data_fn: fns.tensor_data,
                 tensor_byte_size_fn: fns.tensor_byte_size,
@@ -1838,15 +2059,15 @@ impl AiDetectorEngine {
                 core_free_fn: fns.core_free,
             };
 
-            let rc = (fns.core_create)(&mut ctx.core);
-            if rc != 0 || ctx.core.is_null() {
-                ctx.core = std::ptr::null_mut();
+            let rc = (fns.core_create)(&mut shared.core);
+            if rc != 0 || shared.core.is_null() {
+                shared.core = std::ptr::null_mut();
                 bail!("ov_core_create returned {rc}");
             }
 
             let c_model = path_to_cstring(model_path)?;
             let mut actual_device = device.to_string();
-            let core = ctx.core;
+            let core = shared.core;
             let compile_model = fns.compile_model;
             let compiled_model_free = fns.compiled_model_free;
 
@@ -1886,9 +2107,9 @@ impl AiDetectorEngine {
                 false
             };
 
-            if !try_compile(device, &mut ctx.compiled_model) {
+            if !try_compile(device, &mut shared.compiled_model) {
                 if !device.eq_ignore_ascii_case("CPU")
-                    && try_compile("CPU", &mut ctx.compiled_model)
+                    && try_compile("CPU", &mut shared.compiled_model)
                 {
                     warn!(
                         "Requested OpenVINO device '{device}' plugin not available; falling back to CPU"
@@ -1899,61 +2120,155 @@ impl AiDetectorEngine {
                 }
             }
 
-            let rc = (fns.create_infer_req)(ctx.compiled_model, &mut ctx.infer_req);
-            if rc != 0 || ctx.infer_req.is_null() {
-                ctx.infer_req = std::ptr::null_mut();
-                bail!("ov_compiled_model_create_infer_request returned {rc}");
+            let create_and_warmup_slot = |slot_idx: usize,
+                                          compiled_model: *mut c_void|
+             -> Result<OvInferSlot> {
+                struct PendingSlotGuard {
+                    slot: OvInferSlot,
+                    tensor_free_fn: Option<OvFreeFn>,
+                    infer_req_free_fn: Option<OvFreeFn>,
+                }
+                impl Drop for PendingSlotGuard {
+                    fn drop(&mut self) {
+                        // SAFETY: Cleans up partially initialized slot handles on early error.
+                        unsafe {
+                            self.slot
+                                .free_handles(self.tensor_free_fn, self.infer_req_free_fn);
+                        }
+                    }
+                }
+
+                let mut guard = PendingSlotGuard {
+                    slot: OvInferSlot {
+                        slot_idx,
+                        output_tensor: std::ptr::null_mut(),
+                        input_tensor: std::ptr::null_mut(),
+                        infer_req: std::ptr::null_mut(),
+                        in_ptr: std::ptr::null_mut(),
+                        in_bytes: 0,
+                        out_ptr: std::ptr::null(),
+                        out_floats: 0,
+                    },
+                    tensor_free_fn: fns.tensor_free,
+                    infer_req_free_fn: fns.infer_req_free,
+                };
+
+                let rc = (fns.create_infer_req)(compiled_model, &mut guard.slot.infer_req);
+                if rc != 0 || guard.slot.infer_req.is_null() {
+                    guard.slot.infer_req = std::ptr::null_mut();
+                    bail!("ov_compiled_model_create_infer_request returned {rc}");
+                }
+
+                let rc = (fns.get_in_tensor)(guard.slot.infer_req, &mut guard.slot.input_tensor);
+                if rc != 0 || guard.slot.input_tensor.is_null() {
+                    guard.slot.input_tensor = std::ptr::null_mut();
+                    bail!("ov_infer_request_get_input_tensor returned {rc}");
+                }
+
+                let mut in_raw: *mut c_void = std::ptr::null_mut();
+                let rc = (fns.tensor_data)(guard.slot.input_tensor, &mut in_raw);
+                if rc != 0 || in_raw.is_null() {
+                    bail!("ov_tensor_data(input) returned {rc}");
+                }
+                let mut in_bytes: usize = 0;
+                let rc = (fns.tensor_byte_size)(guard.slot.input_tensor, &mut in_bytes);
+                if rc != 0 || in_bytes == 0 || in_bytes > MAX_TENSOR_BYTES {
+                    bail!("ov_tensor_get_byte_size(input) returned rc={rc}, bytes={in_bytes}");
+                }
+
+                let rc = (fns.infer_fn)(guard.slot.infer_req);
+                if rc != 0 {
+                    bail!("ov_infer_request_infer warmup returned {rc}");
+                }
+
+                let rc = (fns.get_out_tensor)(guard.slot.infer_req, &mut guard.slot.output_tensor);
+                if rc != 0 || guard.slot.output_tensor.is_null() {
+                    guard.slot.output_tensor = std::ptr::null_mut();
+                    bail!("ov_infer_request_get_output_tensor returned {rc}");
+                }
+
+                let mut out_raw: *mut c_void = std::ptr::null_mut();
+                let rc = (fns.tensor_data)(guard.slot.output_tensor, &mut out_raw);
+                if rc != 0 || out_raw.is_null() {
+                    bail!("ov_tensor_data(output) returned {rc}");
+                }
+                let mut out_bytes: usize = 0;
+                let rc = (fns.tensor_byte_size)(guard.slot.output_tensor, &mut out_bytes);
+                if rc != 0
+                    || out_bytes < 6 * std::mem::size_of::<f32>()
+                    || out_bytes > MAX_TENSOR_BYTES
+                    || !out_bytes.is_multiple_of(std::mem::size_of::<f32>())
+                {
+                    bail!("ov_tensor_get_byte_size(output) returned rc={rc}, bytes={out_bytes}");
+                }
+
+                guard.slot.in_ptr = in_raw as *mut u8;
+                guard.slot.in_bytes = in_bytes;
+                guard.slot.out_ptr = out_raw as *const f32;
+                guard.slot.out_floats = out_bytes / std::mem::size_of::<f32>();
+
+                let ready = std::mem::replace(
+                    &mut guard.slot,
+                    OvInferSlot {
+                        slot_idx,
+                        output_tensor: std::ptr::null_mut(),
+                        input_tensor: std::ptr::null_mut(),
+                        infer_req: std::ptr::null_mut(),
+                        in_ptr: std::ptr::null_mut(),
+                        in_bytes: 0,
+                        out_ptr: std::ptr::null(),
+                        out_floats: 0,
+                    },
+                );
+                Ok(ready)
+            };
+
+            let first_slot = create_and_warmup_slot(0, shared.compiled_model)?;
+            shared.in_bytes = first_slot.in_bytes;
+            shared
+                .out_floats
+                .store(first_slot.out_floats, std::sync::atomic::Ordering::Relaxed);
+
+            let mut created_slots = Vec::with_capacity(target_slots);
+            created_slots.push(first_slot);
+
+            for slot_idx in 1..target_slots {
+                match create_and_warmup_slot(slot_idx, shared.compiled_model) {
+                    Ok(mut next_slot) => {
+                        let duplicate_handle = created_slots.iter().any(|existing| {
+                            existing.infer_req == next_slot.infer_req
+                                || existing.in_ptr == next_slot.in_ptr
+                        });
+                        if duplicate_handle || next_slot.in_bytes != shared.in_bytes {
+                            if !duplicate_handle {
+                                next_slot.free_handles(fns.tensor_free, fns.infer_req_free);
+                            }
+                            break;
+                        }
+                        created_slots.push(next_slot);
+                    }
+                    Err(err) => {
+                        warn!(
+                            "OpenVINO additional infer slot {slot_idx} unavailable ({err:#}); continuing with {} slot(s)",
+                            created_slots.len()
+                        );
+                        break;
+                    }
+                }
             }
 
-            let rc = (fns.get_in_tensor)(ctx.infer_req, &mut ctx.input_tensor);
-            if rc != 0 || ctx.input_tensor.is_null() {
-                ctx.input_tensor = std::ptr::null_mut();
-                bail!("ov_infer_request_get_input_tensor returned {rc}");
-            }
+            shared.slot_count = created_slots.len();
+            *shared
+                .slots
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = created_slots;
 
-            let mut in_raw: *mut c_void = std::ptr::null_mut();
-            let rc = (fns.tensor_data)(ctx.input_tensor, &mut in_raw);
-            if rc != 0 || in_raw.is_null() {
-                bail!("ov_tensor_data(input) returned {rc}");
-            }
-            let mut in_bytes: usize = 0;
-            let rc = (fns.tensor_byte_size)(ctx.input_tensor, &mut in_bytes);
-            if rc != 0 || in_bytes == 0 || in_bytes > MAX_TENSOR_BYTES {
-                bail!("ov_tensor_get_byte_size(input) returned rc={rc}, bytes={in_bytes}");
-            }
-
-            let rc = (fns.infer_fn)(ctx.infer_req);
-            if rc != 0 {
-                bail!("ov_infer_request_infer warmup returned {rc}");
-            }
-
-            let rc = (fns.get_out_tensor)(ctx.infer_req, &mut ctx.output_tensor);
-            if rc != 0 || ctx.output_tensor.is_null() {
-                ctx.output_tensor = std::ptr::null_mut();
-                bail!("ov_infer_request_get_output_tensor returned {rc}");
-            }
-
-            let mut out_raw: *mut c_void = std::ptr::null_mut();
-            let rc = (fns.tensor_data)(ctx.output_tensor, &mut out_raw);
-            if rc != 0 || out_raw.is_null() {
-                bail!("ov_tensor_data(output) returned {rc}");
-            }
-            let mut out_bytes: usize = 0;
-            let rc = (fns.tensor_byte_size)(ctx.output_tensor, &mut out_bytes);
-            if rc != 0
-                || out_bytes < 6 * std::mem::size_of::<f32>()
-                || out_bytes > MAX_TENSOR_BYTES
-                || !out_bytes.is_multiple_of(std::mem::size_of::<f32>())
-            {
-                bail!("ov_tensor_get_byte_size(output) returned rc={rc}, bytes={out_bytes}");
-            }
-
-            ctx.in_ptr = in_raw as *mut u8;
-            ctx.in_bytes = in_bytes;
-            ctx.out_ptr = out_raw as *const f32;
-            ctx.out_floats = out_bytes / std::mem::size_of::<f32>();
-
-            Ok((ctx, actual_device))
+            Ok((
+                OpenVinoCContext {
+                    shared: Arc::new(shared),
+                },
+                actual_device,
+            ))
         }
     }
 
@@ -2034,7 +2349,13 @@ impl AiDetectorEngine {
                 core_free: load_opt_sym!(c"ov_core_free", OvFreeFn),
             };
 
-            Self::init_ov_context_from_fns(handle, fns, &model_path, device)
+            Self::init_ov_context_from_fns_with_slots(
+                handle,
+                fns,
+                &model_path,
+                device,
+                DEFAULT_OV_INFER_SLOTS,
+            )
         }
     }
 
@@ -2050,104 +2371,120 @@ impl AiDetectorEngine {
         let mut out_results = Vec::new();
         let mut ran_model = false;
 
+        let meta = {
+            let guard = lock_unpoisoned(&self.inner);
+            guard.snapshot_decode_metadata()
+        };
+
+        let model_w = meta.model_w;
+        let model_h = meta.model_h;
+        let nchw_layout = meta.nchw_layout;
+        let expected_elems = (model_w as usize)
+            .saturating_mul(model_h as usize)
+            .saturating_mul(3);
+
+        if expected_elems > 0
+            && expected_elems <= MAX_TENSOR_FLOATS
+            && tensor_nhwc.len() >= expected_elems
         {
-            let mut guard = lock_unpoisoned(&self.inner);
-            let model_w = guard.model_w;
-            let model_h = guard.model_h;
-            let nchw_layout = guard.nchw_layout;
-            let expected_elems = (model_w as usize)
-                .saturating_mul(model_h as usize)
-                .saturating_mul(3);
+            let tensor_nhwc = &tensor_nhwc[..expected_elems];
+            ran_model = meta.backend.is_some();
 
-            if expected_elems > 0
-                && expected_elems <= MAX_TENSOR_FLOATS
-                && tensor_nhwc.len() >= expected_elems
-            {
-                let tensor_nhwc = &tensor_nhwc[..expected_elems];
-                ran_model = guard.backend.is_some();
+            match meta.backend.as_ref() {
+                Some(InferenceRuntimeBackend::OpenVino(ctx)) => {
+                    let expected_f32_bytes = expected_elems.checked_mul(std::mem::size_of::<f32>());
+                    let base_in_bytes = ctx.in_bytes();
+                    // Preprocess NHWC u8 -> planar/interleaved f32 or u8 OUTSIDE any lock or slot!
+                    let prepared_f32 = if expected_f32_bytes == Some(base_in_bytes) {
+                        let mut buf = vec![0.0f32; expected_elems];
+                        prepare_input_tensor_f32(
+                            tensor_nhwc,
+                            model_w,
+                            model_h,
+                            nchw_layout,
+                            &mut buf,
+                        );
+                        Some(buf)
+                    } else {
+                        None
+                    };
+                    let prepared_u8 = if prepared_f32.is_none() && base_in_bytes == expected_elems {
+                        let mut buf = vec![0u8; expected_elems];
+                        prepare_input_tensor_u8(
+                            tensor_nhwc,
+                            model_w,
+                            model_h,
+                            nchw_layout,
+                            &mut buf,
+                        );
+                        Some(buf)
+                    } else {
+                        None
+                    };
 
-                match guard.backend.as_mut() {
-                    Some(InferenceRuntimeBackend::OpenVino(ctx)) => {
-                        let expected_f32_bytes =
-                            expected_elems.checked_mul(std::mem::size_of::<f32>());
-                        // SAFETY: `ctx` holds live OpenVINO C-API tensor/infer handles protected by
-                        // `self.inner` mutex; input/output pointers, alignments, and byte lengths
-                        // are re-queried and bounds-checked before constructing slices or copying.
+                    let raw_output: Option<Vec<f32>> = if (prepared_f32.is_some()
+                        || prepared_u8.is_some())
+                        && let Some(mut checkout) = OvSlotCheckout::acquire(&ctx.shared)
+                    {
+                        let shared = &ctx.shared;
+                        let slot = checkout.slot_mut();
+                        // SAFETY: `slot` is exclusively owned by `checkout` for the duration of this
+                        // block; input/output pointers and byte lengths are re-queried and bounds-checked
+                        // before copying, and output floats are copied into an owned `Vec<f32>` before
+                        // returning `slot` to the pool.
                         unsafe {
-                            if !ctx.input_tensor.is_null() {
+                            if !slot.input_tensor.is_null() {
                                 let mut in_raw: *mut c_void = std::ptr::null_mut();
                                 let mut in_bytes: usize = 0;
-                                let rc_d = (ctx.tensor_data_fn)(ctx.input_tensor, &mut in_raw);
+                                let rc_d = (shared.tensor_data_fn)(slot.input_tensor, &mut in_raw);
                                 let rc_s =
-                                    (ctx.tensor_byte_size_fn)(ctx.input_tensor, &mut in_bytes);
+                                    (shared.tensor_byte_size_fn)(slot.input_tensor, &mut in_bytes);
                                 if rc_d == 0
                                     && rc_s == 0
                                     && !in_raw.is_null()
                                     && (1..=MAX_TENSOR_BYTES).contains(&in_bytes)
                                 {
-                                    ctx.in_ptr = in_raw as *mut u8;
-                                    ctx.in_bytes = in_bytes;
+                                    slot.in_ptr = in_raw as *mut u8;
+                                    slot.in_bytes = in_bytes;
                                 } else {
-                                    ctx.in_ptr = std::ptr::null_mut();
-                                    ctx.in_bytes = 0;
+                                    slot.in_ptr = std::ptr::null_mut();
+                                    slot.in_bytes = 0;
                                 }
                             }
-                            let size_matches = expected_f32_bytes == Some(ctx.in_bytes)
-                                || ctx.in_bytes == expected_elems;
-                            if !ctx.in_ptr.is_null()
-                                && ctx.in_bytes > 0
-                                && ctx.in_bytes <= MAX_TENSOR_BYTES
+                            let size_matches = expected_f32_bytes == Some(slot.in_bytes)
+                                || slot.in_bytes == expected_elems;
+                            let mut copied_out = None;
+                            if !slot.in_ptr.is_null()
+                                && slot.in_bytes > 0
+                                && slot.in_bytes <= MAX_TENSOR_BYTES
                                 && size_matches
                             {
-                                if expected_f32_bytes == Some(ctx.in_bytes)
-                                    && (ctx.in_ptr as usize)
-                                        .is_multiple_of(std::mem::align_of::<f32>())
+                                if let Some(ref f32_src) = prepared_f32
+                                    && expected_f32_bytes == Some(slot.in_bytes)
                                 {
-                                    let dst_f32 = std::slice::from_raw_parts_mut(
-                                        ctx.in_ptr as *mut f32,
-                                        expected_elems,
-                                    );
-                                    prepare_input_tensor_f32(
-                                        tensor_nhwc,
-                                        model_w,
-                                        model_h,
-                                        nchw_layout,
-                                        dst_f32,
-                                    );
-                                } else if expected_f32_bytes == Some(ctx.in_bytes) {
-                                    let mut tmp_f32 = vec![0.0f32; expected_elems];
-                                    prepare_input_tensor_f32(
-                                        tensor_nhwc,
-                                        model_w,
-                                        model_h,
-                                        nchw_layout,
-                                        &mut tmp_f32,
-                                    );
                                     std::ptr::copy_nonoverlapping(
-                                        tmp_f32.as_ptr() as *const u8,
-                                        ctx.in_ptr,
-                                        ctx.in_bytes,
+                                        f32_src.as_ptr() as *const u8,
+                                        slot.in_ptr,
+                                        slot.in_bytes,
                                     );
-                                } else {
-                                    let dst_u8 =
-                                        std::slice::from_raw_parts_mut(ctx.in_ptr, expected_elems);
-                                    prepare_input_tensor_u8(
-                                        tensor_nhwc,
-                                        model_w,
-                                        model_h,
-                                        nchw_layout,
-                                        dst_u8,
+                                } else if let Some(ref u8_src) = prepared_u8
+                                    && slot.in_bytes == expected_elems
+                                {
+                                    std::ptr::copy_nonoverlapping(
+                                        u8_src.as_ptr(),
+                                        slot.in_ptr,
+                                        expected_elems,
                                     );
                                 }
 
-                                let rc = (ctx.infer_fn)(ctx.infer_req);
-                                if rc == 0 && !ctx.output_tensor.is_null() {
+                                let rc = (shared.infer_fn)(slot.infer_req);
+                                if rc == 0 && !slot.output_tensor.is_null() {
                                     let mut out_raw: *mut c_void = std::ptr::null_mut();
                                     let mut out_bytes: usize = 0;
                                     let rc_od =
-                                        (ctx.tensor_data_fn)(ctx.output_tensor, &mut out_raw);
-                                    let rc_os = (ctx.tensor_byte_size_fn)(
-                                        ctx.output_tensor,
+                                        (shared.tensor_data_fn)(slot.output_tensor, &mut out_raw);
+                                    let rc_os = (shared.tensor_byte_size_fn)(
+                                        slot.output_tensor,
                                         &mut out_bytes,
                                     );
                                     if rc_od == 0
@@ -2157,63 +2494,92 @@ impl AiDetectorEngine {
                                             .contains(&out_bytes)
                                         && out_bytes.is_multiple_of(std::mem::size_of::<f32>())
                                     {
-                                        ctx.out_ptr = out_raw as *const f32;
-                                        ctx.out_floats = out_bytes / std::mem::size_of::<f32>();
+                                        slot.out_ptr = out_raw as *const f32;
+                                        slot.out_floats = out_bytes / std::mem::size_of::<f32>();
                                     } else {
-                                        ctx.out_ptr = std::ptr::null();
-                                        ctx.out_floats = 0;
+                                        slot.out_ptr = std::ptr::null();
+                                        slot.out_floats = 0;
                                     }
                                 } else {
-                                    ctx.out_ptr = std::ptr::null();
-                                    ctx.out_floats = 0;
+                                    slot.out_ptr = std::ptr::null();
+                                    slot.out_floats = 0;
                                 }
 
                                 if rc == 0
-                                    && !ctx.out_ptr.is_null()
-                                    && (6..=MAX_TENSOR_FLOATS).contains(&ctx.out_floats)
+                                    && !slot.out_ptr.is_null()
+                                    && (6..=MAX_TENSOR_FLOATS).contains(&slot.out_floats)
                                 {
-                                    if (ctx.out_ptr as usize)
-                                        .is_multiple_of(std::mem::align_of::<f32>())
-                                    {
-                                        let slice =
-                                            std::slice::from_raw_parts(ctx.out_ptr, ctx.out_floats);
-                                        out_results = Self::decode_output_with_state(
-                                            &guard,
-                                            slice,
-                                            region,
-                                            frame_w,
-                                            frame_h,
-                                            score_threshold,
-                                        );
-                                    } else {
-                                        let mut aligned_out = vec![0.0f32; ctx.out_floats];
-                                        std::ptr::copy_nonoverlapping(
-                                            ctx.out_ptr as *const u8,
-                                            aligned_out.as_mut_ptr() as *mut u8,
-                                            ctx.out_floats * std::mem::size_of::<f32>(),
-                                        );
-                                        out_results = Self::decode_output_with_state(
-                                            &guard,
-                                            &aligned_out,
-                                            region,
-                                            frame_w,
-                                            frame_h,
-                                            score_threshold,
-                                        );
-                                    }
+                                    shared.out_floats.store(
+                                        slot.out_floats,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    let mut aligned_out = vec![0.0f32; slot.out_floats];
+                                    std::ptr::copy_nonoverlapping(
+                                        slot.out_ptr as *const u8,
+                                        aligned_out.as_mut_ptr() as *mut u8,
+                                        slot.out_floats * std::mem::size_of::<f32>(),
+                                    );
+                                    copied_out = Some(aligned_out);
                                 }
                             }
+                            copied_out
                         }
+                    } else {
+                        None
+                    };
+
+                    // Slot has already been returned to the pool; run YOLO decode + NMS concurrently!
+                    if let Some(ref out_slice) = raw_output {
+                        out_results = Self::decode_output_with_meta(
+                            &meta,
+                            out_slice,
+                            region,
+                            frame_w,
+                            frame_h,
+                            score_threshold,
+                        );
                     }
-                    // SAFETY: `ort_ctx` holds live ONNX Runtime C-API handles and a 101-slot vtable
-                    // protected by `self.inner` mutex; required vtable slots, tensor pointers, and
-                    // element counts are validated before creating slices or releasing values.
-                    Some(InferenceRuntimeBackend::OnnxRuntime(ort_ctx)) => unsafe {
-                        if !ort_ctx.vtable.is_null()
-                            && !ort_ctx.session.is_null()
-                            && !ort_ctx.mem_info.is_null()
+                }
+                Some(InferenceRuntimeBackend::OnnxRuntime(ort_ctx)) => {
+                    let ort = &ort_ctx.shared;
+                    let shape: [i64; 4] = if nchw_layout {
+                        [1, 3, model_h as i64, model_w as i64]
+                    } else {
+                        [1, model_h as i64, model_w as i64, 3]
+                    };
+                    // Prepare thread-local input buffer OUTSIDE any mutex!
+                    let mut local_u8 = Vec::new();
+                    let mut local_f32 = Vec::new();
+                    if ort.input_is_u8 {
+                        local_u8.resize(expected_elems, 0u8);
+                        prepare_input_tensor_u8(
+                            tensor_nhwc,
+                            model_w,
+                            model_h,
+                            nchw_layout,
+                            &mut local_u8,
+                        );
+                    } else {
+                        local_f32.resize(expected_elems, 0.0f32);
+                        prepare_input_tensor_f32(
+                            tensor_nhwc,
+                            model_w,
+                            model_h,
+                            nchw_layout,
+                            &mut local_f32,
+                        );
+                    }
+
+                    // SAFETY: `ort` holds live ONNX Runtime C-API handles (`Arc<OrtShared>`) and a
+                    // 101-slot vtable; per-call `OrtValue*` input/output handles are created from
+                    // thread-local buffers and released before returning `raw_output`.
+                    let raw_output: Option<Vec<f32>> = unsafe {
+                        let mut copied_out = None;
+                        if !ort.vtable.is_null()
+                            && !ort.session.is_null()
+                            && !ort.mem_info.is_null()
                         {
-                            let vt = std::slice::from_raw_parts(ort_ctx.vtable, 101);
+                            let vt = std::slice::from_raw_parts(ort.vtable, 101);
                             let slots_ok = [9usize, 49, 51, 60, 64, 65, 93, 96, 99]
                                 .iter()
                                 .all(|&idx| !vt[idx].is_null());
@@ -2248,51 +2614,22 @@ impl AiDetectorEngine {
                                 let release_status: OrtReleaseFn =
                                     std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[93]);
 
-                                let shape: [i64; 4] = if nchw_layout {
-                                    [1, 3, model_h as i64, model_w as i64]
-                                } else {
-                                    [1, model_h as i64, model_w as i64, 3]
-                                };
-
                                 let mut in_val: *mut c_void = std::ptr::null_mut();
-                                let create_st = if ort_ctx.input_is_u8 {
-                                    if ort_ctx.in_u8_buf.len() != expected_elems {
-                                        ort_ctx.in_u8_buf.resize(expected_elems, 0u8);
-                                    }
-                                    prepare_input_tensor_u8(
-                                        tensor_nhwc,
-                                        model_w,
-                                        model_h,
-                                        nchw_layout,
-                                        &mut ort_ctx.in_u8_buf,
-                                    );
+                                let create_st = if ort.input_is_u8 {
                                     create_tensor(
-                                        ort_ctx.mem_info,
-                                        ort_ctx.in_u8_buf.as_mut_ptr() as *mut c_void,
-                                        ort_ctx.in_u8_buf.len(),
+                                        ort.mem_info,
+                                        local_u8.as_mut_ptr() as *mut c_void,
+                                        local_u8.len(),
                                         shape.as_ptr(),
                                         shape.len(),
                                         ORT_TENSOR_ELEMENT_DATA_TYPE_UINT8,
                                         &mut in_val,
                                     )
                                 } else {
-                                    if ort_ctx.in_f32_buf.len() != expected_elems {
-                                        ort_ctx.in_f32_buf.resize(expected_elems, 0.0f32);
-                                    }
-                                    prepare_input_tensor_f32(
-                                        tensor_nhwc,
-                                        model_w,
-                                        model_h,
-                                        nchw_layout,
-                                        &mut ort_ctx.in_f32_buf,
-                                    );
                                     create_tensor(
-                                        ort_ctx.mem_info,
-                                        ort_ctx.in_f32_buf.as_mut_ptr() as *mut c_void,
-                                        ort_ctx
-                                            .in_f32_buf
-                                            .len()
-                                            .saturating_mul(std::mem::size_of::<f32>()),
+                                        ort.mem_info,
+                                        local_f32.as_mut_ptr() as *mut c_void,
+                                        local_f32.len().saturating_mul(std::mem::size_of::<f32>()),
                                         shape.as_ptr(),
                                         shape.len(),
                                         ORT_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
@@ -2306,13 +2643,13 @@ impl AiDetectorEngine {
                                         release_val(in_val);
                                     }
                                 } else if !in_val.is_null() {
-                                    let in_names = [ort_ctx.input_name.as_ptr()];
+                                    let in_names = [ort.input_name.as_ptr()];
                                     let in_vals = [in_val as *const c_void];
-                                    let out_names = [ort_ctx.output_name.as_ptr()];
+                                    let out_names = [ort.output_name.as_ptr()];
                                     let mut out_val: *mut c_void = std::ptr::null_mut();
 
                                     let run_st = run_fn(
-                                        ort_ctx.session,
+                                        ort.session,
                                         std::ptr::null(),
                                         in_names.as_ptr(),
                                         in_vals.as_ptr(),
@@ -2441,7 +2778,10 @@ impl AiDetectorEngine {
                                         if let Some(out_floats) = valid_elem_count
                                             && !out_ptr.is_null()
                                         {
-                                            ort_ctx.out_floats = out_floats;
+                                            ort.out_floats.store(
+                                                out_floats,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
                                             let slice_vec: Vec<f32> = if (out_ptr as usize)
                                                 .is_multiple_of(std::mem::align_of::<f32>())
                                             {
@@ -2461,14 +2801,7 @@ impl AiDetectorEngine {
                                             };
                                             release_val(out_val);
                                             release_val(in_val);
-                                            out_results = Self::decode_output_with_state(
-                                                &guard,
-                                                &slice_vec,
-                                                region,
-                                                frame_w,
-                                                frame_h,
-                                                score_threshold,
-                                            );
+                                            copied_out = Some(slice_vec);
                                         } else {
                                             release_val(out_val);
                                             release_val(in_val);
@@ -2479,9 +2812,21 @@ impl AiDetectorEngine {
                                 }
                             }
                         }
-                    },
-                    None => {}
+                        copied_out
+                    };
+
+                    if let Some(ref out_slice) = raw_output {
+                        out_results = Self::decode_output_with_meta(
+                            &meta,
+                            out_slice,
+                            region,
+                            frame_w,
+                            frame_h,
+                            score_threshold,
+                        );
+                    }
                 }
+                None => {}
             }
         }
 
@@ -2506,16 +2851,19 @@ impl AiDetectorEngine {
         frame_h: u32,
         score_threshold: f32,
     ) -> Vec<DetectionResult> {
-        let guard = lock_unpoisoned(&self.inner);
-        Self::decode_output_with_state(&guard, slice, region, frame_w, frame_h, score_threshold)
+        let meta = {
+            let guard = lock_unpoisoned(&self.inner);
+            guard.snapshot_decode_metadata()
+        };
+        Self::decode_output_with_meta(&meta, slice, region, frame_w, frame_h, score_threshold)
     }
 
     pub fn set_labelmap(&self, labelmap: BTreeMap<i32, String>) {
         let mut guard = lock_unpoisoned(&self.inner);
-        guard.labelmap = labelmap;
+        guard.labelmap = Arc::new(labelmap);
     }
 
-    fn custom_labelmap_class_count(state: &DetectorRuntimeState) -> Option<usize> {
+    fn custom_labelmap_class_count(state: &DecodeMetadata) -> Option<usize> {
         if state.labelmap.is_empty() {
             return None;
         }
@@ -2530,7 +2878,7 @@ impl AiDetectorEngine {
         if c_cfg >= 1 { Some(c_cfg) } else { None }
     }
 
-    fn resolve_yolo_label(state: &DetectorRuntimeState, cls_idx: i32) -> Option<String> {
+    fn resolve_yolo_label(state: &DecodeMetadata, cls_idx: i32) -> Option<String> {
         if cls_idx < 0 {
             return None;
         }
@@ -2601,7 +2949,7 @@ impl AiDetectorEngine {
     }
 
     fn decode_transposed_yolo(
-        state: &DetectorRuntimeState,
+        state: &DecodeMetadata,
         slice: &[f32],
         num_classes: usize,
         num_anchors: usize,
@@ -2683,7 +3031,7 @@ impl AiDetectorEngine {
     }
 
     fn decode_row_major_yolo(
-        state: &DetectorRuntimeState,
+        state: &DecodeMetadata,
         slice: &[f32],
         num_classes: usize,
         region: BoundingBox,
@@ -2759,8 +3107,8 @@ impl AiDetectorEngine {
         nms_detections(out_results, 0.50)
     }
 
-    fn decode_output_with_state(
-        state: &DetectorRuntimeState,
+    fn decode_output_with_meta(
+        state: &DecodeMetadata,
         slice: &[f32],
         region: BoundingBox,
         frame_w: u32,
@@ -3261,6 +3609,8 @@ pub struct FaceGallery {
     sample_files: BTreeMap<String, Vec<String>>,
     file_cache: BTreeMap<PathBuf, (u64, Option<std::time::SystemTime>, Vec<f32>)>,
     loaded_dir: Option<PathBuf>,
+    last_synced_at: Option<Instant>,
+    sync_runs: u64,
 }
 
 pub fn sanitize_face_profile_name(raw: &str) -> Option<String> {
@@ -3344,6 +3694,32 @@ impl FaceGallery {
         Ok(gallery)
     }
 
+    /// Returns the number of directory synchronizations performed by this gallery instance.
+    pub fn sync_count(&self) -> u64 {
+        self.sync_runs
+    }
+
+    /// Marks the directory freshness cache stale so the next `sync_from_dir_if_stale` re-scans disk.
+    pub fn invalidate_cache(&mut self) {
+        self.last_synced_at = None;
+    }
+
+    /// Synchronizes from `faces_dir` only when never synced for `faces_dir`, explicitly
+    /// invalidated, or older than `ttl`. Returns `Ok(true)` if a filesystem sync ran.
+    pub fn sync_from_dir_if_stale(
+        &mut self,
+        faces_dir: &Path,
+        ttl: std::time::Duration,
+    ) -> Result<bool> {
+        if self.loaded_dir.as_deref() == Some(faces_dir)
+            && self.last_synced_at.is_some_and(|ts| ts.elapsed() < ttl)
+        {
+            return Ok(false);
+        }
+        self.sync_from_dir(faces_dir)?;
+        Ok(true)
+    }
+
     /// Resolves an existing canonical profile key matching `clean_name` case-insensitively
     /// (checking in-memory profiles first, then subdirectories inside `faces_dir`).
     pub fn resolve_canonical_name(&self, clean_name: &str, faces_dir: Option<&Path>) -> String {
@@ -3376,16 +3752,21 @@ impl FaceGallery {
     /// Synchronizes enrolled face profiles from `{faces_dir}/<name>/*.{jpg,jpeg,webp,png,bin}`
     /// while preserving any in-memory embeddings already enrolled during the current session.
     pub fn sync_from_dir(&mut self, faces_dir: &Path) -> Result<()> {
-        self.loaded_dir = Some(faces_dir.to_path_buf());
         match std::fs::symlink_metadata(faces_dir) {
             Ok(meta) => {
                 if !meta.file_type().is_dir() {
                     bail!("faces_dir must be a real directory and not a symlink");
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.loaded_dir = Some(faces_dir.to_path_buf());
+                self.last_synced_at = Some(Instant::now());
+                self.sync_runs = self.sync_runs.saturating_add(1);
+                return Ok(());
+            }
             Err(e) => return Err(e.into()),
         }
+        self.loaded_dir = Some(faces_dir.to_path_buf());
         let entries = std::fs::read_dir(faces_dir)?;
         let mut dir_paths: Vec<PathBuf> = entries
             .flatten()
@@ -3478,6 +3859,8 @@ impl FaceGallery {
             }
         }
         self.file_cache.retain(|k, _| active_files.contains(k));
+        self.last_synced_at = Some(Instant::now());
+        self.sync_runs = self.sync_runs.saturating_add(1);
         Ok(())
     }
 
@@ -3651,6 +4034,8 @@ impl FaceGallery {
             embs_entry.push(emb.clone());
             files_entry.push(filename);
         }
+        self.loaded_dir = Some(base_dir.to_path_buf());
+        self.last_synced_at = Some(Instant::now());
         Ok((file_path, emb))
     }
 
@@ -3708,6 +4093,7 @@ impl FaceGallery {
             }
             self.file_cache.retain(|k, _| !k.starts_with(&target));
         }
+        self.last_synced_at = Some(Instant::now());
         Ok(removed_mem || removed_disk)
     }
 
@@ -7239,5 +7625,238 @@ detectors:
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn multi_slot_concurrent_openvino_inference_and_cached_face_gallery_lookup() {
+        // 1. Multi-slot OpenVINO concurrent inference across 4 OS threads meeting at a Barrier
+        static NEXT_REQ_ID: AtomicU64 = AtomicU64::new(0);
+        static WARMUP_DONE: AtomicU64 = AtomicU64::new(0);
+        static ACTIVE_INFERS: AtomicU64 = AtomicU64::new(0);
+        static PEAK_CONCURRENT_INFERS: AtomicU64 = AtomicU64::new(0);
+        static FREE_SEQ: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        static SLOT_IN_BUFS: Mutex<[[u8; 64 * 64 * 3]; 4]> = Mutex::new([[0u8; 64 * 64 * 3]; 4]);
+        static SLOT_OUT_BUF: [f32; 7] = [0.0, 1.0, 0.91, 0.1, 0.1, 0.5, 0.8];
+        static PARALLEL_BARRIER: std::sync::OnceLock<Arc<std::sync::Barrier>> =
+            std::sync::OnceLock::new();
+
+        unsafe extern "C" fn ms_core_create(out: *mut *mut c_void) -> c_int {
+            // SAFETY: Test mock writes sentinel core handle.
+            unsafe {
+                *out = 0x900usize as *mut c_void;
+            }
+            0
+        }
+        unsafe extern "C" fn ms_compile(
+            _c: *mut c_void,
+            _m: *const c_char,
+            _d: *const c_char,
+            _n: usize,
+            out: *mut *mut c_void,
+            _k: *const c_char,
+            _v: *const c_char,
+        ) -> c_int {
+            // SAFETY: Test mock writes sentinel compiled_model handle.
+            unsafe {
+                *out = 0x901usize as *mut c_void;
+            }
+            0
+        }
+        unsafe extern "C" fn ms_create_req(_cm: *mut c_void, out: *mut *mut c_void) -> c_int {
+            let idx = NEXT_REQ_ID.fetch_add(1, Ordering::SeqCst) as usize;
+            // SAFETY: Test mock writes distinct infer_req sentinel handle per slot (0x100 + idx).
+            unsafe {
+                *out = (0x100usize + idx) as *mut c_void;
+            }
+            0
+        }
+        unsafe extern "C" fn ms_in_tensor(req: *mut c_void, out: *mut *mut c_void) -> c_int {
+            let slot = (req as usize).saturating_sub(0x100);
+            // SAFETY: Test mock writes distinct input_tensor sentinel handle per slot (0x200 + slot).
+            unsafe {
+                *out = (0x200usize + slot) as *mut c_void;
+            }
+            0
+        }
+        unsafe extern "C" fn ms_out_tensor(req: *mut c_void, out: *mut *mut c_void) -> c_int {
+            let slot = (req as usize).saturating_sub(0x100);
+            // SAFETY: Test mock writes distinct output_tensor sentinel handle per slot (0x300 + slot).
+            unsafe {
+                *out = (0x300usize + slot) as *mut c_void;
+            }
+            0
+        }
+        unsafe extern "C" fn ms_tensor_data(t: *mut c_void, out: *mut *mut c_void) -> c_int {
+            let h = t as usize;
+            // SAFETY: Each slot index [0..4) maps to its own disjoint input array in SLOT_IN_BUFS.
+            unsafe {
+                if (0x200..0x204).contains(&h) {
+                    let slot = h - 0x200;
+                    let base = SLOT_IN_BUFS.lock().unwrap().as_mut_ptr();
+                    *out = base.add(slot) as *mut c_void;
+                } else {
+                    *out = SLOT_OUT_BUF.as_ptr() as *mut c_void;
+                }
+            }
+            0
+        }
+        unsafe extern "C" fn ms_tensor_size(t: *mut c_void, out: *mut usize) -> c_int {
+            let h = t as usize;
+            // SAFETY: Writes valid byte length for input vs output tensor.
+            unsafe {
+                if (0x200..0x204).contains(&h) {
+                    *out = 64 * 64 * 3;
+                } else {
+                    *out = std::mem::size_of_val(&SLOT_OUT_BUF);
+                }
+            }
+            0
+        }
+        unsafe extern "C" fn ms_infer(_req: *mut c_void) -> c_int {
+            if WARMUP_DONE.load(Ordering::SeqCst) != 0 {
+                let cur = ACTIVE_INFERS.fetch_add(1, Ordering::SeqCst) + 1;
+                PEAK_CONCURRENT_INFERS.fetch_max(cur, Ordering::SeqCst);
+                if let Some(bar) = PARALLEL_BARRIER.get() {
+                    bar.wait();
+                }
+                ACTIVE_INFERS.fetch_sub(1, Ordering::SeqCst);
+            }
+            0
+        }
+        unsafe extern "C" fn ms_free(ptr: *mut c_void) {
+            FREE_SEQ.lock().unwrap().push(ptr as usize);
+        }
+
+        NEXT_REQ_ID.store(0, Ordering::SeqCst);
+        WARMUP_DONE.store(0, Ordering::SeqCst);
+        ACTIVE_INFERS.store(0, Ordering::SeqCst);
+        PEAK_CONCURRENT_INFERS.store(0, Ordering::SeqCst);
+        FREE_SEQ.lock().unwrap().clear();
+        let _ = PARALLEL_BARRIER.set(Arc::new(std::sync::Barrier::new(4)));
+
+        let fns = OvCFunctionTable {
+            core_create: ms_core_create,
+            // SAFETY: `ms_compile` uses C ABI compatible with `OvCoreCompileModelFn`.
+            compile_model: unsafe {
+                std::mem::transmute::<*const c_void, OvCoreCompileModelFn>(
+                    ms_compile as *const c_void,
+                )
+            },
+            create_infer_req: ms_create_req,
+            get_in_tensor: ms_in_tensor,
+            get_out_tensor: ms_out_tensor,
+            infer_fn: ms_infer,
+            tensor_data: ms_tensor_data,
+            tensor_byte_size: ms_tensor_size,
+            tensor_free: Some(ms_free),
+            infer_req_free: Some(ms_free),
+            compiled_model_free: Some(ms_free),
+            core_free: Some(ms_free),
+        };
+
+        // SAFETY: `fns` contains valid test mock OpenVINO C-API functions.
+        let (ov_ctx, _) = unsafe {
+            AiDetectorEngine::init_ov_context_from_fns_with_slots(
+                std::ptr::null_mut(),
+                fns,
+                Path::new("/tmp/ms.xml"),
+                "CPU",
+                4,
+            )
+            .unwrap()
+        };
+        assert_eq!(ov_ctx.slot_count(), 4);
+        WARMUP_DONE.store(1, Ordering::SeqCst);
+
+        let cfg =
+            NinjaConfig::from_yaml_str("version: 0.18-0\n", PathBuf::from("/tmp/ms.yml")).unwrap();
+        let engine = Arc::new(AiDetectorEngine::new(&cfg));
+        {
+            let mut g = engine.inner.lock().unwrap();
+            g.model_w = 64;
+            g.model_h = 64;
+            g.is_yolo = false;
+            g.backend = Some(InferenceRuntimeBackend::OpenVino(ov_ctx));
+        }
+
+        let mut threads = Vec::new();
+        for t_idx in 0..4u8 {
+            let eng = Arc::clone(&engine);
+            threads.push(std::thread::spawn(move || {
+                let crop = vec![t_idx.wrapping_mul(31); 64 * 64 * 3];
+                let region = BoundingBox::new(0, 0, 640, 480);
+                eng.detect_region(&crop, region, 1280, 720, 0.5)
+            }));
+        }
+        for th in threads {
+            let dets = th.join().unwrap();
+            assert_eq!(dets.len(), 1);
+            assert_eq!(dets[0].label, "person");
+        }
+        assert_eq!(
+            PEAK_CONCURRENT_INFERS.load(Ordering::SeqCst),
+            4,
+            "all 4 inference slots must execute concurrently without serializing on engine.inner"
+        );
+
+        drop(engine);
+        assert_eq!(
+            *FREE_SEQ.lock().unwrap(),
+            vec![
+                0x300, 0x200, 0x100, // slot 0
+                0x301, 0x201, 0x101, // slot 1
+                0x302, 0x202, 0x102, // slot 2
+                0x303, 0x203, 0x103, // slot 3
+                0x901, // compiled_model
+                0x900, // core
+            ]
+        );
+
+        // 2. Cached FaceGallery lookup: match_face_crop syncs lazily once and avoids per-frame read_dir
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp_faces =
+            std::env::temp_dir().join(format!("ninjanvr-face-ttl-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(tmp_faces.join("Alice")).unwrap();
+        std::fs::write(
+            tmp_faces.join("Alice").join("s1.bin"),
+            b"alice-reference-crop",
+        )
+        .unwrap();
+
+        let face_engine = AiDetectorEngine::new(&cfg);
+        assert_eq!(face_engine.face_gallery().lock().unwrap().sync_count(), 0);
+
+        // First match_face_crop triggers lazy initial sync (sync_count == 1)
+        let m1 = face_engine
+            .match_face_crop(&tmp_faces, b"alice-reference-crop", 0.68, false)
+            .unwrap();
+        assert_eq!(m1.sub_label, "Alice");
+        assert!(m1.is_known);
+        assert_eq!(face_engine.face_gallery().lock().unwrap().sync_count(), 1);
+
+        // 25 subsequent person frames within TTL do ZERO additional sync_from_dir scans!
+        for _ in 0..25 {
+            let m = face_engine
+                .match_face_crop(&tmp_faces, b"alice-reference-crop", 0.68, false)
+                .unwrap();
+            assert_eq!(m.sub_label, "Alice");
+        }
+        assert_eq!(face_engine.face_gallery().lock().unwrap().sync_count(), 1);
+
+        // External file written on disk is picked up immediately after invalidate_face_gallery_cache()
+        std::fs::create_dir_all(tmp_faces.join("Bob")).unwrap();
+        std::fs::write(tmp_faces.join("Bob").join("s1.bin"), b"bob-reference-crop").unwrap();
+        face_engine.invalidate_face_gallery_cache();
+
+        let m_bob = face_engine
+            .match_face_crop(&tmp_faces, b"bob-reference-crop", 0.68, false)
+            .unwrap();
+        assert_eq!(m_bob.sub_label, "Bob");
+        assert_eq!(face_engine.face_gallery().lock().unwrap().sync_count(), 2);
+
+        let _ = std::fs::remove_dir_all(&tmp_faces);
     }
 }

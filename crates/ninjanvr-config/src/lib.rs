@@ -220,6 +220,14 @@ pub enum ConfigValidationError {
     },
     #[error("invalid {0} path")]
     InvalidTlsPath(&'static str),
+    #[error("invalid {0} environment variable name")]
+    InvalidSecretEnvVar(&'static str),
+    #[error("invalid peer '{peer}' token_env environment variable name")]
+    InvalidPeerTokenEnv { peer: String },
+    #[error("invalid auth.oidc.issuer_url")]
+    InvalidOidcIssuerUrl,
+    #[error("invalid camera '{camera}' {field}")]
+    InvalidCameraField { camera: String, field: &'static str },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -509,24 +517,34 @@ impl GenAiConfig {
                         .and_then(|s| s.strip_suffix('}'))
                         .unwrap_or(after_dollar.trim())
                         .trim();
-                    if !env_name.is_empty()
+                    if is_safe_genai_secret_env_var_name(env_name)
                         && let Ok(val) = std::env::var(env_name)
                         && !val.trim().is_empty()
                     {
                         return val.trim().to_string();
                     }
-                } else {
+                    return String::new();
+                }
+                if is_safe_genai_secret_env_var_name(trimmed) {
                     if let Ok(val) = std::env::var(trimmed)
                         && !val.trim().is_empty()
                     {
                         return val.trim().to_string();
                     }
-                    return trimmed.to_string();
+                    return String::new();
                 }
+                let looks_like_env_ident = trimmed.contains('_')
+                    && trimmed
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+                if looks_like_env_ident {
+                    return String::new();
+                }
+                return trimmed.to_string();
             }
         }
         let env_var = self.api_key_env.trim();
-        if !env_var.is_empty()
+        if is_safe_genai_secret_env_var_name(env_var)
             && let Ok(val) = std::env::var(env_var)
             && !val.trim().is_empty()
         {
@@ -4002,6 +4020,15 @@ impl NinjaConfig {
     /// Applies a partial or full structured JSON configuration update,
     /// automatically preserving any scrubbed RTSP/MQTT credentials and refreshing `raw_yaml`.
     pub fn apply_structured_json(&mut self, patch: &Value) -> Result<()> {
+        let rollback_backup = self.clone();
+        let res = self.apply_structured_json_inner(patch);
+        if res.is_err() {
+            *self = rollback_backup;
+        }
+        res
+    }
+
+    fn apply_structured_json_inner(&mut self, patch: &Value) -> Result<()> {
         let Some(obj) = patch.as_object() else {
             anyhow::bail!("structured config payload must be a JSON object");
         };
@@ -4602,6 +4629,7 @@ impl NinjaConfig {
             self.cameras = next_cams;
         }
         sanitize_config_floats(self);
+        validate_config_file_paths(self)?;
 
         let clean_yaml = self.to_clean_yaml()?;
         // Verify the generated YAML can be parsed back cleanly
@@ -5031,7 +5059,95 @@ fn merge_json_values(base: &mut Value, patch: &Value, replace_map_keys: &[&str])
     }
 }
 
+fn validate_record_storage_paths(
+    record: &RecordConfig,
+    camera_ctx: Option<&str>,
+) -> std::result::Result<(), ConfigValidationError> {
+    let field_err = |global_field: &'static str, cam_field: &'static str| {
+        if let Some(cam) = camera_ctx {
+            ConfigValidationError::InvalidCameraField {
+                camera: cam.to_string(),
+                field: cam_field,
+            }
+        } else {
+            ConfigValidationError::InvalidPathField(global_field)
+        }
+    };
+
+    if let Some(ref target_dir) = record.alert_backup.target_dir
+        && !is_safe_storage_dir_path(target_dir)
+    {
+        return Err(field_err(
+            "record.alert_backup.target_dir",
+            "record.alert_backup.target_dir",
+        ));
+    }
+    if let Some(ref hot_dir) = record.storage_tiers.hot_dir
+        && !is_safe_storage_dir_path(hot_dir)
+    {
+        return Err(field_err(
+            "record.storage_tiers.hot_dir",
+            "record.storage_tiers.hot_dir",
+        ));
+    }
+    if let Some(ref cold_dir) = record.storage_tiers.cold_dir
+        && !is_safe_storage_dir_path(cold_dir)
+    {
+        return Err(field_err(
+            "record.storage_tiers.cold_dir",
+            "record.storage_tiers.cold_dir",
+        ));
+    }
+    for (cam_key, dir_path) in &record.storage_tiers.per_camera_dir {
+        if !is_safe_go2rtc_stream_name(cam_key) || !is_safe_storage_dir_path(dir_path) {
+            return Err(field_err(
+                "record.storage_tiers.per_camera_dir",
+                "record.storage_tiers.per_camera_dir",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_config_file_paths(cfg: &NinjaConfig) -> std::result::Result<(), ConfigValidationError> {
+    if !is_safe_database_path(&cfg.database.path) {
+        return Err(ConfigValidationError::InvalidPathField("database.path"));
+    }
+    if !cfg.auth.oidc.client_secret_env.trim().is_empty()
+        && !is_safe_secret_env_var_name(&cfg.auth.oidc.client_secret_env)
+    {
+        return Err(ConfigValidationError::InvalidSecretEnvVar(
+            "auth.oidc.client_secret_env",
+        ));
+    }
+    if cfg.auth.oidc.issuer_url.chars().any(char::is_control)
+        || (cfg.auth.oidc.enabled
+            && !cfg.auth.oidc.issuer_url.trim().is_empty()
+            && !is_safe_oidc_issuer_url(&cfg.auth.oidc.issuer_url))
+    {
+        return Err(ConfigValidationError::InvalidOidcIssuerUrl);
+    }
+    for (peer_name, peer) in &cfg.peers {
+        if !peer.token_env.trim().is_empty() && !is_safe_secret_env_var_name(&peer.token_env) {
+            return Err(ConfigValidationError::InvalidPeerTokenEnv {
+                peer: peer_name.clone(),
+            });
+        }
+    }
+    validate_record_storage_paths(&cfg.record, None)?;
+    for (cam_name, cam) in &cfg.cameras {
+        validate_record_storage_paths(&cam.record, Some(cam_name))?;
+        for inp in &cam.ffmpeg.inputs {
+            if inp.path.chars().any(char::is_control)
+                || (!inp.path.trim().is_empty() && !is_safe_camera_input_url(&inp.path))
+            {
+                return Err(ConfigValidationError::InvalidCameraField {
+                    camera: cam_name.clone(),
+                    field: "ffmpeg.inputs.path",
+                });
+            }
+        }
+    }
     if !is_safe_labelmap_path(Path::new(&cfg.model.labelmap_path)) {
         return Err(ConfigValidationError::InvalidPathField(
             "model.labelmap_path",
@@ -5588,6 +5704,353 @@ fn validate_existing_or_ancestor_canonical_path(
         }
     }
     true
+}
+
+/// Validates that an environment variable reference (`peers.*.token_env`,
+/// `auth.oidc.client_secret_env`) matches `^[A-Z][A-Z0-9_]{1,127}$`, starts with an allowed
+/// `NINJANVR_` or `OIDC_` prefix, and does not target internal signing keys or runtime paths
+/// (`NINJANVR_JWT_SECRET`, `PATH`, `LD_PRELOAD`, `AWS_*`, `OPENBAO_*`, `KUBERNETES_*`, etc.).
+pub fn is_safe_secret_env_var_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    let bytes = trimmed.as_bytes();
+    if !(2..=128).contains(&bytes.len()) || !bytes[0].is_ascii_uppercase() {
+        return false;
+    }
+    if !bytes[1..]
+        .iter()
+        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+    {
+        return false;
+    }
+    if !(trimmed.starts_with("NINJANVR_") || trimmed.starts_with("OIDC_")) {
+        return false;
+    }
+    if trimmed.contains("JWT") {
+        return false;
+    }
+    !matches!(
+        trimmed,
+        "NINJANVR_FORBIDDEN_INTERNAL_SECRET"
+            | "NINJANVR_MASTER_KEY"
+            | "NINJANVR_COOKIE_SECRET"
+            | "NINJANVR_SHARE_SECRET"
+            | "NINJANVR_FFMPEG_BIN"
+            | "NINJANVR_FFPROBE_BIN"
+            | "NINJANVR_GO2RTC_BIN"
+            | "NINJANVR_ORT_LIB_DIR"
+            | "NINJANVR_OPENVINO_LIB_DIR"
+            | "NINJANVR_MODEL_PATH"
+            | "NINJANVR_LABELMAP_PATH"
+            | "NINJANVR_WEB_DIR"
+            | "NINJANVR_MEDIA_DIR"
+            | "NINJANVR_CONFIG_PATH"
+            | "NINJANVR_DB_PATH"
+            | "NINJANVR_HTTP_PORT"
+            | "NINJANVR_HTTPS_PORT"
+            | "NINJANVR_DISABLE_GO2RTC"
+            | "NINJANVR_HTTP_ENFORCE_AUTH"
+            | "NINJANVR_ENFORCE_HTTP_AUTH"
+            | "NINJANVR_RELEASE_VERSION"
+    )
+}
+
+/// Validates an environment variable name allowed for `genai.api_key` / `genai.api_key_env`.
+pub fn is_safe_genai_secret_env_var_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    matches!(
+        trimmed,
+        "GEMINI_API_KEY"
+            | "OPENAI_API_KEY"
+            | "OLLAMA_API_KEY"
+            | "GOOGLE_API_KEY"
+            | "ANTHROPIC_API_KEY"
+    ) || is_safe_secret_env_var_name(trimmed)
+}
+
+fn validate_oidc_issuer_url_impl(raw: &str, allow_loopback_http: bool) -> bool {
+    if raw.chars().any(char::is_control) {
+        return false;
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let Some((scheme, after_scheme)) = trimmed.split_once("://") else {
+        return false;
+    };
+    let scheme_lc = scheme.to_ascii_lowercase();
+    if !matches!(scheme_lc.as_str(), "https" | "http") || after_scheme.is_empty() {
+        return false;
+    }
+    let host_and_rest = match find_userinfo_at_index(after_scheme) {
+        Some(at_idx) => &after_scheme[at_idx + 1..],
+        None => after_scheme,
+    };
+    if host_and_rest.is_empty()
+        || host_and_rest.contains(['?', '#', '\\'])
+        || host_and_rest.contains("..")
+    {
+        return false;
+    }
+    let host_port = extract_authority_host_port(host_and_rest);
+    if host_port.is_empty() || host_port.contains('%') {
+        return false;
+    }
+    let host_only = extract_authority_host(host_port);
+    if host_only.is_empty() {
+        return false;
+    }
+    let port_part = &host_port[host_only.len()..];
+    if !port_part.is_empty() {
+        let Some(p_str) = port_part.strip_prefix(':') else {
+            return false;
+        };
+        if p_str.is_empty()
+            || !p_str.chars().all(|c| c.is_ascii_digit())
+            || !p_str.parse::<u16>().is_ok_and(|p| p > 0)
+        {
+            return false;
+        }
+    }
+    let is_loopback = matches!(
+        host_only.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "[::1]"
+    );
+    if scheme_lc == "http" {
+        return allow_loopback_http && is_loopback;
+    }
+    if is_loopback {
+        return true;
+    }
+    extract_non_loopback_host(&format!("https://{host_and_rest}")).is_some()
+}
+
+/// Validates `auth.oidc.issuer_url`: requires `https://` for remote identity providers (blocking
+/// cloud metadata/SSRF hosts, query/fragment injection, and path traversal) while permitting
+/// `http://127.0.0.1` / `http://localhost` / `http://[::1]` for local loopback OIDC providers.
+pub fn is_safe_oidc_issuer_url(raw: &str) -> bool {
+    validate_oidc_issuer_url_impl(raw, true)
+}
+
+/// Strict `https://`-only variant of [`is_safe_oidc_issuer_url`].
+pub fn is_safe_oidc_issuer_url_strict_https(raw: &str) -> bool {
+    validate_oidc_issuer_url_impl(raw, false)
+}
+
+fn has_forbidden_storage_or_db_path(path: &Path) -> bool {
+    if has_forbidden_path_components_or_prefix(path) {
+        return true;
+    }
+    let Some(raw_str) = path.to_str() else {
+        return true;
+    };
+    let lc = raw_str.trim().to_ascii_lowercase();
+    for prefix in ["/usr", "/bin", "/sbin", "/boot", "/lib", "/lib64"] {
+        if lc == prefix || lc.starts_with(&format!("{prefix}/")) || path.starts_with(prefix) {
+            return true;
+        }
+    }
+    if path.is_absolute()
+        && let Some(std::path::Component::Normal(first)) = path.components().nth(1)
+        && let Some(first_str) = first.to_str()
+        && matches!(
+            first_str.to_ascii_lowercase().as_str(),
+            "usr" | "bin" | "sbin" | "boot" | "lib" | "lib64"
+        )
+    {
+        return true;
+    }
+    false
+}
+
+fn path_has_models_component(path: &Path) -> bool {
+    path.components().any(|comp| {
+        if let std::path::Component::Normal(seg) = comp
+            && let Some(s) = seg.to_str()
+        {
+            matches!(s.to_ascii_lowercase().as_str(), "models" | "openvino-model")
+        } else {
+            false
+        }
+    })
+}
+
+/// Validates `database.path` (`:memory:` or empty is permitted; file paths must have a `.db`,
+/// `.sqlite`, or `.sqlite3` extension, avoid traversal/system prefixes, and never point inside
+/// `models/` or `openvino-model/` upload directories).
+pub fn is_safe_database_path(raw: &str) -> bool {
+    if raw.chars().any(char::is_control) {
+        return false;
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == ":memory:" {
+        return true;
+    }
+    let path = Path::new(trimmed);
+    if has_forbidden_storage_or_db_path(path) || path_has_models_component(path) {
+        return false;
+    }
+    if !path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            ["db", "sqlite", "sqlite3"]
+                .iter()
+                .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+        })
+    {
+        return false;
+    }
+    if let Ok(sym_meta) = std::fs::symlink_metadata(path) {
+        if sym_meta.file_type().is_symlink() || sym_meta.is_dir() || !sym_meta.is_file() {
+            return false;
+        }
+        let Ok(canon) = std::fs::canonicalize(path) else {
+            return false;
+        };
+        if has_forbidden_storage_or_db_path(&canon) || path_has_models_component(&canon) {
+            return false;
+        }
+        if !canon
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| {
+                ["db", "sqlite", "sqlite3"]
+                    .iter()
+                    .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+            })
+        {
+            return false;
+        }
+    } else {
+        if !path.is_absolute() {
+            return false;
+        }
+        for ancestor in path.ancestors().skip(1) {
+            if ancestor.as_os_str().is_empty() {
+                break;
+            }
+            if let Ok(anc_meta) = std::fs::symlink_metadata(ancestor) {
+                if anc_meta.file_type().is_symlink() || !anc_meta.is_dir() {
+                    return false;
+                }
+                let Ok(canon_anc) = std::fs::canonicalize(ancestor) else {
+                    return false;
+                };
+                if has_forbidden_storage_or_db_path(&canon_anc)
+                    || path_has_models_component(&canon_anc)
+                {
+                    return false;
+                }
+                break;
+            }
+        }
+    }
+    true
+}
+
+/// Validates storage/backup directory paths (`record.alert_backup.target_dir`,
+/// `record.storage_tiers.{hot_dir, cold_dir, per_camera_dir}`).
+pub fn is_safe_storage_dir_path(path: &Path) -> bool {
+    if !path.is_absolute() || has_forbidden_storage_or_db_path(path) {
+        return false;
+    }
+    if let Ok(sym_meta) = std::fs::symlink_metadata(path) {
+        if sym_meta.file_type().is_symlink() || !sym_meta.is_dir() {
+            return false;
+        }
+        let Ok(canon) = std::fs::canonicalize(path) else {
+            return false;
+        };
+        if has_forbidden_storage_or_db_path(&canon) {
+            return false;
+        }
+    } else {
+        for ancestor in path.ancestors().skip(1) {
+            if ancestor.as_os_str().is_empty() {
+                break;
+            }
+            if let Ok(anc_meta) = std::fs::symlink_metadata(ancestor) {
+                if anc_meta.file_type().is_symlink() || !anc_meta.is_dir() {
+                    return false;
+                }
+                let Ok(canon_anc) = std::fs::canonicalize(ancestor) else {
+                    return false;
+                };
+                if has_forbidden_storage_or_db_path(&canon_anc) {
+                    return false;
+                }
+                break;
+            }
+        }
+    }
+    true
+}
+
+/// Validates a camera FFmpeg stream input URL (`cameras.*.ffmpeg.inputs[].path`), rejecting
+/// leading `-` option injection, control characters, local file paths, and dangerous FFmpeg
+/// protocols (`file:`, `concat:`, `subfile:`, `pipe:`, `lavfi:`, `fd:`, `exec:`, etc.).
+pub fn is_safe_camera_input_url(raw: &str) -> bool {
+    if raw.chars().any(char::is_control) {
+        return false;
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.starts_with('-') || trimmed.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let Some((scheme, after_scheme)) = trimmed.split_once("://") else {
+        return false;
+    };
+    let scheme_lc = scheme.to_ascii_lowercase();
+    if !matches!(
+        scheme_lc.as_str(),
+        "rtsp" | "rtsps" | "rtspx" | "rtmp" | "rtmps" | "http" | "https" | "srt"
+    ) || after_scheme.is_empty()
+    {
+        return false;
+    }
+    let host_and_rest = match find_userinfo_at_index(after_scheme) {
+        Some(at_idx) => &after_scheme[at_idx + 1..],
+        None => after_scheme,
+    };
+    if host_and_rest.is_empty() {
+        return false;
+    }
+    let host_port = extract_authority_host_port(host_and_rest);
+    if host_port.is_empty() || host_port.contains('%') {
+        return false;
+    }
+    let host_only = extract_authority_host(host_port);
+    if host_only.is_empty() {
+        return false;
+    }
+    let port_part = &host_port[host_only.len()..];
+    if !port_part.is_empty() {
+        let Some(p_str) = port_part.strip_prefix(':') else {
+            return false;
+        };
+        if p_str.is_empty()
+            || !p_str.chars().all(|c| c.is_ascii_digit())
+            || !p_str.parse::<u16>().is_ok_and(|p| p > 0)
+        {
+            return false;
+        }
+    }
+    let path_part = host_and_rest[host_port.len()..]
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("");
+    if path_part.contains("..") || path_part.contains('\\') {
+        return false;
+    }
+    let is_loopback = matches!(
+        host_only.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "[::1]"
+    );
+    if is_loopback {
+        return true;
+    }
+    extract_non_loopback_host(&format!("{scheme_lc}://{host_and_rest}")).is_some()
 }
 
 /// Validates that a candidate labelmap path is a safe `.txt` file path without parent traversal,
@@ -7165,6 +7628,8 @@ pub struct Go2RtcSupervisor {
     homekit_config_path: PathBuf,
     pid: Arc<AtomicU32>,
     running: AtomicBool,
+    reload_notify: Arc<tokio::sync::Notify>,
+    reload_generation: AtomicU64,
 }
 
 impl Go2RtcSupervisor {
@@ -7185,18 +7650,67 @@ impl Go2RtcSupervisor {
             .find(|p| p.is_file())
             .unwrap_or_else(|| PathBuf::from("/usr/local/go2rtc/bin/go2rtc"));
 
+        Self::with_paths(
+            config,
+            go2rtc_bin,
+            PathBuf::from(DEFAULT_GO2RTC_SHM_PATH),
+            PathBuf::from(DEFAULT_GO2RTC_HOMEKIT_PATH),
+        )
+    }
+
+    pub fn with_paths(
+        config: Arc<RwLock<NinjaConfig>>,
+        go2rtc_bin: PathBuf,
+        shm_config_path: PathBuf,
+        homekit_config_path: PathBuf,
+    ) -> Self {
         Self {
             config,
             go2rtc_bin,
-            shm_config_path: PathBuf::from(DEFAULT_GO2RTC_SHM_PATH),
-            homekit_config_path: PathBuf::from(DEFAULT_GO2RTC_HOMEKIT_PATH),
+            shm_config_path,
+            homekit_config_path,
             pid: Arc::new(AtomicU32::new(0)),
             running: AtomicBool::new(false),
+            reload_notify: Arc::new(tokio::sync::Notify::new()),
+            reload_generation: AtomicU64::new(0),
         }
     }
 
     pub fn pid(&self) -> u32 {
         self.pid.load(Ordering::Relaxed)
+    }
+
+    pub fn reload_count(&self) -> u64 {
+        self.reload_generation.load(Ordering::SeqCst)
+    }
+
+    /// Signals the supervised `go2rtc` loop to rewrite its runtime configuration and restart
+    /// the child process immediately so added/modified camera streams take effect without a
+    /// full container restart.
+    pub fn request_reload(&self) {
+        self.reload_generation.fetch_add(1, Ordering::SeqCst);
+        self.reload_notify.notify_one();
+    }
+
+    /// Atomically writes an updated runtime `go2rtc.yaml` to `shm_path` (preserving overlay merge
+    /// when targeting the supervisor's configured `shm_config_path` or `/dev/shm/go2rtc.yaml`)
+    /// and notifies the supervisor loop to restart `go2rtc`.
+    pub async fn reload_config_file(&self, config: &NinjaConfig, shm_path: &Path) -> Result<()> {
+        let cfg_snapshot = config.clone();
+        let target_buf = shm_path.to_path_buf();
+        let overlay_buf =
+            if shm_path == self.shm_config_path || shm_path == Path::new(DEFAULT_GO2RTC_SHM_PATH) {
+                Some(self.homekit_config_path.clone())
+            } else {
+                None
+            };
+        tokio::task::spawn_blocking(move || {
+            cfg_snapshot.write_go2rtc_config_with_overlay(&target_buf, overlay_buf.as_deref())
+        })
+        .await
+        .context("go2rtc reload config writer task panicked")??;
+        self.request_reload();
+        Ok(())
     }
 
     pub fn spawn_supervisor_task(self: Arc<Self>) {
@@ -7209,6 +7723,7 @@ impl Go2RtcSupervisor {
         }
         tokio::spawn(async move {
             loop {
+                let gen_before_prep = self.reload_generation.load(Ordering::SeqCst);
                 let cfg_snapshot = self.config.read().await.clone();
                 let shm_path = self.shm_config_path.clone();
                 let hk_path = self.homekit_config_path.clone();
@@ -7224,13 +7739,19 @@ impl Go2RtcSupervisor {
                     Ok(pair) => pair,
                     Err(err) => {
                         error!("go2rtc config writer task panicked: {err:#}");
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                            _ = self.reload_notify.notified() => {}
+                        }
                         continue;
                     }
                 };
                 if let Err(err) = write_res {
                     error!("Failed to write go2rtc config: {err:#}");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                        _ = self.reload_notify.notified() => {}
+                    }
                     continue;
                 }
 
@@ -7239,7 +7760,14 @@ impl Go2RtcSupervisor {
                         "go2rtc binary not found at {}, retrying in 15s",
                         self.go2rtc_bin.display()
                     );
-                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                        _ = self.reload_notify.notified() => {}
+                    }
+                    continue;
+                }
+
+                if self.reload_generation.load(Ordering::SeqCst) != gen_before_prep {
                     continue;
                 }
 
@@ -7249,20 +7777,40 @@ impl Go2RtcSupervisor {
                     .stderr(Stdio::inherit())
                     .kill_on_drop(true);
 
+                let mut reloaded = false;
                 match cmd.spawn() {
                     Ok(mut child) => {
                         let pid = child.id().unwrap_or(0);
                         self.pid.store(pid, Ordering::Relaxed);
                         info!("Started supervised go2rtc process (PID: {pid})");
-                        let status = child.wait().await;
-                        self.pid.store(0, Ordering::Relaxed);
-                        warn!("go2rtc process exited with status: {status:?}, restarting in 3s");
+                        tokio::select! {
+                            status = child.wait() => {
+                                self.pid.store(0, Ordering::Relaxed);
+                                warn!("go2rtc process exited with status: {status:?}, restarting in 3s");
+                            }
+                            _ = self.reload_notify.notified() => {
+                                reloaded = true;
+                                info!("Reloading supervised go2rtc process (PID: {pid}) after stream config update");
+                                let _ = child.start_kill();
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(3),
+                                    child.wait(),
+                                )
+                                .await;
+                                self.pid.store(0, Ordering::Relaxed);
+                            }
+                        }
                     }
                     Err(err) => {
                         error!("Failed to spawn go2rtc: {err:#}");
                     }
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                if !reloaded {
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
+                        _ = self.reload_notify.notified() => {}
+                    }
+                }
             }
         });
     }
@@ -11293,5 +11841,221 @@ cameras:
             })
         );
         assert_eq!(cfg.resolve_stream_owner_camera("lobby_talk"), Some("lobby"));
+    }
+
+    #[test]
+    fn rejects_unsafe_env_vars_oidc_issuers_db_storage_paths_and_rtsp_inputs() {
+        // 1. Secret env var allowlist/denylist
+        for allowed_env in [
+            "NINJANVR_OIDC_CLIENT_SECRET",
+            "NINJANVR_OIDC_SECRET",
+            "NINJANVR_PEER_WAREHOUSE_TOKEN",
+            "OIDC_CLIENT_SECRET",
+        ] {
+            assert!(
+                is_safe_secret_env_var_name(allowed_env),
+                "expected '{allowed_env}' to be accepted"
+            );
+        }
+        for rejected_env in [
+            "",
+            "NINJANVR_JWT_SECRET",
+            "NINJANVR_JWT_KEY_ROTATION",
+            "NINJANVR_FORBIDDEN_INTERNAL_SECRET",
+            "NINJANVR_FFMPEG_BIN",
+            "PATH",
+            "HOME",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "AWS_SECRET_ACCESS_KEY",
+            "OPENBAO_TOKEN",
+            "KUBERNETES_SERVICE_HOST",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "ninjanvr_oidc_secret",
+            "1NINJANVR_SECRET",
+            "NINJANVR_SECRET;ID",
+        ] {
+            assert!(
+                !is_safe_secret_env_var_name(rejected_env),
+                "expected '{rejected_env}' to be rejected"
+            );
+        }
+
+        // GenAiConfig::resolve_api_key must never exfiltrate NINJANVR_JWT_SECRET or system env vars
+        let jwt_probe_val = "do-not-exfiltrate-jwt-secret";
+        // SAFETY: Test-scoped check setting/removing NINJANVR_FORBIDDEN_INTERNAL_SECRET synchronously.
+        unsafe {
+            std::env::set_var("NINJANVR_FORBIDDEN_INTERNAL_SECRET", jwt_probe_val);
+        }
+        let unsafe_genai = GenAiConfig {
+            api_key: Some("$NINJANVR_FORBIDDEN_INTERNAL_SECRET".to_string()),
+            api_key_env: "NINJANVR_FORBIDDEN_INTERNAL_SECRET".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(unsafe_genai.resolve_api_key(), "");
+        // SAFETY: Clean up test-scoped env var.
+        unsafe {
+            std::env::remove_var("NINJANVR_FORBIDDEN_INTERNAL_SECRET");
+        }
+
+        // 2. OIDC issuer URL validation
+        assert!(is_safe_oidc_issuer_url(
+            "https://idp.example.invalid/realms/nvr"
+        ));
+        assert!(is_safe_oidc_issuer_url("http://127.0.0.1:45678"));
+        assert!(!is_safe_oidc_issuer_url_strict_https(
+            "http://127.0.0.1:45678"
+        ));
+        for bad_issuer in [
+            "",
+            "http://idp.example.invalid",
+            "http://169.254.169.254/latest/meta-data",
+            "https://169.254.169.254/oidc",
+            "https://idp.example.invalid/oidc?evil=1",
+            "https://idp.example.invalid/oidc#frag",
+            "https://idp.example.invalid/../secret",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                !is_safe_oidc_issuer_url(bad_issuer),
+                "expected OIDC issuer '{bad_issuer}' to be rejected"
+            );
+        }
+
+        // 3. Database, storage dir, and camera input path validation via NinjaConfig::from_yaml_str
+        assert!(is_safe_database_path(":memory:"));
+        assert!(is_safe_database_path("/config/ninjanvr.db"));
+        assert!(is_safe_database_path("/config/data/events.sqlite3"));
+        for bad_yaml in [
+            "database:\n  path: /etc/passwd.db\n",
+            "database:\n  path: /usr/local/ninjanvr.db\n",
+            "database:\n  path: /config/../etc/ninjanvr.db\n",
+            "database:\n  path: /config/ninjanvr.txt\n",
+            "database:\n  path: /config/models/evil.db\n",
+            "database:\n  path: /openvino-model/evil.sqlite\n",
+            "auth:\n  oidc:\n    enabled: true\n    client_secret_env: NINJANVR_JWT_SECRET\n",
+            "auth:\n  oidc:\n    enabled: true\n    issuer_url: http://idp.example.invalid\n",
+            "peers:\n  edge1:\n    url: https://peer.example.invalid\n    token_env: AWS_SECRET_ACCESS_KEY\n",
+            "record:\n  alert_backup:\n    target_dir: /etc/backups\n",
+            "record:\n  storage_tiers:\n    cold_dir: /proc/1/root\n",
+            "record:\n  storage_tiers:\n    hot_dir: /usr/share/hot\n",
+            "record:\n  storage_tiers:\n    per_camera_dir:\n      front_door: /bin/evil\n",
+            "cameras:\n  front:\n    ffmpeg:\n      inputs:\n        - path: file:///etc/passwd\n",
+            "cameras:\n  front:\n    ffmpeg:\n      inputs:\n        - path: concat:/tmp/a.mp4|/tmp/b.mp4\n",
+            "cameras:\n  front:\n    ffmpeg:\n      inputs:\n        - path: subfile,,start,0,end,10,,:/etc/passwd\n",
+            "cameras:\n  front:\n    ffmpeg:\n      inputs:\n        - path: pipe:0\n",
+            "cameras:\n  front:\n    ffmpeg:\n      inputs:\n        - path: lavfi:testsrc\n",
+            "cameras:\n  front:\n    ffmpeg:\n      inputs:\n        - path: fd:0\n",
+            "cameras:\n  front:\n    ffmpeg:\n      inputs:\n        - path: \"-i /etc/passwd\"\n",
+        ] {
+            assert!(
+                NinjaConfig::from_yaml_str(bad_yaml, PathBuf::from("/tmp/config.yml")).is_err(),
+                "expected unsafe config YAML to fail validation:\n{bad_yaml}"
+            );
+        }
+
+        // Transactional rollback on invalid structured JSON update
+        let mut valid_cfg =
+            NinjaConfig::from_yaml_str("version: 0.18-0\n", PathBuf::from("/tmp/config.yml"))
+                .unwrap();
+        let orig_db_path = valid_cfg.database.path.clone();
+        assert!(
+            valid_cfg
+                .apply_structured_json(&json!({
+                    "database": { "path": "/etc/shadow.db" }
+                }))
+                .is_err()
+        );
+        assert_eq!(valid_cfg.database.path, orig_db_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go2rtc_supervisor_reload_rewrites_yaml_and_restarts_supervised_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr-g2-reload-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let shm_path = tmp_dir.join("go2rtc.yaml");
+        let hk_path = tmp_dir.join("go2rtc_homekit.yml");
+        let starts_log = tmp_dir.join("starts.log");
+        let fake_bin = tmp_dir.join("fake_go2rtc.sh");
+
+        let script = format!(
+            "#!/bin/sh\ncp \"{}\" \"{}.snap.$$\"\necho \"$$\" >> \"{}\"\nsleep 30\n",
+            shm_path.display(),
+            shm_path.display(),
+            starts_log.display()
+        );
+        std::fs::write(&fake_bin, script).unwrap();
+        std::fs::set_permissions(&fake_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let initial_yaml = r#"
+go2rtc:
+  streams:
+    front_door:
+      - rtsp://192.0.2.10:554/main
+"#;
+        let cfg = NinjaConfig::from_yaml_str(initial_yaml, tmp_dir.join("config.yml")).unwrap();
+        let shared_cfg = Arc::new(RwLock::new(cfg));
+        let sup = Arc::new(Go2RtcSupervisor::with_paths(
+            shared_cfg.clone(),
+            fake_bin,
+            shm_path.clone(),
+            hk_path,
+        ));
+        sup.clone().spawn_supervisor_task();
+
+        let mut first_pid = 0u32;
+        for _ in 0..50 {
+            let p = sup.pid();
+            if p != 0 {
+                first_pid = p;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_ne!(first_pid, 0, "expected initial go2rtc child PID");
+
+        // Update shared config with a new camera stream and trigger dynamic reload
+        {
+            let mut w = shared_cfg.write().await;
+            w.go2rtc.streams.insert(
+                "back_patio".to_string(),
+                json!(["rtsp://192.0.2.20:554/main"]),
+            );
+            sup.reload_config_file(&w, &shm_path).await.unwrap();
+        }
+        assert_eq!(sup.reload_count(), 1);
+
+        let mut second_pid = 0u32;
+        for _ in 0..80 {
+            let p = sup.pid();
+            if p != 0 && p != first_pid {
+                second_pid = p;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_ne!(
+            second_pid, 0,
+            "expected supervised go2rtc child to restart with a new PID after reload"
+        );
+        let rewritten = std::fs::read_to_string(&shm_path).unwrap();
+        assert!(rewritten.contains("back_patio"));
+
+        // Clean up child and temp dir
+        let _ = Command::new("kill")
+            .args(["-9", &second_pid.to_string()])
+            .status()
+            .await;
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

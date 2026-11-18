@@ -555,23 +555,104 @@ pub fn check_acoustic_event_trigger(dbfs: i64, cfg: &AudioConfig) -> Option<Stri
     }
 }
 
-fn decode_audio_dbfs_via_ffmpeg(path: &Path) -> i64 {
+const MAX_AUDIO_PROBE_PCM_BYTES: usize = 256 * 1024;
+const AUDIO_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn decode_audio_dbfs_with_bin_and_timeout(
+    ffmpeg_bin: &Path,
+    path: &Path,
+    timeout: std::time::Duration,
+) -> i64 {
+    use std::io::Read;
+
     let safe_input = sanitize_ffmpeg_path_arg(path);
-    let output = std::process::Command::new(resolve_ffmpeg_bin())
-        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
-        .arg(safe_input)
-        .args([
-            "-t", "15", "-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1",
-        ])
-        .output();
-    let Ok(out) = output else {
+    let mut cmd = std::process::Command::new(ffmpeg_bin);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-protocol_whitelist",
+        "file,pipe",
+        "-i",
+    ])
+    .arg(safe_input)
+    .args([
+        "-t", "15", "-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+
+    let Ok(mut child) = cmd.spawn() else {
         return 0;
     };
-    if !out.status.success() || out.stdout.len() < 4 {
+    let child_pid = child.id();
+
+    let kill_probe_tree = |c: &mut std::process::Child| {
+        #[cfg(unix)]
+        if let Ok(raw_pid) = i32::try_from(child_pid)
+            && raw_pid > 1
+        {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(raw_pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        let _ = c.kill();
+        let _ = c.wait();
+    };
+
+    let reader_handle = child.stdout.take().map(|stdout| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::with_capacity(64 * 1024);
+            let _ = stdout
+                .take(MAX_AUDIO_PROBE_PCM_BYTES as u64)
+                .read_to_end(&mut buf);
+            buf
+        })
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    let exit_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    kill_probe_tree(&mut child);
+                    if let Some(h) = reader_handle {
+                        let _ = h.join();
+                    }
+                    return 0;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => {
+                kill_probe_tree(&mut child);
+                if let Some(h) = reader_handle {
+                    let _ = h.join();
+                }
+                return 0;
+            }
+        }
+    };
+
+    let raw_pcm = reader_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
+    if !exit_status.is_some_and(|s| s.success()) && raw_pcm.len() < MAX_AUDIO_PROBE_PCM_BYTES {
         return 0;
     }
-    let pcm_samples: Vec<i16> = out
-        .stdout
+    if raw_pcm.len() < 4 {
+        return 0;
+    }
+    let pcm_samples: Vec<i16> = raw_pcm
         .as_chunks::<2>()
         .0
         .iter()
@@ -581,17 +662,35 @@ fn decode_audio_dbfs_via_ffmpeg(path: &Path) -> i64 {
     compute_pcm_rms_dbfs(&pcm_samples)
 }
 
+fn decode_audio_dbfs_via_ffmpeg(path: &Path) -> i64 {
+    decode_audio_dbfs_with_bin_and_timeout(&resolve_ffmpeg_bin(), path, AUDIO_PROBE_TIMEOUT)
+}
+
 /// Probes an MP4 segment file to extract the acoustic RMS level in dBFS
 /// (`-89`..`-1` for active audio, `0` if silent or no `soun` track).
 ///
 /// First inspects the ISO-BMFF `moov` -> `soun` track in pure Rust (`< 0.05ms`):
 /// - If there is no `soun` track or `sample_count == 0`, returns `0` immediately without spawning FFmpeg.
 /// - If `stsd` indicates a compressed codec (`mp4a` AAC, `alaw`, `ulaw`, `Opus`, etc.), decodes the
-///   audio track to 8kHz mono `s16le` PCM via `ffmpeg` before computing RMS (avoiding raw compressed
-///   bitstream byte reinterpretation, whose uniform entropy always averages ~`-5 dBFS`).
+///   audio track to 8kHz mono `s16le` PCM via `ffmpeg` (bounded to `5s` and `256 KiB`) only when
+///   `decode_compressed` is `true`.
 /// - If `stsd` is uncompressed PCM (or omitted in synthetic test containers), reads raw `s16le` samples
 ///   directly from the `mdat` chunk offsets.
 pub fn probe_mp4_audio_dbfs_fast(path: &Path) -> i64 {
+    probe_mp4_audio_dbfs_with_policy(path, true)
+}
+
+/// Policy-gated variant of [`probe_mp4_audio_dbfs_fast`] that skips spawning `ffmpeg` for
+/// compressed audio codecs when `decode_compressed` is `false`.
+pub fn probe_mp4_audio_dbfs_with_policy(path: &Path, decode_compressed: bool) -> i64 {
+    probe_mp4_audio_dbfs_with_bin(path, decode_compressed, None)
+}
+
+fn probe_mp4_audio_dbfs_with_bin(
+    path: &Path,
+    decode_compressed: bool,
+    ffmpeg_bin_override: Option<&Path>,
+) -> i64 {
     use std::io::{Read, Seek, SeekFrom};
     let Ok((mut file, meta)) = open_regular_file_nofollow(path) else {
         return 0;
@@ -645,7 +744,15 @@ pub fn probe_mp4_audio_dbfs_fast(path: &Path) -> i64 {
                     return 0;
                 }
                 if is_compressed {
-                    return decode_audio_dbfs_via_ffmpeg(path);
+                    if !decode_compressed {
+                        return 0;
+                    }
+                    return match ffmpeg_bin_override {
+                        Some(bin) => {
+                            decode_audio_dbfs_with_bin_and_timeout(bin, path, AUDIO_PROBE_TIMEOUT)
+                        }
+                        None => decode_audio_dbfs_via_ffmpeg(path),
+                    };
                 }
                 let mut payload = Vec::with_capacity(8192);
                 for off in offsets.into_iter().take(8) {
@@ -1016,11 +1123,30 @@ fn parse_soun_trak(trak: &[u8]) -> Option<(Vec<u64>, u64, u32, bool)> {
     None
 }
 
-/// Parses the UTC start timestamp from a staged filename `{camera}_%Y%m%d%H%M%S.mp4`.
+/// Parses the UTC start timestamp from a staged filename (`{camera}_{epoch_ms}_seg_{seq}.mp4`
+/// or legacy `{camera}_%Y%m%d%H%M%S.mp4`).
 fn parse_staged_start_time(camera: &str, staged_path: &Path) -> Option<f64> {
     let stem = staged_path.file_stem()?.to_str()?;
-    let date_part = stem.strip_prefix(&format!("{camera}_"))?;
-    let ndt = NaiveDateTime::parse_from_str(date_part, "%Y%m%d%H%M%S").ok()?;
+    let rest = stem.strip_prefix(&format!("{camera}_"))?;
+    if let Some((epoch_str, seq_str)) = rest.split_once("_seg_") {
+        let raw_epoch: u64 = epoch_str.parse().ok()?;
+        let seq: u64 = seq_str.parse().ok()?;
+        let base_sec = if raw_epoch >= 100_000_000_000 {
+            (raw_epoch as f64) / 1000.0
+        } else {
+            raw_epoch as f64
+        };
+        return Some(base_sec + (seq as f64) * 10.0);
+    }
+    if rest.starts_with("seg_") {
+        let modified = std::fs::symlink_metadata(staged_path)
+            .ok()?
+            .modified()
+            .ok()?;
+        let mtime_sec = modified.duration_since(UNIX_EPOCH).ok()?.as_secs_f64();
+        return Some((mtime_sec - 10.0).max(0.0));
+    }
+    let ndt = NaiveDateTime::parse_from_str(rest, "%Y%m%d%H%M%S").ok()?;
     Some(ndt.and_utc().timestamp() as f64)
 }
 
@@ -1134,7 +1260,7 @@ pub fn sync_recordings_from_disk(db: &NinjaDatabase, media_dir: &Path) -> Result
                         continue;
                     };
                     let end_time = start_time + duration;
-                    let dbfs = probe_mp4_audio_dbfs_fast(&file_path);
+                    let dbfs = probe_mp4_audio_dbfs_with_policy(&file_path, false);
                     let seg_size_mb =
                         ((meta.len() as f64) / (1024.0 * 1024.0) * 100.0).round() / 100.0;
                     let db_canonical_path = format!(
@@ -1163,34 +1289,58 @@ pub fn sync_recordings_from_disk(db: &NinjaDatabase, media_dir: &Path) -> Result
     Ok(synced)
 }
 
-/// Builds the FFmpeg CLI arguments for segment recording, injecting `-itsoffset <sec>` and
+/// Builds the hardened FFmpeg CLI arguments for segment recording (`-nostdin`,
+/// `-protocol_whitelist rtsp,rtsps,rtp,tcp,udp,tls,crypto`), injecting `-itsoffset <sec>` and
 /// stream mapping when `audio_offset_ms != 0` to compensate for RTSP audio/video lip-sync drift.
+/// Rejects URLs starting with `-`, containing control/whitespace characters, or using disallowed schemes.
 pub fn build_recorder_ffmpeg_args(
     rtsp_url: &str,
     out_pattern: &str,
     audio_offset_ms: i32,
-) -> Vec<String> {
+) -> Result<Vec<String>> {
+    let trimmed_url = rtsp_url.trim();
+    if rtsp_url.starts_with('-')
+        || trimmed_url.starts_with('-')
+        || !ninjanvr_config::is_safe_camera_input_url(trimmed_url)
+    {
+        anyhow::bail!("disallowed recorder RTSP URL");
+    }
+    let Some((scheme, _)) = trimmed_url.split_once("://") else {
+        anyhow::bail!("recorder URL missing scheme");
+    };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "rtsp" | "rtsps") {
+        anyhow::bail!("disallowed recorder URL scheme '{scheme}' (expected rtsp or rtsps)");
+    }
+    if out_pattern.trim().is_empty() || out_pattern.chars().any(char::is_control) {
+        anyhow::bail!("invalid recorder output segment pattern");
+    }
+
     let mut args = vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
         "error".to_string(),
+        "-nostdin".to_string(),
         "-probesize".to_string(),
         "32768".to_string(),
         "-analyzeduration".to_string(),
         "500000".to_string(),
         "-threads".to_string(),
         "1".to_string(),
+        "-protocol_whitelist".to_string(),
+        "rtsp,rtsps,rtp,tcp,udp,tls,crypto".to_string(),
         "-rtsp_transport".to_string(),
         "tcp".to_string(),
         "-timeout".to_string(),
         "10000000".to_string(),
         "-i".to_string(),
-        rtsp_url.to_string(),
+        trimmed_url.to_string(),
     ];
 
     if audio_offset_ms != 0 {
         let offset_sec = (audio_offset_ms as f64) / 1000.0;
         args.extend([
+            "-protocol_whitelist".to_string(),
+            "rtsp,rtsps,rtp,tcp,udp,tls,crypto".to_string(),
             "-rtsp_transport".to_string(),
             "tcp".to_string(),
             "-timeout".to_string(),
@@ -1198,7 +1348,7 @@ pub fn build_recorder_ffmpeg_args(
             "-itsoffset".to_string(),
             format!("{offset_sec:.3}"),
             "-i".to_string(),
-            rtsp_url.to_string(),
+            trimmed_url.to_string(),
             "-map".to_string(),
             "0:v:0".to_string(),
             "-map".to_string(),
@@ -1216,8 +1366,6 @@ pub fn build_recorder_ffmpeg_args(
         "mp4".to_string(),
         "-reset_timestamps".to_string(),
         "1".to_string(),
-        "-strftime".to_string(),
-        "1".to_string(),
         "-segment_list".to_string(),
         "pipe:1".to_string(),
         "-segment_list_type".to_string(),
@@ -1228,7 +1376,7 @@ pub fn build_recorder_ffmpeg_args(
         "aac".to_string(),
         safe_out_pattern,
     ]);
-    args
+    Ok(args)
 }
 
 /// Builds the FFmpeg CLI arguments for Cold Compaction (`record.cold_compaction`),
@@ -1373,13 +1521,46 @@ pub fn prune_empty_parent_dirs(file_path: &Path, stop_at: &Path) {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CameraRecordPolicy {
     pub keep_continuous: bool,
     pub keep_motion: bool,
     pub continuous_substream: bool,
     pub retain_mode: String,
     pub audio_offset_ms: i32,
+    pub audio_probe_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CameraRecorderSpec {
+    rtsp_url: String,
+    policy: CameraRecordPolicy,
+}
+
+struct SupervisedRecorderHandle {
+    spec: CameraRecorderSpec,
+    stop_flag: Arc<AtomicBool>,
+    stop_notify: Arc<tokio::sync::Notify>,
+    active_pid: Arc<std::sync::atomic::AtomicU32>,
+    join_handle: tokio::task::JoinHandle<()>,
+}
+
+/// Computes the capped exponential reconnect backoff (`5s -> 10s -> 20s -> 40s -> 60s`)
+/// with deterministic per-camera jitter (`0..500ms`).
+pub fn compute_recorder_backoff_delay(
+    consecutive_failures: u32,
+    camera: &str,
+) -> std::time::Duration {
+    let shift = consecutive_failures.min(4);
+    let base_secs = (5u64 << shift).min(60);
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in camera.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash ^= (consecutive_failures as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let jitter_ms = hash % 500;
+    std::time::Duration::from_millis(base_secs * 1_000 + jitter_ms)
 }
 
 /// Manages direct segment recording and retention cleanup for all configured cameras.
@@ -1388,9 +1569,14 @@ pub struct RecordingEngine {
     config: Arc<RwLock<NinjaConfig>>,
     db: NinjaDatabase,
     media_dir: PathBuf,
+    ffmpeg_bin: PathBuf,
     activity_ledger: SharedActivityLedger,
     storage_degraded: Arc<AtomicBool>,
     storage_error: Arc<std::sync::Mutex<Option<String>>>,
+    recorders: Arc<tokio::sync::Mutex<HashMap<String, SupervisedRecorderHandle>>>,
+    bg_tasks: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    shutdown_flag: Arc<AtomicBool>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
 }
 
 impl RecordingEngine {
@@ -1407,14 +1593,14 @@ impl RecordingEngine {
                 (true, Some(e))
             }
         };
-        Self {
+        Self::with_storage_state(
             config,
             db,
             media_dir,
             activity_ledger,
-            storage_degraded: Arc::new(AtomicBool::new(degraded)),
-            storage_error: Arc::new(std::sync::Mutex::new(err_msg)),
-        }
+            Arc::new(AtomicBool::new(degraded)),
+            Arc::new(std::sync::Mutex::new(err_msg)),
+        )
     }
 
     pub fn with_storage_state(
@@ -1429,82 +1615,273 @@ impl RecordingEngine {
             config,
             db,
             media_dir,
+            ffmpeg_bin: resolve_ffmpeg_bin(),
             activity_ledger,
             storage_degraded,
             storage_error,
+            recorders: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            bg_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Overrides the `ffmpeg` executable path for isolated integration/unit testing.
+    pub fn with_ffmpeg_bin(mut self, ffmpeg_bin: PathBuf) -> Self {
+        self.ffmpeg_bin = ffmpeg_bin;
+        self
+    }
+
+    /// Returns the sorted list of cameras with active supervised recorder loops.
+    pub async fn active_recorder_cameras(&self) -> Vec<String> {
+        let map = self.recorders.lock().await;
+        let mut names: Vec<String> = map
+            .iter()
+            .filter(|(_, h)| !h.join_handle.is_finished())
+            .map(|(k, _)| k.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn desired_camera_specs(cfg: &NinjaConfig) -> HashMap<String, CameraRecorderSpec> {
+        cfg.cameras
+            .iter()
+            .filter(|(name, c)| c.enabled && c.record.enabled && is_safe_identifier(name))
+            .filter_map(|(name, c)| {
+                let use_sub_default =
+                    c.record.continuous_substream || cfg.record.continuous_substream;
+                let input_url = if use_sub_default && c.record.continuous.days == 0.0 {
+                    cfg.camera_input_for_role(name, "detect")
+                        .or_else(|| cfg.camera_input_for_role(name, "record"))?
+                } else {
+                    cfg.camera_input_for_role(name, "record")?
+                };
+                if !ninjanvr_config::is_safe_camera_input_url(&input_url) {
+                    warn!("Skipping recorder for camera {name}: unsafe stream input URL");
+                    return None;
+                }
+                let has_pre_post_buffer = c.record.alerts.pre_capture > 0
+                    || c.record.alerts.post_capture > 0
+                    || c.record.detections.pre_capture > 0
+                    || c.record.detections.post_capture > 0;
+                let policy = CameraRecordPolicy {
+                    keep_continuous: (c.record.continuous.days.is_finite()
+                        && c.record.continuous.days > 0.0)
+                        || use_sub_default
+                        || has_pre_post_buffer,
+                    keep_motion: c.record.motion.days.is_finite() && c.record.motion.days > 0.0,
+                    continuous_substream: use_sub_default,
+                    retain_mode: c.record.alerts.retain.mode.clone(),
+                    audio_offset_ms: c.ffmpeg.audio_offset_ms.unwrap_or(0),
+                    audio_probe_enabled: c.audio.enabled || cfg.audio.enabled,
+                };
+                Some((
+                    name.clone(),
+                    CameraRecorderSpec {
+                        rtsp_url: input_url,
+                        policy,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    fn signal_recorder_sigterm(pid: u32) {
+        #[cfg(unix)]
+        if let Ok(raw_pid) = i32::try_from(pid)
+            && raw_pid > 1
+        {
+            let target = nix::unistd::Pid::from_raw(raw_pid);
+            if nix::sys::signal::killpg(target, nix::sys::signal::Signal::SIGTERM).is_err() {
+                let _ = nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGTERM);
+            }
+        }
+    }
+
+    async fn stop_handles_gracefully(&self, mut handles: Vec<(String, SupervisedRecorderHandle)>) {
+        if handles.is_empty() {
+            return;
+        }
+        for (_, h) in &handles {
+            h.stop_flag.store(true, Ordering::SeqCst);
+            let pid = h.active_pid.load(Ordering::SeqCst);
+            if pid > 0 {
+                Self::signal_recorder_sigterm(pid);
+            }
+            h.stop_notify.notify_waiters();
+        }
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+        for (_, h) in &mut handles {
+            let now = tokio::time::Instant::now();
+            if now < deadline {
+                if tokio::time::timeout(deadline - now, &mut h.join_handle)
+                    .await
+                    .is_err()
+                {
+                    h.join_handle.abort();
+                }
+            } else {
+                h.join_handle.abort();
+            }
+        }
+
+        for (camera, h) in handles {
+            let staging_dir = self
+                .media_dir
+                .join("recordings")
+                .join(".staging")
+                .join(&camera);
+            self.sweep_staging_dir(&camera, &staging_dir, &h.spec.policy)
+                .await;
+        }
+    }
+
+    /// Reconciles active supervised per-camera FFmpeg recorders against `self.config`:
+    /// stops removed/disabled cameras or cameras whose stream URL / `CameraRecordPolicy` changed,
+    /// and spawns recorder workers for newly added or enabled cameras.
+    pub async fn reconcile(&self) {
+        if self.shutdown_flag.load(Ordering::SeqCst) {
+            return;
+        }
+        let desired = {
+            let cfg = self.config.read().await;
+            Self::desired_camera_specs(&cfg)
+        };
+
+        let to_stop = {
+            let mut map = self.recorders.lock().await;
+            let stale_keys: Vec<String> = map
+                .iter()
+                .filter_map(|(cam, handle)| {
+                    let keep = desired.get(cam).is_some_and(|spec| {
+                        *spec == handle.spec && !handle.join_handle.is_finished()
+                    });
+                    (!keep).then(|| cam.clone())
+                })
+                .collect();
+            let mut removed = Vec::with_capacity(stale_keys.len());
+            for key in stale_keys {
+                if let Some(handle) = map.remove(&key) {
+                    removed.push((key, handle));
+                }
+            }
+            removed
+        };
+
+        self.stop_handles_gracefully(to_stop).await;
+
+        if self.shutdown_flag.load(Ordering::SeqCst) {
+            return;
+        }
+
+        let mut map = self.recorders.lock().await;
+        if self.shutdown_flag.load(Ordering::SeqCst) {
+            return;
+        }
+        for (camera_name, spec) in desired {
+            if map
+                .get(&camera_name)
+                .is_some_and(|h| !h.join_handle.is_finished() && h.spec == spec)
+            {
+                continue;
+            }
+            let stop_flag = Arc::new(AtomicBool::new(false));
+            let stop_notify = Arc::new(tokio::sync::Notify::new());
+            let active_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+            let engine = self.clone();
+            let cam_task = camera_name.clone();
+            let url_task = spec.rtsp_url.clone();
+            let policy_task = spec.policy.clone();
+            let stop_flag_task = Arc::clone(&stop_flag);
+            let stop_notify_task = Arc::clone(&stop_notify);
+            let pid_task = Arc::clone(&active_pid);
+
+            let join_handle = tokio::spawn(async move {
+                engine
+                    .run_camera_recorder_loop(
+                        cam_task,
+                        url_task,
+                        policy_task,
+                        stop_flag_task,
+                        stop_notify_task,
+                        pid_task,
+                    )
+                    .await;
+            });
+
+            map.insert(
+                camera_name,
+                SupervisedRecorderHandle {
+                    spec,
+                    stop_flag,
+                    stop_notify,
+                    active_pid,
+                    join_handle,
+                },
+            );
+        }
+    }
+
+    /// Gracefully stops all supervised camera recorders (`SIGTERM` -> wait up to `4s` for trailing
+    /// `moov` atom flush -> final `sweep_staging_dir` commit to SQLite) and halts background workers.
+    pub async fn shutdown(&self) {
+        self.shutdown_flag.store(true, Ordering::SeqCst);
+        self.shutdown_notify.notify_waiters();
+
+        let drained: Vec<(String, SupervisedRecorderHandle)> = {
+            let mut map = self.recorders.lock().await;
+            map.drain().collect()
+        };
+        self.stop_handles_gracefully(drained).await;
+
+        let bg: Vec<tokio::task::JoinHandle<()>> = {
+            let mut tasks = self.bg_tasks.lock().await;
+            std::mem::take(&mut *tasks)
+        };
+        for h in bg {
+            h.abort();
         }
     }
 
     pub async fn start(self: Arc<Self>) {
-        let cameras: Vec<(String, String, CameraRecordPolicy)> = {
-            let cfg = self.config.read().await;
-            cfg.cameras
-                .iter()
-                .filter(|(_, c)| c.enabled && c.record.enabled)
-                .filter_map(|(name, c)| {
-                    let use_sub_default =
-                        c.record.continuous_substream || cfg.record.continuous_substream;
-                    let input_url = if use_sub_default && c.record.continuous.days == 0.0 {
-                        cfg.camera_input_for_role(name, "detect")
-                            .or_else(|| cfg.camera_input_for_role(name, "record"))?
-                    } else {
-                        cfg.camera_input_for_role(name, "record")?
-                    };
-                    let has_pre_post_buffer = c.record.alerts.pre_capture > 0
-                        || c.record.alerts.post_capture > 0
-                        || c.record.detections.pre_capture > 0
-                        || c.record.detections.post_capture > 0;
-                    let policy = CameraRecordPolicy {
-                        keep_continuous: (c.record.continuous.days.is_finite()
-                            && c.record.continuous.days > 0.0)
-                            || use_sub_default
-                            || has_pre_post_buffer,
-                        keep_motion: c.record.motion.days.is_finite() && c.record.motion.days > 0.0,
-                        continuous_substream: use_sub_default,
-                        retain_mode: c.record.alerts.retain.mode.clone(),
-                        audio_offset_ms: c.ffmpeg.audio_offset_ms.unwrap_or(0),
-                    };
-                    Some((name.clone(), input_url, policy))
-                })
-                .collect()
-        };
+        self.shutdown_flag.store(false, Ordering::SeqCst);
+        self.reconcile().await;
 
-        for (camera_name, rtsp_url, policy) in cameras {
-            let engine = self.clone();
-            tokio::spawn(async move {
-                engine
-                    .run_camera_recorder_loop(camera_name, rtsp_url, policy)
-                    .await;
-            });
-        }
-
-        let cleanup_engine = self.clone();
-        tokio::spawn(async move {
+        let mut bg = self.bg_tasks.lock().await;
+        let cleanup_engine = (*self).clone();
+        bg.push(tokio::spawn(async move {
             cleanup_engine.run_retention_cleanup_loop().await;
-        });
+        }));
 
-        let preview_engine = self.clone();
-        tokio::spawn(async move {
+        let preview_engine = (*self).clone();
+        bg.push(tokio::spawn(async move {
             preview_engine.run_preview_generator_loop().await;
-        });
+        }));
 
-        let recovery_engine = self.clone();
-        tokio::spawn(async move {
+        let recovery_engine = (*self).clone();
+        bg.push(tokio::spawn(async move {
             recovery_engine.run_storage_recovery_probe_loop().await;
-        });
+        }));
 
-        let dbfs_repair_engine = self.clone();
-        tokio::spawn(async move {
+        let dbfs_repair_engine = (*self).clone();
+        bg.push(tokio::spawn(async move {
             dbfs_repair_engine.run_legacy_dbfs_repair_once().await;
-        });
+        }));
     }
 
     async fn run_legacy_dbfs_repair_once(&self) {
-        let configured_cold_dir = {
+        let (configured_cold_dir, any_audio_enabled) = {
             let cfg = self.config.read().await;
-            cfg.record.storage_tiers.cold_dir.clone()
+            let audio_on = cfg.audio.enabled || cfg.cameras.values().any(|c| c.audio.enabled);
+            (cfg.record.storage_tiers.cold_dir.clone(), audio_on)
         };
         loop {
+            if self.shutdown_flag.load(Ordering::SeqCst) {
+                break;
+            }
             let engine_ref = self.clone();
             let cold_ref = configured_cold_dir.clone();
             let repaired_batch = tokio::task::spawn_blocking(move || {
@@ -1520,7 +1897,11 @@ impl RecordingEngine {
                     let real_dbfs = if let Some(media_path) =
                         engine_ref.resolve_contained_recording_file(&db_path, cold_ref.as_deref())
                     {
-                        let d = probe_mp4_audio_dbfs_fast(&media_path);
+                        let d = probe_mp4_audio_dbfs_with_bin(
+                            &media_path,
+                            any_audio_enabled,
+                            Some(&engine_ref.ffmpeg_bin),
+                        );
                         if d == -5 { 0 } else { d }
                     } else {
                         0
@@ -1540,7 +1921,13 @@ impl RecordingEngine {
 
     async fn run_storage_recovery_probe_loop(&self) {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                _ = self.shutdown_notify.notified() => break,
+            }
+            if self.shutdown_flag.load(Ordering::SeqCst) {
+                break;
+            }
             let media_dir = self.media_dir.clone();
             let probe_res = tokio::task::spawn_blocking(move || probe_storage_writable(&media_dir))
                 .await
@@ -1596,6 +1983,7 @@ impl RecordingEngine {
                     let _ = std::fs::remove_file(&path);
                 }
             }
+            valid.sort();
             valid
         })
         .await
@@ -1613,6 +2001,9 @@ impl RecordingEngine {
         camera: String,
         rtsp_url: String,
         policy: CameraRecordPolicy,
+        stop_flag: Arc<AtomicBool>,
+        stop_notify: Arc<tokio::sync::Notify>,
+        active_pid: Arc<std::sync::atomic::AtomicU32>,
     ) {
         if !is_safe_identifier(&camera) {
             warn!("Refusing to start recorder for unsafe camera identifier: {camera}");
@@ -1623,9 +2014,13 @@ impl RecordingEngine {
             .join("recordings")
             .join(".staging")
             .join(&camera);
-        let ffmpeg_bin = resolve_ffmpeg_bin();
+        let ffmpeg_bin = self.ffmpeg_bin.clone();
+        let mut consecutive_failures: u32 = 0;
 
         loop {
+            if stop_flag.load(Ordering::SeqCst) || self.shutdown_flag.load(Ordering::SeqCst) {
+                break;
+            }
             if let Err(err) = std::fs::create_dir_all(&staging_dir) {
                 self.storage_degraded.store(true, Ordering::SeqCst);
                 if let Ok(mut guard) = self.storage_error.lock() {
@@ -1638,18 +2033,33 @@ impl RecordingEngine {
                     "Storage unavailable for {camera} staging dir ({}); retrying in 30s",
                     err
                 );
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                    _ = stop_notify.notified() => break,
+                    _ = self.shutdown_notify.notified() => break,
+                }
                 continue;
             }
             self.sweep_staging_dir(&camera, &staging_dir, &policy).await;
 
-            let out_pattern = staging_dir.join(format!("{camera}_%Y%m%d%H%M%S.mp4"));
-            let ff_args = build_recorder_ffmpeg_args(
+            let session_start_epoch = unix_now_f64();
+            let session_epoch_ms = (session_start_epoch * 1_000.0).round() as u64;
+            let out_pattern = staging_dir.join(format!("{camera}_{session_epoch_ms}_seg_%09d.mp4"));
+            let ff_args = match build_recorder_ffmpeg_args(
                 &rtsp_url,
                 out_pattern.to_string_lossy().as_ref(),
                 policy.audio_offset_ms,
-            );
+            ) {
+                Ok(args) => args,
+                Err(err) => {
+                    warn!("Refusing to spawn recorder for camera {camera}: {err:#}");
+                    break;
+                }
+            };
+
             let mut cmd = Command::new(&ffmpeg_bin);
+            #[cfg(unix)]
+            cmd.process_group(0);
             cmd.env("TZ", "UTC")
                 .args(&ff_args)
                 .stdin(Stdio::null())
@@ -1659,17 +2069,69 @@ impl RecordingEngine {
 
             let Ok(mut child) = cmd.spawn() else {
                 warn!(
-                    "ffmpeg binary ({}) not available for camera {camera} recorder; retrying in 15s",
+                    "ffmpeg binary ({}) not available for camera {camera} recorder; retrying",
                     ffmpeg_bin.display()
                 );
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                let delay = compute_recorder_backoff_delay(consecutive_failures, &camera);
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = stop_notify.notified() => break,
+                    _ = self.shutdown_notify.notified() => break,
+                }
                 continue;
             };
 
-            info!("Started direct segment recorder for camera {camera}");
+            let session_started = tokio::time::Instant::now();
+            let pid = child.id().unwrap_or(0);
+            active_pid.store(pid, Ordering::SeqCst);
+            if stop_flag.load(Ordering::SeqCst) || self.shutdown_flag.load(Ordering::SeqCst) {
+                if pid > 0 {
+                    Self::signal_recorder_sigterm(pid);
+                }
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(3500), child.wait())
+                    .await;
+                active_pid.store(0, Ordering::SeqCst);
+                break;
+            }
+
+            info!("Started direct segment recorder for camera {camera} (PID: {pid})");
+            let mut stopping = false;
             if let Some(stdout) = child.stdout.take() {
                 let mut reader = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = reader.next_line().await {
+                loop {
+                    let line_opt = if stopping {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_millis(3500),
+                            reader.next_line(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(opt)) => opt,
+                            _ => break,
+                        }
+                    } else {
+                        tokio::select! {
+                            res = reader.next_line() => res.ok().flatten(),
+                            _ = stop_notify.notified() => {
+                                stopping = true;
+                                if pid > 0 {
+                                    Self::signal_recorder_sigterm(pid);
+                                }
+                                continue;
+                            }
+                            _ = self.shutdown_notify.notified() => {
+                                stopping = true;
+                                if pid > 0 {
+                                    Self::signal_recorder_sigterm(pid);
+                                }
+                                continue;
+                            }
+                        }
+                    };
+                    let Some(line) = line_opt else {
+                        break;
+                    };
                     let parts: Vec<&str> = line.trim().split(',').collect();
                     if parts.len() >= 3 {
                         let seg_filename = parts[0];
@@ -1679,13 +2141,22 @@ impl RecordingEngine {
                             );
                             continue;
                         }
-                        let seg_dur = parts[2].parse::<f64>().unwrap_or(10.0)
-                            - parts[1].parse::<f64>().unwrap_or(0.0);
+                        let csv_start_off = parts[1]
+                            .parse::<f64>()
+                            .ok()
+                            .filter(|v| v.is_finite() && *v >= 0.0);
+                        let csv_end_off = parts[2].parse::<f64>().ok().filter(|v| v.is_finite());
+                        let seg_dur = match (csv_start_off, csv_end_off) {
+                            (Some(s), Some(e)) if e > s => e - s,
+                            _ => 10.0,
+                        };
+                        let explicit_start = csv_start_off.map(|off| session_start_epoch + off);
                         let staged_path = staging_dir.join(seg_filename);
                         if let Err(err) = self
-                            .finalize_closed_segment(
+                            .finalize_closed_segment_at(
                                 &camera,
                                 &staged_path,
+                                explicit_start,
                                 seg_dur.max(0.5),
                                 &policy,
                             )
@@ -1697,9 +2168,48 @@ impl RecordingEngine {
                 }
             }
 
-            let status = child.wait().await;
-            warn!("Recorder for {camera} exited ({status:?}); reconnecting in 5s");
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let status = if stopping
+                || stop_flag.load(Ordering::SeqCst)
+                || self.shutdown_flag.load(Ordering::SeqCst)
+            {
+                if pid > 0 {
+                    Self::signal_recorder_sigterm(pid);
+                }
+                match tokio::time::timeout(std::time::Duration::from_millis(3500), child.wait())
+                    .await
+                {
+                    Ok(res) => res,
+                    Err(_) => {
+                        let _ = child.kill().await;
+                        child.wait().await
+                    }
+                }
+            } else {
+                child.wait().await
+            };
+            active_pid.store(0, Ordering::SeqCst);
+
+            if stopping
+                || stop_flag.load(Ordering::SeqCst)
+                || self.shutdown_flag.load(Ordering::SeqCst)
+            {
+                break;
+            }
+
+            if session_started.elapsed() >= std::time::Duration::from_secs(30) {
+                consecutive_failures = 0;
+            }
+            let delay = compute_recorder_backoff_delay(consecutive_failures, &camera);
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            warn!(
+                "Recorder for {camera} exited ({status:?}); reconnecting in {:.1}s",
+                delay.as_secs_f64()
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = stop_notify.notified() => break,
+                _ = self.shutdown_notify.notified() => break,
+            }
         }
     }
 
@@ -1707,6 +2217,18 @@ impl RecordingEngine {
         &self,
         camera: &str,
         staged_path: &Path,
+        csv_duration: f64,
+        policy: &CameraRecordPolicy,
+    ) -> Result<()> {
+        self.finalize_closed_segment_at(camera, staged_path, None, csv_duration, policy)
+            .await
+    }
+
+    async fn finalize_closed_segment_at(
+        &self,
+        camera: &str,
+        staged_path: &Path,
+        explicit_start_time: Option<f64>,
         csv_duration: f64,
         policy: &CameraRecordPolicy,
     ) -> Result<()> {
@@ -1728,11 +2250,22 @@ impl RecordingEngine {
 
         let staged_probe_path = staged_path.to_path_buf();
         let cam_probe = camera.to_string();
+        let audio_probe_enabled = policy.audio_probe_enabled;
+        let ffmpeg_bin_probe = self.ffmpeg_bin.clone();
         let probe_res =
             tokio::task::spawn_blocking(move || -> Result<Option<StagedSegmentProbe>> {
-                let meta = std::fs::symlink_metadata(&staged_probe_path).with_context(|| {
-                    format!("missing staged segment {}", staged_probe_path.display())
-                })?;
+                let meta = match std::fs::symlink_metadata(&staged_probe_path) {
+                    Ok(m) => m,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "failed to stat staged segment {}",
+                                staged_probe_path.display()
+                            )
+                        });
+                    }
+                };
                 if !meta.file_type().is_file() {
                     anyhow::bail!(
                         "staged segment {} is not a regular file",
@@ -1747,10 +2280,16 @@ impl RecordingEngine {
                 let duration = probe_mp4_duration_fast(&staged_probe_path)
                     .unwrap_or(csv_duration)
                     .clamp(0.5, 60.0);
-                let start_time = parse_staged_start_time(&cam_probe, &staged_probe_path)
+                let start_time = explicit_start_time
+                    .filter(|ts| ts.is_finite() && *ts > 0.0)
+                    .or_else(|| parse_staged_start_time(&cam_probe, &staged_probe_path))
                     .unwrap_or_else(|| unix_now_f64() - duration);
                 let end_time = start_time + duration;
-                let probed_dbfs = probe_mp4_audio_dbfs_fast(&staged_probe_path);
+                let probed_dbfs = probe_mp4_audio_dbfs_with_bin(
+                    &staged_probe_path,
+                    audio_probe_enabled,
+                    Some(&ffmpeg_bin_probe),
+                );
                 Ok(Some(StagedSegmentProbe {
                     size_bytes,
                     duration,
@@ -1958,10 +2497,19 @@ impl RecordingEngine {
     }
 
     async fn run_retention_cleanup_loop(&self) {
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+            _ = self.shutdown_notify.notified() => return,
+        }
         loop {
+            if self.shutdown_flag.load(Ordering::SeqCst) {
+                break;
+            }
             let expire_interval = self.run_retention_pass_once(unix_now_f64()).await;
-            tokio::time::sleep(std::time::Duration::from_secs(expire_interval)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(expire_interval)) => {}
+                _ = self.shutdown_notify.notified() => break,
+            }
         }
     }
 
@@ -2705,10 +3253,16 @@ impl RecordingEngine {
     }
 
     async fn run_preview_generator_loop(&self) {
-        let ffmpeg_bin = resolve_ffmpeg_bin();
-        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        let ffmpeg_bin = self.ffmpeg_bin.clone();
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+            _ = self.shutdown_notify.notified() => return,
+        }
 
         loop {
+            if self.shutdown_flag.load(Ordering::SeqCst) {
+                break;
+            }
             let cameras: Vec<(String, String)> = {
                 let cfg = self.config.read().await;
                 cfg.cameras
@@ -2899,7 +3453,10 @@ impl RecordingEngine {
                 }
             }
 
-            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => {}
+                _ = self.shutdown_notify.notified() => break,
+            }
         }
     }
 }
@@ -4700,11 +5257,21 @@ mod tests {
         assert!(args_stripped_audio.iter().any(|a| a == "-an"));
 
         let rec_args_zero =
-            build_recorder_ffmpeg_args("rtsp://127.0.0.1:8554/cam", "/tmp/cam_%Y.mp4", 0);
+            build_recorder_ffmpeg_args("rtsp://127.0.0.1:8554/cam", "/tmp/cam_seg_%09d.mp4", 0)
+                .unwrap();
+        assert!(rec_args_zero.iter().any(|a| a == "-nostdin"));
+        assert!(
+            rec_args_zero
+                .windows(2)
+                .any(|w| w == ["-protocol_whitelist", "rtsp,rtsps,rtp,tcp,udp,tls,crypto"])
+        );
         assert!(!rec_args_zero.iter().any(|a| a == "-itsoffset"));
+        assert!(!rec_args_zero.iter().any(|a| a == "-strftime"));
 
         let rec_args_offset =
-            build_recorder_ffmpeg_args("rtsp://127.0.0.1:8554/cam", "/tmp/cam_%Y.mp4", -450);
+            build_recorder_ffmpeg_args("rtsp://127.0.0.1:8554/cam", "/tmp/cam_seg_%09d.mp4", -450)
+                .unwrap();
+        assert!(rec_args_offset.iter().any(|a| a == "-nostdin"));
         assert!(rec_args_offset.iter().any(|a| a == "-itsoffset"));
         assert!(rec_args_offset.iter().any(|a| a == "-0.450"));
         assert!(rec_args_offset.iter().any(|a| a == "1:a:0?"));
@@ -5291,6 +5858,7 @@ mod tests {
             continuous_substream: false,
             retain_mode: "all".to_string(),
             audio_offset_ms: 0,
+            audio_probe_enabled: false,
         };
 
         engine
@@ -7264,6 +7832,253 @@ cameras:
         .await;
         assert!(err_cancel.is_err());
         assert!(db.get_export_by_id("exp_pre_cancel").unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recorder_ffmpeg_hardening_exponential_backoff_and_staged_monotonic_start_parsing() {
+        // 1. Disallowed recorder URLs (leading `-`, local file, concat, subfile, pipe, http) fail closed
+        for bad_url in [
+            "-i /etc/passwd",
+            " -i /etc/passwd",
+            "file:///etc/passwd",
+            "concat:/tmp/a.mp4|/tmp/b.mp4",
+            "subfile,,start,0,end,10,,:/etc/passwd",
+            "pipe:0",
+            "lavfi:testsrc",
+            "http://192.0.2.10:8080/live.mp4",
+            "rtsp://169.254.169.254:554/live",
+        ] {
+            assert!(
+                build_recorder_ffmpeg_args(bad_url, "/tmp/cam_seg_%09d.mp4", 0).is_err(),
+                "expected recorder URL '{bad_url}' to be rejected"
+            );
+        }
+
+        // Valid rtsps:// with audio_offset_ms != 0 injects -protocol_whitelist before BOTH -i inputs
+        let args = build_recorder_ffmpeg_args(
+            "rtsps://192.0.2.10:322/stream1",
+            "/tmp/cam_1793628310000_seg_%09d.mp4",
+            250,
+        )
+        .unwrap();
+        let wl_count = args
+            .windows(2)
+            .filter(|w| w == &["-protocol_whitelist", "rtsp,rtsps,rtp,tcp,udp,tls,crypto"])
+            .count();
+        assert_eq!(wl_count, 2);
+
+        // 2. Exponential backoff schedule: 5s -> 10s -> 20s -> 40s -> 60s (capped)
+        let d0 = compute_recorder_backoff_delay(0, "front_door");
+        let d1 = compute_recorder_backoff_delay(1, "front_door");
+        let d2 = compute_recorder_backoff_delay(2, "front_door");
+        let d3 = compute_recorder_backoff_delay(3, "front_door");
+        let d4 = compute_recorder_backoff_delay(4, "front_door");
+        let d9 = compute_recorder_backoff_delay(9, "front_door");
+        assert!((5_000..5_500).contains(&d0.as_millis()));
+        assert!((10_000..10_500).contains(&d1.as_millis()));
+        assert!((20_000..20_500).contains(&d2.as_millis()));
+        assert!((40_000..40_500).contains(&d3.as_millis()));
+        assert!((60_000..60_500).contains(&d4.as_millis()));
+        assert!((60_000..60_500).contains(&d9.as_millis()));
+
+        // 3. Monotonic staged filename start-time parsing (ms epoch + sequence index) & legacy strftime compatibility
+        let p_mono = Path::new("/tmp/front_door_1793628310500_seg_000000003.mp4");
+        let ts_mono = parse_staged_start_time("front_door", p_mono).unwrap();
+        assert!((ts_mono - 1_793_628_340.5).abs() < 1e-3);
+
+        let p_legacy = Path::new("/tmp/front_door_20261102140510.mp4");
+        assert!(parse_staged_start_time("front_door", p_legacy).is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn audio_probe_gating_timeout_cap_reconcile_and_graceful_sigterm_shutdown() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("ninjanvr-media-sup-{}", random_suffix()));
+        let media_dir = root.join("media");
+        std::fs::create_dir_all(&media_dir).unwrap();
+        let db = NinjaDatabase::open(root.join("ninjanvr.db")).unwrap();
+
+        // Build a synthetic MP4 with a compressed `mp4a` audio stsd entry + valid video `mvhd`
+        let make_box = |btype: &[u8; 4], payload: &[u8]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(8 + payload.len());
+            out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+            out.extend_from_slice(btype);
+            out.extend_from_slice(payload);
+            out
+        };
+        let mut mvhd_payload = vec![0u8; 24];
+        mvhd_payload[12..16].copy_from_slice(&1000u32.to_be_bytes());
+        mvhd_payload[16..20].copy_from_slice(&10_000u32.to_be_bytes()); // 10.0s
+        let mvhd = make_box(b"mvhd", &mvhd_payload);
+
+        let mut hdlr_soun = vec![0u8; 16];
+        hdlr_soun[8..12].copy_from_slice(b"soun");
+        let mut stsd_payload = vec![0u8; 8];
+        stsd_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+        stsd_payload.extend_from_slice(&make_box(b"mp4a", &[0u8; 28]));
+        let mut stsz_payload = vec![0u8; 12];
+        stsz_payload[4..8].copy_from_slice(&256u32.to_be_bytes());
+        stsz_payload[8..12].copy_from_slice(&10u32.to_be_bytes());
+        let mut stco_payload = vec![0u8; 12];
+        stco_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+        stco_payload[8..12].copy_from_slice(&32u32.to_be_bytes());
+        let stbl = make_box(
+            b"stbl",
+            &[
+                make_box(b"stsd", &stsd_payload),
+                make_box(b"stsz", &stsz_payload),
+                make_box(b"stco", &stco_payload),
+            ]
+            .concat(),
+        );
+        let minf = make_box(b"minf", &stbl);
+        let mdia = make_box(b"mdia", &[make_box(b"hdlr", &hdlr_soun), minf].concat());
+        let trak_soun = make_box(b"trak", &mdia);
+        let moov = make_box(b"moov", &[mvhd, trak_soun].concat());
+        let ftyp = make_box(b"ftyp", b"isom\x00\x00\x02\x00isom");
+        let mdat = make_box(b"mdat", &vec![0x55u8; 2048]);
+        let aac_mp4 = [ftyp, mdat, moov].concat();
+
+        let template_mp4 = root.join("template_aac.mp4");
+        std::fs::write(&template_mp4, &aac_mp4).unwrap();
+
+        // 1. Audio probe gating: when decode_compressed == false, fake probe script is NEVER invoked!
+        let probe_hits = root.join("probe_hits.log");
+        let probe_script = root.join("probe_ffmpeg.sh");
+        std::fs::write(
+            &probe_script,
+            format!(
+                "#!/bin/sh\necho hit >> \"{}\"\nexit 0\n",
+                probe_hits.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&probe_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            probe_mp4_audio_dbfs_with_bin(&template_mp4, false, Some(&probe_script)),
+            0
+        );
+        assert!(
+            !probe_hits.exists(),
+            "compressed audio FFmpeg decode must NOT run when audio_probe_enabled is false"
+        );
+        let _ = probe_mp4_audio_dbfs_with_bin(&template_mp4, true, Some(&probe_script));
+        assert!(
+            probe_hits.exists(),
+            "compressed audio FFmpeg decode runs when audio_probe_enabled is true"
+        );
+
+        // 2. Hanging audio-probe process is killed & reaped within timeout without hanging worker
+        let hang_script = root.join("hang_ffmpeg.sh");
+        std::fs::write(&hang_script, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&hang_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let t_hang = std::time::Instant::now();
+        let hang_res = decode_audio_dbfs_with_bin_and_timeout(
+            &hang_script,
+            &template_mp4,
+            std::time::Duration::from_millis(120),
+        );
+        assert_eq!(hang_res, 0);
+        assert!(
+            t_hang.elapsed() < std::time::Duration::from_secs(2),
+            "timed-out audio probe must terminate promptly"
+        );
+
+        // 3. Dynamic reconcile() + graceful SIGTERM shutdown() flushing trailing staged segment to SQLite
+        let rec_script = root.join("rec_ffmpeg.sh");
+        // Last argument to ffmpeg is `safe_out_pattern` (`.../front_door_<epoch>_seg_%09d.mp4`).
+        // On SIGTERM, replace `%09d` with `000000000`, copy valid MP4 trailer, and exit 0!
+        std::fs::write(
+            &rec_script,
+            format!(
+                "#!/bin/sh\nfor last; do true; done\nout_seg=$(printf '%s' \"$last\" | sed 's/%09d/000000000/')\ntrap 'cp \"{}\" \"$out_seg\"; exit 0' TERM INT\nwhile :; do sleep 0.05; done\n",
+                template_mp4.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&rec_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let yaml = r#"
+cameras:
+  front_door:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/front_door
+          roles: [record]
+    record:
+      enabled: true
+      continuous:
+        days: 3
+"#;
+        let cfg = NinjaConfig::from_yaml_str(yaml, root.join("config.yml")).unwrap();
+        let shared_cfg = Arc::new(RwLock::new(cfg));
+        let ledger: SharedActivityLedger = Arc::new(RwLock::new(HashMap::new()));
+        let engine = RecordingEngine::new(
+            Arc::clone(&shared_cfg),
+            db.clone(),
+            media_dir.clone(),
+            ledger,
+        )
+        .with_ffmpeg_bin(rec_script);
+
+        engine.reconcile().await;
+        assert_eq!(
+            engine.active_recorder_cameras().await,
+            vec!["front_door".to_string()]
+        );
+
+        // Add a second camera dynamically and reconcile
+        {
+            let mut w = shared_cfg.write().await;
+            let mut patio = w.cameras["front_door"].clone();
+            patio.ffmpeg.inputs[0].path = "rtsp://127.0.0.1:8554/patio".to_string();
+            w.cameras.insert("patio".to_string(), patio);
+        }
+        engine.reconcile().await;
+        assert_eq!(
+            engine.active_recorder_cameras().await,
+            vec!["front_door".to_string(), "patio".to_string()]
+        );
+
+        // Give rec_ffmpeg.sh 120ms to install its SIGTERM trap, then disable `patio` via reconcile
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        {
+            let mut w = shared_cfg.write().await;
+            w.cameras.get_mut("patio").unwrap().enabled = false;
+        }
+        engine.reconcile().await;
+        assert_eq!(
+            engine.active_recorder_cameras().await,
+            vec!["front_door".to_string()]
+        );
+        let patio_recs = db.query_recordings("patio", 0.0, 9_999_999_999.0).unwrap();
+        assert_eq!(
+            patio_recs.len(),
+            1,
+            "disabling camera via reconcile() must SIGTERM recorder and commit trailing segment"
+        );
+
+        // Graceful engine shutdown commits front_door's trailing segment and leaves 0 active recorders
+        engine.shutdown().await;
+        assert!(engine.active_recorder_cameras().await.is_empty());
+        let fd_recs = db
+            .query_recordings("front_door", 0.0, 9_999_999_999.0)
+            .unwrap();
+        assert_eq!(
+            fd_recs.len(),
+            1,
+            "shutdown() must SIGTERM active recorders and commit closed segment to SQLite"
+        );
+        assert!(
+            !probe_hits.exists() || fd_recs[0].dbfs == 0,
+            "audio_probe_enabled=false must keep dbfs=0 without audio decode"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

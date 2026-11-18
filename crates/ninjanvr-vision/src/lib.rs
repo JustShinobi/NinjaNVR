@@ -1284,9 +1284,10 @@ pub fn check_frame_tamper(yuv_data: &[u8], width: u32, height: u32) -> FrameInte
     let near_modal_16: u32 = hist[low16..=high16].iter().sum();
     let uniform_ratio_16 = (near_modal_16 as f32) / (count as f32);
 
-    let is_tampered_or_blind = uniform_ratio >= 0.85
-        || variance < 2.0
-        || (edge_gradient < 1.8 && uniform_ratio_16 >= 0.55 && variance < 450.0);
+    let low_gradient_occluded =
+        (edge_gradient < 1.8 && uniform_ratio_16 >= 0.55 && variance < 180.0)
+            || (edge_gradient < 1.2 && uniform_ratio_16 >= 0.78 && variance < 450.0);
+    let is_tampered_or_blind = uniform_ratio >= 0.85 || variance < 2.0 || low_gradient_occluded;
 
     FrameIntegrityReport {
         y_variance: variance,
@@ -3320,6 +3321,72 @@ mod tests {
         assert!(
             m_oversized.is_empty(),
             "PolygonMask must reject polygon strings exceeding MAX_POLYGON_VERTICES (256)"
+        );
+    }
+
+    #[test]
+    fn check_frame_tamper_passes_denoised_ir_night_gradient_and_detects_occlusion_or_defocus() {
+        let w = 640u32;
+        let h = 360u32;
+        let y_len = (w * h) as usize;
+        let uv_len = y_len / 4;
+
+        // 1. Denoised IR night scene: smooth radial/vertical spotlight gradient where adjacent
+        //    horizontal differences are < 1.0 (3DNR smoothed), ~60-70% of pixels sit near the dark
+        //    IR background mode (Y ~ 20..36), yet global contrast across the illuminated foreground
+        //    produces variance in [200..400]. Previously false-positived; must NOT report tamper!
+        let mut ir_night = vec![128u8; y_len + uv_len * 2];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let fy = y as f32 / h as f32;
+                let fx = (x as f32 / w as f32) - 0.5;
+                // Dark sky/walls in upper 58% (Y ~ 20..34), smooth IR spotlight ramp in lower 42% (up to Y ~ 110)
+                let spotlight = ((fy - 0.45).max(0.0) / 0.55).powf(1.2) * (1.0 - 0.7 * fx * fx);
+                let luma = (22.0 + spotlight * 88.0).round().clamp(0.0, 255.0) as u8;
+                ir_night[y * w as usize + x] = luma;
+            }
+        }
+        assert!(is_monochrome_ir(&ir_night, w, h));
+        let rep_ir = check_frame_tamper(&ir_night, w, h);
+        assert!(
+            rep_ir.y_variance >= 180.0 && rep_ir.y_variance < 450.0,
+            "expected moderate IR variance in [180, 450), got {}",
+            rep_ir.y_variance
+        );
+        assert!(
+            !rep_ir.is_tampered_or_blind,
+            "denoised IR night gradient must not false-positive as camera_tamper: {rep_ir:?}"
+        );
+
+        // 2. Genuine hand/cloth/spray occlusion with low variance (< 180) and low edge gradient still triggers
+        let mut soft_occluded = vec![128u8; y_len + uv_len * 2];
+        for y in 0..h as usize {
+            let luma = (24 + (y * 22) / (h as usize)) as u8;
+            let row_start = y * (w as usize);
+            soft_occluded[row_start..row_start + (w as usize)].fill(luma);
+        }
+        let rep_occluded = check_frame_tamper(&soft_occluded, w, h);
+        assert!(rep_occluded.y_variance < 180.0);
+        assert!(
+            rep_occluded.is_tampered_or_blind,
+            "low-variance soft lens occlusion must trigger tamper: {rep_occluded:?}"
+        );
+
+        // 3. Heavy defocus / frosted washout (uniform_ratio_16 >= 0.80, edge_gradient < 1.2) still triggers
+        let mut frosted_washout = vec![128u8; y_len + uv_len * 2];
+        for y in 0..h as usize {
+            let luma = if y < (h as usize * 82) / 100 {
+                40u8
+            } else {
+                95u8
+            };
+            let row_start = y * (w as usize);
+            frosted_washout[row_start..row_start + (w as usize)].fill(luma);
+        }
+        let rep_frosted = check_frame_tamper(&frosted_washout, w, h);
+        assert!(
+            rep_frosted.is_tampered_or_blind,
+            "frosted high-uniformity washout must trigger tamper: {rep_frosted:?}"
         );
     }
 }
