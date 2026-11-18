@@ -3603,16 +3603,20 @@ input[type="range"] {
 }
 
 .nvr-tile-actions {
-  display: none;
+  display: inline-flex;
   align-items: center;
   gap: 4px;
   flex-wrap: wrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
 }
 
 .nvr-cam-tile:hover .nvr-tile-actions,
 .nvr-cam-tile:focus-within .nvr-tile-actions,
 .nvr-cam-tile.has-open-sheet .nvr-tile-actions {
-  display: inline-flex;
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .nvr-tile-icon {

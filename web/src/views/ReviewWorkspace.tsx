@@ -1337,7 +1337,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                   <button
                     type="button"
                     className="nvr-btn mono sm"
-                    style={{ minHeight: 22, padding: "2px 6px", fontSize: "var(--text-xs)" }}
+                    style={{ padding: "2px 6px", fontSize: "var(--text-xs)" }}
                     onClick={() => {
                       const pageIds = getVisibleReviewPageIds(
                         visibleFilteredReviews,
@@ -1354,8 +1354,8 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                   </button>
                   <button
                     type="button"
-                    className="nvr-btn success"
-                    style={{ minHeight: 22, padding: "2px 7px", fontSize: "var(--text-xs)" }}
+                    className="nvr-btn success sm"
+                    style={{ padding: "2px 7px", fontSize: "var(--text-xs)" }}
                     onClick={() =>
                       void handleAcknowledgeReviews(
                         selectedBatchReviewIds.length > 0
@@ -1883,7 +1883,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     ({formatRelTime(activeReview.start_time)})
                   </span>
                 </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0, flexWrap: "wrap" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, maxWidth: "100%", flexWrap: "wrap" }}>
                   {primaryDetectionEventId && (
                     <>
                       <button
