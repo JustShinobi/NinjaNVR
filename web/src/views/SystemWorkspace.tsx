@@ -31,6 +31,26 @@ export function toFiniteNumber(val: unknown, fallback: number = 0): number {
   return fallback;
 }
 
+export function formatCameraTelemetryValue(
+  val: unknown,
+  digits: number = 1,
+  unit: string = ""
+): string {
+  if (val === null || val === undefined) {
+    return "—";
+  }
+  if (typeof val === "number") {
+    return Number.isFinite(val) ? `${val.toFixed(digits)}${unit}` : "—";
+  }
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (!trimmed) return "—";
+    const parsed = parseFloat(trimmed);
+    return Number.isFinite(parsed) ? `${parsed.toFixed(digits)}${unit}` : "—";
+  }
+  return "—";
+}
+
 const SENSITIVE_RTSP_QUERY_KEYS = new Set([
   "password",
   "pass",
@@ -451,6 +471,7 @@ interface SystemWorkspaceProps {
   logPaused: boolean;
   setLogPaused: React.Dispatch<React.SetStateAction<boolean>>;
   notify: (msg: string) => void;
+  initialRightMode?: "alerts" | "logs";
 }
 
 export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
@@ -463,6 +484,7 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
   logPaused,
   setLogPaused,
   notify,
+  initialRightMode = "alerts",
 }) => {
   const { t, locale } = useI18n();
   const isPt = locale === "pt";
@@ -506,7 +528,9 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
       notify("Clipboard access unavailable in this browser context");
     }
   };
-  const [rightMode, setRightMode] = React.useState<"alerts" | "logs">("alerts");
+  const [rightMode, setRightMode] = React.useState<"alerts" | "logs">(
+    initialRightMode
+  );
   const [healthSearch, setHealthSearch] = React.useState("");
   const [healthStatusFilter, setHealthStatusFilter] =
     React.useState<HealthStatusFilter>("all");
@@ -571,8 +595,13 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
       <div className="nvr-panel">
         <div className="nvr-panel-header">
           <span>
-            HARDWARE & PIPELINE TELEMETRY (UPTIME{" "}
-            {formatUptime(Math.max(0, toFiniteNumber(stats?.service?.uptime, 0)))})
+            {isPt
+              ? `TELEMETRIA DE HARDWARE & PIPELINE (UPTIME ${formatUptime(
+                  Math.max(0, toFiniteNumber(stats?.service?.uptime, 0))
+                )})`
+              : `HARDWARE & PIPELINE TELEMETRY (UPTIME ${formatUptime(
+                  Math.max(0, toFiniteNumber(stats?.service?.uptime, 0))
+                )})`}
           </span>
           <span className="mono">{stats?.service?.version || "—"}</span>
         </div>
@@ -590,9 +619,13 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
           >
             <div
               className="nvr-panel-header"
-              style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}
+              style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 6 }}
             >
-              <span>AI SITUATION BRIEF & MCP SERVER (/api/ai/context · /api/mcp)</span>
+              <span>
+                {isPt
+                  ? "RESUMO SITUACIONAL DE IA & SERVIDOR MCP (/api/ai/context · /api/mcp)"
+                  : "AI SITUATION BRIEF & MCP SERVER (/api/ai/context · /api/mcp)"}
+              </span>
               <div style={{ display: "flex", gap: 6 }}>
                 <button
                   type="button"
@@ -606,7 +639,7 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                     );
                   }}
                 >
-                  Copy MCP URL
+                  {isPt ? "Copiar URL MCP" : "Copy MCP URL"}
                 </button>
                 <button
                   type="button"
@@ -627,7 +660,11 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                         setAiBriefText(
                           data.markdown_brief || JSON.stringify(data, null, 2)
                         );
-                        notify("Generated 24h AI Situation Brief");
+                        notify(
+                          isPt
+                            ? "Resumo situacional de IA (24h) gerado"
+                            : "Generated 24h AI Situation Brief"
+                        );
                       } else {
                         notify(`Failed to fetch AI context (${res.status})`);
                       }
@@ -642,7 +679,13 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                     }
                   }}
                 >
-                  {aiBriefBusy ? "Generating..." : "Generate 24h AI Brief"}
+                  {aiBriefBusy
+                    ? isPt
+                      ? "Gerando..."
+                      : "Generating..."
+                    : isPt
+                    ? "Gerar Resumo IA 24h"
+                    : "Generate 24h AI Brief"}
                 </button>
               </div>
             </div>
@@ -669,7 +712,7 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "repeat(3, 1fr)",
+              gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
               gap: 10,
             }}
           >
@@ -693,8 +736,10 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
               >
                 <span style={{ color: "var(--text-secondary)" }}>
                   {stats?.primary_detector?.device
-                    ? `INFERÊNCIA · ${stats.primary_detector.device}`
-                    : "INFERÊNCIA"}
+                    ? `${isPt ? "INFERÊNCIA" : "INFERENCE"} · ${stats.primary_detector.device}`
+                    : isPt
+                    ? "INFERÊNCIA"
+                    : "INFERENCE"}
                 </span>
                 <span
                   className="mono"
@@ -726,7 +771,9 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                   marginBottom: 6,
                 }}
               >
-                <span style={{ color: "var(--text-secondary)" }}>SYSTEM CPU</span>
+                <span style={{ color: "var(--text-secondary)" }}>
+                  {isPt ? "CPU DO SISTEMA" : "SYSTEM CPU"}
+                </span>
                 <span
                   className="mono"
                   style={{ color: "var(--signal-live-text)", fontWeight: 700 }}
@@ -736,7 +783,7 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
               </div>
               <CanvasSparkline
                 values={statsHistory.map((s) =>
-                  toFiniteNumber(s.cpu_usages?.["ninjanvr.full_system"]?.cpu, 6.5)
+                  toFiniteNumber(s.cpu_usages?.["ninjanvr.full_system"]?.cpu, 0)
                 )}
                 color="#10b981"
                 maxVal={100}
@@ -759,7 +806,9 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                   marginBottom: 6,
                 }}
               >
-                <span style={{ color: "var(--text-secondary)" }}>MEMORY RSS</span>
+                <span style={{ color: "var(--text-secondary)" }}>
+                  {isPt ? "MEMÓRIA RSS" : "MEMORY RSS"}
+                </span>
                 <span
                   className="mono"
                   style={{ color: "var(--signal-motion-text)", fontWeight: 700 }}
@@ -769,7 +818,7 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
               </div>
               <CanvasSparkline
                 values={statsHistory.map((s) =>
-                  toFiniteNumber(s.cpu_usages?.["ninjanvr.full_system"]?.mem, 26.0)
+                  toFiniteNumber(s.cpu_usages?.["ninjanvr.full_system"]?.mem, 0)
                 )}
                 color="#f59e0b"
                 maxVal={100}
@@ -810,16 +859,16 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                   type="text"
                   className="nvr-input mono"
                   style={{ height: 22, width: 136, fontSize: "var(--text-xs)" }}
-                  placeholder="Search camera..."
+                  placeholder={isPt ? "Buscar câmera..." : "Search camera..."}
                   aria-label="Search camera health"
                   value={healthSearch}
                   onChange={(e) => setHealthSearch(e.target.value)}
                 />
                 {(
                   [
-                    ["all", "All"],
-                    ["offline", "Offline / 0 FPS"],
-                    ["active_ai", "Active AI"],
+                    ["all", isPt ? "Todas" : "All"],
+                    ["offline", isPt ? "Offline / 0 FPS" : "Offline / 0 FPS"],
+                    ["active_ai", isPt ? "IA Ativa" : "Active AI"],
                   ] as Array<[HealthStatusFilter, string]>
                 ).map(([flt, label]) => (
                   <button
@@ -843,7 +892,7 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                     style={{ cursor: "pointer" }}
                     onClick={() => toggleHealthSort("channel")}
                   >
-                    Channel{" "}
+                    {isPt ? "Canal" : "Channel"}{" "}
                     {healthSortCol === "channel"
                       ? healthSortDir === "asc"
                         ? "▲"
@@ -866,7 +915,7 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                     style={{ cursor: "pointer" }}
                     onClick={() => toggleHealthSort("detection_fps")}
                   >
-                    AI Detect FPS{" "}
+                    {isPt ? "FPS IA" : "AI Detect FPS"}{" "}
                     {healthSortCol === "detection_fps"
                       ? healthSortDir === "asc"
                         ? "▲"
@@ -884,7 +933,7 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                         : "▼"
                       : ""}
                   </th>
-                  <th>Capture CPU</th>
+                  <th>{isPt ? "CPU Captura" : "Capture CPU"}</th>
                 </tr>
               </thead>
               <tbody>
@@ -893,13 +942,13 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                   return (
                     <tr key={cam}>
                       <td style={{ fontWeight: 700, textTransform: "uppercase" }}>{cam}</td>
-                      <td>{toFiniteNumber(cs?.camera_fps, 5.0).toFixed(1)}</td>
-                      <td>{toFiniteNumber(cs?.process_fps, 5.0).toFixed(1)}</td>
+                      <td>{formatCameraTelemetryValue(cs?.camera_fps, 1)}</td>
+                      <td>{formatCameraTelemetryValue(cs?.process_fps, 1)}</td>
                       <td style={{ color: "var(--signal-accent-text)" }}>
-                        {toFiniteNumber(cs?.detection_fps, 0.0).toFixed(1)}
+                        {formatCameraTelemetryValue(cs?.detection_fps, 1)}
                       </td>
-                      <td>{toFiniteNumber(cs?.ffmpeg_cpu, 1.2).toFixed(1)}%</td>
-                      <td>{toFiniteNumber(cs?.capture_cpu, 1.0).toFixed(1)}%</td>
+                      <td>{formatCameraTelemetryValue(cs?.ffmpeg_cpu, 1, "%")}</td>
+                      <td>{formatCameraTelemetryValue(cs?.capture_cpu, 1, "%")}</td>
                     </tr>
                   );
                 })}
@@ -954,17 +1003,23 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                   }
                 }}
               >
-                {syncStorageBusy ? "Syncing..." : "Sync Storage DB"}
+                {syncStorageBusy
+                  ? isPt
+                    ? "Sincronizando..."
+                    : "Syncing..."
+                  : isPt
+                  ? "Sincronizar DB"
+                  : "Sync Storage DB"}
               </button>
             </div>
             <table className="nvr-table mono">
               <thead>
                 <tr>
-                  <th>Mount Path</th>
+                  <th>{isPt ? "Ponto de Montagem" : "Mount Path"}</th>
                   <th>FS</th>
-                  <th>Used</th>
-                  <th>Total</th>
-                  <th>Utilization</th>
+                  <th>{isPt ? "Usado" : "Used"}</th>
+                  <th>{isPt ? "Total" : "Total"}</th>
+                  <th>{isPt ? "Utilização" : "Utilization"}</th>
                 </tr>
               </thead>
               <tbody>
@@ -1033,10 +1088,10 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                 <table className="nvr-table mono" style={{ borderTop: "1px solid var(--border-hairline)" }}>
                   <thead>
                     <tr>
-                      <th>Camera Channel</th>
-                      <th>Disk Usage</th>
-                      <th>Write Rate</th>
-                      <th>Est. Runway</th>
+                      <th>{isPt ? "Canal" : "Camera Channel"}</th>
+                      <th>{isPt ? "Uso de Disco" : "Disk Usage"}</th>
+                      <th>{isPt ? "Taxa de Escrita" : "Write Rate"}</th>
+                      <th>{isPt ? "Retenção Est." : "Est. Runway"}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1046,10 +1101,11 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                         <td>{(Math.max(0, toFiniteNumber(cs.usage, 0)) / 1024).toFixed(2)} GB</td>
                         <td>{Math.max(0, toFiniteNumber(cs.bandwidth, 0)).toFixed(1)} MB/h</td>
                         <td style={{ color: "var(--signal-live-text)" }}>
-                          {toFiniteNumber(
+                          {formatCameraTelemetryValue(
                             cs.estimated_retention_days ?? stats.service.estimated_retention_days,
-                            14
-                          ).toFixed(1)}d
+                            1,
+                            "d"
+                          )}
                         </td>
                       </tr>
                     ))}
@@ -1136,6 +1192,8 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                   ? isPt
                     ? "Filtrar alertas..."
                     : "Filter alerts..."
+                  : isPt
+                  ? "Filtrar logs..."
                   : "Filter logs..."
               }
               value={logSearch}
@@ -1216,9 +1274,15 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                   : "HEURISTIC PIPELINE & CONFIGURATION DIAGNOSTICS"}
               </span>
               <div style={{ display: "flex", gap: 6 }}>
-                <span className="nvr-badge alert mono">{critCount} CRITICAL</span>
-                <span className="nvr-badge motion mono">{warnCount} WARNING</span>
-                <span className="nvr-badge mono">{optCount} OPTIMIZATION</span>
+                <span className="nvr-badge alert mono">
+                  {critCount} {isPt ? "CRÍTICOS" : "CRITICAL"}
+                </span>
+                <span className="nvr-badge motion mono">
+                  {warnCount} {isPt ? "AVISOS" : "WARNING"}
+                </span>
+                <span className="nvr-badge mono">
+                  {optCount} {isPt ? "OTIMIZAÇÃO" : "OPTIMIZATION"}
+                </span>
               </div>
             </div>
 
@@ -1358,7 +1422,7 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                   key={idx}
                   style={{
                     padding: "2px 0",
-                    borderBottom: "1px solid rgba(255,255,255,0.03)",
+                    borderBottom: "1px solid var(--border-divider)",
                     color:
                       line.includes("ERR") || line.includes("WARN")
                         ? "var(--signal-motion-text)"

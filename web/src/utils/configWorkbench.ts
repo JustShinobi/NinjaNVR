@@ -1153,6 +1153,7 @@ export interface ConfigWorkbenchSnapshot {
   baselineYaml: string;
   rawYaml: string;
   isDirty: boolean;
+  hasUnsavedRawEdits: boolean;
   isSaving: boolean;
   revision: number;
   yamlStale: boolean;
@@ -1184,6 +1185,8 @@ export interface ApplyOutOfBandPatchOptions {
 
 export interface CommitStructuredOptions {
   restart?: boolean;
+  discardRawEdits?: boolean;
+  rawYamlConflictMessage?: string;
   savedMessage?: string;
   restartedMessage?: string;
   failedMessage?: string;
@@ -1240,6 +1243,7 @@ export interface ConfigWorkbenchSession {
     options?: CommitStructuredOptions
   ): Promise<WorkbenchCommitOutcome>;
   commitRaw(options?: CommitRawOptions): Promise<WorkbenchCommitOutcome>;
+  discardRawEdits(): void;
   discardDraft(): void;
 }
 
@@ -1280,6 +1284,7 @@ export function createConfigWorkbenchSession(
     baselineYaml,
     rawYaml,
     isDirty,
+    hasUnsavedRawEdits,
     isSaving,
     revision,
     yamlStale,
@@ -1293,6 +1298,7 @@ export function createConfigWorkbenchSession(
       baselineYaml,
       rawYaml,
       isDirty,
+      hasUnsavedRawEdits,
       isSaving,
       revision,
       yamlStale,
@@ -1716,6 +1722,25 @@ export function createConfigWorkbenchSession(
       };
     }
 
+    if (hasUnsavedRawEdits && !commitOptions?.discardRawEdits) {
+      const conflictMsg =
+        commitOptions?.rawYamlConflictMessage ||
+        "Unsaved Raw config.yml edits exist. Save or discard Raw YAML edits before saving visual settings.";
+      saveOutcome = { ok: false, message: conflictMsg, at: Date.now() };
+      publish();
+      return {
+        ok: false,
+        status: 409,
+        config: baselineConfig ? cloneSafe(baselineConfig) : null,
+        rawYaml,
+        message: conflictMsg,
+        rejectedGeometryCount: 0,
+      };
+    }
+    if (hasUnsavedRawEdits && commitOptions?.discardRawEdits) {
+      hasUnsavedRawEdits = false;
+    }
+
     const saveRev = revision;
     const { cleaned: payloadConfig, rejectedCount } =
       sanitizedDraftCache === draftConfig
@@ -1998,6 +2023,26 @@ export function createConfigWorkbenchSession(
     }
   };
 
+  const discardRawEdits = (): void => {
+    if (!hasUnsavedRawEdits) return;
+    revision += 1;
+    hasUnsavedRawEdits = false;
+    saveOutcome = null;
+    const structuredDirty = Boolean(
+      draftConfig && !deepEqualConfigValue(baselineConfig, draftConfig)
+    );
+    if (structuredDirty && draftConfig) {
+      rawYaml = buildCleanYamlFromDraft(draftConfig, baselineYaml);
+      yamlStale = false;
+      isDirty = true;
+    } else {
+      rawYaml = baselineYaml;
+      yamlStale = false;
+      isDirty = false;
+    }
+    publish();
+  };
+
   const discardDraft = (): void => {
     revision += 1;
     sanitizedDraftCache = null;
@@ -2031,6 +2076,7 @@ export function createConfigWorkbenchSession(
     applyOutOfBandPatch,
     commitStructured,
     commitRaw,
+    discardRawEdits,
     discardDraft,
   };
 }

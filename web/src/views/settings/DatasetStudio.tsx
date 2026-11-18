@@ -44,6 +44,7 @@ import {
 import {
   createSampleMutationEpochTracker,
 } from "../../utils/operationalFeed";
+import { useTwoStepConfirm } from "./vision/useTwoStepConfirm";
 import {
   applySecurity15ClassPreset,
   buildLocalFinetuneCliCommand,
@@ -99,6 +100,7 @@ export const DatasetStudioSection: React.FC<{
   const { locale } = useI18n();
   const isPt = locale === "pt";
   const t = useCallback((pt: string, en: string) => (isPt ? pt : en), [isPt]);
+  const { isArmed, confirmOrArm, clearArmed } = useTwoStepConfirm(3000);
 
   const [summary, setSummary] = useState<DatasetSummaryResponse | null>(null);
   const [samples, setSamples] = useState<DatasetSampleItem[]>([]);
@@ -246,7 +248,8 @@ export const DatasetStudioSection: React.FC<{
     setDraft(null);
     setSelectedBox(null);
     setNaturalSize(null);
-  }, [selected?.id]);
+    clearArmed();
+  }, [selected?.id, clearArmed]);
 
   // Pin the fallback selection (queue[0]) so later edits keep it on stage.
   useEffect(() => {
@@ -517,7 +520,6 @@ export const DatasetStudioSection: React.FC<{
 
   const discardSample = async (sample: DatasetSampleItem) => {
     if (!isSafeDatasetSampleId(sample?.id)) return;
-    if (!window.confirm(t("Descartar esta amostra do dataset?", "Discard this sample from the dataset?"))) return;
     const myEpoch = sampleEpochTracker.begin(sample.id);
     const next = neighbourAfter(sample.id);
     setSamples((prev) => removeDatasetSampleFromList(prev, sample.id));
@@ -1394,9 +1396,20 @@ export const DatasetStudioSection: React.FC<{
               {t("Sem objetos", "No objects")} <kbd className="nvr-kbd">N</kbd>
             </button>
           </div>
-          <button type="button" className="nvr-btn danger mono sm" disabled={busy} onClick={() => void discardSample(selected)}>
+          <button
+            type="button"
+            className="nvr-btn danger mono sm"
+            disabled={busy}
+            onClick={() => {
+              confirmOrArm(`discard-sample:${selected.id}`, () => {
+                void discardSample(selected);
+              });
+            }}
+          >
             <Trash2 size={12} />
-            {t("Descartar amostra", "Discard sample")}
+            {isArmed(`discard-sample:${selected.id}`)
+              ? t("Confirmar?", "Click again to confirm")
+              : t("Descartar amostra", "Discard sample")}
           </button>
           <p className="nvr-ds-hint" style={{ margin: "4px 0 0" }}>
             {t(

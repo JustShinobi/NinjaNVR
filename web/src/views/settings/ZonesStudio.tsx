@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { LiveMsePlayer } from "../../components/VideoPlayers";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { LiveMsePlayer, mapClientPointToFrame } from "../../components/VideoPlayers";
 import { useI18n } from "../../i18n";
 import { useNvrStore } from "../../store/useNvrStore";
 import type { CameraMotionConfig, NinjaConfigResponse } from "../../types/nvr";
@@ -44,15 +44,32 @@ import {
 } from "../../utils/zonesStudio";
 import { ToggleSwitch } from "./ConsoleAndStreamsPanels";
 import { ROI_ALERT_DURATION_PILLS, STATE_ROI_SCENARIO_PRESETS } from "./VisionAndAiPanels";
+import { useTwoStepConfirm } from "./vision/useTwoStepConfirm";
 
-const KIND_COLOR: Record<VisionItemKind, string> = {
+export const KIND_COLOR: Record<VisionItemKind, string> = {
   zone: "#0ea5e9",
   line: "#10b981",
   state: "#f59e0b",
   motion_mask: "#ef4444",
   object_mask: "#a855f7",
-  privacy_mask: "#64748b",
+  privacy_mask: "#475569",
 };
+
+export function resolveVisionTagStyle(kind: VisionItemKind): {
+  background: string;
+  color: string;
+} {
+  return {
+    background: KIND_COLOR[kind],
+    color: kind === "privacy_mask" ? "#ffffff" : "#05070a",
+  };
+}
+
+export function shouldGuardDraftPolygonSwitch(
+  draftPoints: ReadonlyArray<Point>
+): boolean {
+  return Array.isArray(draftPoints) && draftPoints.length > 0;
+}
 
 /** On-screen OSD clock area shortcut for motion masks (top-left corner). */
 const OSD_CLOCK_POINTS: Point[] = [
@@ -142,10 +159,15 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
   const [rulerOn, setRulerOn] = useState(false);
   const [rulerPoints, setRulerPoints] = useState<Point[]>([]);
   const [copyTarget, setCopyTarget] = useState("");
-  const motionNow = useNvrStore((st) => st.cameraActivity[inspectorCam]?.motion);
-  const liveStates = useNvrStore((st) => st.cameraActivity[inspectorCam]?.states);
+  const [stageInteractionMode, setStageInteractionMode] = useState<"plot" | "pan_zoom">("plot");
+  const [activeCam, setActiveCam] = useState<string>(inspectorCam);
+  const [pendingCamProp, setPendingCamProp] = useState<string | null>(null);
+  const plotAnchorRef = useRef<HTMLDivElement | null>(null);
+  const { isArmed, confirmOrArm, clearArmed } = useTwoStepConfirm(3000);
+  const motionNow = useNvrStore((st) => st.cameraActivity[activeCam]?.motion);
+  const liveStates = useNvrStore((st) => st.cameraActivity[activeCam]?.states);
 
-  const camCfg = draftConfig.cameras?.[inspectorCam];
+  const camCfg = draftConfig.cameras?.[activeCam];
   const detW = camCfg?.detect?.width || 1280;
   const detH = camCfg?.detect?.height || 720;
   const cameraNames = Object.keys(draftConfig.cameras || {});
@@ -155,29 +177,55 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
   const unsavedIds = useMemo(() => {
     const ids = new Set<string>();
     for (const c of changes) {
-      if (c.camera !== inspectorCam) continue;
+      if (c.camera !== activeCam) continue;
       if (isMaskKind(c.kind as VisionItemKind)) ids.add(`${c.camera}:${c.kind}:coords:${c.key}`);
       else ids.add(`${c.camera}:${c.kind}:${c.key}`);
     }
     return ids;
-  }, [changes, inspectorCam]);
+  }, [changes, activeCam]);
 
   const isUnsaved = (item: VisionItem): boolean => {
     if (isMaskKind(item.ref.kind)) {
       const coords = readMasks(camCfg, item.ref.kind)[Number(item.ref.key)] ?? "";
-      return unsavedIds.has(`${inspectorCam}:${item.ref.kind}:coords:${coords}`);
+      return unsavedIds.has(`${activeCam}:${item.ref.kind}:coords:${coords}`);
     }
-    return unsavedIds.has(refId(inspectorCam, item.ref));
+    return unsavedIds.has(refId(activeCam, item.ref));
   };
 
-  // Reset transient UI when the operator switches camera.
+  // Guard camera switch when polygon vertices are in progress; otherwise reset cleanly.
   useEffect(() => {
+    if (inspectorCam === activeCam) {
+      setPendingCamProp(null);
+      return;
+    }
+    if (shouldGuardDraftPolygonSwitch(draftPoints)) {
+      setPendingCamProp(inspectorCam);
+      return;
+    }
+    setActiveCam(inspectorCam);
+    setPendingCamProp(null);
     setMode({ name: "list" });
     setSelected(null);
     setRulerPoints([]);
     setCopyTarget("");
+    setStageInteractionMode("plot");
+    clearArmed();
     setDraftPoints([]);
-  }, [inspectorCam, setDraftPoints]);
+  }, [inspectorCam, activeCam, draftPoints, setDraftPoints, clearArmed]);
+
+  const confirmPendingCameraSwitch = () => {
+    if (!pendingCamProp) return;
+    const nextCam = pendingCamProp;
+    setPendingCamProp(null);
+    setActiveCam(nextCam);
+    setMode({ name: "list" });
+    setSelected(null);
+    setRulerPoints([]);
+    setCopyTarget("");
+    setStageInteractionMode("plot");
+    clearArmed();
+    setDraftPoints([]);
+  };
 
   const editing = mode.name === "edit" ? mode.editor : null;
 
@@ -193,6 +241,8 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
     }
     setRulerOn(false);
     setSelected(null);
+    setStageInteractionMode("plot");
+    clearArmed();
     setDraftPoints([]);
     setMode({ name: "edit", editor: base });
   };
@@ -202,14 +252,18 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
     const loaded = editorStateFromItem(camCfg, ref);
     if (!loaded) return;
     setRulerOn(false);
+    setStageInteractionMode("plot");
+    clearArmed();
     setDraftPoints(loaded.points);
     setMode({ name: "edit", editor: loaded.state });
   };
 
   const cancelEdit = useCallback(() => {
+    clearArmed();
+    setStageInteractionMode("plot");
     setDraftPoints([]);
     setMode({ name: "list" });
-  }, [setDraftPoints]);
+  }, [setDraftPoints, clearArmed]);
 
   const patchEditor = (patch: Partial<VisionEditorState>) => {
     if (mode.name !== "edit") return;
@@ -245,15 +299,17 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
   const commit = () => {
     if (!editing) return;
     const trial = clone(draftConfig);
-    const res = commitVisionEditor(trial, inspectorCam, editing, draftPoints);
+    const res = commitVisionEditor(trial, activeCam, editing, draftPoints);
     if (!res.ok) {
       notify(commitError(res.error));
       return;
     }
     updateDraft((next) => {
-      next.cameras[inspectorCam] = trial.cameras[inspectorCam];
+      next.cameras[activeCam] = trial.cameras[activeCam];
     });
     setSelected(res.ref);
+    setStageInteractionMode("plot");
+    clearArmed();
     setDraftPoints([]);
     setMode({ name: "list" });
     notify(
@@ -266,14 +322,14 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
   const removeSelected = () => {
     if (!selected) return;
     const ref = selected;
-    updateDraft((next) => deleteVisionItem(next, inspectorCam, ref));
+    updateDraft((next) => deleteVisionItem(next, activeCam, ref));
     setSelected(null);
   };
 
   const copySelected = () => {
     if (!selected || !copyTarget) return;
     const trial = clone(draftConfig);
-    const ref = copyVisionItemToCamera(trial, inspectorCam, selected, copyTarget);
+    const ref = copyVisionItemToCamera(trial, activeCam, selected, copyTarget);
     if (!ref) {
       notify(tr("Não foi possível copiar", "Could not copy"));
       return;
@@ -316,7 +372,11 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
       if (isTypingTarget(e.target)) return;
       if (e.key === "Escape") {
         e.preventDefault();
-        cancelEdit();
+        if (shouldGuardDraftPolygonSwitch(draftPoints)) {
+          confirmOrArm("escape-cancel", cancelEdit);
+        } else {
+          cancelEdit();
+        }
       } else if (e.key === "Backspace") {
         e.preventDefault();
         setDraftPoints((prev) => prev.slice(0, -1));
@@ -324,16 +384,16 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [mode.name, cancelEdit, setDraftPoints]);
+  }, [mode.name, draftPoints, confirmOrArm, cancelEdit, setDraftPoints]);
 
   // While editing an existing item, hide its saved shape so only the draft is drawn.
   const stageCamCfg = useMemo(() => {
     if (!camCfg) return camCfg;
     if (!editing || editing.originalKey === null) return camCfg;
     const tmp = clone(draftConfig);
-    deleteVisionItem(tmp, inspectorCam, { kind: editing.kind, key: editing.originalKey });
-    return tmp.cameras[inspectorCam];
-  }, [camCfg, editing, draftConfig, inspectorCam]);
+    deleteVisionItem(tmp, activeCam, { kind: editing.kind, key: editing.originalKey });
+    return tmp.cameras[activeCam];
+  }, [camCfg, editing, draftConfig, activeCam]);
 
   if (!camCfg) {
     return (
@@ -378,6 +438,7 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
       }))}
       detW={detW}
       detH={detH}
+      plotAnchorRef={plotAnchorRef}
     />
   );
 
@@ -387,12 +448,37 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
       ? [tr("Movimento dentro das áreas vermelhas tracejadas é ignorado", "Motion inside dashed red areas is ignored")]
       : mode.name === "pick"
       ? [tr("Escolha o tipo à esquerda para começar a desenhar", "Pick a type on the left to start drawing")]
+      : drawing && stageInteractionMode === "pan_zoom"
+      ? [
+          tr(
+            "Use pinça ou Ctrl+roda para dar zoom e arraste para enquadrar; depois volte para Marcar",
+            "Pinch or Ctrl+wheel to zoom and drag to pan; then switch back to Plot"
+          ),
+        ]
       : stageHints(pt, editing, rulerOn && mode.name === "list");
   const ruler = rulerPoints.length === 2 ? measureBox(rulerPoints[0], rulerPoints[1], detW, detH) : null;
 
   return (
     <div className="nvr-zs">
       <aside className="nvr-zs-panel" aria-label={tr("Configuração da câmera", "Camera configuration")}>
+        {pendingCamProp && shouldGuardDraftPolygonSwitch(draftPoints) && (
+          <div className="nvr-zs-status is-pending" role="alertdialog" data-testid="zs-camera-draft-guard">
+            <span>
+              {tr(
+                `Descartar ${draftPoints.length} ponto(s) e trocar para ${pendingCamProp}?`,
+                `Discard ${draftPoints.length} point(s) and switch to ${pendingCamProp}?`
+              )}
+            </span>
+            <span className="nvr-zs-row">
+              <button type="button" className="nvr-btn sm danger" onClick={confirmPendingCameraSwitch}>
+                {tr("Confirmar", "Confirm")}
+              </button>
+              <button type="button" className="nvr-btn sm" onClick={() => setPendingCamProp(null)}>
+                {tr("Manter", "Keep")}
+              </button>
+            </span>
+          </div>
+        )}
         {mode.name === "list" && (
           <>
             <SaveStatus
@@ -442,13 +528,13 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
                 motionNow={motionNow}
                 onPatch={(patch) =>
                   updateDraft((next) => {
-                    const m = next.cameras[inspectorCam]?.motion;
+                    const m = next.cameras[activeCam]?.motion;
                     if (m) Object.assign(m, patch);
                   })
                 }
                 onProfile={(id) =>
                   updateDraft((next) => {
-                    const m = next.cameras[inspectorCam]?.motion;
+                    const m = next.cameras[activeCam]?.motion;
                     if (m) applyMotionProfile(m, id);
                   })
                 }
@@ -491,7 +577,7 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
                       >
                         <option value="">{tr("Copiar para…", "Copy to…")}</option>
                         {cameraNames
-                          .filter((c) => c !== inspectorCam)
+                          .filter((c) => c !== activeCam)
                           .map((c) => (
                             <option key={c} value={c}>
                               {c}
@@ -503,8 +589,19 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
                       </button>
                     </>
                   )}
-                  <button type="button" className="nvr-btn sm danger" onClick={removeSelected}>
-                    {tr("Excluir", "Delete")}
+                  <button
+                    type="button"
+                    className="nvr-btn sm danger"
+                    onClick={() =>
+                      confirmOrArm(
+                        `delete-item:${selectedItem.ref.kind}:${selectedItem.ref.key}`,
+                        removeSelected
+                      )
+                    }
+                  >
+                    {isArmed(`delete-item:${selectedItem.ref.kind}:${selectedItem.ref.key}`)
+                      ? tr("Confirmar?", "Click again to confirm")
+                      : tr("Excluir", "Delete")}
                   </button>
                 </div>
               </div>
@@ -533,11 +630,28 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
                 : []
             }
             onCommit={commit}
-            onCancel={cancelEdit}
-            onChangeType={() => {
-              setDraftPoints([]);
-              setMode({ name: "pick" });
+            onCancel={() => {
+              if (shouldGuardDraftPolygonSwitch(draftPoints)) {
+                confirmOrArm("cancel-edit", cancelEdit);
+              } else {
+                cancelEdit();
+              }
             }}
+            cancelArmed={isArmed("cancel-edit") || isArmed("escape-cancel")}
+            onChangeType={() => {
+              if (shouldGuardDraftPolygonSwitch(draftPoints)) {
+                confirmOrArm("change-type", () => {
+                  setDraftPoints([]);
+                  setMode({ name: "pick" });
+                });
+              } else {
+                setDraftPoints([]);
+                setMode({ name: "pick" });
+              }
+            }}
+            changeTypeArmed={isArmed("change-type")}
+            isArmed={isArmed}
+            confirmOrArm={confirmOrArm}
             detW={detW}
             detH={detH}
           />
@@ -551,29 +665,83 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
               <span key={h}>{h}</span>
             ))}
           </div>
-          {mode.name === "list" && tab === "areas" && (
-            <button
-              type="button"
-              aria-pressed={rulerOn}
-              className={`nvr-btn sm ${rulerOn ? "active" : ""}`}
-              onClick={() => {
-                setRulerOn((v) => !v);
-                setRulerPoints([]);
-              }}
-            >
-              {tr("Régua", "Ruler")}
-            </button>
-          )}
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+            {drawing && (
+              <div
+                className="nvr-segmented"
+                role="group"
+                data-testid="zs-stage-mode-toggle"
+                aria-label={tr("Modo de interação no vídeo", "Video stage interaction mode")}
+              >
+                <button
+                  type="button"
+                  aria-pressed={stageInteractionMode === "plot"}
+                  className={`nvr-btn sm ${stageInteractionMode === "plot" ? "active" : ""}`}
+                  onClick={() => setStageInteractionMode("plot")}
+                >
+                  {tr("Marcar", "Plot")}
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={stageInteractionMode === "pan_zoom"}
+                  className={`nvr-btn sm ${stageInteractionMode === "pan_zoom" ? "active" : ""}`}
+                  onClick={() => setStageInteractionMode("pan_zoom")}
+                >
+                  {tr("Zoom / Mover", "Pan / Zoom")}
+                </button>
+              </div>
+            )}
+            {mode.name === "list" && tab === "areas" && (
+              <button
+                type="button"
+                aria-pressed={rulerOn}
+                className={`nvr-btn sm ${rulerOn ? "active" : ""}`}
+                onClick={() => {
+                  setRulerOn((v) => !v);
+                  setStageInteractionMode("plot");
+                  setRulerPoints([]);
+                }}
+              >
+                {tr("Régua", "Ruler")}
+              </button>
+            )}
+          </div>
         </div>
-        <div className="nvr-zs-video nvr-cam-tile">
+        <div
+          className="nvr-zs-video nvr-cam-tile"
+          style={{
+            cursor: drawing && stageInteractionMode === "plot" ? "crosshair" : undefined,
+          }}
+          onPointerDownCapture={
+            drawing && stageInteractionMode === "plot"
+              ? (e) => {
+                  if ((e.target as HTMLElement).closest("[data-zoom-hud]")) return;
+                  e.stopPropagation();
+                }
+              : undefined
+          }
+          onClick={
+            drawing && stageInteractionMode === "plot"
+              ? (e) => {
+                  if ((e.target as HTMLElement).closest("[data-zoom-hud]")) return;
+                  const rect =
+                    plotAnchorRef.current?.getBoundingClientRect() ??
+                    e.currentTarget.getBoundingClientRect();
+                  const [nx, ny] = mapClientPointToFrame(e.clientX, e.clientY, rect);
+                  onPlotPoint(nx, ny);
+                }
+              : undefined
+          }
+        >
           <LiveMsePlayer
-            camera={inspectorCam}
+            camera={activeCam}
             useMainStream={false}
             cameraConfig={stageCamCfg}
             showVectors={true}
+            pushToTalkSupported={false}
             draftPoints={editing ? draftPoints : []}
             draftColor={editing ? KIND_COLOR[editing.kind] : undefined}
-            onPlotPoint={drawing ? onPlotPoint : undefined}
+            onPlotPoint={undefined}
             stageOverlay={overlay}
           />
         </div>
@@ -651,13 +819,20 @@ const StageOverlay: React.FC<{
   stateRois: Array<{ name: string; crop: [number, number, number, number]; current?: string }>;
   detW: number;
   detH: number;
-}> = ({ pt, editing, draftPoints, selected, rulerPoints, stateRois, detW, detH }) => {
+  plotAnchorRef: React.RefObject<HTMLDivElement | null>;
+}> = ({ pt, editing, draftPoints, selected, rulerPoints, stateRois, detW, detH, plotAnchorRef }) => {
   const pct = (v: number) => `${(v * 100).toFixed(2)}%`;
   const svgPoints = (pts: Point[]) => pts.map(([x, y]) => `${x * 1000},${y * 1000}`).join(" ");
   const showLine = editing?.kind === "line" && draftPoints.length === 2;
   const guide = showLine ? tripwireGuide(draftPoints[0], draftPoints[1]) : null;
+  const selectedTagStyle = selected ? resolveVisionTagStyle(selected.ref.kind) : null;
   return (
     <>
+      <div
+        ref={plotAnchorRef}
+        aria-hidden="true"
+        style={{ position: "absolute", inset: 0, pointerEvents: "none" }}
+      />
       <svg viewBox="0 0 1000 1000" preserveAspectRatio="none" className="nvr-zs-overlay-svg" aria-hidden="true">
         {stateRois.map((r) => (
           <polygon
@@ -718,13 +893,14 @@ const StageOverlay: React.FC<{
           {r.current ? ` · ${r.current}` : ""}
         </span>
       ))}
-      {selected && selected.outline[0] && (
+      {selected && selected.outline[0] && selectedTagStyle && (
         <span
           className="nvr-zs-tag"
           style={{
             left: pct(selected.outline[0][0]),
             top: pct(selected.outline[0][1]),
-            background: KIND_COLOR[selected.ref.kind],
+            background: selectedTagStyle.background,
+            color: selectedTagStyle.color,
             transform: selected.outline[0][1] < 0.06 ? "translate(0, 4px)" : undefined,
           }}
         >
@@ -974,10 +1150,28 @@ const EditorPanel: React.FC<{
   takenNames: string[];
   onCommit: () => void;
   onCancel: () => void;
+  cancelArmed: boolean;
   onChangeType: () => void;
+  changeTypeArmed: boolean;
+  isArmed: (key: string) => boolean;
+  confirmOrArm: (key: string, onConfirmed: () => void) => boolean;
   detW: number;
   detH: number;
-}> = ({ pt, editor, points, onPatch, onSetPoints, takenNames, onCommit, onCancel, onChangeType }) => {
+}> = ({
+  pt,
+  editor,
+  points,
+  onPatch,
+  onSetPoints,
+  takenNames,
+  onCommit,
+  onCancel,
+  cancelArmed,
+  onChangeType,
+  changeTypeArmed,
+  isArmed,
+  confirmOrArm,
+}) => {
   const tr = (a: string, b: string) => (pt ? a : b);
   const isNew = editor.originalKey === null;
   const k = editor.kind;
@@ -1032,13 +1226,23 @@ const EditorPanel: React.FC<{
         </div>
         {isNew && (
           <button type="button" className="nvr-zs-link" onClick={onChangeType}>
-            {tr("Trocar tipo", "Change type")}
+            {changeTypeArmed
+              ? tr("Confirmar descarte?", "Confirm discard?")
+              : tr("Trocar tipo", "Change type")}
           </button>
         )}
       </div>
       <div className="nvr-zs-scroll">
         {isMaskKind(k) && (
-          <MaskKindPicker pt={pt} kind={k} locked={!isNew} onChange={(kind) => onPatch({ kind })} />
+          <MaskKindPicker
+            pt={pt}
+            kind={k}
+            locked={!isNew}
+            hasDraftPoints={shouldGuardDraftPolygonSwitch(points)}
+            isArmed={isArmed}
+            confirmOrArm={confirmOrArm}
+            onChange={(kind) => onPatch({ kind })}
+          />
         )}
 
         {k === "state" && (
@@ -1127,8 +1331,15 @@ const EditorPanel: React.FC<{
                   {tr("Desfazer ponto", "Undo point")}
                 </button>
               )}
-              <button type="button" className="nvr-btn sm" disabled={points.length === 0} onClick={() => onSetPoints([])}>
-                {tr("Recomeçar", "Start over")}
+              <button
+                type="button"
+                className={`nvr-btn sm ${isArmed("start-over") ? "danger" : ""}`}
+                disabled={points.length === 0}
+                onClick={() => confirmOrArm("start-over", () => onSetPoints([]))}
+              >
+                {isArmed("start-over")
+                  ? tr("Confirmar?", "Confirm?")
+                  : tr("Recomeçar", "Start over")}
               </button>
             </span>
           </div>
@@ -1333,8 +1544,14 @@ const EditorPanel: React.FC<{
           <button type="button" className="nvr-btn primary nvr-zs-grow" onClick={onCommit}>
             {isNew ? tr("Adicionar à câmera", "Add to camera") : tr("Aplicar alterações", "Apply changes")}
           </button>
-          <button type="button" className="nvr-btn" onClick={onCancel}>
-            {tr("Cancelar", "Cancel")}
+          <button
+            type="button"
+            className={`nvr-btn ${cancelArmed ? "danger" : ""}`}
+            onClick={onCancel}
+          >
+            {cancelArmed
+              ? tr("Confirmar?", "Click again to confirm")
+              : tr("Cancelar", "Cancel")}
           </button>
         </div>
         <span className="nvr-zs-muted">
@@ -1349,8 +1566,11 @@ const MaskKindPicker: React.FC<{
   pt: boolean;
   kind: MaskKind;
   locked: boolean;
+  hasDraftPoints: boolean;
+  isArmed: (key: string) => boolean;
+  confirmOrArm: (key: string, onConfirmed: () => void) => boolean;
   onChange: (k: MaskKind) => void;
-}> = ({ pt, kind, locked, onChange }) => {
+}> = ({ pt, kind, locked, hasDraftPoints, isArmed, confirmOrArm, onChange }) => {
   const rows: Array<[MaskKind, string, string, string]> = [
     [
       "motion_mask",
@@ -1375,19 +1595,29 @@ const MaskKindPicker: React.FC<{
     <section className="nvr-zs-section">
       <h4>{pt ? "TIPO DE MÁSCARA" : "MASK TYPE"}</h4>
       <div className="nvr-segmented nvr-zs-masktabs" role="group" aria-label={pt ? "Tipo de máscara" : "Mask type"}>
-        {rows.map(([k, key]) => (
-          <button
-            key={k}
-            type="button"
-            aria-pressed={kind === k}
-            disabled={locked && kind !== k}
-            className={`nvr-btn ${kind === k ? "active" : ""}`}
-            onClick={() => onChange(k)}
-          >
-            <span>{maskKindLabel(k, pt)}</span>
-            <span className="mono nvr-zs-muted">{key}</span>
-          </button>
-        ))}
+        {rows.map(([k, key]) => {
+          const armed = isArmed(`mask-switch:${k}`);
+          return (
+            <button
+              key={k}
+              type="button"
+              aria-pressed={kind === k}
+              disabled={locked && kind !== k}
+              className={`nvr-btn ${kind === k ? "active" : armed ? "danger" : ""}`}
+              onClick={() => {
+                if (k === kind) return;
+                if (hasDraftPoints) {
+                  confirmOrArm(`mask-switch:${k}`, () => onChange(k));
+                } else {
+                  onChange(k);
+                }
+              }}
+            >
+              <span>{armed ? (pt ? "Confirmar?" : "Confirm?") : maskKindLabel(k, pt)}</span>
+              <span className="mono nvr-zs-muted">{key}</span>
+            </button>
+          );
+        })}
       </div>
       <details className="nvr-zs-details" open>
         <summary>{pt ? "Qual a diferença?" : "What's the difference?"}</summary>

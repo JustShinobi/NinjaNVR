@@ -33,6 +33,7 @@ import {
   type ConfigWorkbenchSession,
   useConfigWorkbenchSession,
 } from "../../utils/configWorkbench";
+import { useTwoStepConfirm } from "./vision/useTwoStepConfirm";
 
 const RESERVED_OBJECT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -458,7 +459,6 @@ export const ConsoleUiSection: React.FC<{
             className="nvr-btn sm"
             onClick={() => {
               resetUiPreferences();
-              setLocale("en");
               notify(
                 isPt
                   ? "Preferências de interface restauradas para o padrão"
@@ -673,6 +673,7 @@ export const ChannelsStreamsSection: React.FC<{
   const isPt = locale === "pt";
   const contextWorkbench = useConfigWorkbenchSession();
   const activeWorkbench = workbenchSession ?? contextWorkbench;
+  const { isArmed, confirmOrArm, clearArmed } = useTwoStepConfirm(3000);
   const [newCamName, setNewCamName] = useState("");
   const [newCamMainUrl, setNewCamMainUrl] = useState("");
   const [newCamSubUrl, setNewCamSubUrl] = useState("");
@@ -785,10 +786,11 @@ export const ChannelsStreamsSection: React.FC<{
     setHwProbeResult(inspectorCam ? getCachedCameraHardware(inspectorCam) : null);
     setCamLogsBusy(false);
     setCamLogsReport(null);
+    clearArmed();
     if (typeof window !== "undefined" && inspectorCam) {
       void handleRunHardwareDiscovery(true);
     }
-  }, [inspectorCam]);
+  }, [inspectorCam, clearArmed]);
 
   React.useEffect(() => {
     return () => {
@@ -1219,21 +1221,41 @@ export const ChannelsStreamsSection: React.FC<{
                     <td onClick={(e) => e.stopPropagation()}>
                       <button
                         type="button"
-                        className="nvr-btn danger sm"
+                        className="nvr-btn danger mono sm"
                         disabled={camKeys.length <= 1}
-                        title="Remove camera from configuration"
+                        aria-label={
+                          isArmed(`delete-cam:${camKey}`)
+                            ? isPt
+                              ? `Confirmar remoção de ${camKey}`
+                              : `Click again to confirm removing ${camKey}`
+                            : `Remove camera ${camKey}`
+                        }
+                        title={
+                          isArmed(`delete-cam:${camKey}`)
+                            ? isPt
+                              ? "Clique novamente para confirmar"
+                              : "Click again to confirm"
+                            : "Remove camera from configuration"
+                        }
                         onClick={() => {
-                          updateDraft((next) => {
-                            delete next.cameras[camKey];
+                          confirmOrArm(`delete-cam:${camKey}`, () => {
+                            updateDraft((next) => {
+                              delete next.cameras[camKey];
+                            });
+                            const remaining = camKeys.filter((k) => k !== camKey);
+                            if (inspectorCam === camKey && remaining.length > 0) {
+                              setInspectorCam(remaining[0]);
+                            }
+                            notify(`Removed camera '${camKey}' from draft`);
                           });
-                          const remaining = camKeys.filter((k) => k !== camKey);
-                          if (inspectorCam === camKey && remaining.length > 0) {
-                            setInspectorCam(remaining[0]);
-                          }
-                          notify(`Removed camera '${camKey}' from draft`);
                         }}
                       >
                         <Trash2 size={11} />
+                        {isArmed(`delete-cam:${camKey}`)
+                          ? isPt
+                            ? "Confirmar?"
+                            : "Click again to confirm"
+                          : null}
                       </button>
                     </td>
                   </tr>
@@ -1302,15 +1324,29 @@ export const ChannelsStreamsSection: React.FC<{
                     </span>
                     <button
                       type="button"
-                      className="nvr-btn danger sm"
+                      className="nvr-btn danger mono sm"
                       disabled={(activeCamCfg.ffmpeg?.inputs?.length || 0) <= 1}
+                      title={
+                        isArmed(`delete-inp:${inspectorCam}:${idx}`)
+                          ? isPt
+                            ? "Clique novamente para confirmar"
+                            : "Click again to confirm"
+                          : "Remove stream input"
+                      }
                       onClick={() =>
-                        updateDraft((next) => {
-                          next.cameras[inspectorCam].ffmpeg?.inputs.splice(idx, 1);
+                        confirmOrArm(`delete-inp:${inspectorCam}:${idx}`, () => {
+                          updateDraft((next) => {
+                            next.cameras[inspectorCam].ffmpeg?.inputs.splice(idx, 1);
+                          });
                         })
                       }
                     >
                       <Trash2 size={10} />
+                      {isArmed(`delete-inp:${inspectorCam}:${idx}`)
+                        ? isPt
+                          ? "Confirmar?"
+                          : "Confirm?"
+                        : null}
                     </button>
                   </div>
                   <input
@@ -1452,7 +1488,7 @@ export const ChannelsStreamsSection: React.FC<{
                 <div
                   style={{
                     display: "grid",
-                    gridTemplateColumns: "minmax(0, 1.5fr) minmax(0, 0.7fr) minmax(0, 0.8fr)",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
                     gap: 6,
                   }}
                 >
@@ -1534,7 +1570,7 @@ export const ChannelsStreamsSection: React.FC<{
                 <div
                   style={{
                     display: "grid",
-                    gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr)",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
                     gap: 6,
                   }}
                 >
@@ -1644,7 +1680,7 @@ export const ChannelsStreamsSection: React.FC<{
                 <div
                   style={{
                     display: "grid",
-                    gridTemplateColumns: "minmax(0, 1fr) minmax(0, 0.7fr) minmax(0, 1fr)",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
                     gap: 6,
                     marginTop: 2,
                   }}
@@ -2688,12 +2724,20 @@ export const ChannelsStreamsSection: React.FC<{
                                   disabled={hwProbeBusy}
                                   aria-label={`Reboot Camera ${inspectorCam}`}
                                   onClick={() =>
-                                    void handleApplyHardwareControl({
-                                      reboot: true,
+                                    confirmOrArm(`reboot-cam:${inspectorCam}`, () => {
+                                      void handleApplyHardwareControl({
+                                        reboot: true,
+                                      });
                                     })
                                   }
                                 >
-                                  {isPt ? "Reiniciar Câmera" : "Reboot Camera"}
+                                  {isArmed(`reboot-cam:${inspectorCam}`)
+                                    ? isPt
+                                      ? "Confirmar?"
+                                      : "Click again to confirm"
+                                    : isPt
+                                    ? "Reiniciar Câmera"
+                                    : "Reboot Camera"}
                                 </button>
                               )}
                             </div>
@@ -2804,7 +2848,7 @@ export const ChannelsStreamsSection: React.FC<{
                   )}
                 </div>
               )}
-              <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)", gap: 8 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 8 }}>
                 {(ffprobeInfo || []).map((probe, pIdx) => {
                   const streams = probe.stdout?.streams || [];
                   const vStream = streams.find((s) => s.width && s.height);
@@ -2903,7 +2947,7 @@ export const ChannelsStreamsSection: React.FC<{
               </span>
             </div>
             <div className="nvr-cfg-card-body">
-              <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1.4fr)", gap: 8 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 8 }}>
                 <input
                   className="nvr-input mono"
                   placeholder={isPt ? "ID da câmera (ex: garagem)" : "Camera ID (e.g. garagem)"}
@@ -3005,16 +3049,30 @@ export const ChannelsStreamsSection: React.FC<{
                     />
                     <button
                       type="button"
-                      className="nvr-btn danger sm"
+                      className="nvr-btn danger mono sm"
+                      title={
+                        isArmed(`delete-go2rtc:${sName}`)
+                          ? isPt
+                            ? "Clique novamente para confirmar"
+                            : "Click again to confirm"
+                          : `Delete go2rtc stream ${sName}`
+                      }
                       onClick={() =>
-                        updateDraft((next) => {
-                          if (next.go2rtc?.streams) {
-                            delete next.go2rtc.streams[sName];
-                          }
+                        confirmOrArm(`delete-go2rtc:${sName}`, () => {
+                          updateDraft((next) => {
+                            if (next.go2rtc?.streams) {
+                              delete next.go2rtc.streams[sName];
+                            }
+                          });
                         })
                       }
                     >
                       <Trash2 size={11} />
+                      {isArmed(`delete-go2rtc:${sName}`)
+                        ? isPt
+                          ? "Confirmar?"
+                          : "Confirm?"
+                        : null}
                     </button>
                   </div>
                 );

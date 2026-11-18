@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useI18n } from "../i18n";
 import { resolveRealCameraSource } from "../store/useNvrStore";
 import {
   CameraConfig,
@@ -121,6 +122,8 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
   mapTheme,
   workbenchSession,
 }) => {
+  const { locale } = useI18n();
+  const isPt = locale === "pt";
   const contextWorkbench = useConfigWorkbenchSession();
   const activeWorkbench = workbenchSession ?? contextWorkbench;
   const [mapEditMode, setMapEditMode] = useState(false);
@@ -575,7 +578,7 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
               onClick={() => setShowMeasurements((v) => !v)}
               title="Toggle metric dimensions (meters & m²) on rooms and walls"
             >
-              Medidas (m)
+              {isPt ? "Medidas (m)" : "Dimensions (m)"}
             </button>
 
             <input
@@ -895,7 +898,7 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
                       }}
                     />
                     <label style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-                      <span>Largura W (m):</span>
+                      <span>{isPt ? "Largura W (m):" : "Width W (m):"}</span>
                       <input
                         type="number"
                         className="nvr-input mono sm"
@@ -924,7 +927,7 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
                       />
                     </label>
                     <label style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-                      <span>Comprimento H (m):</span>
+                      <span>{isPt ? "Comprimento H (m):" : "Length H (m):"}</span>
                       <input
                         type="number"
                         className="nvr-input mono sm"
@@ -1144,7 +1147,7 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
                       </button>
                     ))}
                     <label style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-                      <span>Ângulo (°):</span>
+                      <span>{isPt ? "Ângulo (°):" : "Angle (°):"}</span>
                       <input
                         type="number"
                         className="nvr-input mono sm"
@@ -1662,7 +1665,7 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
             const rw = room.w * 1000;
             const rh = room.h * 600;
             const isRoomSelected = selectedRoomId === room.id;
-            const strokeCol = room.color || "#38bdf8";
+            const strokeCol = room.color || "var(--signal-accent-text)";
             const rmMetrics = computeRoomMetrics(
               room,
               floorplanWidthM,
@@ -1734,7 +1737,7 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
                     x={rx + rw / 2}
                     y={ry + rh / 2 + 12}
                     textAnchor="middle"
-                    fill={strokeCol}
+                    fill="var(--signal-accent-text)"
                     fontSize="11"
                     fontFamily="JetBrains Mono, monospace"
                     fontWeight="600"
@@ -1753,7 +1756,7 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
                       x={rx + rw / 2}
                       y={Math.max(14, ry - 6)}
                       textAnchor="middle"
-                      fill="#38bdf8"
+                      fill="var(--signal-accent-text)"
                       fontSize="11"
                       fontFamily="JetBrains Mono, monospace"
                       fontWeight="700"
@@ -1765,7 +1768,7 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
                       x={Math.max(28, rx - 8)}
                       y={ry + rh / 2 + 4}
                       textAnchor="end"
-                      fill="#38bdf8"
+                      fill="var(--signal-accent-text)"
                       fontSize="11"
                       fontFamily="JetBrains Mono, monospace"
                       fontWeight="700"
@@ -1796,7 +1799,7 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
                         y={h.cy - 5}
                         width={10}
                         height={10}
-                        fill="#38bdf8"
+                        fill="var(--signal-accent-text)"
                         stroke={mapTheme.floorplanCamNodeStroke}
                         strokeWidth={1.5}
                         style={{ cursor: h.cursor }}
@@ -2238,7 +2241,7 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
               : hasMotion
               ? "#f59e0b"
               : isSelected
-              ? "#38bdf8"
+              ? "var(--signal-accent-text)"
               : "rgba(56, 189, 248, 0.45)";
 
             return (
@@ -2477,7 +2480,7 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
                 />
               </label>
               <label className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                <div>Alcance (m)</div>
+                <div>{isPt ? "Alcance (m)" : "Range (m)"}</div>
                 <input
                   type="range"
                   min={5}
@@ -2519,7 +2522,9 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
             }}
           >
             <span>
-              ROOMS ({floorplanRooms.length}) // MEDIDAS EM METROS
+              {isPt
+                ? `ROOMS (${floorplanRooms.length}) // MEDIDAS EM METROS`
+                : `ROOMS (${floorplanRooms.length}) // DIMENSIONS IN METERS`}
             </span>
             <button
               type="button"

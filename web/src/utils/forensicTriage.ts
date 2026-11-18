@@ -304,12 +304,52 @@ export function resolveNextBriefingStep(
   return null;
 }
 
+export function isOngoingIncident(
+  endTime: number | null | undefined
+): boolean {
+  return endTime === null || endTime === undefined;
+}
+
+export function resolveAdjacentReviewAfterAck<T extends Pick<ReviewItem, "id">>(
+  visibleReviews: ReadonlyArray<T>,
+  acknowledgedIds: ReadonlyArray<string>,
+  currentActiveId: string | null | undefined,
+  statusFilter: "unreviewed" | "reviewed" | "all"
+): T | null {
+  if (!currentActiveId || visibleReviews.length === 0) {
+    return null;
+  }
+  const ackSet = new Set(acknowledgedIds.filter(Boolean));
+  if (!ackSet.has(currentActiveId)) {
+    return visibleReviews.find((r) => r.id === currentActiveId) ?? null;
+  }
+  const currentIdx = visibleReviews.findIndex((r) => r.id === currentActiveId);
+  if (statusFilter !== "unreviewed") {
+    return currentIdx >= 0 ? visibleReviews[currentIdx] : null;
+  }
+  if (currentIdx < 0) {
+    return visibleReviews.find((r) => !ackSet.has(r.id)) ?? null;
+  }
+  for (let i = currentIdx + 1; i < visibleReviews.length; i += 1) {
+    if (!ackSet.has(visibleReviews[i].id)) {
+      return visibleReviews[i];
+    }
+  }
+  for (let i = currentIdx - 1; i >= 0; i -= 1) {
+    if (!ackSet.has(visibleReviews[i].id)) {
+      return visibleReviews[i];
+    }
+  }
+  return null;
+}
+
 export function computeReviewPlaybackWindow(
   startTime: number,
   endTime: number | null | undefined,
   preRollSec: number = 4,
   postRollSec: number = 6,
-  fallbackDurationSec: number = 20
+  fallbackDurationSec: number = 20,
+  nowSec?: number
 ): { startSec: number; endSec: number } {
   const safeStart =
     typeof startTime === "number" && Number.isFinite(startTime) && startTime > 0
@@ -329,16 +369,80 @@ export function computeReviewPlaybackWindow(
     fallbackDurationSec > 0
       ? fallbackDurationSec
       : 20;
+  const startSec = Math.max(0, safeStart - safePre);
+  if (isOngoingIncident(endTime)) {
+    const effectiveNow =
+      typeof nowSec === "number" && Number.isFinite(nowSec) && nowSec > 0
+        ? Math.floor(nowSec)
+        : Math.floor(Date.now() / 1000);
+    const ongoingEnd = Math.max(safeStart + safeFallbackDur, effectiveNow);
+    const endSec = Math.min(
+      startSec + MAX_FORENSIC_EXPORT_WINDOW_SEC,
+      Math.max(startSec + 1, ongoingEnd)
+    );
+    return { startSec, endSec };
+  }
   const baseEnd =
     typeof endTime === "number" && Number.isFinite(endTime) && endTime > safeStart
       ? endTime
       : safeStart + safeFallbackDur;
-  const startSec = Math.max(0, safeStart - safePre);
   const endSec = Math.min(
     startSec + MAX_FORENSIC_EXPORT_WINDOW_SEC,
     Math.max(startSec + 1, baseEnd + safePost)
   );
   return { startSec, endSec };
+}
+
+export interface TwoStepConfirmController {
+  isArmed: (key: string) => boolean;
+  getArmedKey: () => string | null;
+  trigger: (key: string) => "armed" | "confirmed";
+  clear: () => void;
+}
+
+export function createTwoStepConfirmController(
+  timeoutMs: number = 3000,
+  nowMs: () => number = () => Date.now()
+): TwoStepConfirmController {
+  const safeTtl =
+    typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? timeoutMs
+      : 3000;
+  let armedKey: string | null = null;
+  let expiresAtMs = 0;
+
+  const pruneIfExpired = () => {
+    if (armedKey !== null && nowMs() >= expiresAtMs) {
+      armedKey = null;
+      expiresAtMs = 0;
+    }
+  };
+
+  return {
+    isArmed(key: string): boolean {
+      pruneIfExpired();
+      return Boolean(key && armedKey === key);
+    },
+    getArmedKey(): string | null {
+      pruneIfExpired();
+      return armedKey;
+    },
+    trigger(key: string): "armed" | "confirmed" {
+      pruneIfExpired();
+      if (key && armedKey === key) {
+        armedKey = null;
+        expiresAtMs = 0;
+        return "confirmed";
+      }
+      armedKey = key || null;
+      expiresAtMs = armedKey ? nowMs() + safeTtl : 0;
+      return "armed";
+    },
+    clear(): void {
+      armedKey = null;
+      expiresAtMs = 0;
+    },
+  };
 }
 
 export function parseSavedReviewPresets(
@@ -688,6 +792,8 @@ export interface SaveForensicNoteResult {
 }
 
 export interface ToggleFalsePositiveOptions {
+  targetKind?: "event" | "review";
+  targetId?: string;
   getActiveTargetId?: () => string | null | undefined;
   isCancelled?: () => boolean;
 }
@@ -701,8 +807,25 @@ export interface ToggleFalsePositiveResult {
 }
 
 export interface VerifyWithAiOptions {
+  targetKind?: "event" | "review";
+  targetId?: string;
   getActiveTargetId?: () => string | null | undefined;
   isCancelled?: () => boolean;
+}
+
+export interface ToggleEventRetainOptions {
+  targetKind?: "event" | "review";
+  targetId?: string;
+  getActiveTargetId?: () => string | null | undefined;
+  isCancelled?: () => boolean;
+}
+
+export interface ToggleEventRetainResult {
+  stale: boolean;
+  shouldApply: boolean;
+  ok: boolean;
+  nextRetained: boolean;
+  message?: string;
 }
 
 export interface VerifyWithAiResult {
@@ -775,6 +898,11 @@ export interface ForensicTriageController {
     eventId: string,
     options?: VerifyWithAiOptions
   ) => Promise<VerifyWithAiResult>;
+  toggleEventRetain: (
+    eventId: string,
+    currentRetained: boolean,
+    options?: ToggleEventRetainOptions
+  ) => Promise<ToggleEventRetainResult>;
   addEventToDataset: (
     params: AddEventToDatasetOptions
   ) => Promise<AddEventToDatasetResult>;
@@ -835,7 +963,7 @@ export function createForensicTriageController(
   let mutationSeq = 0;
   let targetEpoch = 0;
   const opSeqByKind: Record<
-    "face" | "plate" | "note" | "falsePositive" | "verifyAi" | "dataset",
+    "face" | "plate" | "note" | "falsePositive" | "verifyAi" | "retain" | "dataset",
     number
   > = {
     face: 0,
@@ -843,6 +971,7 @@ export function createForensicTriageController(
     note: 0,
     falsePositive: 0,
     verifyAi: 0,
+    retain: 0,
     dataset: 0,
   };
   const activeTargetByKind: Record<"event" | "review", string | null> = {
@@ -879,7 +1008,7 @@ export function createForensicTriageController(
   const getMutationSequence = (): number => mutationSeq;
 
   const evaluateMutationFreshness = (
-    opKind: "face" | "plate" | "note" | "falsePositive" | "verifyAi" | "dataset",
+    opKind: "face" | "plate" | "note" | "falsePositive" | "verifyAi" | "retain" | "dataset",
     reqEpoch: number,
     reqOpSeq: number,
     targetKind: "event" | "review",
@@ -1564,6 +1693,9 @@ export function createForensicTriageController(
     const reqOpSeq = ++opSeqByKind.falsePositive;
     const reqEpoch = targetEpoch;
 
+    const targetKind = options?.targetKind ?? "event";
+    const targetId = (options?.targetId || cleanEventId).trim();
+
     let res = await fetchFn(
       `/api/events/${encodeURIComponent(cleanEventId)}/false_positive`,
       {
@@ -1573,6 +1705,17 @@ export function createForensicTriageController(
         body: JSON.stringify({ false_positive: desiredFp }),
       }
     );
+    if (res.status === 404 || res.status === 405) {
+      res = await fetchFn(
+        `/api/events/${encodeURIComponent(cleanEventId)}/false_positive`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ false_positive: desiredFp }),
+        }
+      );
+    }
     if (res.status === 404 || res.status === 405) {
       res = await fetchFn(
         `/api/events/${encodeURIComponent(cleanEventId)}/false-positive`,
@@ -1607,8 +1750,8 @@ export function createForensicTriageController(
       "falsePositive",
       reqEpoch,
       reqOpSeq,
-      "event",
-      cleanEventId,
+      targetKind,
+      targetId,
       res.ok,
       options?.getActiveTargetId,
       options?.isCancelled
@@ -1642,6 +1785,9 @@ export function createForensicTriageController(
     const reqOpSeq = ++opSeqByKind.verifyAi;
     const reqEpoch = targetEpoch;
 
+    const targetKind = options?.targetKind ?? "event";
+    const targetId = (options?.targetId || cleanEventId).trim();
+
     const res = await fetchFn(
       `/api/events/${encodeURIComponent(cleanEventId)}/verify-ai`,
       {
@@ -1660,8 +1806,8 @@ export function createForensicTriageController(
       "verifyAi",
       reqEpoch,
       reqOpSeq,
-      "event",
-      cleanEventId,
+      targetKind,
+      targetId,
       Boolean(res.ok && rec),
       options?.getActiveTargetId,
       options?.isCancelled
@@ -1739,6 +1885,74 @@ export function createForensicTriageController(
         ? { falsePositive: Boolean(rec.false_positive) }
         : {}),
       aiVerification,
+    };
+  };
+
+  const toggleEventRetain = async (
+    eventId: string,
+    currentRetained: boolean,
+    options?: ToggleEventRetainOptions
+  ): Promise<ToggleEventRetainResult> => {
+    const cleanEventId = (eventId || "").trim();
+    const desiredRetained = !currentRetained;
+    if (!cleanEventId) {
+      return {
+        stale: false,
+        shouldApply: false,
+        ok: false,
+        nextRetained: currentRetained,
+      };
+    }
+
+    mutationSeq += 1;
+    const reqOpSeq = ++opSeqByKind.retain;
+    const reqEpoch = targetEpoch;
+    const targetKind = options?.targetKind ?? "event";
+    const targetId = (options?.targetId || cleanEventId).trim();
+
+    const res = await fetchFn(
+      `/api/events/${encodeURIComponent(cleanEventId)}/retain`,
+      {
+        method: desiredRetained ? "POST" : "DELETE",
+        credentials: "include",
+      }
+    );
+
+    const rawData = await res.json().catch(() => null);
+    const rec =
+      rawData && typeof rawData === "object"
+        ? (rawData as Record<string, unknown>)
+        : null;
+    const resolvedRetained =
+      rec && typeof rec.retain_indefinitely === "boolean"
+        ? rec.retain_indefinitely
+        : res.ok
+        ? desiredRetained
+        : currentRetained;
+    const message =
+      rec && typeof rec.message === "string"
+        ? rec.message
+        : rec && typeof rec.error === "string"
+        ? rec.error
+        : undefined;
+
+    const { stale, shouldApply } = evaluateMutationFreshness(
+      "retain",
+      reqEpoch,
+      reqOpSeq,
+      targetKind,
+      targetId,
+      res.ok,
+      options?.getActiveTargetId,
+      options?.isCancelled
+    );
+
+    return {
+      stale,
+      shouldApply,
+      ok: res.ok,
+      nextRetained: resolvedRetained,
+      ...(message ? { message } : {}),
     };
   };
 
@@ -2102,6 +2316,7 @@ export function createForensicTriageController(
     saveForensicNote,
     toggleFalsePositive,
     verifyWithAi,
+    toggleEventRetain,
     addEventToDataset,
     loadFilterPresets,
     saveFilterPreset,

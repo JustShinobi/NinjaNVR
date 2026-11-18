@@ -117,6 +117,14 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   );
   const [scope, setScope] = useState<"global" | string>("camera");
   const [visionReviewOpen, setVisionReviewOpen] = useState(false);
+  const [pendingYamlExitCategory, setPendingYamlExitCategory] =
+    useState<SettingsCategory | null>(null);
+  const [pendingDraftSwitch, setPendingDraftSwitch] = useState<
+    | { kind: "camera"; cam: string; setCameraScope?: boolean }
+    | { kind: "category"; cat: SettingsCategory }
+    | { kind: "scope_global" }
+    | null
+  >(null);
 
   const contextSession = useConfigWorkbenchSession();
   const sharedSession = workbenchSession ?? contextSession;
@@ -141,6 +149,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
     rawYaml: sessionRawYaml,
     yamlStale,
     isDirty,
+    hasUnsavedRawEdits,
     isSaving,
     saveOutcome,
   } = useConfigWorkbenchSnapshot(session);
@@ -173,6 +182,29 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   }, [sharedSession, session, rawYaml, isDirty, isSaving]);
 
   useEffect(() => {
+    if (!isDirty && draftPoints.length === 0) return;
+    if (typeof window === "undefined") return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [isDirty, draftPoints.length]);
+
+  useEffect(() => {
+    if (draftPoints.length === 0 && pendingDraftSwitch !== null) {
+      setPendingDraftSwitch(null);
+    }
+  }, [draftPoints.length, pendingDraftSwitch]);
+
+  useEffect(() => {
+    if (!hasUnsavedRawEdits && pendingYamlExitCategory !== null) {
+      setPendingYamlExitCategory(null);
+    }
+  }, [hasUnsavedRawEdits, pendingYamlExitCategory]);
+
+  useEffect(() => {
     const subTabChanged = prevZonesSubTabRef.current !== zonesSubTab;
     prevZonesSubTabRef.current = zonesSubTab;
     if (subTabChanged) {
@@ -183,7 +215,13 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
         }
         setActiveCategory("yaml");
       } else if (zonesSubTab === "visual" && activeCategory === "yaml") {
-        setActiveCategory("vision");
+        if (hasUnsavedRawEdits) {
+          setPendingYamlExitCategory("vision");
+          setZonesSubTab("yaml");
+          prevZonesSubTabRef.current = "yaml";
+        } else {
+          setActiveCategory("vision");
+        }
       }
       return;
     }
@@ -197,9 +235,11 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
     zonesSubTab,
     activeCategory,
     yamlStale,
+    hasUnsavedRawEdits,
     session,
     sharedSession,
     setRawYaml,
+    setZonesSubTab,
   ]);
 
   const allCamKeys = Object.keys(draftConfig?.cameras || {});
@@ -323,12 +363,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
     session.hydrateRawYamlFromServer(syncedYaml);
   };
 
-  const switchInspectorCamera = (cam: string) => {
-    setInspectorCam(cam);
-    setDraftPoints([]);
-  };
-
-  const selectCategory = (cat: SettingsCategory) => {
+  const applyCategorySwitch = (cat: SettingsCategory) => {
     if (cat === "yaml") {
       const syncedYaml = session.ensureDraftYamlSynced();
       if (!sharedSession && syncedYaml) {
@@ -337,10 +372,74 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
     }
     const nextSubTab = cat === "yaml" ? "yaml" : "visual";
     prevZonesSubTabRef.current = nextSubTab;
+    setPendingYamlExitCategory(null);
+    setPendingDraftSwitch(null);
     setActiveCategory(cat);
     setVisionReviewOpen(false);
     setZonesSubTab(nextSubTab);
     setDraftPoints([]);
+  };
+
+  const switchInspectorCamera = (cam: string, setCameraScope = false) => {
+    if (cam === effectiveInspectorCam && (!setCameraScope || scope !== "global")) {
+      return;
+    }
+    if (draftPoints.length > 0) {
+      if (
+        pendingDraftSwitch?.kind === "camera" &&
+        pendingDraftSwitch.cam === cam
+      ) {
+        if (setCameraScope) setScope("camera");
+        setPendingDraftSwitch(null);
+        setInspectorCam(cam);
+        setDraftPoints([]);
+        return;
+      }
+      setPendingDraftSwitch({ kind: "camera", cam, setCameraScope });
+      return;
+    }
+    if (setCameraScope) setScope("camera");
+    setInspectorCam(cam);
+    setDraftPoints([]);
+  };
+
+  const selectCategory = (cat: SettingsCategory) => {
+    if (cat === activeCategory) {
+      setPendingYamlExitCategory(null);
+      return;
+    }
+    if (activeCategory === "yaml" && cat !== "yaml" && hasUnsavedRawEdits) {
+      setPendingYamlExitCategory(cat);
+      return;
+    }
+    if (draftPoints.length > 0) {
+      if (
+        pendingDraftSwitch?.kind === "category" &&
+        pendingDraftSwitch.cat === cat
+      ) {
+        applyCategorySwitch(cat);
+        return;
+      }
+      setPendingDraftSwitch({ kind: "category", cat });
+      return;
+    }
+    applyCategorySwitch(cat);
+  };
+
+  const confirmPendingDraftSwitch = () => {
+    if (!pendingDraftSwitch) return;
+    const action = pendingDraftSwitch;
+    setPendingDraftSwitch(null);
+    if (action.kind === "camera") {
+      if (action.setCameraScope) setScope("camera");
+      setInspectorCam(action.cam);
+      setDraftPoints([]);
+    } else if (action.kind === "scope_global") {
+      setScope("global");
+      setDraftPoints([]);
+    } else {
+      applyCategorySwitch(action.cat);
+    }
   };
 
   const effectiveSavedConfig = baselineConfig ?? config;
@@ -519,6 +618,17 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                   type="button"
                   className={`nvr-btn mono ${scope === "global" ? "active" : ""} sm`}
                   onClick={() => {
+                    if (scope === "global") return;
+                    if (draftPoints.length > 0) {
+                      if (pendingDraftSwitch?.kind === "scope_global") {
+                        setPendingDraftSwitch(null);
+                        setScope("global");
+                        setDraftPoints([]);
+                        return;
+                      }
+                      setPendingDraftSwitch({ kind: "scope_global" });
+                      return;
+                    }
                     setScope("global");
                     setDraftPoints([]);
                   }}
@@ -529,8 +639,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                   cameras={displayCams}
                   selectedCamera={scope === "global" ? "" : effectiveInspectorCam}
                   onSelect={(cam) => {
-                    setScope("camera");
-                    switchInspectorCamera(cam);
+                    switchInspectorCamera(cam, true);
                   }}
                   cameraGroups={draftConfig?.camera_groups}
                   ariaLabel="Settings camera scope selector"
@@ -706,6 +815,125 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
           </div>
         </div>
 
+        {pendingYamlExitCategory && (
+          <div
+            role="alertdialog"
+            aria-label={
+              isPt
+                ? "Edições não salvas no Raw config.yml"
+                : "Unsaved Raw config.yml edits"
+            }
+            data-testid="raw-yaml-unsaved-guard"
+            className="mono"
+            style={{
+              padding: "10px 14px",
+              background: "var(--signal-motion-tint)",
+              borderBottom: "1px solid var(--signal-motion-border)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              flexWrap: "wrap",
+              gap: 10,
+              fontSize: "var(--text-xs)",
+            }}
+          >
+            <span style={{ color: "var(--text-primary)", fontWeight: 600 }}>
+              {isPt
+                ? "Você possui edições não salvas no Raw config.yml. Salve ou descarte antes de trocar para uma aba visual para não sobrescrevê-las."
+                : "You have unsaved edits in Raw config.yml. Save or discard them before switching to a visual tab so your YAML changes are never overwritten."}
+            </span>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+              <button
+                type="button"
+                className="nvr-btn primary sm"
+                disabled={isSaving}
+                onClick={async () => {
+                  const targetCat = pendingYamlExitCategory;
+                  await handleSaveRawYaml("saveonly");
+                  if (!isMountedRef.current) return;
+                  if (!session.getSnapshot().hasUnsavedRawEdits && targetCat) {
+                    applyCategorySwitch(targetCat);
+                  }
+                }}
+              >
+                {isPt ? "Salvar Raw YAML primeiro" : "Save Raw YAML first"}
+              </button>
+              <button
+                type="button"
+                className="nvr-btn danger sm"
+                disabled={isSaving}
+                onClick={() => {
+                  const targetCat = pendingYamlExitCategory;
+                  session.discardRawEdits();
+                  if (!sharedSession) {
+                    setRawYaml(session.getSnapshot().rawYaml);
+                  }
+                  if (targetCat) {
+                    applyCategorySwitch(targetCat);
+                  } else {
+                    setPendingYamlExitCategory(null);
+                  }
+                }}
+              >
+                {isPt ? "Descartar edições Raw YAML" : "Discard Raw YAML edits"}
+              </button>
+              <button
+                type="button"
+                className="nvr-btn sm"
+                onClick={() => setPendingYamlExitCategory(null)}
+              >
+                {isPt ? "Continuar no Raw YAML" : "Stay in Raw YAML"}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {pendingDraftSwitch && draftPoints.length > 0 && (
+          <div
+            role="alertdialog"
+            aria-label={
+              isPt
+                ? "Confirmar descarte de polígono em desenho"
+                : "Confirm discarding in-progress polygon draft"
+            }
+            data-testid="draft-polygon-guard"
+            className="mono"
+            style={{
+              padding: "8px 14px",
+              background: "var(--signal-motion-tint)",
+              borderBottom: "1px solid var(--signal-motion-border)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              flexWrap: "wrap",
+              gap: 10,
+              fontSize: "var(--text-xs)",
+            }}
+          >
+            <span style={{ color: "var(--text-primary)", fontWeight: 600 }}>
+              {isPt
+                ? `Há ${draftPoints.length} vértice(s) não aplicado(s) no vídeo. Descartar o desenho atual e continuar?`
+                : `There are ${draftPoints.length} unapplied polygon vertex point(s). Discard the current draft and switch?`}
+            </span>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+              <button
+                type="button"
+                className="nvr-btn danger sm"
+                onClick={confirmPendingDraftSwitch}
+              >
+                {isPt ? "Confirmar descarte" : "Confirm discard"}
+              </button>
+              <button
+                type="button"
+                className="nvr-btn sm"
+                onClick={() => setPendingDraftSwitch(null)}
+              >
+                {isPt ? "Continuar desenhando" : "Keep drawing"}
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Main Body Content */}
         {activeCategory === "yaml" ? (
           <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
@@ -763,7 +991,12 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                 scope={scope === "global" ? "global" : effectiveInspectorCam}
                 inspectorCam={effectiveInspectorCam}
                 notify={notify}
-                onOpenVectorStudio={() => selectCategory("vision")}
+                onOpenVectorStudio={(targetCam?: string) => {
+                  if (targetCam && displayCams.includes(targetCam)) {
+                    setInspectorCam(targetCam);
+                  }
+                  selectCategory("vision");
+                }}
                 workbenchSession={session}
               />
             )}

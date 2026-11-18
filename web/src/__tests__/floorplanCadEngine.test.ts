@@ -405,7 +405,7 @@ describe("FloorplanCadModule (floorplanCadEngine)", () => {
     expect(html).toContain("TACTICAL FLOORPLAN // SECTOR FOV CONES");
     expect(html).toContain("SECTOR FEED // LOBBY");
     expect(html).toContain("HEADING ANGLE:");
-    expect(html).toContain("ROOMS (0) // MEDIDAS EM METROS");
+    expect(html).toContain("ROOMS (0) // DIMENSIONS IN METERS");
   });
 });
 

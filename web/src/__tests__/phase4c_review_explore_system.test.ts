@@ -154,10 +154,14 @@ describe("Phase 4C — ReviewWorkspace security & regression suite", () => {
       endSec: 1025,
     });
 
-    // Null or NaN end_time falls back cleanly
-    expect(computeReviewPlaybackWindow(1000, null, 4, 6, 20)).toEqual({
+    // Ongoing (null) end_time expands to Math.max(start_time + 20, nowSec); NaN falls back cleanly
+    expect(computeReviewPlaybackWindow(1000, null, 4, 6, 20, 1005)).toEqual({
       startSec: 996,
-      endSec: 1026,
+      endSec: 1020,
+    });
+    expect(computeReviewPlaybackWindow(1000, null, 4, 6, 20, 1090)).toEqual({
+      startSec: 996,
+      endSec: 1090,
     });
     expect(computeReviewPlaybackWindow(1000, Number.NaN, 4, 6, 20)).toEqual({
       startSec: 996,

@@ -241,19 +241,22 @@ export function resolveReviewArchivePlayback(
     review.camera,
     options?.configuredCameras
   );
+  const safeNow = resolveFiniteNowSec(options?.nowSec);
   const incidentBounds = computeReviewPlaybackWindow(
     review.start_time,
     review.end_time,
     4,
     6,
-    20
+    20,
+    safeNow
   );
   const exportWindow = computeReviewPlaybackWindow(
     review.start_time,
     review.end_time,
     5,
     5,
-    20
+    20,
+    safeNow
   );
   const baseWindow: LoadedVodWindow =
     options?.currentWindow &&

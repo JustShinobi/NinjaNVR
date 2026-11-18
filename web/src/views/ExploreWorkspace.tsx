@@ -16,9 +16,13 @@ import { countActiveExploreFilters } from "../utils/liveTileHud";
 import { resolveSafeMediaUrl } from "../utils/mediaUrlPolicy";
 import {
   EventMutationPatch,
+  buildEventsFeedUrl,
+  matchesOperationalDateBounds,
+  parseOperationalDateBoundsSec,
   reconcileDeletedFaceProfile,
   reconcileEventMutation,
 } from "../utils/operationalFeed";
+import { useTwoStepConfirm } from "./settings/vision/useTwoStepConfirm";
 import {
   BatchFaceProgress,
   DEFAULT_LPR_FORMAT_REGEX,
@@ -104,6 +108,8 @@ interface ExploreWorkspaceProps {
   ) => void;
 }
 
+const EXPLORE_PAGE_STEP = 50;
+
 export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   cameraNames,
   filteredEvents,
@@ -118,8 +124,6 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   exploreRetainedOnly,
   setExploreRetainedOnly,
   globalDaysSummary,
-  reviewDateFilter,
-  setReviewDateFilter,
   selectedEvent,
   setSelectedEvent,
   eventViewMode,
@@ -131,7 +135,14 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   notify,
   onReconcileEvents,
 }) => {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
+  const isPt = locale === "pt";
+  const { isArmed, confirmOrArm, clearArmed } = useTwoStepConfirm(3000);
+  const [exploreDateFilter, setExploreDateFilter] = React.useState("");
+  const [dateScopedEvents, setDateScopedEvents] = React.useState<EventItem[] | null>(
+    null
+  );
+  const [visibleLimit, setVisibleLimit] = React.useState<number>(EXPLORE_PAGE_STEP);
   const [showForensic, setShowForensic] = React.useState(false);
   const [eventNoteDraft, setEventNoteDraft] = React.useState("");
   const [aiVerifyBusy, setAiVerifyBusy] = React.useState(false);
@@ -332,7 +343,8 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     debugReplaySeqRef.current += 1;
     setDebugBusy(false);
     setDebugTrace(null);
-  }, [selectedEvent?.id, triageController]);
+    clearArmed();
+  }, [selectedEvent?.id, triageController, clearArmed]);
 
   React.useEffect(() => {
     if (
@@ -783,18 +795,78 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     SavedExploreFilterPreset[]
   >(() => triageController.loadFilterPresets("explore"));
 
+  React.useEffect(() => {
+    const cleanDate = exploreDateFilter.trim();
+    if (!cleanDate) {
+      setDateScopedEvents(null);
+      return;
+    }
+    if (typeof fetch !== "function") return;
+    let cancelled = false;
+    const controller = new AbortController();
+    fetch(buildEventsFeedUrl(cleanDate), {
+      credentials: "include",
+      signal: controller.signal,
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((arr: unknown) => {
+        if (!cancelled && Array.isArray(arr)) {
+          setDateScopedEvents(arr as EventItem[]);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [exploreDateFilter]);
+
+  const baseExploreEvents = React.useMemo(() => {
+    if (!exploreDateFilter) {
+      return filteredEvents;
+    }
+    const source = dateScopedEvents ?? filteredEvents;
+    const bounds = parseOperationalDateBoundsSec(exploreDateFilter);
+    const q = exploreQuery.trim().toLowerCase();
+    return source.filter((ev) => {
+      if (!matchesOperationalDateBounds(ev, bounds)) return false;
+      if (exploreCamera !== "all" && ev.camera !== exploreCamera) return false;
+      if (exploreLabel !== "all" && ev.label !== exploreLabel) return false;
+      if (exploreRetainedOnly && !ev.retain_indefinitely) return false;
+      if (q) {
+        const attrs = Array.isArray(ev.data?.attributes)
+          ? ev.data.attributes.join(" ")
+          : "";
+        const notes = ev.data?.notes || "";
+        const hay = `${ev.id} ${ev.camera} ${ev.label} ${ev.sub_label || ""} ${(
+          ev.zones || []
+        ).join(" ")} ${attrs} ${notes}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [
+    filteredEvents,
+    dateScopedEvents,
+    exploreDateFilter,
+    exploreCamera,
+    exploreLabel,
+    exploreRetainedOnly,
+    exploreQuery,
+  ]);
+
   const availableZones = React.useMemo(() => {
     const set = new Set<string>();
-    for (const ev of filteredEvents) {
+    for (const ev of baseExploreEvents) {
       for (const z of ev.zones || ev.data?.provenance?.zones || []) {
         if (z) set.add(z);
       }
     }
     return Array.from(set).sort();
-  }, [filteredEvents]);
+  }, [baseExploreEvents]);
 
   const visibleEvents = React.useMemo(() => {
-    return filteredEvents.filter((ev) => {
+    return baseExploreEvents.filter((ev) => {
       if (excludeLabel !== "none" && ev.label.toLowerCase() === excludeLabel) {
         return false;
       }
@@ -813,12 +885,54 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
       return true;
     });
   }, [
-    filteredEvents,
+    baseExploreEvents,
     excludeLabel,
     zoneFilter,
     minScoreFilter,
     stationaryFilter,
     plateFilter,
+  ]);
+
+  React.useEffect(() => {
+    setVisibleLimit(EXPLORE_PAGE_STEP);
+  }, [
+    exploreQuery,
+    exploreCamera,
+    exploreLabel,
+    excludeLabel,
+    zoneFilter,
+    minScoreFilter,
+    stationaryFilter,
+    exploreRetainedOnly,
+    plateFilter,
+    exploreDateFilter,
+  ]);
+
+  const pagedEvents = React.useMemo(
+    () => visibleEvents.slice(0, visibleLimit),
+    [visibleEvents, visibleLimit]
+  );
+  const remainingEventsCount = Math.max(
+    0,
+    visibleEvents.length - pagedEvents.length
+  );
+
+  const handleClearAllExploreFilters = React.useCallback(() => {
+    setExploreQuery("");
+    setExploreCamera("all");
+    setExploreLabel("all");
+    setExcludeLabel("none");
+    setZoneFilter("all");
+    setMinScoreFilter(0);
+    setStationaryFilter("all");
+    setExploreRetainedOnly(false);
+    setPlateFilter("");
+    setExploreDateFilter("");
+  }, [
+    setExploreQuery,
+    setExploreCamera,
+    setExploreLabel,
+    setExploreRetainedOnly,
   ]);
 
   const handleSaveExplorePreset = () => {
@@ -840,17 +954,18 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     setPresetName("");
   };
 
-  const activeExploreFilterCount = countActiveExploreFilters({
-    camera: exploreCamera,
-    label: exploreLabel,
-    excludeLabel,
-    zone: zoneFilter,
-    minScore: minScoreFilter,
-    stationary: stationaryFilter,
-    retainedOnly: exploreRetainedOnly,
-    plate: plateFilter,
-    date: reviewDateFilter,
-  });
+  const activeExploreFilterCount =
+    countActiveExploreFilters({
+      camera: exploreCamera,
+      label: exploreLabel,
+      excludeLabel,
+      zone: zoneFilter,
+      minScore: minScoreFilter,
+      stationary: stationaryFilter,
+      retainedOnly: exploreRetainedOnly,
+      plate: plateFilter,
+      date: exploreDateFilter,
+    }) + (exploreQuery.trim() ? 1 : 0);
 
   return (
     <>
@@ -982,14 +1097,24 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
           </button>
           <RecordingCalendarPopover
             daysSummary={globalDaysSummary}
-            selectedDate={reviewDateFilter}
+            selectedDate={exploreDateFilter}
             showTimePicker={false}
             allowClear={true}
             openUpward={false}
             buttonLabelPrefix="Date"
-            onSelectDate={(dateStr) => setReviewDateFilter(dateStr)}
-            onClear={() => setReviewDateFilter("")}
+            onSelectDate={(dateStr) => setExploreDateFilter(dateStr)}
+            onClear={() => setExploreDateFilter("")}
           />
+          {activeExploreFilterCount > 0 && (
+            <button
+              type="button"
+              className="nvr-btn mono sm"
+              data-testid="explore-clear-filters-bar"
+              onClick={handleClearAllExploreFilters}
+            >
+              {isPt ? "Limpar Filtros" : "Clear All Filters"}
+            </button>
+          )}
           <input
             className="nvr-input mono"
             style={{ width: 110, height: 26, fontSize: "var(--text-xs)" }}
@@ -1062,7 +1187,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                 className="nvr-btn mono sm"
                 style={{ height: 20, padding: "0 6px", fontSize: "var(--text-xs)" }}
                 onClick={() => {
-                  const pageIds = visibleEvents.slice(0, 50).map((e) => e.id);
+                  const pageIds = pagedEvents.map((e) => e.id);
                   setSelectedBatchEventIds((prev) =>
                     prev.length === pageIds.length ? [] : pageIds
                   );
@@ -1072,7 +1197,9 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                   ? `Clear (${selectedBatchEventIds.length})`
                   : "Select Page"}
               </button>
-              <span className="mono">TOP 50</span>
+              <span className="mono">
+                {Math.min(visibleLimit, visibleEvents.length)}/{visibleEvents.length}
+              </span>
             </div>
           </div>
           {selectedBatchEventIds.length > 0 && (
@@ -1143,35 +1270,36 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
             </div>
           )}
           <div className="nvr-scroll-y">
-            {visibleEvents.slice(0, 50).map((ev) => {
+            {pagedEvents.map((ev) => {
               const topScore = Math.round(resolveFiniteEventScore(ev, 0.85) * 100);
               const isSelected = selectedEvent?.id === ev.id;
               const isBatchChecked = selectedBatchEventIds.includes(ev.id);
+              const rowDeleteKey = `delete-event-row:${ev.id}`;
+              const rowDeleteArmed = isArmed(rowDeleteKey);
               const matchedExport = findMatchingExport(
                 exportsList,
                 ev.camera,
                 ev.start_time,
                 ev.end_time
               );
+              const effSub =
+                ev.id in localEventSubLabels
+                  ? localEventSubLabels[ev.id]
+                  : ev.sub_label;
+              const subBadge = formatSubLabelBadge(
+                effSub,
+                ev.sub_label_score ?? ev.data?.sub_label_score ?? (effSub ? 1.0 : null)
+              );
               return (
                 <div
                   key={ev.id}
-                  role="button"
-                  tabIndex={0}
                   className={`nvr-list-row ${isSelected ? "is-selected" : ""}`}
-                  onClick={() => setSelectedEvent(ev)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      setSelectedEvent(ev);
-                    }
-                  }}
+                  style={{ cursor: "default" }}
                 >
                   <input
                     type="checkbox"
                     aria-label={`Select event ${ev.id} for batch face assignment`}
                     checked={isBatchChecked}
-                    onClick={(e) => e.stopPropagation()}
                     onChange={(e) => {
                       const checked = e.target.checked;
                       setSelectedBatchEventIds((prev) =>
@@ -1184,55 +1312,63 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                     }}
                     style={{ cursor: "pointer", flexShrink: 0 }}
                   />
-                  <img
-                    src={`/api/events/${encodeURIComponent(ev.id)}/thumbnail.webp`}
-                    alt={ev.label}
-                    width={80}
-                    height={46}
-                    loading="lazy"
+                  <button
+                    type="button"
+                    aria-pressed={isSelected}
+                    onClick={() => setSelectedEvent(ev)}
                     style={{
-                      width: 80,
-                      height: 46,
-                      objectFit: "contain",
-                      background: "var(--video-stage-bg)",
-                      borderRadius: 3,
-                      border: "1px solid var(--border-hairline)",
+                      flex: 1,
+                      minWidth: 0,
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 10,
+                      background: "transparent",
+                      border: "none",
+                      padding: 0,
+                      color: "inherit",
+                      font: "inherit",
+                      textAlign: "left",
+                      cursor: "pointer",
                     }}
-                  />
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div
+                  >
+                    <img
+                      src={`/api/events/${encodeURIComponent(ev.id)}/thumbnail.webp`}
+                      alt={ev.label}
+                      width={80}
+                      height={46}
+                      loading="lazy"
                       style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        gap: 6,
-                        whiteSpace: "nowrap",
+                        width: 80,
+                        height: 46,
+                        objectFit: "contain",
+                        background: "var(--video-stage-bg)",
+                        borderRadius: 3,
+                        border: "1px solid var(--border-hairline)",
+                        flexShrink: 0,
                       }}
-                    >
+                    />
+                    <span style={{ flex: 1, minWidth: 0, display: "block" }}>
                       <span
-                        className="mono"
-                        style={{ fontWeight: 700, textTransform: "uppercase" }}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: 6,
+                          whiteSpace: "nowrap",
+                        }}
                       >
-                        {formatEventLabelWithSubLabel(
-                          ev.label,
-                          ev.id in localEventSubLabels
-                            ? localEventSubLabels[ev.id]
-                            : ev.sub_label,
-                          ev.data?.detected_attributes
-                        )}{" "}
-                        · {topScore}%
-                      </span>
-                      {(() => {
-                        const effSub =
-                          ev.id in localEventSubLabels
-                            ? localEventSubLabels[ev.id]
-                            : ev.sub_label;
-                        const subBadge = formatSubLabelBadge(
-                          effSub,
-                          ev.sub_label_score ?? ev.data?.sub_label_score ?? (effSub ? 1.0 : null)
-                        );
-                        if (!subBadge) return null;
-                        return (
+                        <span
+                          className="mono"
+                          style={{ fontWeight: 700, textTransform: "uppercase" }}
+                        >
+                          {formatEventLabelWithSubLabel(
+                            ev.label,
+                            effSub,
+                            ev.data?.detected_attributes
+                          )}{" "}
+                          · {topScore}%
+                        </span>
+                        {subBadge && (
                           <span
                             className={`nvr-badge mono ${
                               subBadge.isUnknown ? "alert" : "live"
@@ -1245,39 +1381,37 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                           >
                             {subBadge.text}
                           </span>
-                        );
-                      })()}
+                        )}
+                        <span
+                          className="mono"
+                          style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+                        >
+                          {ev.camera.toUpperCase()}
+                        </span>
+                      </span>
                       <span
                         className="mono"
-                        style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+                        style={{
+                          fontSize: "var(--text-xs)",
+                          color: "var(--text-muted)",
+                          marginTop: 3,
+                          whiteSpace: "nowrap",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: 6,
+                        }}
                       >
-                        {ev.camera.toUpperCase()}
-                      </span>
-                    </div>
-                    <div
-                      className="mono"
-                      style={{
-                        fontSize: "var(--text-xs)",
-                        color: "var(--text-muted)",
-                        marginTop: 3,
-                        whiteSpace: "nowrap",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        gap: 6,
-                      }}
-                    >
-                      <span>
-                        {formatDateTime(ev.start_time)} ·{" "}
-                        {typeof ev.end_time === "number" &&
-                        Number.isFinite(ev.end_time) &&
-                        ev.end_time > 0 &&
-                        typeof ev.start_time === "number" &&
-                        Number.isFinite(ev.start_time)
-                          ? `${Math.max(1, Math.round(ev.end_time - ev.start_time))}s`
-                          : t.explore.inProgress}
-                      </span>
-                      <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                        <span>
+                          {formatDateTime(ev.start_time)} ·{" "}
+                          {typeof ev.end_time === "number" &&
+                          Number.isFinite(ev.end_time) &&
+                          ev.end_time > 0 &&
+                          typeof ev.start_time === "number" &&
+                          Number.isFinite(ev.start_time)
+                            ? `${Math.max(1, Math.round(ev.end_time - ev.start_time))}s`
+                            : t.explore.inProgress}
+                        </span>
                         {ev.data?.recognized_license_plate && (
                           <span
                             className="nvr-badge mono"
@@ -1292,43 +1426,107 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                             {ev.data.recognized_license_plate}
                           </span>
                         )}
-                      {matchedExport && (
-                        <button
-                          className="nvr-badge live mono"
-                          style={{
-                            height: 19,
-                            padding: "0 5px",
-                            fontSize: "var(--text-xs)",
-                            cursor: "pointer",
-                          }}
-                          title={`Open exported clip ${matchedExport.name}`}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            if (onOpenExport) {
-                              onOpenExport(matchedExport);
-                            } else {
-                              switchTab("exports");
-                            }
-                          }}
-                        >
-                          EXPORTED
-                        </button>
-                      )}
                       </span>
-                    </div>
+                    </span>
+                  </button>
+                  <div className="nvr-row-actions">
+                    {matchedExport && (
+                      <button
+                        type="button"
+                        className="nvr-badge live mono"
+                        style={{
+                          height: 19,
+                          padding: "0 5px",
+                          fontSize: "var(--text-xs)",
+                          cursor: "pointer",
+                        }}
+                        title={`Open exported clip ${matchedExport.name}`}
+                        onClick={() => {
+                          if (onOpenExport) {
+                            onOpenExport(matchedExport);
+                          } else {
+                            switchTab("exports");
+                          }
+                        }}
+                      >
+                        EXPORTED
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="nvr-btn danger mono"
+                      style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                      aria-label={
+                        rowDeleteArmed
+                          ? isPt
+                            ? `Confirmar exclusão do evento ${ev.id}`
+                            : `Click again to confirm deleting event ${ev.id}`
+                          : `Delete event ${ev.id}`
+                      }
+                      title={
+                        rowDeleteArmed
+                          ? isPt
+                            ? "Clique novamente para confirmar"
+                            : "Click again to confirm"
+                          : "Delete tracked object event"
+                      }
+                      onClick={() => {
+                        confirmOrArm(rowDeleteKey, () => {
+                          void handleEventDelete(ev.id);
+                        });
+                      }}
+                    >
+                      {rowDeleteArmed ? (
+                        isPt ? "Confirmar?" : "Confirm?"
+                      ) : (
+                        <Trash2 size={11} />
+                      )}
+                    </button>
                   </div>
                 </div>
               );
             })}
+            {remainingEventsCount > 0 && (
+              <div style={{ padding: "10px 12px", textAlign: "center" }}>
+                <button
+                  type="button"
+                  className="nvr-btn mono"
+                  data-testid="explore-load-more"
+                  onClick={() => setVisibleLimit((prev) => prev + EXPLORE_PAGE_STEP)}
+                >
+                  {isPt
+                    ? `Mostrar mais 50 (${remainingEventsCount} restantes)`
+                    : `Show 50 more (${remainingEventsCount} remaining)`}
+                </button>
+              </div>
+            )}
             {visibleEvents.length === 0 && (
               <div
                 style={{
                   padding: 24,
                   textAlign: "center",
                   color: "var(--text-muted)",
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  gap: 10,
                 }}
               >
-                No tracked object events match the active filter criteria.
+                <span>
+                  {isPt
+                    ? "Nenhum evento de objeto rastreado corresponde aos filtros ativos."
+                    : "No tracked object events match the active filter criteria."}
+                </span>
+                {(activeExploreFilterCount > 0 || filteredEvents.length > 0) && (
+                  <button
+                    type="button"
+                    className="nvr-btn mono sm"
+                    data-testid="explore-clear-filters-empty"
+                    onClick={handleClearAllExploreFilters}
+                  >
+                    {isPt ? "Limpar Filtros" : "Clear All Filters"}
+                  </button>
+                )}
               </div>
             )}
           </div>
@@ -1503,12 +1701,34 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                     Debug Replay
                   </button>
                   <button
-                    className="nvr-btn danger"
-                    aria-label="Delete tracked object event"
-                    title="Delete tracked object event"
-                    onClick={() => handleEventDelete(selectedEvent.id)}
+                    type="button"
+                    className="nvr-btn danger mono"
+                    aria-label={
+                      isArmed(`delete-event:${selectedEvent.id}`)
+                        ? isPt
+                          ? "Confirmar exclusão do evento"
+                          : "Click again to confirm deleting event"
+                        : "Delete tracked object event"
+                    }
+                    title={
+                      isArmed(`delete-event:${selectedEvent.id}`)
+                        ? isPt
+                          ? "Clique novamente para confirmar"
+                          : "Click again to confirm"
+                        : "Delete tracked object event"
+                    }
+                    onClick={() => {
+                      confirmOrArm(`delete-event:${selectedEvent.id}`, () => {
+                        void handleEventDelete(selectedEvent.id);
+                      });
+                    }}
                   >
                     <Trash2 size={12} />
+                    {isArmed(`delete-event:${selectedEvent.id}`)
+                      ? isPt
+                        ? "Confirmar?"
+                        : "Click again to confirm"
+                      : null}
                   </button>
                 </div>
               </div>

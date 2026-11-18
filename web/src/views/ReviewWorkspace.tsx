@@ -1,5 +1,5 @@
 import React from "react";
-import { Check, Trash2 } from "lucide-react";
+import { Check, Sparkles, Trash2 } from "lucide-react";
 import { useI18n } from "../i18n";
 import { resolveRealCameraSource, useNvrStore } from "../store/useNvrStore";
 import { useCompactViewport } from "../utils/useCompactViewport";
@@ -15,6 +15,7 @@ import {
   reconcileReviewMutation,
 } from "../utils/operationalFeed";
 import {
+  AiVerificationResult,
   EnrolledFaceProfileItem,
   ExportItem,
   RecordingDaySummary,
@@ -31,6 +32,7 @@ import {
 import { createTrimScrubChannel } from "../utils/exportClipFlow";
 import { RecordingCalendarPopover } from "../components/RecordingCalendarPopover";
 import { validateExportTimeWindow } from "./ExportsWorkspace";
+import { useTwoStepConfirm } from "./settings/vision/useTwoStepConfirm";
 import {
   BatchFaceProgress,
   SavedReviewFilterPreset,
@@ -38,17 +40,20 @@ import {
   clearFaceProfileFromReviews,
   computeReviewPlaybackWindow,
   createForensicTriageController,
+  formatAiVerificationBadge,
   formatDetectedAttributePill,
   formatEventLabelWithSubLabel,
   formatLicensePlateBadge,
   formatSubLabelBadge,
   getVisibleReviewPageIds,
+  isOngoingIncident,
   matchesLicensePlateFilter,
   normalizeFaceProfileName,
   normalizeForensicLicensePlate,
   normalizeLicensePlate,
   parseFacesApiResponse,
   parseSavedReviewPresets,
+  resolveAdjacentReviewAfterAck,
   resolveNextBriefingStep,
   resolveReviewThumbUrl,
   shouldApplyReviewMutationResult,
@@ -68,16 +73,39 @@ export {
   formatLicensePlateBadge,
   formatSubLabelBadge,
   getVisibleReviewPageIds,
+  isOngoingIncident,
   matchesLicensePlateFilter,
   normalizeFaceProfileName,
   normalizeForensicLicensePlate,
   normalizeLicensePlate,
   parseFacesApiResponse,
   parseSavedReviewPresets,
+  resolveAdjacentReviewAfterAck,
   resolveNextBriefingStep,
   resolveReviewThumbUrl,
   shouldApplyReviewMutationResult,
 };
+
+const REVIEW_PAGE_STEP = 50;
+const REVIEW_SPEED_STEPS = [0.5, 1, 2, 4] as const;
+
+function isEditableKeyTarget(target: EventTarget | null): boolean {
+  if (!target || typeof target !== "object") return false;
+  const el = target as {
+    tagName?: string;
+    isContentEditable?: boolean;
+    getAttribute?: (name: string) => string | null;
+  };
+  const tag = (el.tagName || "").toLowerCase();
+  if (tag === "input" || tag === "textarea" || tag === "select") {
+    return true;
+  }
+  if (el.isContentEditable) {
+    return true;
+  }
+  const contentEditableAttr = el.getAttribute?.("contenteditable");
+  return contentEditableAttr === "true" || contentEditableAttr === "";
+}
 
 interface ReviewWorkspaceProps {
   cameraNames: string[];
@@ -143,10 +171,27 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   switchTab,
   onReconcileReviews,
 }) => {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
+  const isPt = locale === "pt";
   const playbackSpeed = useNvrStore((s) => s.playbackSpeed);
   const setPlaybackSpeed = useNvrStore((s) => s.setPlaybackSpeed);
   const configuredCameras = useNvrStore((s) => s.config?.cameras);
+  const { isArmed, confirmOrArm, clearArmed } = useTwoStepConfirm(3000);
+  const [visibleLimit, setVisibleLimit] = React.useState<number>(REVIEW_PAGE_STEP);
+  const [reviewEventTriageState, setReviewEventTriageState] = React.useState<
+    Record<
+      string,
+      {
+        falsePositive?: boolean;
+        retained?: boolean;
+        aiVerification?: AiVerificationResult;
+        statusMessage?: string;
+      }
+    >
+  >({});
+  const [reviewAiVerifyBusy, setReviewAiVerifyBusy] = React.useState(false);
+  const [reviewFpBusy, setReviewFpBusy] = React.useState(false);
+  const [reviewRetainBusy, setReviewRetainBusy] = React.useState(false);
   const [reviewPlayhead, setReviewPlayhead] = React.useState<{
     reviewId: string;
     ts: number;
@@ -262,7 +307,11 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     setShareFallbackUrl(null);
     setShareCopied(false);
     setShareCreating(false);
-  }, [activeReview?.id, triageController]);
+    setReviewAiVerifyBusy(false);
+    setReviewFpBusy(false);
+    setReviewRetainBusy(false);
+    clearArmed();
+  }, [activeReview?.id, triageController, clearArmed]);
 
   React.useEffect(() => {
     if (!activeReview) {
@@ -590,6 +639,382 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     });
   }, [filteredReviews, excludeObjectFilter, zoneFilter, plateFilter]);
 
+  React.useEffect(() => {
+    setVisibleLimit(REVIEW_PAGE_STEP);
+  }, [
+    reviewCameraFilter,
+    reviewSeverityFilter,
+    reviewObjectFilter,
+    excludeObjectFilter,
+    zoneFilter,
+    reviewStatusFilter,
+    reviewDateFilter,
+    plateFilter,
+  ]);
+
+  const pagedReviews = React.useMemo(
+    () => visibleFilteredReviews.slice(0, visibleLimit),
+    [visibleFilteredReviews, visibleLimit]
+  );
+  const remainingReviewsCount = Math.max(
+    0,
+    visibleFilteredReviews.length - pagedReviews.length
+  );
+
+  const activeFilterCount = countActiveReviewFilters({
+    camera: reviewCameraFilter,
+    severity: reviewSeverityFilter,
+    object: reviewObjectFilter,
+    status: reviewStatusFilter,
+    date: reviewDateFilter,
+    excludeObject: excludeObjectFilter,
+    zone: zoneFilter,
+    plate: plateFilter,
+  });
+
+  const handleClearAllReviewFilters = React.useCallback(() => {
+    setReviewCameraFilter("all");
+    setReviewSeverityFilter("all");
+    setReviewObjectFilter("all");
+    setExcludeObjectFilter("none");
+    setZoneFilter("all");
+    setReviewDateFilter("");
+    setPlateFilter("");
+    const hasUnreviewed = reviews.some((r) => !r.has_been_reviewed);
+    setReviewStatusFilter(hasUnreviewed ? "unreviewed" : "all");
+  }, [
+    reviews,
+    setReviewCameraFilter,
+    setReviewSeverityFilter,
+    setReviewObjectFilter,
+    setReviewDateFilter,
+    setReviewStatusFilter,
+  ]);
+
+  const handleAcknowledgeReviews = React.useCallback(
+    async (ids: string[], reviewed = true) => {
+      if (ids.length === 0) return;
+      const shouldAdvanceActive = Boolean(
+        reviewed &&
+          reviewStatusFilter === "unreviewed" &&
+          activeReview &&
+          ids.includes(activeReview.id)
+      );
+      const nextActive = shouldAdvanceActive
+        ? resolveAdjacentReviewAfterAck(
+            visibleFilteredReviews,
+            ids,
+            activeReview?.id,
+            reviewStatusFilter
+          )
+        : null;
+      if (shouldAdvanceActive) {
+        if (nextActive) {
+          const nextIdx = visibleFilteredReviews.findIndex(
+            (r) => r.id === nextActive.id
+          );
+          if (nextIdx >= visibleLimit) {
+            setVisibleLimit(nextIdx + REVIEW_PAGE_STEP);
+          }
+        }
+        setActiveReview(nextActive);
+      }
+      await handleMarkReviews(ids, reviewed);
+    },
+    [
+      reviewStatusFilter,
+      activeReview,
+      visibleFilteredReviews,
+      visibleLimit,
+      setActiveReview,
+      handleMarkReviews,
+    ]
+  );
+
+  const handleConfirmDeleteReviews = React.useCallback(
+    async (ids: string[]) => {
+      if (ids.length === 0) return;
+      const deletingActive = Boolean(activeReview && ids.includes(activeReview.id));
+      const nextActive = deletingActive
+        ? resolveAdjacentReviewAfterAck(
+            visibleFilteredReviews,
+            ids,
+            activeReview?.id,
+            "unreviewed"
+          )
+        : null;
+      await handleDeleteReviews(ids);
+      if (deletingActive && isMountedRef.current) {
+        setActiveReview(nextActive);
+      }
+    },
+    [activeReview, visibleFilteredReviews, handleDeleteReviews, setActiveReview]
+  );
+
+  const triggerExportActiveReview = React.useCallback(() => {
+    if (!activeReview) return;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const win = computeReviewPlaybackWindow(
+      activeReview.start_time,
+      activeReview.end_time,
+      5,
+      5,
+      20,
+      nowSec
+    );
+    const checked = validateExportTimeWindow(win.startSec, win.endSec);
+    if (!checked.valid) return;
+    const realReviewCam = resolveRealCameraSource(
+      activeReview.camera,
+      configuredCameras
+    );
+    void handleQuickExport(
+      realReviewCam,
+      checked.startSec,
+      checked.endSec,
+      `${activeReview.camera}_${activeReview.id}`
+    );
+  }, [activeReview, configuredCameras, handleQuickExport]);
+
+  const primaryDetectionEventId = React.useMemo(() => {
+    const dets = (activeReview?.data?.detections || [])
+      .map((d) => d.trim())
+      .filter((d) => d.length > 0);
+    return dets[0] || null;
+  }, [activeReview?.id, activeReview?.data?.detections]);
+
+  const handleToggleReviewFalsePositive = async () => {
+    if (!activeReview || !primaryDetectionEventId || reviewFpBusy) return;
+    const targetReviewId = activeReview.id;
+    const currentFp = Boolean(
+      reviewEventTriageState[targetReviewId]?.falsePositive
+    );
+    triageController.setActiveTarget("review", targetReviewId);
+    setReviewFpBusy(true);
+    try {
+      const result = await triageController.toggleFalsePositive(
+        primaryDetectionEventId,
+        currentFp,
+        {
+          targetKind: "review",
+          targetId: targetReviewId,
+          getActiveTargetId: () => activeReviewIdRef.current,
+          isCancelled: () => !isMountedRef.current,
+        }
+      );
+      if (!isMountedRef.current || result.stale) return;
+      if (result.ok) {
+        setReviewEventTriageState((prev) => ({
+          ...prev,
+          [targetReviewId]: {
+            ...(prev[targetReviewId] || {}),
+            falsePositive: result.nextFp,
+            statusMessage: result.nextFp
+              ? isPt
+                ? "Marcado como Falso Positivo — assinatura espacial salva"
+                : "Marked as False Positive — spatial & dhash64 suppression saved"
+              : isPt
+              ? "Marcação de Falso Positivo removida"
+              : "Cleared False Positive flag",
+          },
+        }));
+      }
+    } catch {
+      // Preserve UI state on transient network failure
+    } finally {
+      if (isMountedRef.current && activeReviewIdRef.current === targetReviewId) {
+        setReviewFpBusy(false);
+      }
+    }
+  };
+
+  const handleVerifyReviewWithAi = async () => {
+    if (!activeReview || !primaryDetectionEventId || reviewAiVerifyBusy) return;
+    const targetReviewId = activeReview.id;
+    triageController.setActiveTarget("review", targetReviewId);
+    setReviewAiVerifyBusy(true);
+    try {
+      const result = await triageController.verifyWithAi(
+        primaryDetectionEventId,
+        {
+          targetKind: "review",
+          targetId: targetReviewId,
+          getActiveTargetId: () => activeReviewIdRef.current,
+          isCancelled: () => !isMountedRef.current,
+        }
+      );
+      if (!isMountedRef.current || result.stale) return;
+      if (result.ok && result.aiVerification) {
+        setReviewEventTriageState((prev) => ({
+          ...prev,
+          [targetReviewId]: {
+            ...(prev[targetReviewId] || {}),
+            aiVerification: result.aiVerification,
+            ...(result.falsePositive !== undefined
+              ? { falsePositive: result.falsePositive }
+              : {}),
+            statusMessage: undefined,
+          },
+        }));
+      } else if (result.error) {
+        setReviewEventTriageState((prev) => ({
+          ...prev,
+          [targetReviewId]: {
+            ...(prev[targetReviewId] || {}),
+            statusMessage: result.error,
+          },
+        }));
+      }
+    } catch {
+      // Preserve UI state on transient network failure
+    } finally {
+      if (isMountedRef.current && activeReviewIdRef.current === targetReviewId) {
+        setReviewAiVerifyBusy(false);
+      }
+    }
+  };
+
+  const handleToggleReviewEventRetain = async () => {
+    if (!activeReview || !primaryDetectionEventId || reviewRetainBusy) return;
+    const targetReviewId = activeReview.id;
+    const currentRetained = Boolean(
+      reviewEventTriageState[targetReviewId]?.retained
+    );
+    triageController.setActiveTarget("review", targetReviewId);
+    setReviewRetainBusy(true);
+    try {
+      const result = await triageController.toggleEventRetain(
+        primaryDetectionEventId,
+        currentRetained,
+        {
+          targetKind: "review",
+          targetId: targetReviewId,
+          getActiveTargetId: () => activeReviewIdRef.current,
+          isCancelled: () => !isMountedRef.current,
+        }
+      );
+      if (!isMountedRef.current || result.stale) return;
+      if (result.ok) {
+        setReviewEventTriageState((prev) => ({
+          ...prev,
+          [targetReviewId]: {
+            ...(prev[targetReviewId] || {}),
+            retained: result.nextRetained,
+            statusMessage: result.nextRetained
+              ? isPt
+                ? "Evento retido indefinidamente"
+                : "Event retained indefinitely"
+              : isPt
+              ? "Trava de retenção removida"
+              : "Event retention lock removed",
+          },
+        }));
+      }
+    } catch {
+      // Preserve UI state on transient network failure
+    } finally {
+      if (isMountedRef.current && activeReviewIdRef.current === targetReviewId) {
+        setReviewRetainBusy(false);
+      }
+    }
+  };
+
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (isEditableKeyTarget(e.target)) return;
+
+      if (e.shiftKey) {
+        if (e.code === "Digit1" || e.key === "!") {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          setPlaybackSpeed(1);
+          return;
+        }
+        if (e.code === "Digit2" || e.key === "@") {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          setPlaybackSpeed(2);
+          return;
+        }
+        if (e.code === "Digit4" || e.key === "$") {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          setPlaybackSpeed(4);
+          return;
+        }
+        return;
+      }
+
+      if (e.key === "[" || e.key === "]") {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        const currIdx = REVIEW_SPEED_STEPS.findIndex(
+          (s) => Math.abs(s - playbackSpeed) < 0.01
+        );
+        const baseIdx = currIdx >= 0 ? currIdx : 1;
+        const nextIdx =
+          e.key === "["
+            ? Math.max(0, baseIdx - 1)
+            : Math.min(REVIEW_SPEED_STEPS.length - 1, baseIdx + 1);
+        setPlaybackSpeed(REVIEW_SPEED_STEPS[nextIdx]);
+        return;
+      }
+
+      const key = e.key.toLowerCase();
+      if (key === "j" || key === "k") {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        if (visibleFilteredReviews.length === 0) return;
+        const idx = visibleFilteredReviews.findIndex(
+          (r) => r.id === activeReview?.id
+        );
+        const nextIdx =
+          key === "j"
+            ? idx < 0
+              ? 0
+              : Math.min(visibleFilteredReviews.length - 1, idx + 1)
+            : idx <= 0
+            ? 0
+            : idx - 1;
+        const nextItem = visibleFilteredReviews[nextIdx];
+        if (nextItem) {
+          if (nextIdx >= visibleLimit) {
+            setVisibleLimit(nextIdx + REVIEW_PAGE_STEP);
+          }
+          setActiveReview(nextItem);
+        }
+        return;
+      }
+
+      if (key === "r" && activeReview) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        void handleAcknowledgeReviews([activeReview.id], true);
+        return;
+      }
+
+      if (key === "e" && activeReview) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        triggerExportActiveReview();
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [
+    activeReview,
+    visibleFilteredReviews,
+    visibleLimit,
+    playbackSpeed,
+    setPlaybackSpeed,
+    setActiveReview,
+    handleAcknowledgeReviews,
+    triggerExportActiveReview,
+  ]);
+
   const handleSavePreset = () => {
     const next = triageController.saveFilterPreset(
       "review",
@@ -609,7 +1034,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   };
 
   const handleStartBriefing = () => {
-    const queue = visibleFilteredReviews.slice(0, 40);
+    const queue = visibleFilteredReviews.slice(0, visibleLimit);
     if (queue.length === 0) return;
     setBriefingQueueIds(queue.map((r) => r.id));
     setBriefingIdx(0);
@@ -832,6 +1257,16 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
               </button>
             </span>
           ))}
+          {activeFilterCount > 0 && (
+            <button
+              type="button"
+              className="nvr-btn mono sm"
+              data-testid="review-clear-filters-bar"
+              onClick={handleClearAllReviewFilters}
+            >
+              {isPt ? "Limpar Filtros" : "Clear All Filters"}
+            </button>
+          )}
           <span
             className="mono"
             style={{
@@ -840,7 +1275,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
               whiteSpace: "nowrap",
             }}
           >
-            {visibleFilteredReviews.length} items
+            {visibleFilteredReviews.length} {isPt ? "itens" : "items"}
           </span>
         </div>
 
@@ -860,7 +1295,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
             >
               {briefingActive
                 ? `■ Stop Brief (${briefingIdx + 1}/${briefingQueueIds.length})`
-                : `▶ Play Tactical Brief (${Math.min(40, visibleFilteredReviews.length)})`}
+                : `▶ Play Tactical Brief (${Math.min(visibleLimit, visibleFilteredReviews.length)})`}
             </button>
           )}
           <span
@@ -871,11 +1306,14 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
               whiteSpace: "nowrap",
             }}
           >
-            {t.review.keyboardHint}
+            {isPt
+              ? "[J/K] Nav · [R] Visto · [E] Clipe · [[/]] Vel"
+              : "[J/K] Nav · [R] Ack · [E] Clip · [[/]] Spd"}
           </span>
           {[0.5, 1, 2, 4].map((spd) => (
             <button
               key={spd}
+              type="button"
               className={`nvr-btn mono ${playbackSpeed === spd ? "active" : ""}`}
               onClick={() => setPlaybackSpeed(spd)}
             >
@@ -888,7 +1326,11 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
       <div className="nvr-workbench is-list-first">
         <div className="nvr-panel">
           <div className="nvr-panel-header" style={{ gap: 6, flexWrap: "wrap" }}>
-            <span>REVIEW QUEUE</span>
+            <span>
+              {isPt ? "FILA DE REVISÃO" : "REVIEW QUEUE"} (
+              {Math.min(visibleLimit, visibleFilteredReviews.length)}/
+              {visibleFilteredReviews.length})
+            </span>
             <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
               {visibleFilteredReviews.length > 0 && (
                 <>
@@ -897,7 +1339,10 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     className="nvr-btn mono sm"
                     style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
                     onClick={() => {
-                      const pageIds = getVisibleReviewPageIds(visibleFilteredReviews, 40);
+                      const pageIds = getVisibleReviewPageIds(
+                        visibleFilteredReviews,
+                        visibleLimit
+                      );
                       setSelectedBatchReviewIds((prev) =>
                         prev.length === pageIds.length ? [] : pageIds
                       );
@@ -908,13 +1353,17 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                       : "Select Page"}
                   </button>
                   <button
+                    type="button"
                     className="nvr-btn success"
                     style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
                     onClick={() =>
-                      handleMarkReviews(
+                      void handleAcknowledgeReviews(
                         selectedBatchReviewIds.length > 0
                           ? selectedBatchReviewIds
-                          : getVisibleReviewPageIds(visibleFilteredReviews, 40),
+                          : getVisibleReviewPageIds(
+                              visibleFilteredReviews,
+                              visibleLimit
+                            ),
                         true
                       )
                     }
@@ -996,9 +1445,12 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
             </div>
           )}
           <div className="nvr-scroll-y">
-            {visibleFilteredReviews.slice(0, 40).map((item) => {
+            {pagedReviews.map((item) => {
               const isSelected = activeReview?.id === item.id;
               const isBatchChecked = selectedBatchReviewIds.includes(item.id);
+              const isOngoing = isOngoingIncident(item.end_time);
+              const deleteKey = `delete-review:${item.id}`;
+              const deleteArmed = isArmed(deleteKey);
               const matchedExport = findMatchingExport(
                 exportsList,
                 item.camera,
@@ -1006,30 +1458,20 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                 item.end_time
               );
               const thumbUrl = resolveReviewThumbUrl(item);
+              const effSub =
+                item.id in localReviewSubLabels
+                  ? localReviewSubLabels[item.id]
+                  : item.data?.sub_labels?.[0] ?? null;
+              const subBadge = formatSubLabelBadge(
+                effSub,
+                item.data?.sub_label_score ?? (effSub ? 1.0 : null)
+              );
               return (
                 <div
                   key={item.id}
-                  role="button"
-                  tabIndex={0}
                   className={`nvr-list-row ${isSelected ? "is-selected" : ""}`}
-                  onClick={() => {
-                    if (briefingActive) {
-                      const qIdx = briefingQueueIds.indexOf(item.id);
-                      if (qIdx >= 0) setBriefingIdx(qIdx);
-                    }
-                    setActiveReview(item);
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      if (briefingActive) {
-                        const qIdx = briefingQueueIds.indexOf(item.id);
-                        if (qIdx >= 0) setBriefingIdx(qIdx);
-                      }
-                      setActiveReview(item);
-                    }
-                  }}
                   style={{
+                    cursor: "default",
                     borderLeft:
                       item.severity === "alert"
                         ? "3px solid var(--signal-alert)" /* slop-lint-disable-line side-tab-border -- real alert severity indicator */
@@ -1040,7 +1482,6 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     type="checkbox"
                     aria-label={`Select review ${item.id} for batch face assignment`}
                     checked={isBatchChecked}
-                    onClick={(e) => e.stopPropagation()}
                     onChange={(e) => {
                       const checked = e.target.checked;
                       setSelectedBatchReviewIds((prev) =>
@@ -1053,81 +1494,124 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     }}
                     style={{ cursor: "pointer", flexShrink: 0 }}
                   />
-                  <img
-                    src={thumbUrl}
-                    alt={item.camera}
-                    width={84}
-                    height={48}
-                    loading="lazy"
-                    style={{
-                      width: 84,
-                      height: 48,
-                      objectFit: "cover",
-                      borderRadius: 2,
-                      border: "1px solid var(--border-hairline)",
+                  <button
+                    type="button"
+                    aria-pressed={isSelected}
+                    onClick={() => {
+                      if (briefingActive) {
+                        const qIdx = briefingQueueIds.indexOf(item.id);
+                        if (qIdx >= 0) setBriefingIdx(qIdx);
+                      }
+                      setActiveReview(item);
                     }}
-                  />
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div
+                    style={{
+                      flex: 1,
+                      minWidth: 0,
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 10,
+                      background: "transparent",
+                      border: "none",
+                      padding: 0,
+                      color: "inherit",
+                      font: "inherit",
+                      textAlign: "left",
+                      cursor: "pointer",
+                    }}
+                  >
+                    <img
+                      src={thumbUrl}
+                      alt={item.camera}
+                      width={84}
+                      height={48}
+                      loading="lazy"
                       style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
+                        width: 84,
+                        height: 48,
+                        objectFit: "cover",
+                        borderRadius: 2,
+                        border: "1px solid var(--border-hairline)",
+                        flexShrink: 0,
                       }}
-                    >
-                      <span style={{ fontWeight: 700, textTransform: "uppercase" }}>
-                        {item.camera}
-                      </span>
+                    />
+                    <span style={{ flex: 1, minWidth: 0, display: "block" }}>
                       <span
-                        className="mono"
                         style={{
-                          fontSize: "var(--text-xs)",
-                          color: "var(--text-secondary)",
-                          whiteSpace: "nowrap",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: 6,
                         }}
                       >
-                        {formatDateTime(item.start_time)}
+                        <span style={{ fontWeight: 700, textTransform: "uppercase" }}>
+                          {item.camera}
+                        </span>
+                        <span
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 5,
+                            flexShrink: 0,
+                          }}
+                        >
+                          {isOngoing && (
+                            <span
+                              className="nvr-badge alert mono"
+                              data-testid={`review-ongoing-badge-${item.id}`}
+                              style={{
+                                height: 18,
+                                padding: "0 5px",
+                                fontSize: "var(--text-xs)",
+                                display: "inline-flex",
+                                alignItems: "center",
+                                gap: 4,
+                              }}
+                            >
+                              <span className="nvr-dot alert" aria-hidden="true" />
+                              {isPt ? "EM ANDAMENTO" : "ONGOING"}
+                            </span>
+                          )}
+                          <span
+                            className="mono"
+                            style={{
+                              fontSize: "var(--text-xs)",
+                              color: "var(--text-secondary)",
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            {formatDateTime(item.start_time)}
+                          </span>
+                        </span>
                       </span>
-                    </div>
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        marginTop: 4,
-                      }}
-                    >
                       <span
-                        className="mono"
                         style={{
-                          fontSize: "var(--text-xs)",
-                          color:
-                            item.severity === "alert"
-                              ? "var(--signal-alert-text)"
-                              : "var(--signal-motion-text)",
-                          textTransform: "uppercase",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: 6,
+                          flexWrap: "wrap",
+                          marginTop: 4,
                         }}
                       >
-                        {formatEventLabelWithSubLabel(
-                          (item.data?.objects || ["motion"]).join(", "),
-                          item.id in localReviewSubLabels
-                            ? localReviewSubLabels[item.id]
-                            : item.data?.sub_labels?.[0] ?? null,
-                          item.data?.detected_attributes
-                        )}
-                      </span>
-                      <div className="nvr-row-actions">
-                        {(() => {
-                          const effSub =
-                            item.id in localReviewSubLabels
-                              ? localReviewSubLabels[item.id]
-                              : item.data?.sub_labels?.[0] ?? null;
-                          const subBadge = formatSubLabelBadge(
+                        <span
+                          className="mono"
+                          style={{
+                            fontSize: "var(--text-xs)",
+                            color:
+                              item.severity === "alert"
+                                ? "var(--signal-alert-text)"
+                                : "var(--signal-motion-text)",
+                            textTransform: "uppercase",
+                          }}
+                        >
+                          {formatEventLabelWithSubLabel(
+                            (item.data?.objects || ["motion"]).join(", "),
                             effSub,
-                            item.data?.sub_label_score ?? (effSub ? 1.0 : null)
-                          );
-                          if (!subBadge) return null;
-                          return (
+                            item.data?.detected_attributes
+                          )}
+                        </span>
+                        <span style={{ display: "inline-flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}>
+                          {subBadge && (
                             <span
                               className={`nvr-badge mono ${
                                 subBadge.isUnknown ? "alert" : "live"
@@ -1140,100 +1624,148 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                             >
                               {subBadge.text}
                             </span>
-                          );
-                        })()}
-                        {(item.data?.recognized_license_plates || []).map((plate) => (
-                          <span
-                            key={plate}
-                            className="nvr-badge mono"
-                            style={{
-                              height: 20,
-                              padding: "0 5px",
-                              fontFamily: "var(--font-mono)",
-                              fontSize: "var(--text-xs)",
-                              color: "var(--signal-accent-text)",
-                            }}
-                          >
-                            {plate}
-                          </span>
-                        ))}
-                        {((item.data?.audio && item.data.audio.length > 0) ||
-                          (item.data?.objects || []).includes("audio")) && (
-                          <span
-                            className="nvr-badge mono"
-                            style={{
-                              height: 20,
-                              padding: "0 5px",
-                              fontSize: "var(--text-xs)",
-                              color: "var(--signal-accent-text)",
-                            }}
-                          >
-                            AUDIO
-                          </span>
-                        )}
-                        {matchedExport && (
-                          <button
-                            className="nvr-badge live mono"
-                            style={{
-                              height: 20,
-                              padding: "0 5px",
-                              fontSize: "var(--text-xs)",
-                              cursor: "pointer",
-                            }}
-                            title={`Open exported clip ${matchedExport.name}`}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              if (onOpenExport) {
-                                onOpenExport(matchedExport);
-                              } else {
-                                switchTab("exports");
-                              }
-                            }}
-                          >
-                            EXPORTED
-                          </button>
-                        )}
-                        {!item.has_been_reviewed && (
-                          <button
-                            className="nvr-btn success"
-                            style={{ height: 22, padding: "0 6px" }}
-                            aria-label={`Mark ${item.camera} review item as viewed`}
-                            title={t.live.markReviewed}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleMarkReviews([item.id], true);
-                            }}
-                          >
-                            <Check size={11} />
-                          </button>
-                        )}
-                        <button
-                          className="nvr-btn danger"
-                          style={{ height: 22, padding: "0 6px" }}
-                          aria-label={`Delete ${item.camera} review item`}
-                          title={t.review.deleteSelected}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleDeleteReviews([item.id]);
-                          }}
-                        >
-                          <Trash2 size={11} />
-                        </button>
-                      </div>
-                    </div>
+                          )}
+                          {(item.data?.recognized_license_plates || []).map((plate) => (
+                            <span
+                              key={plate}
+                              className="nvr-badge mono"
+                              style={{
+                                height: 20,
+                                padding: "0 5px",
+                                fontFamily: "var(--font-mono)",
+                                fontSize: "var(--text-xs)",
+                                color: "var(--signal-accent-text)",
+                              }}
+                            >
+                              {plate}
+                            </span>
+                          ))}
+                          {((item.data?.audio && item.data.audio.length > 0) ||
+                            (item.data?.objects || []).includes("audio")) && (
+                            <span
+                              className="nvr-badge mono"
+                              style={{
+                                height: 20,
+                                padding: "0 5px",
+                                fontSize: "var(--text-xs)",
+                                color: "var(--signal-accent-text)",
+                              }}
+                            >
+                              AUDIO
+                            </span>
+                          )}
+                        </span>
+                      </span>
+                    </span>
+                  </button>
+                  <div className="nvr-row-actions">
+                    {matchedExport && (
+                      <button
+                        type="button"
+                        className="nvr-badge live mono"
+                        style={{
+                          height: 20,
+                          padding: "0 5px",
+                          fontSize: "var(--text-xs)",
+                          cursor: "pointer",
+                        }}
+                        title={`Open exported clip ${matchedExport.name}`}
+                        onClick={() => {
+                          if (onOpenExport) {
+                            onOpenExport(matchedExport);
+                          } else {
+                            switchTab("exports");
+                          }
+                        }}
+                      >
+                        EXPORTED
+                      </button>
+                    )}
+                    {!item.has_been_reviewed && (
+                      <button
+                        type="button"
+                        className="nvr-btn success"
+                        style={{ height: 22, padding: "0 6px" }}
+                        aria-label={`Mark ${item.camera} review item as viewed`}
+                        title={t.live.markReviewed}
+                        onClick={() => {
+                          void handleAcknowledgeReviews([item.id], true);
+                        }}
+                      >
+                        <Check size={11} />
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="nvr-btn danger mono"
+                      style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                      aria-label={
+                        deleteArmed
+                          ? isPt
+                            ? `Confirmar exclusão de ${item.camera}`
+                            : `Click again to confirm deleting ${item.camera}`
+                          : `Delete ${item.camera} review item`
+                      }
+                      title={
+                        deleteArmed
+                          ? isPt
+                            ? "Clique novamente para confirmar"
+                            : "Click again to confirm"
+                          : t.review.deleteSelected
+                      }
+                      onClick={() => {
+                        confirmOrArm(deleteKey, () => {
+                          void handleConfirmDeleteReviews([item.id]);
+                        });
+                      }}
+                    >
+                      {deleteArmed ? (
+                        isPt ? "Confirmar?" : "Confirm?"
+                      ) : (
+                        <Trash2 size={11} />
+                      )}
+                    </button>
                   </div>
                 </div>
               );
             })}
+            {remainingReviewsCount > 0 && (
+              <div style={{ padding: "10px 12px", textAlign: "center" }}>
+                <button
+                  type="button"
+                  className="nvr-btn mono"
+                  data-testid="review-load-more"
+                  onClick={() => setVisibleLimit((prev) => prev + REVIEW_PAGE_STEP)}
+                >
+                  {isPt
+                    ? `Mostrar mais 50 (${remainingReviewsCount} restantes)`
+                    : `Show 50 more (${remainingReviewsCount} remaining)`}
+                </button>
+              </div>
+            )}
             {visibleFilteredReviews.length === 0 && (
               <div
                 style={{
                   padding: 24,
                   textAlign: "center",
                   color: "var(--text-muted)",
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  gap: 10,
                 }}
               >
-                {t.review.emptyState}
+                <span>{t.review.emptyState}</span>
+                {(activeFilterCount > 0 || reviews.length > 0) && (
+                  <button
+                    type="button"
+                    className="nvr-btn mono sm"
+                    data-testid="review-clear-filters-empty"
+                    onClick={handleClearAllReviewFilters}
+                  >
+                    {isPt ? "Limpar Filtros" : "Clear All Filters"}
+                  </button>
+                )}
               </div>
             )}
           </div>
@@ -1256,6 +1788,16 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     {activeReview.camera.toUpperCase()} //{" "}
                     {formatDateTime(activeReview.start_time)}
                   </span>
+                  {isOngoingIncident(activeReview.end_time) && (
+                    <span
+                      className="nvr-badge alert mono"
+                      data-testid="review-detail-ongoing-badge"
+                      style={{ display: "inline-flex", alignItems: "center", gap: 5 }}
+                    >
+                      <span className="nvr-dot alert" aria-hidden="true" />
+                      {isPt ? "EM ANDAMENTO" : "ONGOING"}
+                    </span>
+                  )}
                   <span className="nvr-badge">
                     {formatEventLabelWithSubLabel(
                       (activeReview.data?.objects || ["person"]).join(", "),
@@ -1325,8 +1867,80 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     ({formatRelTime(activeReview.start_time)})
                   </span>
                 </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0, flexWrap: "wrap" }}>
+                  {primaryDetectionEventId && (
+                    <>
+                      <button
+                        type="button"
+                        className={`nvr-btn mono ${
+                          reviewEventTriageState[activeReview.id]?.retained ? "active" : ""
+                        }`}
+                        disabled={reviewRetainBusy}
+                        data-testid="review-retain-event"
+                        title={
+                          isPt
+                            ? "Reter evento associado indefinidamente"
+                            : "Retain associated detection event indefinitely"
+                        }
+                        onClick={() => void handleToggleReviewEventRetain()}
+                      >
+                        {reviewEventTriageState[activeReview.id]?.retained
+                          ? isPt
+                            ? "Retido ✓"
+                            : "Retained ✓"
+                          : isPt
+                          ? "Reter Indefinidamente"
+                          : "Retain Indefinitely"}
+                      </button>
+                      <button
+                        type="button"
+                        className={`nvr-btn mono ${
+                          reviewEventTriageState[activeReview.id]?.falsePositive
+                            ? "active danger"
+                            : ""
+                        }`}
+                        disabled={reviewFpBusy}
+                        data-testid="review-mark-false-positive"
+                        title={
+                          isPt
+                            ? "Marcar evento associado como falso positivo"
+                            : "Toggle false-positive memory suppression on associated detection"
+                        }
+                        onClick={() => void handleToggleReviewFalsePositive()}
+                      >
+                        {reviewEventTriageState[activeReview.id]?.falsePositive
+                          ? isPt
+                            ? "Falso Positivo ✓"
+                            : "False Positive ✓"
+                          : isPt
+                          ? "Marcar Falso Positivo"
+                          : "Mark False Positive"}
+                      </button>
+                      <button
+                        type="button"
+                        className="nvr-btn mono"
+                        disabled={reviewAiVerifyBusy}
+                        data-testid="review-verify-ai"
+                        title={
+                          isPt
+                            ? "Verificar detecção com o Juiz de IA Visual"
+                            : "Verify detection snapshot with Vision AI Judge"
+                        }
+                        onClick={() => void handleVerifyReviewWithAi()}
+                      >
+                        <Sparkles size={12} />
+                        {reviewAiVerifyBusy
+                          ? isPt
+                            ? "Verificando..."
+                            : "Verifying..."
+                          : isPt
+                          ? "Verificar com IA"
+                          : "Verify with AI"}
+                      </button>
+                    </>
+                  )}
                   <button
+                    type="button"
                     className={`nvr-btn mono ${showForensic ? "active" : ""}`}
                     onClick={() => setShowForensic((v) => !v)}
                     title="Inspect exact score, threshold, pixel area, aspect ratio, and zone provenance"
@@ -1469,43 +2083,109 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                         : t.review.shareLinkBtn}
                   </button>
                   <button
+                    type="button"
                     className="nvr-btn primary"
-                    onClick={() => {
-                      const win = computeReviewPlaybackWindow(
-                        activeReview.start_time,
-                        activeReview.end_time,
-                        5,
-                        5,
-                        20
-                      );
-                      const checked = validateExportTimeWindow(
-                        win.startSec,
-                        win.endSec
-                      );
-                      if (!checked.valid) return;
-                      const realReviewCam = resolveRealCameraSource(
-                        activeReview.camera,
-                        configuredCameras
-                      );
-                      void handleQuickExport(
-                        realReviewCam,
-                        checked.startSec,
-                        checked.endSec,
-                        `${activeReview.camera}_${activeReview.id}`
-                      );
-                    }}
+                    onClick={triggerExportActiveReview}
                   >
                     {t.review.exportClip}
                   </button>
                   <button
+                    type="button"
                     className="nvr-btn success"
-                    onClick={() => handleMarkReviews([activeReview.id], true)}
+                    onClick={() => void handleAcknowledgeReviews([activeReview.id], true)}
                   >
                     <Check size={12} />
                     {t.review.markSelectedReviewed}
                   </button>
+                  <button
+                    type="button"
+                    className="nvr-btn danger mono"
+                    aria-label={
+                      isArmed(`delete-active-review:${activeReview.id}`)
+                        ? isPt
+                          ? "Confirmar exclusão do segmento"
+                          : "Click again to confirm deleting review"
+                        : t.review.deleteSelected
+                    }
+                    title={
+                      isArmed(`delete-active-review:${activeReview.id}`)
+                        ? isPt
+                          ? "Clique novamente para confirmar"
+                          : "Click again to confirm"
+                        : t.review.deleteSelected
+                    }
+                    onClick={() => {
+                      confirmOrArm(`delete-active-review:${activeReview.id}`, () => {
+                        void handleConfirmDeleteReviews([activeReview.id]);
+                      });
+                    }}
+                  >
+                    <Trash2 size={12} />
+                    {isArmed(`delete-active-review:${activeReview.id}`)
+                      ? isPt
+                        ? "Confirmar?"
+                        : "Click again to confirm"
+                      : null}
+                  </button>
                 </div>
               </div>
+
+              {(reviewEventTriageState[activeReview.id]?.aiVerification ||
+                reviewEventTriageState[activeReview.id]?.falsePositive ||
+                reviewEventTriageState[activeReview.id]?.statusMessage) && (
+                <div
+                  className="mono"
+                  style={{
+                    background: "var(--bg-subcard)",
+                    borderBottom: "1px solid var(--border-strong)",
+                    padding: "7px 12px",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    flexWrap: "wrap",
+                    gap: 10,
+                    fontSize: "var(--text-xs)",
+                    fontVariantNumeric: "tabular-nums",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                    {reviewEventTriageState[activeReview.id]?.aiVerification && (
+                      <>
+                        <span
+                          className={`nvr-badge mono ${
+                            reviewEventTriageState[activeReview.id]!.aiVerification!
+                              .is_true_positive
+                              ? "live"
+                              : "alert"
+                          }`}
+                        >
+                          {formatAiVerificationBadge(
+                            reviewEventTriageState[activeReview.id]!.aiVerification!
+                          )}
+                        </span>
+                        <span style={{ color: "var(--text-primary)" }}>
+                          Reason:{" "}
+                          <strong>
+                            {reviewEventTriageState[activeReview.id]!.aiVerification!.reason}
+                          </strong>
+                        </span>
+                      </>
+                    )}
+                    {reviewEventTriageState[activeReview.id]?.falsePositive && (
+                      <span className="nvr-badge alert mono">
+                        {isPt
+                          ? "SUPRIMIDO NA MEMÓRIA DE FALSOS POSITIVOS"
+                          : "SUPPRESSED IN FALSE-POSITIVE MEMORY"}
+                      </span>
+                    )}
+                    {reviewEventTriageState[activeReview.id]?.statusMessage && (
+                      <span style={{ color: "var(--text-secondary)" }}>
+                        {reviewEventTriageState[activeReview.id]?.statusMessage}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
 
               {(shareError || shareFallbackUrl) && (
                 <div
