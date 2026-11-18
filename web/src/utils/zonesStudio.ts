@@ -128,7 +128,8 @@ function clamp01(v: number): number {
 }
 
 export function linePoints(line: LineConfig, detW: number, detH: number): [Point, Point] {
-  const pts = line.points || [0, 0, 0, 0];
+  const pts =
+    Array.isArray(line.points) && line.points.length >= 4 ? line.points : [0, 0, 0, 0];
   const pixel = pts.some((n) => n > 1.5);
   const w = detW > 1 ? detW : 1280;
   const h = detH > 1 ? detH : 720;

@@ -1137,7 +1137,7 @@ export const App: React.FC = () => {
     if (!authChecked || authNeeded) return;
     let cancelled = false;
     if (activeTab === "explore") {
-      const evUrl = buildEventsFeedUrl(reviewDateFilter);
+      const evUrl = buildEventsFeedUrl("");
       fetch(evUrl, { credentials: "include" })
         .then(async (r) => {
           if (!r.ok) {
@@ -1225,7 +1225,6 @@ export const App: React.FC = () => {
     activeTab,
     userRole,
     inspectorCam,
-    reviewDateFilter,
     subLabelsRefreshTick,
     exploreRetryTick,
     setCoreDataError,
@@ -1599,14 +1598,10 @@ export const App: React.FC = () => {
     reviewStatusFilter,
   ]);
 
-  // Filtered Explore items
+  // Filtered Explore items (ExploreWorkspace manages its own independent exploreDateFilter)
   const filteredEvents = useMemo(() => {
-    const dateBounds = reviewDateFilter
-      ? parseOperationalDateBoundsSec(reviewDateFilter)
-      : null;
     const q = exploreQuery.trim().toLowerCase();
     return events.filter((ev) => {
-      if (!matchesOperationalDateBounds(ev, dateBounds)) return false;
       if (exploreCamera !== "all" && ev.camera !== exploreCamera) return false;
       if (exploreLabel !== "all" && ev.label !== exploreLabel) return false;
       if (exploreRetainedOnly && !ev.retain_indefinitely) return false;
@@ -1622,7 +1617,6 @@ export const App: React.FC = () => {
     });
   }, [
     events,
-    reviewDateFilter,
     exploreCamera,
     exploreLabel,
     exploreRetainedOnly,

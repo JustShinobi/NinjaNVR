@@ -1260,7 +1260,9 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "space-between",
+                flexWrap: "wrap",
                 gap: 8,
+                rowGap: 6,
                 padding: "6px 8px",
                 background: "var(--bg-canvas)",
                 border: "1px solid var(--border-hairline)",
@@ -1273,7 +1275,7 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                   ? "DIAGNÓSTICO HEURÍSTICO DE PIPELINE & CONFIGURAÇÃO"
                   : "HEURISTIC PIPELINE & CONFIGURATION DIAGNOSTICS"}
               </span>
-              <div style={{ display: "flex", gap: 6 }}>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                 <span className="nvr-badge alert mono">
                   {critCount} {isPt ? "CRÍTICOS" : "CRITICAL"}
                 </span>

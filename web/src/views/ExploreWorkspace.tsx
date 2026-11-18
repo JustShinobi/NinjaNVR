@@ -1319,6 +1319,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                     style={{
                       flex: 1,
                       minWidth: 0,
+                      overflow: "hidden",
                       display: "flex",
                       alignItems: "center",
                       gap: 10,
@@ -1332,6 +1333,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                     }}
                   >
                     <img
+                      className="nvr-queue-thumb"
                       src={`/api/events/${encodeURIComponent(ev.id)}/thumbnail.webp`}
                       alt={ev.label}
                       width={80}
@@ -1347,14 +1349,15 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                         flexShrink: 0,
                       }}
                     />
-                    <span style={{ flex: 1, minWidth: 0, display: "block" }}>
+                    <span style={{ flex: 1, minWidth: 0, overflow: "hidden", display: "block" }}>
                       <span
                         style={{
                           display: "flex",
                           alignItems: "center",
                           justifyContent: "space-between",
+                          flexWrap: "wrap",
                           gap: 6,
-                          whiteSpace: "nowrap",
+                          rowGap: 3,
                         }}
                       >
                         <span

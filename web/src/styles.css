@@ -538,6 +538,7 @@ dialog::backdrop {
 .nvr-row-primary-btn {
   flex: 1 1 auto;
   min-width: 0;
+  overflow: hidden;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -1359,14 +1360,16 @@ dialog::backdrop {
 }
 
 .nvr-panel-header {
-  height: 36px;
+  height: auto;
   min-height: 36px;
-  padding: 0 12px;
+  padding: 4px 12px;
   border-bottom: 1px solid var(--border-hairline);
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 8px;
+  row-gap: 6px;
   font-size: var(--text-xs);
   font-weight: 600;
   letter-spacing: 0.05em;
@@ -3607,7 +3610,8 @@ input[type="range"] {
 }
 
 .nvr-cam-tile:hover .nvr-tile-actions,
-.nvr-cam-tile:focus-within .nvr-tile-actions {
+.nvr-cam-tile:focus-within .nvr-tile-actions,
+.nvr-cam-tile.has-open-sheet .nvr-tile-actions {
   display: inline-flex;
 }
 
@@ -4008,7 +4012,9 @@ input[type="range"] {
   }
 
   .nvr-subbar .nvr-btn {
-    min-height: 36px;
+    min-height: 44px;
+    min-block-size: 44px;
+    height: auto;
   }
 
   /* Event strip collapses to one summary row + the latest event */
@@ -4279,7 +4285,9 @@ input[type="range"] {
   }
 
   .nvr-timeline-dock .nvr-btn {
-    min-height: 36px;
+    min-height: 44px;
+    min-block-size: 44px;
+    height: auto;
   }
 }
 
@@ -4305,7 +4313,8 @@ input[type="range"] {
 
   .nvr-subbar .nvr-select,
   .nvr-subbar .nvr-input {
-    min-height: 36px;
+    min-height: 44px;
+    min-block-size: 44px;
     max-width: 100%;
   }
 
@@ -4438,7 +4447,9 @@ input[type="range"] {
 }
 
 .nvr-filter-toggle-row .nvr-btn {
-  min-height: 40px;
+  min-height: 44px;
+  min-block-size: 44px;
+  height: auto;
   gap: 8px;
 }
 
@@ -4515,7 +4526,9 @@ input[type="range"] {
   }
 
   .nvr-zoom-hud .nvr-btn {
-    min-height: 36px;
+    min-height: 44px;
+    min-block-size: 44px;
+    height: auto;
   }
 }
 
@@ -4528,7 +4541,9 @@ input[type="range"] {
 
 @media (max-width: 767px), (pointer: coarse) and (max-height: 500px) {
   .nvr-workbench .nvr-matrix-2x2 .nvr-btn {
-    height: 36px !important;
+    min-height: 44px !important;
+    min-block-size: 44px !important;
+    height: auto !important;
     min-width: 44px;
   }
 
@@ -4580,7 +4595,9 @@ input[type="range"] {
   }
 
   .nvr-panel-header .nvr-btn {
-    min-height: 36px;
+    min-height: 44px;
+    min-block-size: 44px;
+    height: auto;
   }
 
   /* Wide tables scroll inside their card instead of pushing the page sideways */
@@ -4602,7 +4619,14 @@ input[type="range"] {
   }
 
   .nvr-focus-stage .nvr-subbar .nvr-btn {
-    min-height: 40px;
+    min-height: 44px;
+    min-block-size: 44px;
+    height: auto;
+  }
+
+  .nvr-queue-thumb {
+    width: 64px !important;
+    height: 38px !important;
   }
 }
 

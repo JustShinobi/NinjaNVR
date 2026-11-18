@@ -1331,13 +1331,13 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
               {Math.min(visibleLimit, visibleFilteredReviews.length)}/
               {visibleFilteredReviews.length})
             </span>
-            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}>
               {visibleFilteredReviews.length > 0 && (
                 <>
                   <button
                     type="button"
                     className="nvr-btn mono sm"
-                    style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                    style={{ minHeight: 22, padding: "2px 6px", fontSize: "var(--text-xs)" }}
                     onClick={() => {
                       const pageIds = getVisibleReviewPageIds(
                         visibleFilteredReviews,
@@ -1355,7 +1355,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                   <button
                     type="button"
                     className="nvr-btn success"
-                    style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                    style={{ minHeight: 22, padding: "2px 7px", fontSize: "var(--text-xs)" }}
                     onClick={() =>
                       void handleAcknowledgeReviews(
                         selectedBatchReviewIds.length > 0
@@ -1507,6 +1507,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     style={{
                       flex: 1,
                       minWidth: 0,
+                      overflow: "hidden",
                       display: "flex",
                       alignItems: "center",
                       gap: 10,
@@ -1520,6 +1521,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     }}
                   >
                     <img
+                      className="nvr-queue-thumb"
                       src={thumbUrl}
                       alt={item.camera}
                       width={84}
@@ -1534,13 +1536,15 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                         flexShrink: 0,
                       }}
                     />
-                    <span style={{ flex: 1, minWidth: 0, display: "block" }}>
+                    <span style={{ flex: 1, minWidth: 0, overflow: "hidden", display: "block" }}>
                       <span
                         style={{
                           display: "flex",
                           alignItems: "center",
                           justifyContent: "space-between",
+                          flexWrap: "wrap",
                           gap: 6,
+                          rowGap: 3,
                         }}
                       >
                         <span style={{ fontWeight: 700, textTransform: "uppercase" }}>
@@ -1774,14 +1778,26 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
         <div className="nvr-focus-stage" ref={detailStageRef}>
           {activeReview ? (
             <>
-              <div className="nvr-subbar">
+              <div
+                className="nvr-subbar"
+                style={{
+                  height: "auto",
+                  minHeight: 40,
+                  padding: "6px 12px",
+                  flexWrap: "wrap",
+                  rowGap: 6,
+                }}
+              >
                 <div
                   style={{
                     display: "flex",
                     alignItems: "center",
+                    flex: "1 1 260px",
+                    flexWrap: "wrap",
                     gap: 8,
+                    rowGap: 4,
                     minWidth: 0,
-                    whiteSpace: "nowrap",
+                    overflow: "hidden",
                   }}
                 >
                   <span className="nvr-badge alert">

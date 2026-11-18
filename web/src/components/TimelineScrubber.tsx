@@ -3389,6 +3389,13 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             HIGH-DPI CANVAS SEEK TRACK + HONEST RANGE CLIPPER + PLAYHEAD NEEDLE
            =================================================================== */}
         <div
+          className="nvr-timeline-track-shell"
+          style={{
+            position: "relative",
+            height: 36,
+          }}
+        >
+        <div
           ref={trackRef}
           className="nvr-timeline-track"
           role="slider"
@@ -3411,8 +3418,8 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               : "Wheel = pan window · Ctrl+Wheel = Zoom · Click = seek playhead · Arrow keys = ±5s (Shift+Arrow = ±30s)"
           }
           style={{
-            position: "relative",
-            height: 36,
+            position: "absolute",
+            inset: 0,
             background: "var(--bg-deep)",
             border: "1px solid var(--border-strong)",
             borderRadius: 3,
@@ -3421,9 +3428,6 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             overflow: "visible",
           }}
           onKeyDown={(e) => {
-            if ((e.target as HTMLElement | null)?.closest?.("[data-handle]")) {
-              return;
-            }
             const step = computeTimelineSliderKeyStep("track", e.key, e.shiftKey);
             if (step !== null) {
               e.preventDefault();
@@ -3471,7 +3475,6 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             if (!draggingTarget) setHoverTs(null);
           }}
           onPointerDown={(e) => {
-            if ((e.target as HTMLElement).closest("[data-handle]")) return;
             const rect = e.currentTarget.getBoundingClientRect();
             dragTrackRectRef.current = {
               left: rect.left,
@@ -3504,6 +3507,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               display: "block",
             }}
           />
+        </div>
 
           {/* Off-Screen IN / OUT Jump Pills (non-overlapping, theme-token safe) */}
           {rangeMode &&

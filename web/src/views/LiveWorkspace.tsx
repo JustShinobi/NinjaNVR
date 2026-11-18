@@ -2452,7 +2452,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   isGrid && isTimelineCam && visibleMatrixCams.length > 1
                     ? "is-timeline-focused"
                     : ""
-                }`}
+                } ${detailsCam === cam ? "has-open-sheet" : ""}`}
                 style={isCompact ? undefined : resolvePersistentTileStyle(liveLayout, descriptor)}
                 onPointerEnter={
                   isDock || isGrid ? () => setHoveredDockCam(cam) : undefined

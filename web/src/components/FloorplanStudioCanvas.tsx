@@ -2714,7 +2714,9 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
             }}
           >
             <span>
-              WALLS &amp; DOORS ({floorplanWalls.length}) // METROS
+              {isPt
+                ? `WALLS & DOORS (${floorplanWalls.length}) // METROS`
+                : `WALLS & DOORS (${floorplanWalls.length}) // METERS`}
             </span>
             <div style={{ display: "flex", gap: 4 }}>
               <button
