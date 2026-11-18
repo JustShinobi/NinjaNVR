@@ -3648,6 +3648,8 @@ impl NinjaConfig {
                 && !trimmed.contains(['@', '?', '#', '\\', '%'])
                 && !trimmed.contains("..")
                 && !trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+                && extract_http_url_effective_port(trimmed)
+                    .is_some_and(|p| !is_disallowed_internal_service_port(p))
                 && let Some(h) = extract_non_loopback_host(trimmed)
                 && !h.is_empty()
             {
@@ -5747,11 +5749,71 @@ pub fn is_safe_secret_env_var_name(name: &str) -> bool {
             | "NINJANVR_DB_PATH"
             | "NINJANVR_HTTP_PORT"
             | "NINJANVR_HTTPS_PORT"
+            | "NINJANVR_METRICS_PORT"
+            | "NINJANVR_METRICS_BIND"
             | "NINJANVR_DISABLE_GO2RTC"
             | "NINJANVR_HTTP_ENFORCE_AUTH"
             | "NINJANVR_ENFORCE_HTTP_AUTH"
+            | "NINJANVR_INSECURE_HTTP_NO_AUTH"
             | "NINJANVR_RELEASE_VERSION"
     )
+}
+
+/// Returns `true` when `port` is a reserved internal NinjaNVR / `go2rtc` / OpenMetrics service port
+/// (including runtime overrides in `NINJANVR_HTTP_PORT`, `NINJANVR_HTTPS_PORT`, and `NINJANVR_METRICS_PORT`)
+/// that outbound SSRF-guarded HTTP/RTSP/ONVIF/WebUI clients must never connect to.
+pub fn is_disallowed_internal_service_port(port: u16) -> bool {
+    if matches!(port, 0 | 1984 | 5000 | 8554 | 8555 | 8971 | 9091) {
+        return true;
+    }
+    for env_key in [
+        "NINJANVR_HTTP_PORT",
+        "NINJANVR_HTTPS_PORT",
+        "NINJANVR_METRICS_PORT",
+    ] {
+        if let Ok(raw) = std::env::var(env_key)
+            && let Ok(env_port) = raw.trim().parse::<u16>()
+            && env_port > 0
+            && env_port == port
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Extracts the effective TCP port from an `http://` or `https://` URL (`80` / `443` when omitted).
+pub fn extract_http_url_effective_port(raw_url: &str) -> Option<u16> {
+    let trimmed = raw_url.trim();
+    let (scheme, after_scheme) = trimmed.split_once("://")?;
+    let default_port = if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else if scheme.eq_ignore_ascii_case("http") {
+        80
+    } else {
+        return None;
+    };
+    let authority_end = after_scheme
+        .find(['/', '?', '#', '\\'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    let host_port = match authority.rfind('@') {
+        Some(at_idx) => &authority[at_idx + 1..],
+        None => authority,
+    };
+    if host_port.starts_with('[') {
+        let end = host_port.find(']')?;
+        let rest = &host_port[end + 1..];
+        if rest.is_empty() {
+            return Some(default_port);
+        }
+        let port_str = rest.strip_prefix(':')?;
+        return port_str.parse::<u16>().ok();
+    }
+    match host_port.rsplit_once(':') {
+        Some((_, port_str)) => port_str.parse::<u16>().ok(),
+        None => Some(default_port),
+    }
 }
 
 /// Validates an environment variable name allowed for `genai.api_key` / `genai.api_key_env`.

@@ -87,8 +87,9 @@ ENV OMP_NUM_THREADS=1
 ENV OV_CPU_THREADS_NUM=1
 
 # 5000: Auth-enforced HTTP API & health probes | 8971: HTTPS/TLS operator console
+# 9091: Dedicated OpenMetrics (/metrics) & /healthz listener (set NINJANVR_METRICS_PORT=0 to disable)
 # 8554: go2rtc RTSP relay | 8555: go2rtc WebRTC media (TCP/UDP)
-EXPOSE 5000 8971 8554 8555/tcp 8555/udp
+EXPOSE 5000 8971 9091 8554 8555/tcp 8555/udp
 
 # Drops privileges to 10001:10001 (ninjanvr) by default on fresh/10001-writable mounts,
 # honors explicit Kubernetes securityContext.runAsNonRoot (--user 10001:10001), and

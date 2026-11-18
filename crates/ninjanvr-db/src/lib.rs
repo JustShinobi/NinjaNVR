@@ -236,6 +236,8 @@ impl Drop for ReadConnGuard<'_> {
     }
 }
 
+type EventCountsCacheEntry = (std::time::Instant, u64, Vec<(String, String, i64)>);
+
 #[derive(Clone)]
 pub struct NinjaDatabase {
     conn: Arc<Mutex<Connection>>,
@@ -243,6 +245,8 @@ pub struct NinjaDatabase {
     path: PathBuf,
     recordings_mutation_seq: Arc<std::sync::atomic::AtomicU64>,
     storage_usage_cache: Arc<Mutex<Option<(std::time::Instant, u64, Value)>>>,
+    events_mutation_seq: Arc<std::sync::atomic::AtomicU64>,
+    event_counts_cache: Arc<Mutex<Option<EventCountsCacheEntry>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -939,6 +943,8 @@ impl NinjaDatabase {
             path,
             recordings_mutation_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             storage_usage_cache: Arc::new(Mutex::new(None)),
+            events_mutation_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            event_counts_cache: Arc::new(Mutex::new(None)),
         };
         db.init_schema()?;
         if !is_in_memory {
@@ -952,6 +958,17 @@ impl NinjaDatabase {
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
+    fn bump_events_mutation(&self) {
+        self.events_mutation_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Monotonic counter incremented whenever rows in `event` are inserted or deleted.
+    pub fn events_mutation_seq(&self) -> u64 {
+        self.events_mutation_seq
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -961,6 +978,7 @@ impl NinjaDatabase {
         let conn = self.lock_conn();
         conn.execute_batch(sql)?;
         self.bump_recordings_mutation();
+        self.bump_events_mutation();
         Ok(())
     }
 
@@ -1095,6 +1113,7 @@ impl NinjaDatabase {
             CREATE INDEX IF NOT EXISTS "review_segment_start_time_end_time" ON "reviewsegment" ("start_time" DESC, "end_time" DESC);
             CREATE INDEX IF NOT EXISTS "review_segment_camera_start_time_end_time" ON "reviewsegment" ("camera", "start_time" ASC, "end_time" ASC);
             CREATE INDEX IF NOT EXISTS "event_camera" ON "event" ("camera");
+            CREATE INDEX IF NOT EXISTS "event_camera_label" ON "event" ("camera", "label");
             CREATE INDEX IF NOT EXISTS "event_start_time_end_time" ON "event" ("start_time" DESC, "end_time" DESC);
             CREATE INDEX IF NOT EXISTS "event_camera_start_time_end_time" ON "event" ("camera", "start_time" ASC, "end_time" ASC);
             CREATE UNIQUE INDEX IF NOT EXISTS "userreviewstatus_user_segment" ON "userreviewstatus" ("user_id", "review_segment_id");
@@ -4601,8 +4620,21 @@ impl NinjaDatabase {
         Ok(())
     }
 
-    /// Returns total event counts grouped by `(camera, label)` for Prometheus `/api/metrics`.
+    /// Returns total event counts grouped by `(camera, label)` for Prometheus `/metrics`,
+    /// backed by covering index `event_camera_label` and a 15-second mutation-invalidated cache.
     pub fn query_event_counts_by_camera_and_label(&self) -> Result<Vec<(String, String, i64)>> {
+        const EVENT_COUNTS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+        let current_seq = self
+            .events_mutation_seq
+            .load(std::sync::atomic::Ordering::Acquire);
+        if let Ok(guard) = self.event_counts_cache.lock()
+            && let Some((cached_at, cached_seq, ref cached_val)) = *guard
+            && cached_seq == current_seq
+            && cached_at.elapsed() < EVENT_COUNTS_CACHE_TTL
+        {
+            return Ok(cached_val.clone());
+        }
+
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT camera, label, COUNT(*) FROM event GROUP BY camera, label ORDER BY camera, label",
@@ -4617,6 +4649,12 @@ impl NinjaDatabase {
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
+        }
+        drop(stmt);
+        drop(conn);
+
+        if let Ok(mut guard) = self.event_counts_cache.lock() {
+            *guard = Some((std::time::Instant::now(), current_seq, out.clone()));
         }
         Ok(out)
     }
@@ -4744,6 +4782,7 @@ impl NinjaDatabase {
             ],
         )?;
         tx.commit()?;
+        self.bump_events_mutation();
         Ok(())
     }
 
@@ -4758,6 +4797,9 @@ impl NinjaDatabase {
             )?;
         }
         tx.commit()?;
+        if count > 0 {
+            self.bump_events_mutation();
+        }
         Ok(count)
     }
 
@@ -4833,6 +4875,9 @@ impl NinjaDatabase {
             }
         }
         tx.commit()?;
+        if !deleted_items.is_empty() {
+            self.bump_events_mutation();
+        }
         Ok(Ok(deleted_items))
     }
 
@@ -6773,6 +6818,9 @@ impl NinjaDatabase {
         }
 
         tx.commit()?;
+        if deleted_events > 0 {
+            self.bump_events_mutation();
+        }
         Ok((deleted_events, deleted_reviews, files_to_remove))
     }
 
@@ -6945,6 +6993,9 @@ impl NinjaDatabase {
         }
 
         tx.commit()?;
+        if total_deleted_events > 0 {
+            self.bump_events_mutation();
+        }
         Ok((total_deleted_events, total_deleted_reviews, all_files))
     }
 

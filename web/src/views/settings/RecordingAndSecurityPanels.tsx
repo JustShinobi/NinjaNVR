@@ -104,6 +104,22 @@ export function validateFederationPeerUrl(rawUrl: string): {
       error: "Invalid peer URL: query parameters and fragments are not allowed",
     };
   }
+  const peerPortNum = parsed.port ? Number(parsed.port) : null;
+  if (
+    peerPortNum !== null &&
+    (peerPortNum === 1984 ||
+      peerPortNum === 5000 ||
+      peerPortNum === 8554 ||
+      peerPortNum === 8555 ||
+      peerPortNum === 9091)
+  ) {
+    return {
+      valid: false,
+      normalizedUrl: "",
+      error:
+        "Disallowed peer URL: internal NinjaNVR HTTP, metrics, and go2rtc ports cannot be federated",
+    };
+  }
   const hostClean = parsed.hostname
     .replace(/^\[|\]$/g, "")
     .replace(/\.+$/, "")

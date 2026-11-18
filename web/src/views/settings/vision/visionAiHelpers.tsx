@@ -487,6 +487,7 @@ export function isSafeGenAiCustomBaseUrl(rawUrl: string): boolean {
     (portNum === 0 ||
       portNum === 5000 ||
       portNum === 8971 ||
+      portNum === 9091 ||
       portNum === 1984 ||
       portNum === 8554)
   ) {
