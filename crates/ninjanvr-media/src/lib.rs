@@ -1574,6 +1574,7 @@ pub struct RecordingEngine {
     storage_degraded: Arc<AtomicBool>,
     storage_error: Arc<std::sync::Mutex<Option<String>>>,
     recorders: Arc<tokio::sync::Mutex<HashMap<String, SupervisedRecorderHandle>>>,
+    reconcile_lock: Arc<tokio::sync::Mutex<()>>,
     bg_tasks: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     shutdown_flag: Arc<AtomicBool>,
     shutdown_notify: Arc<tokio::sync::Notify>,
@@ -1620,6 +1621,7 @@ impl RecordingEngine {
             storage_degraded,
             storage_error,
             recorders: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
             bg_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
@@ -1742,6 +1744,7 @@ impl RecordingEngine {
     /// stops removed/disabled cameras or cameras whose stream URL / `CameraRecordPolicy` changed,
     /// and spawns recorder workers for newly added or enabled cameras.
     pub async fn reconcile(&self) {
+        let _reconcile_guard = self.reconcile_lock.lock().await;
         if self.shutdown_flag.load(Ordering::SeqCst) {
             return;
         }
@@ -1812,7 +1815,7 @@ impl RecordingEngine {
                     .await;
             });
 
-            map.insert(
+            if let Some(prev) = map.insert(
                 camera_name,
                 SupervisedRecorderHandle {
                     spec,
@@ -1821,7 +1824,11 @@ impl RecordingEngine {
                     active_pid,
                     join_handle,
                 },
-            );
+            ) {
+                prev.stop_flag.store(true, Ordering::SeqCst);
+                prev.stop_notify.notify_waiters();
+                prev.join_handle.abort();
+            }
         }
     }
 

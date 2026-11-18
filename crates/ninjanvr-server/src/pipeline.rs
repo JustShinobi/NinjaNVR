@@ -1300,6 +1300,7 @@ pub struct VisionPipeline {
     pub alert_backup_semaphore: Arc<Semaphore>,
     pub preview_write_semaphore: Arc<Semaphore>,
     pub workers: Arc<tokio::sync::Mutex<HashMap<String, SupervisedVisionWorker>>>,
+    pub reconcile_lock: Arc<tokio::sync::Mutex<()>>,
     pub shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
     pub shutdown_notify: Arc<tokio::sync::Notify>,
     pub ffmpeg_bin: PathBuf,
@@ -1346,6 +1347,7 @@ impl VisionPipeline {
             alert_backup_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_ALERT_BACKUP_TASKS)),
             preview_write_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_PREVIEW_WRITE_TASKS)),
             workers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
             shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             ffmpeg_bin: resolve_ffmpeg_bin(),
@@ -1443,6 +1445,11 @@ impl VisionPipeline {
 
     /// Reconciles active supervised per-camera vision workers against `self.config`.
     pub async fn reconcile(&self) {
+        let _reconcile_guard = self.reconcile_lock.lock().await;
+        self.reconcile_locked().await;
+    }
+
+    async fn reconcile_locked(&self) {
         if self.shutdown_flag.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
@@ -1517,7 +1524,7 @@ impl VisionPipeline {
                 .await;
             });
 
-            map.insert(
+            if let Some(prev) = map.insert(
                 cam_name,
                 SupervisedVisionWorker {
                     spec,
@@ -1526,7 +1533,12 @@ impl VisionPipeline {
                     active_pid,
                     join_handle,
                 },
-            );
+            ) {
+                prev.stop_flag
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                prev.stop_notify.notify_waiters();
+                prev.join_handle.abort();
+            }
         }
     }
 
@@ -1544,6 +1556,7 @@ impl VisionPipeline {
 
     /// Stops and re-spawns all supervised camera vision workers when supervision is active.
     pub async fn restart_workers(&self) {
+        let _reconcile_guard = self.reconcile_lock.lock().await;
         if self.shutdown_flag.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
@@ -1552,7 +1565,7 @@ impl VisionPipeline {
             map.drain().collect()
         };
         self.stop_workers_gracefully(drained).await;
-        self.reconcile().await;
+        self.reconcile_locked().await;
     }
 
     pub async fn start(self: Arc<Self>) {

@@ -5177,7 +5177,7 @@ async fn api_recognized_license_plates(
         .db
         .query_recognized_license_plates()
         .unwrap_or_default();
-    {
+    if caller_can_mutate(&state, &jar, &headers, true).await {
         let cfg = state.config.read().await;
         for known in cfg.lpr.known_plates.keys() {
             let norm = ninjanvr_infer::normalize_license_plate(known);
@@ -6450,6 +6450,9 @@ async fn api_recordings_sync(
     })
     .await
     .unwrap_or((0, 0));
+    if removed_orphans > 0 {
+        state.vod_cache.invalidate_all();
+    }
     let duration_ms = started.elapsed().as_millis() as u64;
     Json(json!({
         "removed_orphans": removed_orphans,

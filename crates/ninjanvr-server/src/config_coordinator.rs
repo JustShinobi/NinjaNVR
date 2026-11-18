@@ -504,6 +504,7 @@ pub fn to_scoped_api_config_for_principal(cfg: &NinjaConfig, principal: &CallerP
                 }
                 if let Some(crec_obj) = cam_map.get_mut("record").and_then(|v| v.as_object_mut()) {
                     crec_obj.insert("alert_backup".to_string(), json!({ "enabled": false }));
+                    crec_obj.insert("storage_tiers".to_string(), json!({ "enabled": false }));
                 }
             }
         }
