@@ -73,6 +73,7 @@ COPY --chmod=0755 --from=ffmpeg-bin /ffprobe /usr/local/bin/ffprobe
 COPY --from=openvino-assets /openvino-model /openvino-model
 COPY --from=openvino-assets /out/openvino/ /usr/local/lib/ninjanvr/openvino/
 COPY --chmod=0755 --from=builder /src/target/release/ninjanvr /usr/local/bin/ninjanvr
+COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/ninjanvr-entrypoint
 COPY --from=ui-builder /src/web/dist /opt/ninjanvr/web
 
 ENV HOME=/config
@@ -89,6 +90,7 @@ ENV OV_CPU_THREADS_NUM=1
 # 8554: go2rtc RTSP relay | 8555: go2rtc WebRTC media (TCP/UDP)
 EXPOSE 5000 8971 8554 8555/tcp 8555/udp
 
-USER 10001:10001
-
-ENTRYPOINT ["/usr/local/bin/ninjanvr"]
+# Drops privileges to 10001:10001 (ninjanvr) by default on fresh/10001-writable mounts,
+# honors explicit Kubernetes securityContext.runAsNonRoot (--user 10001:10001), and
+# preserves drop-in compatibility when upgrading over legacy root-owned HostPath mounts.
+ENTRYPOINT ["/usr/local/bin/ninjanvr-entrypoint"]
