@@ -28,11 +28,22 @@ pub const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 128;
 pub const HTTP2_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
 pub const MAX_PRIVATE_KEY_FILE_BYTES: u64 = 256 * 1024;
 
-/// Strips any client-supplied `x-peer-ip` headers (plus spoofing variants) and injects the
-/// verified TCP socket peer IP (canonicalizing IPv4-mapped IPv6 addresses) so downstream rate limiters,
-/// proxy auth, and audit logs never trust a client-controlled `x-peer-ip` header on either HTTP (`:5000`) or HTTPS (`:8971`).
+/// Strips any client-supplied `x-peer-ip`, `x-ninjanvr-enforce-auth`, and `x-ninjanvr-https-listener`
+/// headers (plus spoofing variants) and injects the verified TCP socket peer IP (canonicalizing IPv4-mapped IPv6 addresses)
+/// so downstream rate limiters, auth gates, proxy auth, and audit logs never trust client-controlled internal headers
+/// on either HTTP (`:5000`) or HTTPS (`:8971`).
 pub fn sanitize_peer_ip_and_host_headers<B>(req: &mut Request<B>, remote_addr: SocketAddr) {
     while req.headers_mut().remove("x-peer-ip").is_some() {}
+    while req
+        .headers_mut()
+        .remove("x-ninjanvr-enforce-auth")
+        .is_some()
+    {}
+    while req
+        .headers_mut()
+        .remove("x-ninjanvr-https-listener")
+        .is_some()
+    {}
     let peer_ip_str = remote_addr.ip().to_canonical().to_string();
     if let Ok(val) = hyper::header::HeaderValue::from_str(&peer_ip_str) {
         req.headers_mut().insert("x-peer-ip", val);
@@ -43,6 +54,28 @@ pub fn sanitize_peer_ip_and_host_headers<B>(req: &mut Request<B>, remote_addr: S
     {
         req.headers_mut().insert(hyper::header::HOST, val);
     }
+}
+
+/// Resolves whether HTTP listener `:5000` enforces authentication (`true` by default, fail-closed).
+/// Only returns `false` when `NINJANVR_HTTP_ENFORCE_AUTH` (or legacy `NINJANVR_ENFORCE_HTTP_AUTH`)
+/// is explicitly `"0" | "false" | "no"`, or `NINJANVR_INSECURE_HTTP_NO_AUTH` is `"1" | "true" | "yes"`.
+pub fn resolve_enforce_http_auth(
+    http_enforce: Option<&str>,
+    legacy_enforce: Option<&str>,
+    insecure_no_auth: Option<&str>,
+) -> bool {
+    if insecure_no_auth
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+    {
+        return false;
+    }
+    if let Some(v) = http_enforce.or(legacy_enforce) {
+        let norm = v.trim().to_ascii_lowercase();
+        if matches!(norm.as_str(), "0" | "false" | "no") {
+            return false;
+        }
+    }
+    true
 }
 
 /// Completes a TLS handshake within `timeout_dur`, aborting stalled/slowloris handshakes.
@@ -480,7 +513,7 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
-#[tokio::main(worker_threads = 4)]
+#[tokio::main]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt()
@@ -568,9 +601,14 @@ async fn main() -> Result<()> {
     let san_hosts = sanitize_san_hosts(&raw_san_hosts);
     let go2rtc_supervisor = state.go2rtc_supervisor.clone();
     let camera_metrics = state.camera_metrics.clone();
-    let enforce_http_auth = std::env::var("NINJANVR_HTTP_ENFORCE_AUTH")
-        .or_else(|_| std::env::var("NINJANVR_ENFORCE_HTTP_AUTH"))
-        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    let enforce_http_auth = resolve_enforce_http_auth(
+        std::env::var("NINJANVR_HTTP_ENFORCE_AUTH").ok().as_deref(),
+        std::env::var("NINJANVR_ENFORCE_HTTP_AUTH").ok().as_deref(),
+        std::env::var("NINJANVR_INSECURE_HTTP_NO_AUTH")
+            .ok()
+            .as_deref(),
+    );
+    let state_for_shutdown = state.clone();
     let app_http = build_router_with_auth(state.clone(), enforce_http_auth);
     let app_https = build_router_with_auth(state, true);
     let (shutdown_tx, mut http_shutdown_rx) = watch::channel(false);
@@ -686,6 +724,10 @@ async fn main() -> Result<()> {
             let hyper_service =
                 hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
                     sanitize_peer_ip_and_host_headers(&mut req, remote_addr);
+                    req.headers_mut().insert(
+                        hyper::header::HeaderName::from_static("x-ninjanvr-https-listener"),
+                        hyper::header::HeaderValue::from_static("1"),
+                    );
                     let mut svc = app_clone.clone();
                     async move { svc.call(req).await }
                 });
@@ -704,6 +746,9 @@ async fn main() -> Result<()> {
                 .await;
         });
     }
+
+    state_for_shutdown.pipeline.shutdown().await;
+    state_for_shutdown.recorder.shutdown().await;
 
     let cam_pids: Vec<u32> = camera_metrics
         .read()
@@ -729,6 +774,8 @@ mod tests {
             .uri("https://nvr.local:8971/api/version")
             .header("x-peer-ip", "127.0.0.1")
             .header("X-Peer-Ip", "10.0.0.1")
+            .header("x-ninjanvr-enforce-auth", "0")
+            .header("x-ninjanvr-https-listener", "1")
             .body(())
             .unwrap();
         let remote: SocketAddr = "203.0.113.45:54321".parse().unwrap();
@@ -741,12 +788,20 @@ mod tests {
             .filter_map(|v| v.to_str().ok())
             .collect();
         assert_eq!(all_peer_ips, vec!["203.0.113.45"]);
+        assert!(!req.headers().contains_key("x-ninjanvr-enforce-auth"));
+        assert!(!req.headers().contains_key("x-ninjanvr-https-listener"));
         assert_eq!(
             req.headers()
                 .get(hyper::header::HOST)
                 .and_then(|v| v.to_str().ok()),
             Some("nvr.local:8971")
         );
+        assert!(resolve_enforce_http_auth(None, None, None));
+        assert!(resolve_enforce_http_auth(Some("1"), None, None));
+        assert!(!resolve_enforce_http_auth(Some("0"), None, None));
+        assert!(!resolve_enforce_http_auth(Some("false"), None, None));
+        assert!(!resolve_enforce_http_auth(Some("no"), None, None));
+        assert!(!resolve_enforce_http_auth(Some("1"), None, Some("true")));
     }
 
     #[tokio::test]

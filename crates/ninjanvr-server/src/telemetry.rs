@@ -240,12 +240,23 @@ pub fn filter_stats_snapshot_for_allowed_cameras(val: &mut Value, allow_list: &[
         .unwrap_or_default();
     let is_exact_cam_permitted = |k: &str| allow_list.iter().any(|a| a == k);
     let mut retained_cam_fps = 0.0;
+    let mut retained_proc_fps = 0.0;
+    let mut retained_skip_fps = 0.0;
     let mut retained_det_fps = 0.0;
     if let Some(cams) = val.get_mut("cameras").and_then(|v| v.as_object_mut()) {
         cams.retain(|k, _| is_exact_cam_permitted(k));
         for c_stat in cams.values() {
-            retained_cam_fps += c_stat
+            let cfps = c_stat
                 .get("camera_fps")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            retained_cam_fps += cfps;
+            retained_proc_fps += c_stat
+                .get("process_fps")
+                .and_then(Value::as_f64)
+                .unwrap_or(cfps);
+            retained_skip_fps += c_stat
+                .get("skipped_fps")
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0);
             retained_det_fps += c_stat
@@ -256,9 +267,12 @@ pub fn filter_stats_snapshot_for_allowed_cameras(val: &mut Value, allow_list: &[
     }
     if let Some(obj) = val.as_object_mut() {
         let rounded_cam = (retained_cam_fps * 10.0).round() / 10.0;
+        let rounded_proc = (retained_proc_fps * 10.0).round() / 10.0;
+        let rounded_skip = (retained_skip_fps * 10.0).round() / 10.0;
         let rounded_det = (retained_det_fps * 10.0).round() / 10.0;
         obj.insert("camera_fps".to_string(), json!(rounded_cam));
-        obj.insert("process_fps".to_string(), json!(rounded_cam));
+        obj.insert("process_fps".to_string(), json!(rounded_proc));
+        obj.insert("skipped_fps".to_string(), json!(rounded_skip));
         obj.insert("detection_fps".to_string(), json!(rounded_det));
     }
     if let Some(service_obj) = val.get_mut("service").and_then(|s| s.as_object_mut()) {
@@ -381,6 +395,28 @@ pub fn render_prometheus_exposition(
     );
     out.push_str("# TYPE ninjanvr_detector_inference_ms gauge\n");
     render_detector_inference_metrics(stats_val, &mut out);
+
+    out.push_str(
+        "# HELP ninjanvr_detector_inferences_total Total AI detector region inferences executed per camera.\n",
+    );
+    out.push_str("# TYPE ninjanvr_detector_inferences_total counter\n");
+    if let Some(cams) = stats_val.get("cameras").and_then(Value::as_object) {
+        for (cam, c_stat) in cams {
+            if let Some(allow_list) = allowed
+                && !allow_list.iter().any(|a| a == cam || a == "*")
+            {
+                continue;
+            }
+            let safe_cam = escape_prom_label_value(cam);
+            let total_inf = c_stat
+                .get("total_inferences")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            out.push_str(&format!(
+                "ninjanvr_detector_inferences_total{{camera=\"{safe_cam}\"}} {total_inf}\n"
+            ));
+        }
+    }
 
     out.push_str("# HELP ninjanvr_storage_used_bytes Used bytes on storage mounts.\n");
     out.push_str("# TYPE ninjanvr_storage_used_bytes gauge\n");
@@ -540,6 +576,7 @@ mod tests {
             "Prometheus must export exact resident bytes (320 MiB), not mem_pct * 1 MiB: {prom}"
         );
         assert!(prom.contains("ninjanvr_camera_online{camera=\"front_door\"} 1\n"));
+        assert!(prom.contains("ninjanvr_detector_inferences_total{camera=\"front_door\"} 0\n"));
     }
 
     #[test]

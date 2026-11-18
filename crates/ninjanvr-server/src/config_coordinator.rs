@@ -15,14 +15,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use ninjanvr_config::{DEFAULT_GO2RTC_SHM_PATH, NinjaConfig, parse_go2rtc_stream_route};
+use ninjanvr_comms::SharedCommsHub;
+use ninjanvr_config::{
+    DEFAULT_GO2RTC_SHM_PATH, Go2RtcSupervisor, NinjaConfig, parse_go2rtc_stream_route,
+};
 use ninjanvr_infer::AiDetectorEngine;
-use serde_json::Value;
+use ninjanvr_media::RecordingEngine;
+use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 
+use crate::auth_gate::CallerPrincipal;
 use crate::camera_protocols::CameraDriverRuntime;
 use crate::mse_hub::MseStreamHub;
+use crate::pipeline::VisionPipeline;
 
 /// Typed error returned by transactional `ConfigCoordinator` commit operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,6 +356,17 @@ pub fn scrub_raw_yaml_secrets_strict(raw_yaml: &str, cfg: &NinjaConfig) -> Strin
 
 /// Builds a sanitized, camera-scoped JSON representation of `cfg` for `/api/config`.
 pub fn to_scoped_api_config(cfg: &NinjaConfig, allowed_cameras: Option<&[String]>) -> Value {
+    let principal = match allowed_cameras {
+        Some(list) => CallerPrincipal::new("scoped", "viewer", Some(list.to_vec())),
+        None => CallerPrincipal::new("admin", "admin", None),
+    };
+    to_scoped_api_config_for_principal(cfg, &principal)
+}
+
+/// Builds a role- and camera-scoped JSON representation of `cfg` for `/api/config`,
+/// redacting topology, credentials, known plates, peers, storage/DB paths, and floorplans
+/// for non-admin or camera-restricted callers.
+pub fn to_scoped_api_config_for_principal(cfg: &NinjaConfig, principal: &CallerPrincipal) -> Value {
     let mut api_cfg = if validate_config_labelmap_paths(cfg).is_ok() {
         cfg.to_api_config()
     } else {
@@ -367,7 +384,8 @@ pub fn to_scoped_api_config(cfg: &NinjaConfig, allowed_cameras: Option<&[String]
         safe_clone.to_api_config()
     };
 
-    if let Some(allowed) = allowed_cameras {
+    let scope_restricted = principal.camera_scope().is_restricted();
+    if let Some(allowed) = principal.allowed_cameras.as_deref() {
         let is_cam_permitted = |cam_name: &str| allowed.iter().any(|a| a == cam_name || a == "*");
         if let Some(cams_obj) = api_cfg.get_mut("cameras").and_then(|v| v.as_object_mut()) {
             cams_obj.retain(|k, _| is_cam_permitted(k));
@@ -408,23 +426,89 @@ pub fn to_scoped_api_config(cfg: &NinjaConfig, allowed_cameras: Option<&[String]
                 }
             }
         }
-        if let Some(rooms_arr) = api_cfg
-            .get_mut("ui")
-            .and_then(|u| u.get_mut("floorplan"))
-            .and_then(|f| f.get_mut("rooms"))
-            .and_then(|v| v.as_array_mut())
+    }
+
+    if scope_restricted && let Some(ui_obj) = api_cfg.get_mut("ui").and_then(|v| v.as_object_mut())
+    {
+        ui_obj.remove("floorplan");
+    }
+
+    if !principal.is_admin() || scope_restricted {
+        if let Some(lpr_obj) = api_cfg.get_mut("lpr").and_then(|v| v.as_object_mut()) {
+            lpr_obj.insert("known_plates".to_string(), json!({}));
+        }
+        if let Some(top_obj) = api_cfg.as_object_mut() {
+            top_obj.insert("peers".to_string(), json!({}));
+            top_obj.insert("database".to_string(), json!({}));
+        }
+        if let Some(mqtt_obj) = api_cfg.get_mut("mqtt").and_then(|v| v.as_object_mut()) {
+            mqtt_obj.insert("host".to_string(), json!(""));
+            mqtt_obj.insert("user".to_string(), Value::Null);
+            mqtt_obj.insert("password".to_string(), Value::Null);
+            mqtt_obj.insert("tls_ca_certs".to_string(), Value::Null);
+            mqtt_obj.insert("tls_client_cert".to_string(), Value::Null);
+            mqtt_obj.insert("tls_client_key".to_string(), Value::Null);
+        }
+        if let Some(auth_obj) = api_cfg.get_mut("auth").and_then(|v| v.as_object_mut()) {
+            auth_obj.insert("trusted_proxies".to_string(), json!([]));
+            auth_obj.insert(
+                "proxy".to_string(),
+                json!({ "enabled": cfg.auth.proxy.enabled }),
+            );
+            if let Some(oidc_obj) = auth_obj.get_mut("oidc").and_then(|v| v.as_object_mut()) {
+                oidc_obj.remove("client_secret_env");
+                oidc_obj.insert("issuer_url".to_string(), json!(""));
+            }
+        }
+        if let Some(rec_obj) = api_cfg.get_mut("record").and_then(|v| v.as_object_mut()) {
+            rec_obj.insert("storage_tiers".to_string(), json!({ "enabled": false }));
+            rec_obj.insert("alert_backup".to_string(), json!({ "enabled": false }));
+        }
+        if let Some(streams_obj) = api_cfg
+            .get_mut("go2rtc")
+            .and_then(|g| g.get_mut("streams"))
+            .and_then(|v| v.as_object_mut())
         {
-            for room in rooms_arr.iter_mut() {
-                if let Some(room_obj) = room.as_object_mut()
-                    && let Some(cam_str) = room_obj.get("camera").and_then(|v| v.as_str())
-                    && !cam_str.is_empty()
-                    && !is_cam_permitted(cam_str)
+            for val in streams_obj.values_mut() {
+                *val = json!(["rtsp://***"]);
+            }
+        }
+        if let Some(cams_obj) = api_cfg.get_mut("cameras").and_then(|v| v.as_object_mut()) {
+            for cam_val in cams_obj.values_mut() {
+                let Some(cam_map) = cam_val.as_object_mut() else {
+                    continue;
+                };
+                cam_map.insert("webui_url".to_string(), Value::Null);
+                if let Some(inputs_arr) = cam_map
+                    .get_mut("ffmpeg")
+                    .and_then(|f| f.get_mut("inputs"))
+                    .and_then(|i| i.as_array_mut())
                 {
-                    room_obj.insert("camera".to_string(), Value::Null);
+                    for inp in inputs_arr {
+                        if let Some(inp_obj) = inp.as_object_mut() {
+                            inp_obj.insert("path".to_string(), json!("rtsp://***"));
+                        }
+                    }
+                }
+                if let Some(onvif_obj) = cam_map.get_mut("onvif").and_then(|v| v.as_object_mut()) {
+                    onvif_obj.insert("host".to_string(), json!(""));
+                    onvif_obj.insert("user".to_string(), Value::Null);
+                    onvif_obj.insert("password".to_string(), Value::Null);
+                }
+                if let Some(hw_obj) = cam_map.get_mut("hardware").and_then(|v| v.as_object_mut()) {
+                    for secret_k in ["host", "user", "username", "password", "cloud_password"] {
+                        if hw_obj.contains_key(secret_k) {
+                            hw_obj.insert(secret_k.to_string(), Value::Null);
+                        }
+                    }
+                }
+                if let Some(crec_obj) = cam_map.get_mut("record").and_then(|v| v.as_object_mut()) {
+                    crec_obj.insert("alert_backup".to_string(), json!({ "enabled": false }));
                 }
             }
         }
     }
+
     api_cfg
 }
 
@@ -626,6 +710,10 @@ pub struct ConfigCoordinator {
     commit_lock: Arc<Mutex<()>>,
     go2rtc_config_path: PathBuf,
     mse_hub: Option<MseStreamHub>,
+    pipeline: Option<Arc<VisionPipeline>>,
+    recorder: Option<Arc<RecordingEngine>>,
+    go2rtc_supervisor: Option<Arc<Go2RtcSupervisor>>,
+    comms: Option<SharedCommsHub>,
 }
 
 impl ConfigCoordinator {
@@ -637,6 +725,10 @@ impl ConfigCoordinator {
             commit_lock: Arc::new(Mutex::new(())),
             go2rtc_config_path: PathBuf::from(DEFAULT_GO2RTC_SHM_PATH),
             mse_hub: None,
+            pipeline: None,
+            recorder: None,
+            go2rtc_supervisor: None,
+            comms: None,
         }
     }
 
@@ -644,6 +736,62 @@ impl ConfigCoordinator {
     pub fn with_mse_hub(mut self, mse_hub: MseStreamHub) -> Self {
         self.mse_hub = Some(mse_hub);
         self
+    }
+
+    /// Attaches runtime supervisors so committed configuration updates reconcile `VisionPipeline`,
+    /// `RecordingEngine`, `Go2RtcSupervisor`, and broadcast `"config"` events over `/ws`.
+    pub fn with_runtime_reconcilers(
+        mut self,
+        pipeline: Arc<VisionPipeline>,
+        recorder: Arc<RecordingEngine>,
+        go2rtc_supervisor: Arc<Go2RtcSupervisor>,
+        comms: SharedCommsHub,
+    ) -> Self {
+        self.pipeline = Some(pipeline);
+        self.recorder = Some(recorder);
+        self.go2rtc_supervisor = Some(go2rtc_supervisor);
+        self.comms = Some(comms);
+        self
+    }
+
+    async fn reconcile_runtime_after_commit(
+        &self,
+        next_cfg: &NinjaConfig,
+        invalidated_cameras: &[String],
+    ) {
+        if let Some(ref comms) = self.comms {
+            comms.init_from_config(next_cfg);
+        }
+        if let Some(ref sup) = self.go2rtc_supervisor {
+            let custom_target = self.go2rtc_config_path != Path::new(DEFAULT_GO2RTC_SHM_PATH)
+                && !self.go2rtc_config_path.as_os_str().is_empty();
+            if !next_cfg.config_path.as_os_str().is_empty() || custom_target {
+                if sup
+                    .reload_config_file(next_cfg, &self.go2rtc_config_path)
+                    .await
+                    .is_err()
+                {
+                    sup.request_reload();
+                }
+            } else {
+                sup.request_reload();
+            }
+        }
+        if let Some(ref pipeline) = self.pipeline {
+            pipeline.reconcile().await;
+        }
+        if let Some(ref recorder) = self.recorder {
+            recorder.reconcile().await;
+        }
+        if let Some(ref comms) = self.comms {
+            comms.publish_json(
+                "config",
+                &json!({
+                    "type": "updated",
+                    "invalidated_cameras": invalidated_cameras,
+                }),
+            );
+        }
     }
 
     /// Overrides the target path used when synchronizing `go2rtc.yaml` (useful for
@@ -740,6 +888,8 @@ impl ConfigCoordinator {
                 hub.invalidate_camera_streams(cam).await;
             }
         }
+        self.reconcile_runtime_after_commit(&next_cfg, &invalidated_cameras)
+            .await;
         Ok(StructuredConfigCommitOutcome {
             config: next_cfg,
             api_config,
@@ -810,6 +960,8 @@ impl ConfigCoordinator {
                 hub.invalidate_camera_streams(cam).await;
             }
         }
+        self.reconcile_runtime_after_commit(&next_cfg, &invalidated_cameras)
+            .await;
         Ok(StructuredConfigCommitOutcome {
             config: next_cfg,
             api_config,
@@ -1033,7 +1185,7 @@ impl ConfigCoordinator {
             .context("Configuration persistence blocking task failed")??
         };
 
-        *self.config.write().await = next_cfg;
+        *self.config.write().await = next_cfg.clone();
         if invalidate_driver {
             if let Some(rt) = camera_runtime {
                 rt.invalidate_camera(camera);
@@ -1041,6 +1193,9 @@ impl ConfigCoordinator {
             if let Some(ref hub) = self.mse_hub {
                 hub.invalidate_camera_streams(camera).await;
             }
+            let invalidated = [camera.to_string()];
+            self.reconcile_runtime_after_commit(&next_cfg, &invalidated)
+                .await;
         }
         Ok(result)
     }

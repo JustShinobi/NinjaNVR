@@ -453,7 +453,15 @@ version: 0.18-0
                 .uri("/api/auth/oidc/callback?code=abc&state=st1")
                 .header(
                     header::COOKIE,
-                    "ninjanvr_oidc_pkce=st1:ver1:http://localhost:5000/api/auth/oidc/callback",
+                    format!(
+                        "ninjanvr_oidc_pkce={}",
+                        ninjanvr_server::format_signed_oidc_pkce_cookie(
+                            &state.jwt_secret,
+                            "st1",
+                            "ver1",
+                            "http://localhost:5000/api/auth/oidc/callback",
+                        )
+                    ),
                 )
                 .body(Body::empty())
                 .unwrap(),
@@ -574,7 +582,15 @@ version: 0.18-0
                     .uri("/api/auth/oidc/callback?code=c1&state=st1")
                     .header(
                         header::COOKIE,
-                        "ninjanvr_oidc_pkce=st1:ver1:http://localhost:5000/api/auth/oidc/callback",
+                        format!(
+                            "ninjanvr_oidc_pkce={}",
+                            ninjanvr_server::format_signed_oidc_pkce_cookie(
+                                &state.jwt_secret,
+                                "st1",
+                                "ver1",
+                                "http://localhost:5000/api/auth/oidc/callback",
+                            )
+                        ),
                     )
                     .body(Body::empty())
                     .unwrap(),
@@ -918,6 +934,7 @@ version: 0.18-0
     let state = new_app_state(&cfg_path, web_dir, media_dir.clone(), false)
         .await
         .unwrap();
+    state.enable_ephemeral_loopback_federation_for_test();
     let _ = state.db.ensure_default_admin(1000).unwrap();
     state
         .db
@@ -1359,7 +1376,15 @@ version: 0.18-0
                     .uri("/api/auth/oidc/callback?code=c1&state=st1")
                     .header(
                         header::COOKIE,
-                        "ninjanvr_oidc_pkce=st1:ver1:http://localhost:5000/api/auth/oidc/callback",
+                        format!(
+                            "ninjanvr_oidc_pkce={}",
+                            ninjanvr_server::format_signed_oidc_pkce_cookie(
+                                &state.jwt_secret,
+                                "st1",
+                                "ver1",
+                                "http://localhost:5000/api/auth/oidc/callback",
+                            )
+                        ),
                     )
                     .body(Body::empty())
                     .unwrap(),
@@ -1399,7 +1424,15 @@ version: 0.18-0
                 .uri("/api/auth/oidc/callback?code=c1&state=st1")
                 .header(
                     header::COOKIE,
-                    "ninjanvr_oidc_pkce=st1:ver1:http://localhost:5000/api/auth/oidc/callback",
+                    format!(
+                        "ninjanvr_oidc_pkce={}",
+                        ninjanvr_server::format_signed_oidc_pkce_cookie(
+                            &state.jwt_secret,
+                            "st1",
+                            "ver1",
+                            "http://localhost:5000/api/auth/oidc/callback",
+                        )
+                    ),
                 )
                 .body(Body::empty())
                 .unwrap(),
@@ -1720,7 +1753,15 @@ version: 0.18-0
                 .uri("/api/auth/oidc/callback?code=c1&state=st1")
                 .header(
                     header::COOKIE,
-                    "ninjanvr_oidc_pkce=st1:ver1:http://localhost:5000/api/auth/oidc/callback",
+                    format!(
+                        "ninjanvr_oidc_pkce={}",
+                        ninjanvr_server::format_signed_oidc_pkce_cookie(
+                            &state.jwt_secret,
+                            "st1",
+                            "ver1",
+                            "http://localhost:5000/api/auth/oidc/callback",
+                        )
+                    ),
                 )
                 .body(Body::empty())
                 .unwrap(),
@@ -1871,7 +1912,15 @@ version: 0.18-0
                     .uri("/api/auth/oidc/callback?code=c1&state=st1")
                     .header(
                         header::COOKIE,
-                        "ninjanvr_oidc_pkce=st1:ver1:http://localhost:5000/api/auth/oidc/callback",
+                        format!(
+                            "ninjanvr_oidc_pkce={}",
+                            ninjanvr_server::format_signed_oidc_pkce_cookie(
+                                &state.jwt_secret,
+                                "st1",
+                                "ver1",
+                                "http://localhost:5000/api/auth/oidc/callback",
+                            )
+                        ),
                     )
                     .body(Body::empty())
                     .unwrap(),

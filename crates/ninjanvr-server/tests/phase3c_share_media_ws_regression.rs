@@ -1765,6 +1765,7 @@ cameras:
 
     // Downgrade `ws_operator` in SQLite to `viewer` while the `/ws` connection is already open
     state.db.update_user_role("ws_operator", "viewer").unwrap();
+    state.auth_gate.invalidate_user("ws_operator");
     state.comms.set_camera_flags(
         "front_door",
         Some(true),

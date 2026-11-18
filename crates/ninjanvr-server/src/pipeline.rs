@@ -32,21 +32,41 @@ pub const MAX_DETECT_WIDTH: u32 = 3840;
 pub const MIN_DETECT_HEIGHT: u32 = 120;
 pub const MAX_DETECT_HEIGHT: u32 = 2160;
 pub const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(15);
+pub const SNAPSHOT_HTTP_TIMEOUT: Duration = Duration::from_millis(4500);
+pub const SIREN_HTTP_TIMEOUT: Duration = Duration::from_millis(8000);
+pub const HEALTHY_STREAM_BACKOFF_RESET: Duration = Duration::from_secs(30);
 pub const MAX_HIGH_RES_SNAPSHOT_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_HIGH_RES_DECODED_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_CONCURRENT_HIGH_RES_SNAPSHOT_TASKS: usize = 4;
 pub const MAX_CONCURRENT_GENAI_VERIFY_TASKS: usize = 4;
 pub const MAX_CONCURRENT_ALERT_BACKUP_TASKS: usize = 2;
+pub const MAX_CONCURRENT_PREVIEW_WRITE_TASKS: usize = 4;
 pub const GENAI_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_PRIVACY_MASK_DEPTH: usize = 16;
 
 pub fn build_snapshot_http_client() -> Option<reqwest::Client> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     reqwest::Client::builder()
-        .timeout(Duration::from_millis(1500))
+        .timeout(SNAPSHOT_HTTP_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok()
+}
+
+pub fn build_siren_http_client() -> Option<reqwest::Client> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder()
+        .timeout(SIREN_HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()
+}
+
+/// Computes exponential reconnect backoff (`5s -> 10s -> 20s -> 40s -> 60s`) for camera vision loops.
+pub fn compute_vision_backoff_delay(consecutive_failures: u32) -> Duration {
+    let shift = consecutive_failures.min(4);
+    let secs = (5u64.saturating_mul(1u64 << shift)).min(60);
+    Duration::from_secs(secs)
 }
 
 /// Validates that a camera stream URL uses `rtsp://` or `rtsps://`, has a valid non-empty host
@@ -411,7 +431,9 @@ pub fn normalize_yuv_frame_for_processing(frame: &YuvFrame) -> Option<YuvFrame> 
 pub struct CameraRuntimeMetrics {
     pub camera_fps: f64,
     pub process_fps: f64,
+    pub skipped_fps: f64,
     pub detection_fps: f64,
+    pub total_inferences: u64,
     pub pid: u32,
     pub last_frame_ts: f64,
     pub night_mode: bool,
@@ -559,6 +581,8 @@ pub struct CameraVisionSession {
     pub preview_sampler: crate::preview_frames::PreviewFrameSampler,
     pub tensor_buf: Vec<u8>,
     pub active_review: Option<ActiveReviewState>,
+    pub active_tamper_review: Option<ReviewItemDto>,
+    pub active_roi_reviews: HashMap<String, ReviewItemDto>,
     pub track_snapshots: HashMap<String, TrackPersistSnapshot>,
     pub normalized_priv_mask: Value,
     pub privacy_mask_policy: PrivacyMaskPolicy,
@@ -568,6 +592,7 @@ pub struct CameraVisionSession {
     pub prev_night_ir: bool,
     pub consecutive_tamper_frames: u32,
     pub tamper_threshold_frames: u32,
+    pub last_seen_frame_ts: f64,
 }
 
 impl CameraVisionSession {
@@ -613,6 +638,8 @@ impl CameraVisionSession {
             preview_sampler,
             tensor_buf,
             active_review: None,
+            active_tamper_review: None,
+            active_roi_reviews: HashMap::new(),
             track_snapshots: HashMap::new(),
             normalized_priv_mask,
             privacy_mask_policy,
@@ -622,6 +649,7 @@ impl CameraVisionSession {
             prev_night_ir: false,
             consecutive_tamper_frames: 0,
             tamper_threshold_frames: (fps * 4).max(12),
+            last_seen_frame_ts: 0.0,
         }
     }
 
@@ -672,7 +700,95 @@ impl CameraVisionSession {
         delta
     }
 
-    /// Publishes idle MQTT/WS state and flushes any open review segment when the camera is disabled.
+    async fn drain_and_finalize_open_state(&mut self, pipeline: &VisionPipeline, reason: &str) {
+        let close_ts = if self.last_seen_frame_ts > 0.0 {
+            self.last_seen_frame_ts
+        } else {
+            unix_now_f64()
+        };
+
+        // 1. Drain all confirmed tracks from ByteTracker and close them in SQLite + /ws
+        let full_region = [BoundingBox::new(0, 0, self.width, self.height)];
+        let max_drain_steps =
+            (self.cam_cfg.detect.max_disappeared.clamp(1, 600) as usize).saturating_add(8);
+        let mut all_ended: Vec<TrackedObject> = Vec::new();
+        for _ in 0..max_drain_steps {
+            let (_active, mut ended) =
+                self.tracker
+                    .update(close_ts, &[], &full_region, &self.cam_cfg);
+            all_ended.append(&mut ended);
+        }
+        self.tracker = ByteTracker::new(&self.camera, self.width, self.height, &self.cam_cfg);
+
+        if !all_ended.is_empty() {
+            let dummy_len = ((self.width as usize) * (self.height as usize) * 3) / 2;
+            let dummy_frame = YuvFrame {
+                camera: self.cam_arc.clone(),
+                timestamp: close_ts,
+                width: self.width,
+                height: self.height,
+                data: Arc::new(vec![128u8; dummy_len]),
+            };
+            let ctx = FrameLifecycleCtx {
+                camera: &self.camera,
+                cam_cfg: &self.cam_cfg,
+                frame: &dummy_frame,
+                now: close_ts,
+            };
+            pipeline
+                .process_lifecycle_events(
+                    &ctx,
+                    &[],
+                    &all_ended,
+                    &mut self.active_review,
+                    &mut self.track_snapshots,
+                )
+                .await;
+        }
+
+        // 2. Close active object-detection review segment
+        pipeline
+            .close_active_review(&self.camera, &mut self.active_review, reason)
+            .await;
+
+        // 3. Close active tamper review segment if open
+        self.consecutive_tamper_frames = 0;
+        let _ = pipeline.comms.set_camera_tamper(&self.camera, false);
+        if let Some(before_dto) = self.active_tamper_review.take() {
+            let mut closed_dto = before_dto.clone();
+            closed_dto.end_time = Some(close_ts.max(before_dto.start_time));
+            pipeline
+                .persist_and_publish_review_dto(
+                    &self.camera,
+                    &closed_dto,
+                    &before_dto,
+                    "end",
+                    reason,
+                )
+                .await;
+        }
+
+        // 4. Close any active ROI anomaly review segments
+        let open_rois: Vec<ReviewItemDto> =
+            self.active_roi_reviews.drain().map(|(_, v)| v).collect();
+        for before_dto in open_rois {
+            let mut closed_dto = before_dto.clone();
+            closed_dto.end_time = Some(close_ts.max(before_dto.start_time));
+            pipeline
+                .persist_and_publish_review_dto(
+                    &self.camera,
+                    &closed_dto,
+                    &before_dto,
+                    "end",
+                    reason,
+                )
+                .await;
+        }
+
+        self.track_snapshots.clear();
+    }
+
+    /// Publishes idle MQTT/WS state and flushes any open review/track segments when the camera is disabled.
     pub async fn handle_camera_disabled(&mut self, pipeline: &VisionPipeline) {
         if self.prev_motion_on {
             self.prev_motion_on = false;
@@ -701,12 +817,11 @@ impl CameraVisionSession {
             0,
             self.prev_night_ir,
         );
-        pipeline
-            .close_active_review(&self.camera, &mut self.active_review, "camera disable")
+        self.drain_and_finalize_open_state(pipeline, "camera disable")
             .await;
     }
 
-    /// Publishes offline MQTT/WS state, flushes any open review segment, and clears track snapshots
+    /// Publishes offline MQTT/WS state, finalizes active tracks, and flushes open review segments
     /// when the substream decoder disconnects.
     pub async fn handle_stream_disconnected(&mut self, pipeline: &VisionPipeline) {
         pipeline
@@ -723,10 +838,8 @@ impl CameraVisionSession {
         pipeline
             .comms
             .update_camera_activity_with_night(&self.camera, false, Vec::new(), 0, false);
-        pipeline
-            .close_active_review(&self.camera, &mut self.active_review, "stream disconnect")
+        self.drain_and_finalize_open_state(pipeline, "stream disconnect")
             .await;
-        self.track_snapshots.clear();
     }
 
     /// Steps a single decoded YUV420p frame through tamper detection, SIMD motion, ROI state
@@ -751,6 +864,7 @@ impl CameraVisionSession {
             self.handle_camera_disabled(pipeline).await;
             return FrameStepSummary::default();
         }
+        self.last_seen_frame_ts = now;
 
         let width = self.width;
         let height = self.height;
@@ -772,7 +886,7 @@ impl CameraVisionSession {
         }
 
         let _ = pipeline
-            .evaluate_camera_tamper(
+            .evaluate_camera_tamper_with_review(
                 &self.camera,
                 &yuv_frame.data,
                 width,
@@ -780,6 +894,7 @@ impl CameraVisionSession {
                 now,
                 &mut self.consecutive_tamper_frames,
                 self.tamper_threshold_frames,
+                &mut self.active_tamper_review,
             )
             .await;
 
@@ -796,7 +911,7 @@ impl CameraVisionSession {
 
         if rt_flags.enabled && rt_flags.detect && !self.roi_monitor.is_empty() {
             let _ = pipeline
-                .evaluate_camera_roi_states(
+                .evaluate_camera_roi_states_with_reviews(
                     &self.camera,
                     &yuv_frame.data,
                     width,
@@ -805,6 +920,7 @@ impl CameraVisionSession {
                     &motion_boxes,
                     &mut self.roi_monitor,
                     false,
+                    &mut self.active_roi_reviews,
                 )
                 .await;
         }
@@ -966,15 +1082,14 @@ impl CameraVisionSession {
             .write()
             .await
             .insert(self.camera.clone(), yuv_frame.clone());
-        pipeline
-            .camera_metrics
-            .write()
-            .await
-            .entry(self.camera.clone())
-            .or_default()
-            .last_frame_ts = now;
+        {
+            let mut m_guard = pipeline.camera_metrics.write().await;
+            let entry = m_guard.entry(self.camera.clone()).or_default();
+            entry.last_frame_ts = now;
+            entry.total_inferences = entry.total_inferences.saturating_add(batch_detect_calls);
+        }
 
-        // 6b. Live event-strip preview frames
+        // 6b. Live event-strip preview frames (gated by bounded Semaphore so disk stalls never exhaust spawn_blocking)
         let moving_objects = active_tracks.iter().any(|t| !t.stationary);
         let fast_object = active_tracks.iter().any(|t| {
             !t.stationary
@@ -988,6 +1103,7 @@ impl CameraVisionSession {
             && self
                 .preview_sampler
                 .should_write(now, motion_on, moving_objects, fast_object)
+            && let Ok(preview_permit) = pipeline.preview_write_semaphore.clone().try_acquire_owned()
         {
             let store = pipeline.preview_frames.clone();
             let frame_for_preview = yuv_frame.clone();
@@ -995,6 +1111,7 @@ impl CameraVisionSession {
             let cam_for_preview = self.camera.clone();
             let ts_ms = (now.max(0.0) * 1000.0) as u64;
             tokio::task::spawn_blocking(move || {
+                let _permit = preview_permit;
                 let mut rgb = yuv420p_to_rgb_image_scaled(
                     &frame_for_preview,
                     None,
@@ -1145,6 +1262,24 @@ pub fn run_motion_gated_region_inference(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CameraVisionSpec {
+    pub sub_url: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub detector: Option<String>,
+}
+
+pub struct SupervisedVisionWorker {
+    pub spec: CameraVisionSpec,
+    pub stop_flag: Arc<std::sync::atomic::AtomicBool>,
+    pub stop_notify: Arc<tokio::sync::Notify>,
+    pub active_pid: Arc<std::sync::atomic::AtomicU32>,
+    pub join_handle: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone)]
 pub struct VisionPipeline {
     pub config: Arc<RwLock<NinjaConfig>>,
     pub db: NinjaDatabase,
@@ -1159,33 +1294,271 @@ pub struct VisionPipeline {
     pub log_hub: crate::LogBufferHub,
     pub camera_driver_runtime: crate::camera_protocols::CameraDriverRuntime,
     pub snapshot_http_client: Option<reqwest::Client>,
+    pub siren_http_client: Option<reqwest::Client>,
     pub high_res_snapshot_semaphore: Arc<Semaphore>,
     pub genai_verify_semaphore: Arc<Semaphore>,
     pub alert_backup_semaphore: Arc<Semaphore>,
+    pub preview_write_semaphore: Arc<Semaphore>,
+    pub workers: Arc<tokio::sync::Mutex<HashMap<String, SupervisedVisionWorker>>>,
+    pub shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    pub shutdown_notify: Arc<tokio::sync::Notify>,
+    pub ffmpeg_bin: PathBuf,
+    pub fallback_tamper_reviews: Arc<tokio::sync::Mutex<HashMap<String, ReviewItemDto>>>,
+    pub fallback_roi_reviews: Arc<tokio::sync::Mutex<HashMap<(String, String), ReviewItemDto>>>,
 }
 
 impl VisionPipeline {
-    pub async fn start(self: Arc<Self>) {
-        let cameras: Vec<(String, CameraConfig, String)> = {
+    // Shared AppState components passed explicitly to construct an isolated VisionPipeline instance
+    #[expect(clippy::too_many_arguments)]
+    pub fn new(
+        config: Arc<RwLock<NinjaConfig>>,
+        db: NinjaDatabase,
+        comms: SharedCommsHub,
+        detector: Arc<AiDetectorEngine>,
+        activity_ledger: SharedActivityLedger,
+        latest_frames: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+        latest_yuv_frames: SharedLatestYuvFrames,
+        preview_frames: crate::preview_frames::PreviewFrameStore,
+        camera_metrics: SharedCameraMetrics,
+        media_dir: PathBuf,
+        log_hub: crate::LogBufferHub,
+        camera_driver_runtime: crate::camera_protocols::CameraDriverRuntime,
+    ) -> Self {
+        Self {
+            config,
+            db,
+            comms,
+            detector,
+            activity_ledger,
+            latest_frames,
+            latest_yuv_frames,
+            preview_frames,
+            camera_metrics,
+            media_dir,
+            log_hub,
+            camera_driver_runtime,
+            snapshot_http_client: build_snapshot_http_client(),
+            siren_http_client: build_siren_http_client(),
+            high_res_snapshot_semaphore: Arc::new(Semaphore::new(
+                MAX_CONCURRENT_HIGH_RES_SNAPSHOT_TASKS,
+            )),
+            genai_verify_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_GENAI_VERIFY_TASKS)),
+            alert_backup_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_ALERT_BACKUP_TASKS)),
+            preview_write_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_PREVIEW_WRITE_TASKS)),
+            workers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            ffmpeg_bin: resolve_ffmpeg_bin(),
+            fallback_tamper_reviews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            fallback_roi_reviews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn with_ffmpeg_bin(mut self, ffmpeg_bin: PathBuf) -> Self {
+        self.ffmpeg_bin = ffmpeg_bin;
+        self
+    }
+
+    pub async fn active_vision_cameras(&self) -> Vec<String> {
+        let map = self.workers.lock().await;
+        let mut out: Vec<String> = map
+            .iter()
+            .filter(|(_, w)| !w.join_handle.is_finished())
+            .map(|(k, _)| k.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn desired_camera_specs(
+        cfg: &NinjaConfig,
+    ) -> BTreeMap<String, (CameraConfig, CameraVisionSpec)> {
+        cfg.cameras
+            .iter()
+            .filter(|(_, c)| c.enabled && c.detect.enabled)
+            .filter_map(|(name, c)| {
+                let sub_url = cfg
+                    .camera_input_for_role(name, "detect")
+                    .or_else(|| cfg.camera_input_for_role(name, "record"))?;
+                let (width, height, _) =
+                    sanitize_yuv420p_dimensions(c.detect.width, c.detect.height);
+                let fps = c.detect.fps.clamp(1, 30);
+                let spec = CameraVisionSpec {
+                    sub_url,
+                    width,
+                    height,
+                    fps,
+                    detector: c.detect.detector.clone(),
+                };
+                Some((name.clone(), (c.clone(), spec)))
+            })
+            .collect()
+    }
+
+    fn signal_decoder_sigterm(pid: u32) {
+        #[cfg(unix)]
+        if let Ok(raw_pid) = i32::try_from(pid)
+            && raw_pid > 1
+            && pid != std::process::id()
+        {
+            let target = nix::unistd::Pid::from_raw(raw_pid);
+            let _ = nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGTERM);
+        }
+    }
+
+    async fn stop_workers_gracefully(&self, mut workers: Vec<(String, SupervisedVisionWorker)>) {
+        if workers.is_empty() {
+            return;
+        }
+        for (_, w) in &workers {
+            w.stop_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            let pid = w.active_pid.load(std::sync::atomic::Ordering::SeqCst);
+            if pid > 0 {
+                Self::signal_decoder_sigterm(pid);
+            }
+            w.stop_notify.notify_waiters();
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        for (cam, mut w) in workers.drain(..) {
+            let now = tokio::time::Instant::now();
+            if now < deadline {
+                if tokio::time::timeout(deadline - now, &mut w.join_handle)
+                    .await
+                    .is_err()
+                {
+                    w.join_handle.abort();
+                }
+            } else {
+                w.join_handle.abort();
+            }
+            if let Some(m) = self.camera_metrics.write().await.get_mut(&cam) {
+                m.camera_fps = 0.0;
+                m.process_fps = 0.0;
+                m.skipped_fps = 0.0;
+                m.detection_fps = 0.0;
+                m.pid = 0;
+            }
+        }
+    }
+
+    /// Reconciles active supervised per-camera vision workers against `self.config`.
+    pub async fn reconcile(&self) {
+        if self.shutdown_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let desired = {
             let cfg = self.config.read().await;
-            cfg.cameras
-                .iter()
-                .filter(|(_, c)| c.enabled && c.detect.enabled)
-                .filter_map(|(name, c)| {
-                    let sub_url = cfg
-                        .camera_input_for_role(name, "detect")
-                        .or_else(|| cfg.camera_input_for_role(name, "record"))?;
-                    Some((name.clone(), c.clone(), sub_url))
-                })
-                .collect()
+            Self::desired_camera_specs(&cfg)
         };
 
-        for (cam_name, cam_cfg, sub_url) in cameras {
-            let p = self.clone();
-            tokio::spawn(async move {
-                p.run_camera_vision_loop(cam_name, cam_cfg, sub_url).await;
-            });
+        let to_stop = {
+            let mut map = self.workers.lock().await;
+            let stale_keys: Vec<String> = map
+                .iter()
+                .filter_map(|(cam, w)| {
+                    let keep = desired
+                        .get(cam)
+                        .is_some_and(|(_, spec)| *spec == w.spec && !w.join_handle.is_finished());
+                    (!keep).then(|| cam.clone())
+                })
+                .collect();
+            let mut removed = Vec::with_capacity(stale_keys.len());
+            for k in stale_keys {
+                if let Some(w) = map.remove(&k) {
+                    removed.push((k, w));
+                }
+            }
+            removed
+        };
+
+        for (cam, _) in &to_stop {
+            if !desired.contains_key(cam) {
+                self.latest_frames.write().await.remove(cam);
+                self.latest_yuv_frames.write().await.remove(cam);
+            }
         }
+        self.stop_workers_gracefully(to_stop).await;
+
+        if self.shutdown_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+
+        let mut map = self.workers.lock().await;
+        if self.shutdown_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        for (cam_name, (cam_cfg, spec)) in desired {
+            if map
+                .get(&cam_name)
+                .is_some_and(|w| !w.join_handle.is_finished() && w.spec == spec)
+            {
+                continue;
+            }
+            let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_notify = Arc::new(tokio::sync::Notify::new());
+            let active_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+            let p = self.clone();
+            let cam_task = cam_name.clone();
+            let url_task = spec.sub_url.clone();
+            let stop_flag_task = Arc::clone(&stop_flag);
+            let stop_notify_task = Arc::clone(&stop_notify);
+            let pid_task = Arc::clone(&active_pid);
+
+            let join_handle = tokio::spawn(async move {
+                p.run_camera_vision_loop_supervised(
+                    cam_task,
+                    cam_cfg,
+                    url_task,
+                    stop_flag_task,
+                    stop_notify_task,
+                    pid_task,
+                )
+                .await;
+            });
+
+            map.insert(
+                cam_name,
+                SupervisedVisionWorker {
+                    spec,
+                    stop_flag,
+                    stop_notify,
+                    active_pid,
+                    join_handle,
+                },
+            );
+        }
+    }
+
+    /// Gracefully stops all supervised camera vision workers and flushes open reviews/tracks.
+    pub async fn shutdown(&self) {
+        self.shutdown_flag
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.shutdown_notify.notify_waiters();
+        let drained: Vec<(String, SupervisedVisionWorker)> = {
+            let mut map = self.workers.lock().await;
+            map.drain().collect()
+        };
+        self.stop_workers_gracefully(drained).await;
+    }
+
+    /// Stops and re-spawns all supervised camera vision workers when supervision is active.
+    pub async fn restart_workers(&self) {
+        if self.shutdown_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let drained: Vec<(String, SupervisedVisionWorker)> = {
+            let mut map = self.workers.lock().await;
+            map.drain().collect()
+        };
+        self.stop_workers_gracefully(drained).await;
+        self.reconcile().await;
+    }
+
+    pub async fn start(self: Arc<Self>) {
+        self.shutdown_flag
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.reconcile().await;
     }
 
     /// Persists a `ReviewItemDto` on the blocking pool and publishes the corresponding
@@ -1278,7 +1651,15 @@ impl VisionPipeline {
         }
     }
 
-    async fn run_camera_vision_loop(&self, camera: String, cam_cfg: CameraConfig, sub_url: String) {
+    async fn run_camera_vision_loop_supervised(
+        &self,
+        camera: String,
+        cam_cfg: CameraConfig,
+        sub_url: String,
+        stop_flag: Arc<std::sync::atomic::AtomicBool>,
+        stop_notify: Arc<tokio::sync::Notify>,
+        active_pid: Arc<std::sync::atomic::AtomicU32>,
+    ) {
         let (width, height, frame_byte_len) =
             sanitize_yuv420p_dimensions(cam_cfg.detect.width, cam_cfg.detect.height);
         let fps = cam_cfg.detect.fps.clamp(1, 30);
@@ -1294,12 +1675,21 @@ impl VisionPipeline {
 
         let mut session =
             CameraVisionSession::new(camera.clone(), cam_cfg, self.detector.model_dimensions());
-        let ffmpeg_bin = resolve_ffmpeg_bin();
+        let ffmpeg_bin = self.ffmpeg_bin.clone();
         let mut last_live_config_check = unix_now_f64();
         let mut consecutive_stall_cycles = 0u32;
+        let mut backoff_attempt = 0u32;
         let mut last_watchdog_reboot_ts = 0.0f64;
+        let recycle_pool: Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::with_capacity(4)));
 
         loop {
+            if stop_flag.load(std::sync::atomic::Ordering::SeqCst)
+                || self.shutdown_flag.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                break;
+            }
+
             let mut cmd = Command::new(&ffmpeg_bin);
             cmd.args(&ff_args)
                 .stdin(Stdio::null())
@@ -1315,12 +1705,22 @@ impl VisionPipeline {
                         "Camera stream went OFFLINE (decoder spawn failed)",
                     );
                 }
-                warn!("Substream decoder for {camera} could not start; retrying in 15s");
-                tokio::time::sleep(Duration::from_secs(15)).await;
+                let delay = compute_vision_backoff_delay(backoff_attempt);
+                backoff_attempt = backoff_attempt.saturating_add(1);
+                warn!(
+                    "Substream decoder for {camera} could not start; retrying in {}s",
+                    delay.as_secs()
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = stop_notify.notified() => break,
+                    _ = self.shutdown_notify.notified() => break,
+                }
                 continue;
             };
 
             let child_pid = child.id().unwrap_or(0);
+            active_pid.store(child_pid, std::sync::atomic::Ordering::SeqCst);
             info!(
                 "Started substream vision pipeline for {camera} ({}x{} @ {} FPS, pid={child_pid})",
                 width, height, fps
@@ -1328,45 +1728,118 @@ impl VisionPipeline {
 
             {
                 let mut m_guard = self.camera_metrics.write().await;
-                let entry = m_guard
-                    .entry(camera.clone())
-                    .or_insert_with(|| CameraRuntimeMetrics {
-                        camera_fps: 0.0,
-                        process_fps: 0.0,
-                        detection_fps: 0.0,
-                        pid: child_pid,
-                        last_frame_ts: 0.0,
-                        night_mode: false,
-                    });
+                let entry = m_guard.entry(camera.clone()).or_default();
                 entry.pid = child_pid;
             }
 
             let mut received_any_frame = false;
+            let mut stream_healthy_since: Option<std::time::Instant> = None;
+
             if let Some(mut stdout) = child.stdout.take() {
-                let mut frame_data: Arc<Vec<u8>> = Arc::new(vec![0u8; frame_byte_len]);
-                let mut frame_count = 0u64;
+                let (frame_tx, mut frame_rx) =
+                    tokio::sync::watch::channel::<Option<(u64, f64, Arc<Vec<u8>>)>>(None);
+                let pool_for_reader = Arc::clone(&recycle_pool);
+                let stop_for_reader = Arc::clone(&stop_flag);
+                let shutdown_for_reader = Arc::clone(&self.shutdown_flag);
+                let stop_notify_reader = Arc::clone(&stop_notify);
+                let shutdown_notify_reader = Arc::clone(&self.shutdown_notify);
+
+                let reader_handle = tokio::spawn(async move {
+                    let mut seq_id = 0u64;
+                    loop {
+                        if stop_for_reader.load(std::sync::atomic::Ordering::SeqCst)
+                            || shutdown_for_reader.load(std::sync::atomic::Ordering::SeqCst)
+                        {
+                            break;
+                        }
+                        let mut raw_buf = pool_for_reader
+                            .lock()
+                            .ok()
+                            .and_then(|mut g| g.pop())
+                            .unwrap_or_else(|| vec![0u8; frame_byte_len]);
+                        if raw_buf.len() != frame_byte_len {
+                            raw_buf.resize(frame_byte_len, 0);
+                        }
+
+                        let read_ok = tokio::select! {
+                            biased;
+                            _ = stop_notify_reader.notified() => false,
+                            _ = shutdown_notify_reader.notified() => false,
+                            res = tokio::time::timeout(FRAME_READ_TIMEOUT, stdout.read_exact(&mut raw_buf)) => {
+                                res.is_ok_and(|r| r.is_ok())
+                            }
+                        };
+                        if !read_ok {
+                            if let Ok(mut g) = pool_for_reader.lock()
+                                && g.len() < 4
+                            {
+                                g.push(raw_buf);
+                            }
+                            break;
+                        }
+
+                        let capture_ts = unix_now_f64();
+                        seq_id = seq_id.saturating_add(1);
+                        let prev_slot =
+                            frame_tx.send_replace(Some((seq_id, capture_ts, Arc::new(raw_buf))));
+                        if let Some((_, _, unread_arc)) = prev_slot
+                            && let Ok(reclaimed) = Arc::try_unwrap(unread_arc)
+                            && let Ok(mut g) = pool_for_reader.lock()
+                            && g.len() < 4
+                        {
+                            g.push(reclaimed);
+                        }
+                    }
+                });
+
+                let mut prev_seq_id = 0u64;
+                let mut window_decoded_frames = 0u64;
+                let mut window_processed_frames = 0u64;
+                let mut window_skipped_frames = 0u64;
+                let mut total_processed_frames = 0u64;
                 let mut detect_calls = 0u64;
                 let mut window_start = unix_now_f64();
+                let mut prev_consumed_arc: Option<Arc<Vec<u8>>> = None;
                 session.reset_stream_edge_state();
 
-                while tokio::time::timeout(
-                    FRAME_READ_TIMEOUT,
-                    stdout.read_exact(Arc::<Vec<u8>>::make_mut(&mut frame_data)),
-                )
-                .await
-                .is_ok_and(|res| res.is_ok())
-                {
-                    let now = unix_now_f64();
-                    frame_count += 1;
-                    if frame_count == 1 {
+                loop {
+                    let changed_res = tokio::select! {
+                        biased;
+                        _ = stop_notify.notified() => Err(()),
+                        _ = self.shutdown_notify.notified() => Err(()),
+                        res = frame_rx.changed() => res.map_err(|_| ()),
+                    };
+                    if changed_res.is_err() {
+                        break;
+                    }
+                    let Some((seq_id, capture_ts, frame_data)) =
+                        frame_rx.borrow_and_update().clone()
+                    else {
+                        continue;
+                    };
+                    if seq_id <= prev_seq_id {
+                        continue;
+                    }
+
+                    let delta_decoded = seq_id - prev_seq_id;
+                    let skipped_now = delta_decoded.saturating_sub(1);
+                    prev_seq_id = seq_id;
+                    window_decoded_frames = window_decoded_frames.saturating_add(delta_decoded);
+                    window_skipped_frames = window_skipped_frames.saturating_add(skipped_now);
+                    window_processed_frames = window_processed_frames.saturating_add(1);
+                    total_processed_frames = total_processed_frames.saturating_add(1);
+
+                    if total_processed_frames == 1 {
                         received_any_frame = true;
+                        stream_healthy_since = Some(std::time::Instant::now());
                         {
                             let mut m_guard = self.camera_metrics.write().await;
                             let entry = m_guard.entry(camera.clone()).or_default();
                             entry.camera_fps = fps as f64;
                             entry.process_fps = fps as f64;
+                            entry.skipped_fps = 0.0;
                             entry.pid = child_pid;
-                            entry.last_frame_ts = now;
+                            entry.last_frame_ts = capture_ts;
                         }
                         if self.comms.set_camera_availability(&camera, true) {
                             self.log_hub.push_ninjanvr(
@@ -1382,8 +1855,8 @@ impl VisionPipeline {
                         }
                     }
 
-                    if now - last_live_config_check >= LIVE_VISION_CONFIG_POLL_SEC {
-                        last_live_config_check = now;
+                    if capture_ts - last_live_config_check >= LIVE_VISION_CONFIG_POLL_SEC {
+                        last_live_config_check = capture_ts;
                         let next_cfg = self.config.read().await.cameras.get(&camera).cloned();
                         if let Some(next_cfg) = next_cfg {
                             let delta = session.apply_live_config_if_changed(&next_cfg);
@@ -1399,43 +1872,65 @@ impl VisionPipeline {
                     }
 
                     let step = session
-                        .step_frame(self, frame_data.clone(), now, frame_count)
+                        .step_frame(self, frame_data.clone(), capture_ts, total_processed_frames)
                         .await;
+
+                    if let Some(old_arc) = prev_consumed_arc.replace(frame_data)
+                        && let Ok(reclaimed) = Arc::try_unwrap(old_arc)
+                        && let Ok(mut g) = recycle_pool.lock()
+                        && g.len() < 4
+                    {
+                        g.push(reclaimed);
+                    }
+
                     if !step.enabled {
                         tokio::task::yield_now().await;
                         continue;
                     }
                     detect_calls += step.detect_calls;
 
-                    // Update rolling FPS metrics every 5 seconds
-                    let elapsed = (now - window_start).max(0.1);
+                    // Update rolling FPS metrics every 5 seconds while preserving monotonic total_inferences
+                    let elapsed = (capture_ts - window_start).max(0.1);
                     if elapsed >= 5.0 {
-                        let c_fps = ((frame_count as f64 / elapsed) * 10.0).round() / 10.0;
+                        let c_fps =
+                            ((window_decoded_frames as f64 / elapsed) * 10.0).round() / 10.0;
+                        let p_fps =
+                            ((window_processed_frames as f64 / elapsed) * 10.0).round() / 10.0;
+                        let s_fps =
+                            ((window_skipped_frames as f64 / elapsed) * 10.0).round() / 10.0;
                         let d_fps = ((detect_calls as f64 / elapsed) * 10.0).round() / 10.0;
-                        self.camera_metrics.write().await.insert(
-                            camera.clone(),
-                            CameraRuntimeMetrics {
-                                camera_fps: c_fps,
-                                process_fps: c_fps,
-                                detection_fps: d_fps,
-                                pid: child_pid,
-                                last_frame_ts: now,
-                                night_mode: step.is_night_ir,
-                            },
-                        );
-                        frame_count = 0;
+                        {
+                            let mut m_guard = self.camera_metrics.write().await;
+                            let entry = m_guard.entry(camera.clone()).or_default();
+                            entry.camera_fps = c_fps;
+                            entry.process_fps = p_fps;
+                            entry.skipped_fps = s_fps;
+                            entry.detection_fps = d_fps;
+                            entry.pid = child_pid;
+                            entry.last_frame_ts = capture_ts;
+                            entry.night_mode = step.is_night_ir;
+                        }
+                        window_decoded_frames = 0;
+                        window_processed_frames = 0;
+                        window_skipped_frames = 0;
                         detect_calls = 0;
-                        window_start = now;
+                        window_start = capture_ts;
                     }
                     tokio::task::yield_now().await;
                 }
+
+                drop(frame_rx);
+                reader_handle.abort();
+                let _ = reader_handle.await;
             }
 
+            active_pid.store(0, std::sync::atomic::Ordering::SeqCst);
             {
                 let mut m_guard = self.camera_metrics.write().await;
                 if let Some(m) = m_guard.get_mut(&camera) {
                     m.camera_fps = 0.0;
                     m.process_fps = 0.0;
+                    m.skipped_fps = 0.0;
                     m.detection_fps = 0.0;
                     m.pid = 0;
                 }
@@ -1455,9 +1950,24 @@ impl VisionPipeline {
             }
             let _ = child.start_kill();
             let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
-            let retry_sec = if received_any_frame {
+
+            if stop_flag.load(std::sync::atomic::Ordering::SeqCst)
+                || self.shutdown_flag.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                break;
+            }
+
+            if stream_healthy_since
+                .is_some_and(|since| since.elapsed() >= HEALTHY_STREAM_BACKOFF_RESET)
+            {
+                backoff_attempt = 0;
+            }
+
+            let retry_dur = if received_any_frame {
                 consecutive_stall_cycles = 0;
-                5
+                let d = compute_vision_backoff_delay(backoff_attempt);
+                backoff_attempt = backoff_attempt.saturating_add(1);
+                d
             } else {
                 consecutive_stall_cycles = consecutive_stall_cycles.saturating_add(1);
                 let now_ts = unix_now_f64();
@@ -1480,15 +1990,25 @@ impl VisionPipeline {
                         warn!(
                             "Triggered automatic ONVIF/CGI SystemReboot recovery for stalled camera {camera}; waiting 35s for boot"
                         );
-                        35
+                        backoff_attempt = 0;
+                        Duration::from_secs(35)
                     } else {
-                        10
+                        let d = compute_vision_backoff_delay(backoff_attempt);
+                        backoff_attempt = backoff_attempt.saturating_add(1);
+                        d
                     }
                 } else {
-                    10
+                    let d = compute_vision_backoff_delay(backoff_attempt);
+                    backoff_attempt = backoff_attempt.saturating_add(1);
+                    d
                 }
             };
-            tokio::time::sleep(Duration::from_secs(retry_sec)).await;
+
+            tokio::select! {
+                _ = tokio::time::sleep(retry_dur) => {}
+                _ = stop_notify.notified() => break,
+                _ = self.shutdown_notify.notified() => break,
+            }
         }
     }
 
@@ -1506,6 +2026,41 @@ impl VisionPipeline {
         now: f64,
         consecutive_tamper_frames: &mut u32,
         tamper_threshold_frames: u32,
+    ) -> bool {
+        let mut active_slot = self.fallback_tamper_reviews.lock().await.remove(camera);
+        let res = self
+            .evaluate_camera_tamper_with_review(
+                camera,
+                yuv_data,
+                width,
+                height,
+                now,
+                consecutive_tamper_frames,
+                tamper_threshold_frames,
+                &mut active_slot,
+            )
+            .await;
+        if let Some(dto) = active_slot {
+            self.fallback_tamper_reviews
+                .lock()
+                .await
+                .insert(camera.to_string(), dto);
+        }
+        res
+    }
+
+    // Frame-loop tamper evaluation with explicit session-owned active ReviewItemDto slot
+    #[expect(clippy::too_many_arguments)]
+    pub async fn evaluate_camera_tamper_with_review(
+        &self,
+        camera: &str,
+        yuv_data: &[u8],
+        width: u32,
+        height: u32,
+        now: f64,
+        consecutive_tamper_frames: &mut u32,
+        tamper_threshold_frames: u32,
+        active_tamper_review: &mut Option<ReviewItemDto>,
     ) -> bool {
         let tamper_report = check_frame_tamper(yuv_data, width, height);
         let threshold = tamper_threshold_frames.max(1);
@@ -1544,8 +2099,12 @@ impl VisionPipeline {
                         }),
                         has_been_reviewed: false,
                     };
-                    self.persist_and_publish_review_dto(camera, &dto, &dto, "new", "camera tamper")
-                        .await;
+                    if self
+                        .persist_and_publish_review_dto(camera, &dto, &dto, "new", "camera tamper")
+                        .await
+                    {
+                        *active_tamper_review = Some(dto);
+                    }
                 }
                 return true;
             }
@@ -1553,6 +2112,18 @@ impl VisionPipeline {
         } else {
             *consecutive_tamper_frames = 0;
             let _ = self.comms.set_camera_tamper(camera, false);
+            if let Some(before_dto) = active_tamper_review.take() {
+                let mut closed_dto = before_dto.clone();
+                closed_dto.end_time = Some(now.max(before_dto.start_time));
+                self.persist_and_publish_review_dto(
+                    camera,
+                    &closed_dto,
+                    &before_dto,
+                    "end",
+                    "camera tamper clear",
+                )
+                .await;
+            }
             false
         }
     }
@@ -1573,6 +2144,54 @@ impl VisionPipeline {
         roi_monitor: &mut CameraRoiStateMonitor,
         force_eval: bool,
     ) -> Vec<RoiStateTransition> {
+        let mut local_map: HashMap<String, ReviewItemDto> = {
+            let mut g = self.fallback_roi_reviews.lock().await;
+            let keys: Vec<(String, String)> =
+                g.keys().filter(|(c, _)| c == camera).cloned().collect();
+            let mut extracted = HashMap::with_capacity(keys.len());
+            for k in keys {
+                if let Some(v) = g.remove(&k) {
+                    extracted.insert(k.1, v);
+                }
+            }
+            extracted
+        };
+        let res = self
+            .evaluate_camera_roi_states_with_reviews(
+                camera,
+                yuv_data,
+                width,
+                height,
+                now,
+                motion_boxes,
+                roi_monitor,
+                force_eval,
+                &mut local_map,
+            )
+            .await;
+        if !local_map.is_empty() {
+            let mut g = self.fallback_roi_reviews.lock().await;
+            for (roi_name, dto) in local_map {
+                g.insert((camera.to_string(), roi_name), dto);
+            }
+        }
+        res
+    }
+
+    // Frame-loop ROI state evaluation with explicit session-owned active ROI review map
+    #[expect(clippy::too_many_arguments)]
+    pub async fn evaluate_camera_roi_states_with_reviews(
+        &self,
+        camera: &str,
+        yuv_data: &[u8],
+        width: u32,
+        height: u32,
+        now: f64,
+        motion_boxes: &[BoundingBox],
+        roi_monitor: &mut CameraRoiStateMonitor,
+        force_eval: bool,
+        active_roi_reviews: &mut HashMap<String, ReviewItemDto>,
+    ) -> Vec<RoiStateTransition> {
         if roi_monitor.is_empty() {
             return Vec::new();
         }
@@ -1586,7 +2205,22 @@ impl VisionPipeline {
                     .publish_roi_state(camera, &tr.roi_name, &tr.current_state);
             }
             if tr.anomaly_triggered {
-                self.emit_roi_anomaly_review_alert(camera, tr, now).await;
+                if let Some(dto) = self.emit_roi_anomaly_review_alert(camera, tr, now).await {
+                    active_roi_reviews.insert(tr.roi_name.clone(), dto);
+                }
+            } else if !tr.is_anomalous
+                && let Some(before_dto) = active_roi_reviews.remove(&tr.roi_name)
+            {
+                let mut closed_dto = before_dto.clone();
+                closed_dto.end_time = Some(now.max(before_dto.start_time));
+                self.persist_and_publish_review_dto(
+                    camera,
+                    &closed_dto,
+                    &before_dto,
+                    "end",
+                    "ROI anomaly clear",
+                )
+                .await;
             }
         }
         transitions
@@ -1613,12 +2247,40 @@ impl VisionPipeline {
                 .publish_roi_state(camera, &tr.roi_name, &tr.current_state);
         }
         if tr.anomaly_triggered {
-            self.emit_roi_anomaly_review_alert(camera, &tr, now).await;
+            if let Some(dto) = self.emit_roi_anomaly_review_alert(camera, &tr, now).await {
+                self.fallback_roi_reviews
+                    .lock()
+                    .await
+                    .insert((camera.to_string(), tr.roi_name.clone()), dto);
+            }
+        } else if !tr.is_anomalous {
+            let open_opt = self
+                .fallback_roi_reviews
+                .lock()
+                .await
+                .remove(&(camera.to_string(), tr.roi_name.clone()));
+            if let Some(before_dto) = open_opt {
+                let mut closed_dto = before_dto.clone();
+                closed_dto.end_time = Some(now.max(before_dto.start_time));
+                self.persist_and_publish_review_dto(
+                    camera,
+                    &closed_dto,
+                    &before_dto,
+                    "end",
+                    "ROI anomaly clear",
+                )
+                .await;
+            }
         }
         Some(tr)
     }
 
-    async fn emit_roi_anomaly_review_alert(&self, camera: &str, tr: &RoiStateTransition, now: f64) {
+    async fn emit_roi_anomaly_review_alert(
+        &self,
+        camera: &str,
+        tr: &RoiStateTransition,
+        now: f64,
+    ) -> Option<ReviewItemDto> {
         self.log_hub.push_ninjanvr(
             "WARNING",
             &format!("ninjanvr.vision.{camera}"),
@@ -1650,8 +2312,14 @@ impl VisionPipeline {
             }),
             has_been_reviewed: false,
         };
-        self.persist_and_publish_review_dto(camera, &dto, &dto, "new", "ROI anomaly")
-            .await;
+        if self
+            .persist_and_publish_review_dto(camera, &dto, &dto, "new", "ROI anomaly")
+            .await
+        {
+            Some(dto)
+        } else {
+            None
+        }
     }
 
     async fn prune_false_positive_track_from_review(
@@ -1781,7 +2449,11 @@ impl VisionPipeline {
             }),
         );
 
-        let Some(client) = self.snapshot_http_client.clone() else {
+        let Some(client) = self
+            .siren_http_client
+            .clone()
+            .or_else(|| self.snapshot_http_client.clone())
+        else {
             return;
         };
         let rt = self.camera_driver_runtime.clone();
@@ -2855,26 +3527,20 @@ mod tests {
         let detector = Arc::new(AiDetectorEngine::new(&cfg));
 
         let camera_driver_runtime = crate::camera_protocols::CameraDriverRuntime::new();
-        let pipeline = VisionPipeline {
-            config: Arc::new(RwLock::new(cfg)),
+        let pipeline = VisionPipeline::new(
+            Arc::new(RwLock::new(cfg)),
             db,
             comms,
             detector,
-            activity_ledger: new_activity_ledger(),
-            latest_frames: Arc::new(RwLock::new(HashMap::new())),
-            latest_yuv_frames: Arc::new(RwLock::new(HashMap::new())),
-            preview_frames: crate::preview_frames::PreviewFrameStore::new(&media_dir),
-            camera_metrics: Arc::new(RwLock::new(HashMap::new())),
+            new_activity_ledger(),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            crate::preview_frames::PreviewFrameStore::new(&media_dir),
+            Arc::new(RwLock::new(HashMap::new())),
             media_dir,
-            log_hub: crate::LogBufferHub::new(),
+            crate::LogBufferHub::new(),
             camera_driver_runtime,
-            snapshot_http_client: build_snapshot_http_client(),
-            high_res_snapshot_semaphore: Arc::new(Semaphore::new(
-                MAX_CONCURRENT_HIGH_RES_SNAPSHOT_TASKS,
-            )),
-            genai_verify_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_GENAI_VERIFY_TASKS)),
-            alert_backup_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_ALERT_BACKUP_TASKS)),
-        };
+        );
         (pipeline, tmp_dir)
     }
 

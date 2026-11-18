@@ -49,9 +49,15 @@ pub type LoginAttemptKey = (String, String);
 pub type LoginAttemptEntry = (u32, Instant);
 
 pub const MAX_LOGIN_FAILURES: u32 = 8;
+pub const MAX_IP_LOGIN_FAILURES: u32 = 24;
 pub const LOGIN_LOCKOUT_WINDOW: Duration = Duration::from_secs(60);
 pub const OIDC_PENDING_STATE_TTL: Duration = Duration::from_secs(600);
 pub const MAX_OIDC_PENDING_STATES: usize = 256;
+pub const AUTH_CACHE_TTL: Duration = Duration::from_secs(5);
+pub const STATIC_MEDIA_CAMERA_CACHE_TTL: Duration = Duration::from_secs(10);
+pub const MAX_CACHED_USERS: usize = 1024;
+pub const MAX_CACHED_TOKENS: usize = 512;
+pub const MAX_CACHED_STATIC_MEDIA: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OidcPendingState {
@@ -60,12 +66,78 @@ pub struct OidcPendingState {
     pub created_at: Instant,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedDbUser {
+    pub username: String,
+    pub role: String,
+    pub allowed_cameras: String,
+    pub password_changed_at_epoch: Option<i64>,
+}
+
+impl From<&ninjanvr_db::DbUser> for CachedDbUser {
+    fn from(u: &ninjanvr_db::DbUser) -> Self {
+        Self {
+            username: u.username.clone(),
+            role: u.role.clone(),
+            allowed_cameras: u.allowed_cameras.clone(),
+            password_changed_at_epoch: u.password_changed_at_epoch,
+        }
+    }
+}
+
+impl From<ninjanvr_db::DbUser> for CachedDbUser {
+    fn from(u: ninjanvr_db::DbUser) -> Self {
+        Self {
+            username: u.username,
+            role: u.role,
+            allowed_cameras: u.allowed_cameras,
+            password_changed_at_epoch: u.password_changed_at_epoch,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedUserAuth {
+    pub db_path: std::path::PathBuf,
+    pub user: CachedDbUser,
+    pub cached_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthCacheLookupError;
+
+impl std::fmt::Display for AuthCacheLookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("failed to query user from authentication store")
+    }
+}
+
+impl std::error::Error for AuthCacheLookupError {}
+
+#[derive(Debug, Clone)]
+pub struct CachedTokenVerification {
+    pub verified: Option<(String, String)>,
+    pub cached_at: Instant,
+}
+
+fn hash_api_token_cache_key(raw_token: &str) -> [u8; 32] {
+    let digest = Sha256::digest(raw_token.as_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
 /// `AppState`-owned authentication & session gate replacing process-global singletons.
 #[derive(Clone, Debug)]
 pub struct AuthSessionGate {
     pub login_attempts: Arc<std::sync::Mutex<HashMap<LoginAttemptKey, LoginAttemptEntry>>>,
+    pub ip_login_attempts: Arc<std::sync::Mutex<HashMap<String, LoginAttemptEntry>>>,
     pub pbkdf2_semaphore: Arc<tokio::sync::Semaphore>,
     pub oidc_pending_states: Arc<std::sync::Mutex<HashMap<String, OidcPendingState>>>,
+    pub user_cache: Arc<std::sync::RwLock<HashMap<String, CachedUserAuth>>>,
+    pub token_verify_cache: Arc<std::sync::RwLock<HashMap<[u8; 32], CachedTokenVerification>>>,
+    pub token_active_cache: Arc<std::sync::RwLock<HashMap<String, (bool, Instant)>>>,
+    pub static_media_camera_cache: Arc<std::sync::RwLock<HashMap<String, (String, Instant)>>>,
 }
 
 impl Default for AuthSessionGate {
@@ -82,8 +154,13 @@ impl AuthSessionGate {
     pub fn with_pbkdf2_permits(permits: usize) -> Self {
         Self {
             login_attempts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            ip_login_attempts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pbkdf2_semaphore: Arc::new(tokio::sync::Semaphore::new(permits.max(1))),
             oidc_pending_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            user_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            token_verify_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            token_active_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            static_media_camera_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -91,8 +168,268 @@ impl AuthSessionGate {
         &self.pbkdf2_semaphore
     }
 
+    pub fn invalidate_user(&self, username: &str) {
+        let key = username.trim().to_ascii_lowercase();
+        if let Ok(mut guard) = self.user_cache.write() {
+            guard.remove(&key);
+        }
+    }
+
+    pub fn invalidate_tokens(&self) {
+        if let Ok(mut guard) = self.token_verify_cache.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.token_active_cache.write() {
+            guard.clear();
+        }
+    }
+
+    pub fn invalidate_static_media(&self) {
+        if let Ok(mut guard) = self.static_media_camera_cache.write() {
+            guard.clear();
+        }
+    }
+
+    pub fn invalidate_all(&self) {
+        if let Ok(mut guard) = self.user_cache.write() {
+            guard.clear();
+        }
+        self.invalidate_tokens();
+        self.invalidate_static_media();
+    }
+
+    pub fn try_get_cached_user(&self, db_path: &Path, username: &str) -> Option<CachedDbUser> {
+        let key = username.trim().to_ascii_lowercase();
+        let guard = self.user_cache.read().ok()?;
+        let entry = guard.get(&key)?;
+        if entry.db_path == db_path && entry.cached_at.elapsed() < AUTH_CACHE_TTL {
+            Some(entry.user.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn put_cached_user(&self, db_path: &Path, username: &str, user: CachedDbUser) {
+        let key = username.trim().to_ascii_lowercase();
+        let now = Instant::now();
+        let Ok(mut guard) = self.user_cache.write() else {
+            return;
+        };
+        if !guard.contains_key(&key) && guard.len() >= MAX_CACHED_USERS {
+            guard.retain(|_, v| now.duration_since(v.cached_at) < AUTH_CACHE_TTL);
+            if guard.len() >= MAX_CACHED_USERS
+                && let Some(oldest) = guard
+                    .iter()
+                    .min_by_key(|(_, v)| v.cached_at)
+                    .map(|(k, _)| k.clone())
+            {
+                guard.remove(&oldest);
+            }
+        }
+        guard.insert(
+            key,
+            CachedUserAuth {
+                db_path: db_path.to_path_buf(),
+                user,
+                cached_at: now,
+            },
+        );
+    }
+
+    pub fn get_user_cached_sync(
+        &self,
+        db: &ninjanvr_db::NinjaDatabase,
+        username: &str,
+    ) -> Result<Option<CachedDbUser>, AuthCacheLookupError> {
+        if let Some(cached) = self.try_get_cached_user(db.path(), username) {
+            return Ok(Some(cached));
+        }
+        match db.get_user(username) {
+            Ok(Some(u)) => {
+                let mapped = CachedDbUser::from(u);
+                self.put_cached_user(db.path(), username, mapped.clone());
+                Ok(Some(mapped))
+            }
+            Ok(None) => Ok(None),
+            Err(_) => Err(AuthCacheLookupError),
+        }
+    }
+
+    pub async fn get_user_cached_async(
+        &self,
+        db: &ninjanvr_db::NinjaDatabase,
+        username: &str,
+    ) -> Result<Option<CachedDbUser>, AuthCacheLookupError> {
+        if let Some(cached) = self.try_get_cached_user(db.path(), username) {
+            return Ok(Some(cached));
+        }
+        let db_path = db.path().to_path_buf();
+        let db_clone = db.clone();
+        let user_owned = username.to_string();
+        let queried = tokio::task::spawn_blocking(move || db_clone.get_user(&user_owned))
+            .await
+            .map_err(|_| AuthCacheLookupError)?
+            .map_err(|_| AuthCacheLookupError)?;
+        if let Some(u) = queried {
+            let mapped = CachedDbUser::from(u);
+            self.put_cached_user(&db_path, username, mapped.clone());
+            Ok(Some(mapped))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn try_get_cached_token(&self, raw_token: &str) -> Option<Option<(String, String)>> {
+        let key = hash_api_token_cache_key(raw_token);
+        let guard = self.token_verify_cache.read().ok()?;
+        let entry = guard.get(&key)?;
+        if entry.cached_at.elapsed() < AUTH_CACHE_TTL {
+            Some(entry.verified.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn put_cached_token(&self, raw_token: &str, verified: Option<(String, String)>) {
+        let key = hash_api_token_cache_key(raw_token);
+        let now = Instant::now();
+        let Ok(mut guard) = self.token_verify_cache.write() else {
+            return;
+        };
+        if !guard.contains_key(&key) && guard.len() >= MAX_CACHED_TOKENS {
+            guard.retain(|_, v| now.duration_since(v.cached_at) < AUTH_CACHE_TTL);
+            if guard.len() >= MAX_CACHED_TOKENS
+                && let Some(oldest) = guard
+                    .iter()
+                    .min_by_key(|(_, v)| v.cached_at)
+                    .map(|(k, _)| *k)
+            {
+                guard.remove(&oldest);
+            }
+        }
+        guard.insert(
+            key,
+            CachedTokenVerification {
+                verified,
+                cached_at: now,
+            },
+        );
+    }
+
+    pub fn verify_api_token_cached_sync(
+        &self,
+        db: &ninjanvr_db::NinjaDatabase,
+        raw_token: &str,
+        now_ts: f64,
+    ) -> Option<(String, String)> {
+        if let Some(cached) = self.try_get_cached_token(raw_token) {
+            return cached;
+        }
+        let verified = db.verify_api_token(raw_token, now_ts).ok().flatten();
+        self.put_cached_token(raw_token, verified.clone());
+        verified
+    }
+
+    pub async fn verify_api_token_cached_async(
+        &self,
+        db: &ninjanvr_db::NinjaDatabase,
+        raw_token: &str,
+        now_ts: f64,
+    ) -> Option<(String, String)> {
+        if let Some(cached) = self.try_get_cached_token(raw_token) {
+            return cached;
+        }
+        let db_clone = db.clone();
+        let tok_owned = raw_token.to_string();
+        let verified =
+            tokio::task::spawn_blocking(move || db_clone.verify_api_token(&tok_owned, now_ts))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .flatten();
+        self.put_cached_token(raw_token, verified.clone());
+        verified
+    }
+
+    pub fn is_api_token_active_cached_sync(
+        &self,
+        db: &ninjanvr_db::NinjaDatabase,
+        name_or_id: &str,
+        now_ts: f64,
+    ) -> bool {
+        let key = name_or_id.trim().to_string();
+        if let Ok(guard) = self.token_active_cache.read()
+            && let Some((active, at)) = guard.get(&key).copied()
+            && at.elapsed() < AUTH_CACHE_TTL
+        {
+            return active;
+        }
+        let active = db
+            .is_api_token_active_by_name(&key, now_ts)
+            .unwrap_or(false);
+        if let Ok(mut guard) = self.token_active_cache.write() {
+            if !guard.contains_key(&key) && guard.len() >= MAX_CACHED_TOKENS {
+                let now = Instant::now();
+                guard.retain(|_, (_, at)| now.duration_since(*at) < AUTH_CACHE_TTL);
+                if guard.len() >= MAX_CACHED_TOKENS {
+                    guard.clear();
+                }
+            }
+            guard.insert(key, (active, Instant::now()));
+        }
+        active
+    }
+
+    pub async fn is_api_token_active_cached_async(
+        &self,
+        db: &ninjanvr_db::NinjaDatabase,
+        name_or_id: &str,
+        now_ts: f64,
+    ) -> bool {
+        let key = name_or_id.trim().to_string();
+        if let Ok(guard) = self.token_active_cache.read()
+            && let Some((active, at)) = guard.get(&key).copied()
+            && at.elapsed() < AUTH_CACHE_TTL
+        {
+            return active;
+        }
+        let db_clone = db.clone();
+        let key_for_db = key.clone();
+        let active = tokio::task::spawn_blocking(move || {
+            db_clone
+                .is_api_token_active_by_name(&key_for_db, now_ts)
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false);
+        if let Ok(mut guard) = self.token_active_cache.write() {
+            if !guard.contains_key(&key) && guard.len() >= MAX_CACHED_TOKENS {
+                let now = Instant::now();
+                guard.retain(|_, (_, at)| now.duration_since(*at) < AUTH_CACHE_TTL);
+                if guard.len() >= MAX_CACHED_TOKENS {
+                    guard.clear();
+                }
+            }
+            guard.insert(key, (active, Instant::now()));
+        }
+        active
+    }
+
     pub fn check_login_rate_limited(&self, scope_key: &str, user_key: &str) -> bool {
         let now = Instant::now();
+        {
+            let mut ip_guard = self
+                .ip_login_attempts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some((ip_cnt, ip_first)) = ip_guard.get(scope_key).copied() {
+                if now.duration_since(ip_first) >= LOGIN_LOCKOUT_WINDOW {
+                    ip_guard.remove(scope_key);
+                } else if ip_cnt >= MAX_IP_LOGIN_FAILURES {
+                    return true;
+                }
+            }
+        }
         let mut guard = self
             .login_attempts
             .lock()
@@ -110,6 +447,39 @@ impl AuthSessionGate {
 
     pub fn record_login_failure(&self, scope_key: &str, user_key: &str) {
         let now = Instant::now();
+        {
+            let mut ip_guard = self
+                .ip_login_attempts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !ip_guard.contains_key(scope_key) && ip_guard.len() >= 1024 {
+                ip_guard.retain(|_, (_, inst)| now.duration_since(*inst) < LOGIN_LOCKOUT_WINDOW);
+                if ip_guard.len() >= 1024
+                    && let Some(unlocked) = ip_guard
+                        .iter()
+                        .filter(|(_, (cnt, _))| *cnt < MAX_IP_LOGIN_FAILURES)
+                        .min_by_key(|(_, (_, inst))| *inst)
+                        .map(|(k, _)| k.clone())
+                {
+                    ip_guard.remove(&unlocked);
+                }
+            }
+            match ip_guard.get_mut(scope_key) {
+                Some((cnt, first_inst)) => {
+                    if now.duration_since(*first_inst) >= LOGIN_LOCKOUT_WINDOW {
+                        *cnt = 1;
+                        *first_inst = now;
+                    } else {
+                        *cnt = cnt.saturating_add(1);
+                    }
+                }
+                None => {
+                    if ip_guard.len() < 1024 {
+                        ip_guard.insert(scope_key.to_string(), (1, now));
+                    }
+                }
+            }
+        }
         let mut guard = self
             .login_attempts
             .lock()
@@ -152,6 +522,15 @@ impl AuthSessionGate {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         guard.remove(&(scope_key.to_string(), user_key.to_ascii_lowercase()));
+    }
+
+    pub fn clear_all_login_failures_for_user(&self, user_key: &str) {
+        let target = user_key.trim().to_ascii_lowercase();
+        let mut guard = self
+            .login_attempts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.retain(|(_, u), _| *u != target);
     }
 
     pub fn store_oidc_pending_state(
@@ -389,6 +768,97 @@ pub fn is_external_public_peer_ip(headers: &HeaderMap) -> bool {
     }
 }
 
+/// Returns `true` when the request requires strict credential enforcement (`x-ninjanvr-enforce-auth`
+/// injected by `build_router_with_auth(..., true)`, supplied Bearer/cookie/proxy credentials, or
+/// external non-internal `x-peer-ip`).
+pub fn request_requires_strict_auth(
+    headers: &HeaderMap,
+    jar: &CookieJar,
+    auth_cfg: &ninjanvr_config::AuthConfig,
+) -> bool {
+    headers.contains_key("x-ninjanvr-enforce-auth")
+        || headers.contains_key(header::AUTHORIZATION)
+        || jar.get(&auth_cfg.cookie_name).is_some()
+        || (auth_cfg.proxy.enabled && extract_trusted_proxy_peer_ip(headers).is_some())
+        || is_external_public_peer_ip(headers)
+}
+
+/// Pre-warms `AuthSessionGate`'s in-memory user/token cache via `spawn_blocking` on cold cache
+/// misses so downstream principal extraction resolves in `O(1)` RAM without blocking Tokio workers.
+pub async fn warm_auth_cache_for_request(
+    state: &AppState,
+    jar: &CookieJar,
+    headers: &HeaderMap,
+    auth_cfg: &ninjanvr_config::AuthConfig,
+) {
+    if !auth_cfg.enabled {
+        return;
+    }
+    if auth_cfg.proxy.enabled && !headers.contains_key(header::AUTHORIZATION) {
+        let trusted_cidrs = if !auth_cfg.proxy.trusted_proxies.is_empty() {
+            &auth_cfg.proxy.trusted_proxies
+        } else {
+            &auth_cfg.trusted_proxies
+        };
+        if let Some(ip) = extract_trusted_proxy_peer_ip(headers)
+            && ip_matches_trusted_proxies(ip, trusted_cidrs)
+        {
+            let user_hdr_trimmed = auth_cfg.proxy.user_header.trim();
+            let user_hdr_name = if user_hdr_trimmed.is_empty() {
+                "remote-user".to_string()
+            } else {
+                user_hdr_trimmed.to_ascii_lowercase()
+            };
+            if let Some(remote_user) = headers
+                .get(user_hdr_name.as_str())
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !is_reserved_token_principal_prefix(s))
+            {
+                let _ = state
+                    .auth_gate
+                    .get_user_cached_async(&state.db, remote_user)
+                    .await;
+                return;
+            }
+        }
+    }
+
+    let token_opt = if let Some(auth_val) = headers.get(header::AUTHORIZATION) {
+        auth_val
+            .to_str()
+            .ok()
+            .and_then(parse_authorization_bearer)
+            .map(str::to_string)
+    } else {
+        jar.get(&auth_cfg.cookie_name)
+            .map(|c| c.value().to_string())
+    };
+    let Some(token_str) = token_opt else {
+        return;
+    };
+    if token_str.starts_with("nnvr_") {
+        let _ = state
+            .auth_gate
+            .verify_api_token_cached_async(&state.db, &token_str, unix_now() as f64)
+            .await;
+        return;
+    }
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.validate_exp = true;
+    if let Ok(decoded) = jsonwebtoken::decode::<JwtClaims>(
+        &token_str,
+        &DecodingKey::from_secret(state.jwt_secret.as_bytes()),
+        &validation,
+    ) && !is_reserved_token_principal_prefix(&decoded.claims.sub)
+    {
+        let _ = state
+            .auth_gate
+            .get_user_cached_async(&state.db, &decoded.claims.sub)
+            .await;
+    }
+}
+
 /// Authenticates a read caller and resolves their effective camera scope (restricting
 /// `"metrics"` tokens to `Some(Vec::new())`).
 pub async fn authenticate_read(
@@ -396,20 +866,21 @@ pub async fn authenticate_read(
     jar: &CookieJar,
     headers: &HeaderMap,
 ) -> Result<CallerPrincipal, AuthRejection> {
-    let cfg = state.config.read().await;
-    if !cfg.auth.enabled {
+    let auth_cfg = state.config.read().await.auth.clone();
+    if !auth_cfg.enabled {
         return Ok(CallerPrincipal {
             username: "admin".to_string(),
             role: "admin".to_string(),
             allowed_cameras: None,
         });
     }
-    if let Some((user, role)) = extract_authenticated_user_with_cfg(state, jar, headers, &cfg.auth)
+    warm_auth_cache_for_request(state, jar, headers, &auth_cfg).await;
+    if let Some((user, role)) = extract_authenticated_user_with_cfg(state, jar, headers, &auth_cfg)
     {
         let allowed_cameras = if role.trim().eq_ignore_ascii_case("metrics") {
             Some(Vec::new())
         } else {
-            resolve_user_allowed_cameras(state, jar, headers, &cfg.auth, &user, &role)
+            resolve_user_allowed_cameras(state, jar, headers, &auth_cfg, &user, &role)
         };
         return Ok(CallerPrincipal {
             username: user,
@@ -417,11 +888,7 @@ pub async fn authenticate_read(
             allowed_cameras,
         });
     }
-    let has_supplied_credentials = headers.contains_key(header::AUTHORIZATION)
-        || jar.get(&cfg.auth.cookie_name).is_some()
-        || (cfg.auth.proxy.enabled && extract_trusted_proxy_peer_ip(headers).is_some())
-        || is_external_public_peer_ip(headers);
-    if has_supplied_credentials {
+    if request_requires_strict_auth(headers, jar, &auth_cfg) {
         Err(AuthRejection::new(StatusCode::UNAUTHORIZED, "Unauthorized"))
     } else {
         Ok(CallerPrincipal {
@@ -466,19 +933,17 @@ pub async fn authorize_mutation(
     }
 
     let principal = {
-        let cfg = state.config.read().await;
-        if !cfg.auth.enabled {
+        let auth_cfg = state.config.read().await.auth.clone();
+        if !auth_cfg.enabled {
             CallerPrincipal {
                 username: "admin".to_string(),
                 role: "admin".to_string(),
                 allowed_cameras: None,
             }
         } else {
-            let has_creds = headers.contains_key(header::AUTHORIZATION)
-                || jar.get(&cfg.auth.cookie_name).is_some()
-                || (cfg.auth.proxy.enabled && extract_trusted_proxy_peer_ip(headers).is_some())
-                || is_external_public_peer_ip(headers);
-            if !has_creds {
+            warm_auth_cache_for_request(state, jar, headers, &auth_cfg).await;
+            let must_auth = request_requires_strict_auth(headers, jar, &auth_cfg);
+            if !must_auth {
                 CallerPrincipal {
                     username: "admin".to_string(),
                     role: "admin".to_string(),
@@ -486,21 +951,14 @@ pub async fn authorize_mutation(
                 }
             } else {
                 let Some((user, role)) =
-                    extract_authenticated_user_with_cfg(state, jar, headers, &cfg.auth)
+                    extract_authenticated_user_with_cfg(state, jar, headers, &auth_cfg)
                 else {
-                    return Err(AuthRejection::new(
-                        StatusCode::FORBIDDEN,
-                        if require_admin {
-                            "Admin role required"
-                        } else {
-                            "Insufficient role for mutation"
-                        },
-                    ));
+                    return Err(AuthRejection::new(StatusCode::UNAUTHORIZED, "Unauthorized"));
                 };
                 let allowed_cameras = if role.trim().eq_ignore_ascii_case("metrics") {
                     Some(Vec::new())
                 } else {
-                    resolve_user_allowed_cameras(state, jar, headers, &cfg.auth, &user, &role)
+                    resolve_user_allowed_cameras(state, jar, headers, &auth_cfg, &user, &role)
                 };
                 CallerPrincipal {
                     username: user,
@@ -541,11 +999,14 @@ pub async fn authorize_mutation(
                 }
             }
             AccessTarget::EventId(event_id) => {
-                let permitted = state
-                    .db
-                    .get_event(event_id)
+                let db_clone = state.db.clone();
+                let eid_owned = event_id.to_string();
+                let ev_opt = tokio::task::spawn_blocking(move || db_clone.get_event(&eid_owned))
+                    .await
                     .ok()
-                    .flatten()
+                    .and_then(|r| r.ok())
+                    .flatten();
+                let permitted = ev_opt
                     .and_then(|ev| ev["camera"].as_str().map(|c| principal.allows_camera(c)))
                     .unwrap_or(false);
                 if !permitted {
@@ -556,12 +1017,15 @@ pub async fn authorize_mutation(
                 }
             }
             AccessTarget::ReviewId(review_id) => {
-                let permitted = state
-                    .db
-                    .get_review_by_id(review_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|r| principal.allows_camera(&r.camera));
+                let db_clone = state.db.clone();
+                let rid_owned = review_id.to_string();
+                let rev_opt =
+                    tokio::task::spawn_blocking(move || db_clone.get_review_by_id(&rid_owned))
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .flatten();
+                let permitted = rev_opt.is_some_and(|r| principal.allows_camera(&r.camera));
                 if !permitted {
                     return Err(AuthRejection::new(
                         StatusCode::FORBIDDEN,
@@ -570,12 +1034,15 @@ pub async fn authorize_mutation(
                 }
             }
             AccessTarget::DatasetSampleId(sample_id) => {
-                let permitted = state
-                    .db
-                    .get_dataset_sample(sample_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|s| principal.allows_camera(&s.camera));
+                let db_clone = state.db.clone();
+                let sid_owned = sample_id.to_string();
+                let sample_opt =
+                    tokio::task::spawn_blocking(move || db_clone.get_dataset_sample(&sid_owned))
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .flatten();
+                let permitted = sample_opt.is_some_and(|s| principal.allows_camera(&s.camera));
                 if !permitted {
                     return Err(AuthRejection::new(
                         StatusCode::FORBIDDEN,
@@ -932,6 +1399,80 @@ pub fn is_hidden_static_media_path(path: &str) -> bool {
     false
 }
 
+fn lookup_export_camera_by_filename(
+    db: &ninjanvr_db::NinjaDatabase,
+    fname: &str,
+) -> Option<String> {
+    if fname.is_empty() {
+        return None;
+    }
+    let mut escaped = String::with_capacity(fname.len());
+    for ch in fname.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    let suffix_pattern = format!("%/{escaped}");
+    db.with_read_conn(|conn| {
+        let mut stmt = conn.prepare_cached(
+            "SELECT camera FROM export WHERE video_path = ?1 OR video_path LIKE ?2 ESCAPE '\\' LIMIT 1",
+        )?;
+        let mut rows = stmt.query([fname, suffix_pattern.as_str()])?;
+        if let Some(row) = rows.next()? {
+            let cam: String = row.get(0)?;
+            if !cam.trim().is_empty() {
+                return Ok(Some(cam));
+            }
+        }
+        Ok(None)
+    })
+    .ok()
+    .flatten()
+}
+
+fn match_longest_camera_key_prefix<'a>(stem: &str, camera_keys: &'a [String]) -> Option<&'a str> {
+    let mut matched_cam: Option<&'a str> = None;
+    for cam in camera_keys {
+        let prefix = format!("{cam}-");
+        if stem.starts_with(&prefix) && matched_cam.is_none_or(|prev| cam.len() > prev.len()) {
+            matched_cam = Some(cam.as_str());
+        }
+    }
+    matched_cam
+}
+
+fn resolve_fast_static_media_camera_no_db(normalized_path: &str) -> Option<String> {
+    if let Some(rest) = normalized_path.strip_prefix("/recordings/") {
+        let parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.len() >= 3 && parts[0].len() == 10 && parts[0].chars().nth(4) == Some('-') {
+            return Some(parts[2].to_string());
+        }
+        if !parts.is_empty() {
+            return Some(parts[0].to_string());
+        }
+        return None;
+    }
+    if let Some(rest) = normalized_path.strip_prefix("/clips/") {
+        let parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+        if (parts.first() == Some(&"previews") || parts.first() == Some(&"preview_frames"))
+            && parts.len() >= 2
+        {
+            return Some(parts[1].to_string());
+        }
+        if parts.len() == 1 {
+            let raw_stem = parts[0].rsplit_once('.').map_or(parts[0], |(s, _)| s);
+            let (is_share_artifact, stem) = strip_share_artifact_prefix(raw_stem);
+            if !is_share_artifact
+                && let Some(latest_cam) = stem.strip_prefix("latest_").filter(|s| !s.is_empty())
+            {
+                return Some(latest_cam.to_string());
+            }
+        }
+    }
+    None
+}
+
 pub fn resolve_static_media_camera(state: &AppState, path: &str) -> Option<String> {
     let camera_keys: Vec<String> = state
         .config
@@ -946,7 +1487,56 @@ pub async fn resolve_static_media_camera_async(state: &AppState, path: &str) -> 
         let cfg = state.config.read().await;
         cfg.cameras.keys().cloned().collect()
     };
-    resolve_static_media_camera_with_keys(state, path, &camera_keys)
+    resolve_static_media_camera_async_with_keys(state, path, &camera_keys).await
+}
+
+pub async fn resolve_static_media_camera_async_with_keys(
+    state: &AppState,
+    path: &str,
+    camera_keys: &[String],
+) -> Option<String> {
+    if is_hidden_static_media_path(path) {
+        return None;
+    }
+    let normalized = normalize_http_path_for_auth(path)?;
+    if is_hidden_static_media_path(&normalized) {
+        return None;
+    }
+    if let Some(fast_cam) = resolve_fast_static_media_camera_no_db(&normalized) {
+        return Some(fast_cam);
+    }
+    if let Ok(guard) = state.auth_gate.static_media_camera_cache.read()
+        && let Some((cam, at)) = guard.get(&normalized)
+        && at.elapsed() < STATIC_MEDIA_CAMERA_CACHE_TTL
+    {
+        return Some(cam.clone());
+    }
+    let state_clone = state.clone();
+    let norm_owned = normalized;
+    let keys_owned = camera_keys.to_vec();
+    tokio::task::spawn_blocking(move || {
+        resolve_static_media_camera_with_keys(&state_clone, &norm_owned, &keys_owned)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn cache_db_confirmed_static_media_camera(state: &AppState, normalized_path: &str, camera: &str) {
+    let Ok(mut guard) = state.auth_gate.static_media_camera_cache.write() else {
+        return;
+    };
+    if !guard.contains_key(normalized_path) && guard.len() >= MAX_CACHED_STATIC_MEDIA {
+        let now = Instant::now();
+        guard.retain(|_, (_, at)| now.duration_since(*at) < STATIC_MEDIA_CAMERA_CACHE_TTL);
+        if guard.len() >= MAX_CACHED_STATIC_MEDIA {
+            guard.clear();
+        }
+    }
+    guard.insert(
+        normalized_path.to_string(),
+        (camera.to_string(), Instant::now()),
+    );
 }
 
 pub fn resolve_static_media_camera_with_keys(
@@ -961,6 +1551,15 @@ pub fn resolve_static_media_camera_with_keys(
     if is_hidden_static_media_path(&normalized) {
         return None;
     }
+    if let Some(fast_cam) = resolve_fast_static_media_camera_no_db(&normalized) {
+        return Some(fast_cam);
+    }
+    if let Ok(guard) = state.auth_gate.static_media_camera_cache.read()
+        && let Some((cam, at)) = guard.get(&normalized)
+        && at.elapsed() < STATIC_MEDIA_CAMERA_CACHE_TTL
+    {
+        return Some(cam.clone());
+    }
     let path = normalized.as_str();
     if let Some(rest) = path.strip_prefix("/exports/") {
         let segs: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
@@ -973,33 +1572,25 @@ pub fn resolve_static_media_camera_with_keys(
         if let Ok(Some(exp)) = state.db.get_export_by_id(exp_id)
             && let Some(cam) = exp["camera"].as_str()
         {
+            cache_db_confirmed_static_media_camera(state, path, cam);
             return Some(cam.to_string());
         }
         if is_share_artifact {
             if let Ok(Some(ev)) = state.db.get_event(exp_id)
                 && let Some(cam) = ev["camera"].as_str()
             {
+                cache_db_confirmed_static_media_camera(state, path, cam);
                 return Some(cam.to_string());
             }
             if let Ok(Some(rev)) = state.db.get_review_by_id(exp_id) {
+                cache_db_confirmed_static_media_camera(state, path, &rev.camera);
                 return Some(rev.camera);
             }
             return None;
         }
-        if !fname.is_empty()
-            && let Ok(exports) = state.db.query_exports()
-        {
-            let suffix = format!("/{fname}");
-            for exp in exports {
-                if exp["video_path"]
-                    .as_str()
-                    .is_some_and(|vp| vp == fname || vp.ends_with(&suffix))
-                    && let Some(cam) = exp["camera"].as_str()
-                    && !cam.is_empty()
-                {
-                    return Some(cam.to_string());
-                }
-            }
+        if let Some(cam) = lookup_export_camera_by_filename(&state.db, fname) {
+            cache_db_confirmed_static_media_camera(state, path, &cam);
+            return Some(cam);
         }
         return exp_id
             .rsplitn(3, '_')
@@ -1007,28 +1598,14 @@ pub fn resolve_static_media_camera_with_keys(
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
     }
-    if let Some(rest) = path.strip_prefix("/recordings/") {
-        let parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
-        if parts.len() >= 3 && parts[0].len() == 10 && parts[0].chars().nth(4) == Some('-') {
-            return Some(parts[2].to_string());
-        }
-        if !parts.is_empty() {
-            return Some(parts[0].to_string());
-        }
-        return None;
-    }
     if let Some(rest) = path.strip_prefix("/clips/") {
         let parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
-        if (parts.first() == Some(&"previews") || parts.first() == Some(&"preview_frames"))
-            && parts.len() >= 2
-        {
-            return Some(parts[1].to_string());
-        }
         if parts.first() == Some(&"dataset") && parts.len() == 2 {
             let sample_id = parts[1].rsplit_once('.').map_or(parts[1], |(s, _)| s);
             if let Ok(Some(sample)) = state.db.get_dataset_sample(sample_id)
                 && !sample.camera.trim().is_empty()
             {
+                cache_db_confirmed_static_media_camera(state, path, &sample.camera);
                 return Some(sample.camera);
             }
             return None;
@@ -1038,6 +1615,7 @@ pub fn resolve_static_media_camera_with_keys(
             if let Ok(Some(ev)) = state.db.get_event(sample_id)
                 && let Some(cam) = ev["camera"].as_str().filter(|s| !s.trim().is_empty())
             {
+                cache_db_confirmed_static_media_camera(state, path, cam);
                 return Some(cam.to_string());
             }
             return None;
@@ -1049,23 +1627,26 @@ pub fn resolve_static_media_camera_with_keys(
                     .or_else(|| raw_after_thumb.strip_suffix(".jpg"))
                     .unwrap_or(raw_after_thumb);
                 if let Ok(Some(rev)) = state.db.get_review_by_id(after_thumb) {
+                    cache_db_confirmed_static_media_camera(state, path, &rev.camera);
                     return Some(rev.camera);
                 }
-                for (idx, _) in after_thumb.match_indices('-') {
+                let matched_cam = match_longest_camera_key_prefix(after_thumb, camera_keys);
+                if let Some(cam_prefix) = matched_cam
+                    && let Some(exact_rev_id) = after_thumb
+                        .strip_prefix(&format!("{cam_prefix}-"))
+                        .filter(|s| !s.is_empty())
+                    && let Ok(Some(rev)) = state.db.get_review_by_id(exact_rev_id)
+                {
+                    cache_db_confirmed_static_media_camera(state, path, &rev.camera);
+                    return Some(rev.camera);
+                }
+                for (idx, _) in after_thumb.match_indices('-').take(6) {
                     let candidate_rev_id = &after_thumb[idx + 1..];
                     if !candidate_rev_id.is_empty()
                         && let Ok(Some(rev)) = state.db.get_review_by_id(candidate_rev_id)
                     {
+                        cache_db_confirmed_static_media_camera(state, path, &rev.camera);
                         return Some(rev.camera);
-                    }
-                }
-                let mut matched_cam: Option<&str> = None;
-                for cam in camera_keys {
-                    let prefix = format!("{cam}-");
-                    if after_thumb.starts_with(&prefix)
-                        && matched_cam.is_none_or(|prev| cam.len() > prev.len())
-                    {
-                        matched_cam = Some(cam.as_str());
                     }
                 }
                 if let Some(cam) = matched_cam {
@@ -1085,55 +1666,70 @@ pub fn resolve_static_media_camera_with_keys(
         if parts.len() == 1 {
             let raw_stem = parts[0].rsplit_once('.').map_or(parts[0], |(s, _)| s);
             let (is_share_artifact, stem) = strip_share_artifact_prefix(raw_stem);
-            if !is_share_artifact
-                && let Some(latest_cam) = stem.strip_prefix("latest_").filter(|s| !s.is_empty())
-            {
-                return Some(latest_cam.to_string());
-            }
             let clean_stem = stem.strip_suffix("-clean").unwrap_or(stem);
             for candidate in [clean_stem, stem] {
                 if let Ok(Some(ev)) = state.db.get_event(candidate)
                     && let Some(cam) = ev["camera"].as_str()
                 {
+                    cache_db_confirmed_static_media_camera(state, path, cam);
                     return Some(cam.to_string());
                 }
                 if let Ok(Some(exp)) = state.db.get_export_by_id(candidate)
                     && let Some(cam) = exp["camera"].as_str()
                 {
+                    cache_db_confirmed_static_media_camera(state, path, cam);
                     return Some(cam.to_string());
                 }
                 if let Ok(Some(rev)) = state.db.get_review_by_id(candidate) {
+                    cache_db_confirmed_static_media_camera(state, path, &rev.camera);
                     return Some(rev.camera);
                 }
             }
             if is_share_artifact {
                 return None;
             }
-            for (idx, _) in clean_stem.match_indices('-') {
+            let matched_cam = match_longest_camera_key_prefix(clean_stem, camera_keys);
+            if let Some(cam_prefix) = matched_cam
+                && let Some(exact_ev_id) = clean_stem
+                    .strip_prefix(&format!("{cam_prefix}-"))
+                    .filter(|s| !s.is_empty())
+            {
+                if let Ok(Some(ev)) = state.db.get_event(exact_ev_id)
+                    && let Some(ev_cam) = ev["camera"].as_str()
+                {
+                    cache_db_confirmed_static_media_camera(state, path, ev_cam);
+                    return Some(ev_cam.to_string());
+                }
+                if let Ok(Some(exp)) = state.db.get_export_by_id(exact_ev_id)
+                    && let Some(exp_cam) = exp["camera"].as_str()
+                {
+                    cache_db_confirmed_static_media_camera(state, path, exp_cam);
+                    return Some(exp_cam.to_string());
+                }
+                if let Ok(Some(rev)) = state.db.get_review_by_id(exact_ev_id) {
+                    cache_db_confirmed_static_media_camera(state, path, &rev.camera);
+                    return Some(rev.camera);
+                }
+            }
+            for (idx, _) in clean_stem.match_indices('-').take(6) {
                 let ev_part = &clean_stem[idx + 1..];
                 if !ev_part.is_empty() {
                     if let Ok(Some(ev)) = state.db.get_event(ev_part)
                         && let Some(ev_cam) = ev["camera"].as_str()
                     {
+                        cache_db_confirmed_static_media_camera(state, path, ev_cam);
                         return Some(ev_cam.to_string());
                     }
                     if let Ok(Some(exp)) = state.db.get_export_by_id(ev_part)
                         && let Some(exp_cam) = exp["camera"].as_str()
                     {
+                        cache_db_confirmed_static_media_camera(state, path, exp_cam);
                         return Some(exp_cam.to_string());
                     }
                     if let Ok(Some(rev)) = state.db.get_review_by_id(ev_part) {
+                        cache_db_confirmed_static_media_camera(state, path, &rev.camera);
                         return Some(rev.camera);
                     }
-                }
-            }
-            let mut matched_cam: Option<&str> = None;
-            for cam in camera_keys {
-                let prefix = format!("{cam}-");
-                if clean_stem.starts_with(&prefix)
-                    && matched_cam.is_none_or(|prev| cam.len() > prev.len())
-                {
-                    matched_cam = Some(cam.as_str());
                 }
             }
             if let Some(cam) = matched_cam {
@@ -1184,6 +1780,12 @@ pub async fn auth_gate_middleware(
         )
             .into_response();
     }
+    if enforce_auth {
+        req.headers_mut().insert(
+            axum::http::HeaderName::from_static("x-ninjanvr-enforce-auth"),
+            axum::http::HeaderValue::from_static("1"),
+        );
+    }
     let (auth_cfg, camera_keys, known_cameras, active_policies) = {
         let cfg = state.config.read().await;
         let keys: Vec<String> = cfg.cameras.keys().cloned().collect();
@@ -1206,6 +1808,7 @@ pub async fn auth_gate_middleware(
             || (is_static_media_route && has_supplied_credentials))
         && is_protected_path(&path)
     {
+        warm_auth_cache_for_request(&state, &jar, req.headers(), &auth_cfg).await;
         let Some((user, role)) =
             extract_authenticated_user_with_cfg(&state, &jar, req.headers(), &auth_cfg)
         else {
@@ -1383,7 +1986,7 @@ pub async fn auth_gate_middleware(
                 || path.starts_with("/clips/")
                 || path == "/clips";
             let static_media_cam = if is_static_media {
-                resolve_static_media_camera_with_keys(&state, &path, &camera_keys)
+                resolve_static_media_camera_async_with_keys(&state, &path, &camera_keys).await
             } else {
                 None
             };
@@ -1583,7 +2186,7 @@ pub async fn auth_gate_middleware(
     {
         let is_non_share_clip_export = (path == "/exports" || path.starts_with("/exports/"))
             && !path.starts_with("/exports/share_clip_");
-        match resolve_static_media_camera_with_keys(&state, &path, &camera_keys) {
+        match resolve_static_media_camera_async_with_keys(&state, &path, &camera_keys).await {
             Some(cam) => {
                 let cam_trimmed = cam.trim();
                 if let Some(policy) = active_policies
@@ -1668,9 +2271,10 @@ pub async fn api_auth_verify(
     jar: CookieJar,
     headers: HeaderMap,
 ) -> Response {
-    let cfg = state.config.read().await;
+    let auth_cfg = state.config.read().await.auth.clone();
+    warm_auth_cache_for_request(&state, &jar, &headers, &auth_cfg).await;
     if let Some((user, role)) =
-        extract_authenticated_user_with_cfg(&state, &jar, &headers, &cfg.auth)
+        extract_authenticated_user_with_cfg(&state, &jar, &headers, &auth_cfg)
     {
         if role.eq_ignore_ascii_case("metrics") {
             return (
@@ -1918,6 +2522,112 @@ pub fn is_reserved_token_principal_prefix(username: &str) -> bool {
             .is_some_and(|p| p.eq_ignore_ascii_case("ext:"))
 }
 
+pub fn is_allowed_oidc_client_secret_env(name: &str) -> bool {
+    let trimmed = name.trim();
+    ninjanvr_config::is_safe_secret_env_var_name(trimmed)
+        && (trimmed.starts_with("NINJANVR_OIDC_") || trimmed.starts_with("OIDC_"))
+}
+
+pub fn sign_oidc_pkce_cookie_payload(jwt_secret: &str, payload: &str) -> String {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(jwt_secret.as_bytes()).expect("HMAC accepts any key");
+    mac.update(b"ninjanvr-oidc-pkce-v1:");
+    mac.update(payload.as_bytes());
+    let sig_hex: String = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("v1.{sig_hex}:{payload}")
+}
+
+pub fn format_signed_oidc_pkce_cookie(
+    jwt_secret: &str,
+    state_str: &str,
+    code_verifier: &str,
+    redirect_uri: &str,
+) -> String {
+    let payload = format!("{state_str}:{code_verifier}:{redirect_uri}");
+    sign_oidc_pkce_cookie_payload(jwt_secret, &payload)
+}
+
+pub fn verify_signed_oidc_pkce_cookie<'a>(
+    jwt_secret: &str,
+    raw_cookie_val: &'a str,
+) -> Option<&'a str> {
+    let rest = raw_cookie_val.strip_prefix("v1.")?;
+    let (sig_hex, payload) = rest.split_once(':')?;
+    if sig_hex.len() != 64 || !sig_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut sig_bytes = [0u8; 32];
+    for (i, chunk) in sig_hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        let hi = (chunk[0] as char).to_digit(16)?;
+        let lo = (chunk[1] as char).to_digit(16)?;
+        sig_bytes[i] = ((hi << 4) | lo) as u8;
+    }
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(jwt_secret.as_bytes()).expect("HMAC accepts any key");
+    mac.update(b"ninjanvr-oidc-pkce-v1:");
+    mac.update(payload.as_bytes());
+    mac.verify_slice(&sig_bytes).ok()?;
+    Some(payload)
+}
+
+/// Determines whether session/OIDC cookies must carry the `Secure` attribute:
+/// enabled whenever `auth_cfg.cookie_secure` is `true`, the request arrived over the `:8971` TLS listener,
+/// the URI scheme is `https`, or a trusted proxy supplied `X-Forwarded-Proto: https`.
+pub fn should_set_secure_cookie(
+    headers: &HeaderMap,
+    uri: &Uri,
+    auth_cfg: &ninjanvr_config::AuthConfig,
+) -> bool {
+    if auth_cfg.cookie_secure
+        || headers.contains_key("x-ninjanvr-https-listener")
+        || uri
+            .scheme_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case("https"))
+    {
+        return true;
+    }
+    let is_xfp_https = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim())
+        .is_some_and(|p| p.eq_ignore_ascii_case("https"));
+    if !is_xfp_https {
+        return false;
+    }
+    let Some(peer_ip) = headers
+        .get("x-peer-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return true;
+    };
+    let default_loopback = ["127.0.0.1/32".to_string(), "::1/128".to_string()];
+    let trusted_cidrs: &[String] = if !auth_cfg.proxy.trusted_proxies.is_empty() {
+        &auth_cfg.proxy.trusted_proxies
+    } else if !auth_cfg.trusted_proxies.is_empty() {
+        &auth_cfg.trusted_proxies
+    } else {
+        &default_loopback
+    };
+    ip_matches_trusted_proxies(peer_ip, trusted_cidrs)
+}
+
+pub fn extract_login_peer_scope(headers: &HeaderMap) -> String {
+    headers
+        .get("x-peer-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+        .map_or_else(|| "local".to_string(), |ip| ip.to_canonical().to_string())
+}
+
 pub fn generate_pkce_pair() -> (String, String, String) {
     let mut verifier_bytes = [0u8; 32];
     rand::fill(&mut verifier_bytes);
@@ -2005,7 +2715,7 @@ pub async fn api_auth_oidc_login(
 ) -> Response {
     let cfg = state.config.read().await;
     let oidc = &cfg.auth.oidc;
-    let cookie_secure = cfg.auth.cookie_secure;
+    let cookie_secure = should_set_secure_cookie(&headers, &uri, &cfg.auth);
     let issuer = if !oidc.issuer_url.trim().is_empty() {
         oidc.issuer_url.trim().trim_end_matches('/').to_string()
     } else {
@@ -2075,10 +2785,9 @@ pub async fn api_auth_oidc_login(
         urlencoding_simple(&scope_str),
     );
 
-    let mut pkce_cookie = Cookie::new(
-        "ninjanvr_oidc_pkce",
-        format!("{state_str}:{verifier}:{redirect_uri}"),
-    );
+    let signed_pkce_val =
+        format_signed_oidc_pkce_cookie(&state.jwt_secret, &state_str, &verifier, &redirect_uri);
+    let mut pkce_cookie = Cookie::new("ninjanvr_oidc_pkce", signed_pkce_val);
     pkce_cookie.set_path("/");
     pkce_cookie.set_http_only(true);
     pkce_cookie.set_secure(cookie_secure);
@@ -2134,7 +2843,26 @@ pub async fn api_auth_oidc_callback(
         )
             .into_response();
     };
-    let Some((expected_state, rest_cookie)) = pkce_cookie.value().split_once(':') else {
+    let raw_pkce_val = pkce_cookie.value();
+    let verified_payload = if raw_pkce_val.starts_with("v1.") {
+        let Some(p) = verify_signed_oidc_pkce_cookie(&state.jwt_secret, raw_pkce_val) else {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "message": "Invalid OIDC PKCE cookie signature" })),
+            )
+                .into_response();
+        };
+        p
+    } else if pending_from_gate.is_some() {
+        raw_pkce_val
+    } else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "Unsigned OIDC PKCE cookie rejected" })),
+        )
+            .into_response();
+    };
+    let Some((expected_state, rest_cookie)) = verified_payload.split_once(':') else {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({ "message": "Malformed OIDC PKCE cookie" })),
@@ -2170,7 +2898,7 @@ pub async fn api_auth_oidc_callback(
         (
             cfg.auth.oidc.clone(),
             cfg.auth.cookie_name.clone(),
-            cfg.auth.cookie_secure,
+            should_set_secure_cookie(&headers, &uri, &cfg.auth),
             cfg.auth.session_length,
         )
     };
@@ -2196,7 +2924,19 @@ pub async fn api_auth_oidc_callback(
         )
             .into_response();
     }
-    let client_secret = std::env::var(&oidc_cfg.client_secret_env).unwrap_or_default();
+    let secret_env_trimmed = oidc_cfg.client_secret_env.trim();
+    if !secret_env_trimmed.is_empty() && !is_allowed_oidc_client_secret_env(secret_env_trimmed) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "message": "Disallowed OIDC client_secret_env variable name" })),
+        )
+            .into_response();
+    }
+    let client_secret = if secret_env_trimmed.is_empty() {
+        String::new()
+    } else {
+        std::env::var(secret_env_trimmed).unwrap_or_default()
+    };
 
     let expected_callback_uri = {
         let base_url = resolve_external_base_url(&headers, &uri);
@@ -2225,7 +2965,6 @@ pub async fn api_auth_oidc_callback(
     let mut token_endpoint = format!("{issuer}/oauth/v2/token");
     let mut userinfo_endpoint = format!("{issuer}/oidc/v1/userinfo");
     let mut jwks_endpoint: Option<String> = None;
-    let mut disc_loaded = false;
     let _ = rustls::crypto::ring::default_provider().install_default();
     if let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -2259,7 +2998,6 @@ pub async fn api_auth_oidc_callback(
                     )
                         .into_response();
                 };
-                disc_loaded = true;
                 if let Some(disc_iss) = disc.get("issuer")
                     && !disc_iss
                         .as_str()
@@ -2350,8 +3088,18 @@ pub async fn api_auth_oidc_callback(
                     )
                         .into_response();
                 }
-                let mut merged_claims = json!({});
-                if let Some(id_token) = tok_json.get("id_token").and_then(|v| v.as_str()) {
+                let Some(id_token) = tok_json
+                    .get("id_token")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                else {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({ "message": "OIDC token response missing required id_token" })),
+                    )
+                        .into_response();
+                };
+                let mut merged_claims = {
                     let parts: Vec<&str> = id_token.split('.').collect();
                     if parts.len() != 3
                         || parts[2].trim().is_empty()
@@ -2489,7 +3237,7 @@ pub async fn api_auth_oidc_callback(
                             )
                                 .into_response();
                         }
-                    } else if disc_loaded {
+                    } else {
                         return (
                             StatusCode::UNAUTHORIZED,
                             Json(json!({ "message": "OIDC discovery document missing required jwks_uri for asymmetric ID token" })),
@@ -2574,8 +3322,8 @@ pub async fn api_auth_oidc_callback(
                         )
                             .into_response();
                     }
-                    merged_claims = claims_json;
-                }
+                    claims_json
+                };
                 if let Some(access_token) = tok_json.get("access_token").and_then(|v| v.as_str()) {
                     let Ok(ui_resp) = client
                         .get(&userinfo_endpoint)
@@ -2692,15 +3440,18 @@ pub async fn api_auth_oidc_callback(
                     };
                     let username = username_str.to_string();
                     let oidc_role = resolve_oidc_role(&merged_claims, &oidc_cfg);
-                    let (canonical_username, role, allowed_cameras) =
-                        match state.db.get_user(&username) {
-                            Ok(Some(db_u)) => (
-                                db_u.username,
-                                cap_external_role_by_db(&oidc_role, &db_u.role),
-                                Some(db_u.allowed_cameras),
-                            ),
-                            _ => (username, oidc_role, Some("*".to_string())),
-                        };
+                    let (canonical_username, role, allowed_cameras) = match state
+                        .auth_gate
+                        .get_user_cached_async(&state.db, &username)
+                        .await
+                    {
+                        Ok(Some(db_u)) => (
+                            db_u.username,
+                            cap_external_role_by_db(&oidc_role, &db_u.role),
+                            Some(db_u.allowed_cameras),
+                        ),
+                        _ => (username, oidc_role, Some("*".to_string())),
+                    };
                     let now = unix_now();
                     let clamped_session_len = session_len.clamp(60, 86_400 * 365);
                     let jwt_claims = JwtClaims {
@@ -2779,7 +3530,7 @@ pub async fn api_login(
         let cfg = state.config.read().await;
         (
             cfg.auth.cookie_name.clone(),
-            cfg.auth.cookie_secure,
+            should_set_secure_cookie(&headers, &uri, &cfg.auth),
             cfg.auth.session_length,
             cfg.auth.enabled,
             cfg.auth.local_login_enabled,
@@ -2821,7 +3572,7 @@ pub async fn api_login(
         );
     }
 
-    let rate_scope = state.jwt_secret.clone();
+    let rate_scope = extract_login_peer_scope(&headers);
     if state
         .auth_gate
         .check_login_rate_limited(&rate_scope, trimmed_user)
@@ -2836,15 +3587,33 @@ pub async fn api_login(
         );
     }
 
-    let Ok(_pbkdf2_permit) = state.auth_gate.pbkdf2_semaphore.acquire().await else {
-        return (
-            jar,
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "message": "Authentication worker pool unavailable" })),
-            )
-                .into_response(),
-        );
+    let _pbkdf2_permit = match tokio::time::timeout(
+        Duration::from_secs(2),
+        state.auth_gate.pbkdf2_semaphore.acquire(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => {
+            return (
+                jar,
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "message": "Authentication worker pool unavailable" })),
+                )
+                    .into_response(),
+            );
+        }
+        Err(_) => {
+            return (
+                jar,
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({ "message": "Authentication busy; try again shortly" })),
+                )
+                    .into_response(),
+            );
+        }
     };
 
     let db_clone = state.db.clone();
@@ -2890,6 +3659,11 @@ pub async fn api_login(
     state
         .auth_gate
         .clear_login_failures(&rate_scope, trimmed_user);
+    state.auth_gate.put_cached_user(
+        state.db.path(),
+        &db_user.username,
+        CachedDbUser::from(&db_user),
+    );
 
     if db_user.role == "admin" {
         state.config.write().await.auth.admin_first_time_login = false;
@@ -2928,10 +3702,10 @@ pub async fn api_logout(
     headers: HeaderMap,
     jar: CookieJar,
 ) -> Response {
-    if method != axum::http::Method::GET
-        && method != axum::http::Method::HEAD
-        && !verify_cookie_csrf_origin(&headers, &uri)
-    {
+    if method == axum::http::Method::GET || method == axum::http::Method::HEAD {
+        return Redirect::to("/login").into_response();
+    }
+    if !verify_cookie_csrf_origin(&headers, &uri) {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({
@@ -3058,7 +3832,8 @@ pub fn extract_authenticated_user_with_cfg(
                 } else {
                     "viewer".to_string()
                 };
-                if let Ok(Some(db_u)) = state.db.get_user(remote_user) {
+                if let Ok(Some(db_u)) = state.auth_gate.get_user_cached_sync(&state.db, remote_user)
+                {
                     return Some((
                         db_u.username,
                         cap_external_role_by_db(&proxy_role, &db_u.role),
@@ -3078,8 +3853,10 @@ pub fn extract_authenticated_user_with_cfg(
     };
 
     if token_str.starts_with("nnvr_") {
-        if let Ok(Some((token_name, scope))) =
-            state.db.verify_api_token(&token_str, unix_now() as f64)
+        if let Some((token_name, scope)) =
+            state
+                .auth_gate
+                .verify_api_token_cached_sync(&state.db, &token_str, unix_now() as f64)
         {
             let mapped_role = if scope == "full" {
                 "admin".to_string()
@@ -3103,11 +3880,21 @@ pub fn extract_authenticated_user_with_cfg(
         return None;
     }
 
-    let (canonical_sub, role) = match state.db.get_user(&decoded.claims.sub) {
-        Ok(Some(db_u)) => (
-            db_u.username,
-            cap_external_role_by_db(&decoded.claims.role, &db_u.role),
-        ),
+    let (canonical_sub, role) = match state
+        .auth_gate
+        .get_user_cached_sync(&state.db, &decoded.claims.sub)
+    {
+        Ok(Some(db_u)) => {
+            if let Some(changed_epoch) = db_u.password_changed_at_epoch
+                && (decoded.claims.iat as i64) < changed_epoch
+            {
+                return None;
+            }
+            (
+                db_u.username,
+                cap_external_role_by_db(&decoded.claims.role, &db_u.role),
+            )
+        }
         Ok(None) => {
             if auth_cfg.enabled
                 && (decoded.claims.role.eq_ignore_ascii_case("admin")
@@ -3129,6 +3916,32 @@ pub fn extract_authenticated_user_with_cfg(
     };
 
     Some((canonical_sub, role))
+}
+
+pub fn extract_jwt_iat(
+    state: &AppState,
+    jar: &CookieJar,
+    headers: &HeaderMap,
+    cookie_name: &str,
+) -> Option<i64> {
+    let token_str = if let Some(auth_val) = headers.get(header::AUTHORIZATION) {
+        let raw = auth_val.to_str().ok()?;
+        parse_authorization_bearer(raw)?.to_string()
+    } else {
+        jar.get(cookie_name).map(|c| c.value().to_string())?
+    };
+    if token_str.starts_with("nnvr_") {
+        return None;
+    }
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.validate_exp = true;
+    let decoded = jsonwebtoken::decode::<JwtClaims>(
+        &token_str,
+        &DecodingKey::from_secret(state.jwt_secret.as_bytes()),
+        &validation,
+    )
+    .ok()?;
+    Some(decoded.claims.iat as i64)
 }
 
 pub fn extract_jwt_allowed_cameras(
@@ -3168,7 +3981,7 @@ pub fn resolve_user_allowed_cameras(
     if auth_cfg.enabled && role.trim().eq_ignore_ascii_case("metrics") {
         return Some(Vec::new());
     }
-    match state.db.get_user(user) {
+    match state.auth_gate.get_user_cached_sync(&state.db, user) {
         Ok(Some(db_u)) => {
             if db_u.role.eq_ignore_ascii_case("admin") {
                 if !role.eq_ignore_ascii_case("admin")
@@ -3298,19 +4111,16 @@ pub async fn caller_allowed_cameras(
     jar: &CookieJar,
     headers: &HeaderMap,
 ) -> Option<Vec<String>> {
-    let cfg = state.config.read().await;
-    if let Some((user, role)) = extract_authenticated_user_with_cfg(state, jar, headers, &cfg.auth)
+    let auth_cfg = state.config.read().await.auth.clone();
+    warm_auth_cache_for_request(state, jar, headers, &auth_cfg).await;
+    if let Some((user, role)) = extract_authenticated_user_with_cfg(state, jar, headers, &auth_cfg)
     {
-        if cfg.auth.enabled && role.trim().eq_ignore_ascii_case("metrics") {
+        if auth_cfg.enabled && role.trim().eq_ignore_ascii_case("metrics") {
             return Some(Vec::new());
         }
-        return resolve_user_allowed_cameras(state, jar, headers, &cfg.auth, &user, &role);
+        return resolve_user_allowed_cameras(state, jar, headers, &auth_cfg, &user, &role);
     }
-    let has_supplied_credentials = headers.contains_key(header::AUTHORIZATION)
-        || jar.get(&cfg.auth.cookie_name).is_some()
-        || (cfg.auth.proxy.enabled && extract_trusted_proxy_peer_ip(headers).is_some())
-        || is_external_public_peer_ip(headers);
-    if cfg.auth.enabled && has_supplied_credentials {
+    if auth_cfg.enabled && request_requires_strict_auth(headers, jar, &auth_cfg) {
         Some(Vec::new())
     } else {
         None
@@ -3383,18 +4193,15 @@ pub async fn caller_can_mutate(
     headers: &HeaderMap,
     require_admin: bool,
 ) -> bool {
-    let cfg = state.config.read().await;
-    if !cfg.auth.enabled {
+    let auth_cfg = state.config.read().await.auth.clone();
+    if !auth_cfg.enabled {
         return true;
     }
-    let has_creds = headers.contains_key(header::AUTHORIZATION)
-        || jar.get(&cfg.auth.cookie_name).is_some()
-        || (cfg.auth.proxy.enabled && extract_trusted_proxy_peer_ip(headers).is_some())
-        || is_external_public_peer_ip(headers);
-    if !has_creds {
+    warm_auth_cache_for_request(state, jar, headers, &auth_cfg).await;
+    if !request_requires_strict_auth(headers, jar, &auth_cfg) {
         return true;
     }
-    let Some((_user, role)) = extract_authenticated_user_with_cfg(state, jar, headers, &cfg.auth)
+    let Some((_user, role)) = extract_authenticated_user_with_cfg(state, jar, headers, &auth_cfg)
     else {
         return false;
     };
@@ -3441,7 +4248,14 @@ pub async fn authorize_review_media(
     if !is_safe_id(id) {
         return Err(ReviewMediaDenied::BadRequest);
     }
-    let Ok(Some(item)) = state.db.get_review_by_id(id) else {
+    let db_for_rev = state.db.clone();
+    let id_owned = id.to_string();
+    let Ok(Some(item)) =
+        tokio::task::spawn_blocking(move || db_for_rev.get_review_by_id(&id_owned))
+            .await
+            .ok()
+            .unwrap_or(Ok(None))
+    else {
         return Err(ReviewMediaDenied::NotFound);
     };
     if let Some(allowed) = effective_caller_allowed_cameras(state, jar, headers).await
@@ -3464,16 +4278,23 @@ pub async fn verify_caller_can_mutate(
     jar: &CookieJar,
     headers: &HeaderMap,
 ) -> Option<AuthRejection> {
-    let cfg = state.config.read().await;
-    if cfg.auth.enabled
-        && let Some((_, role)) = extract_authenticated_user_with_cfg(state, jar, headers, &cfg.auth)
-    {
-        let role_lc = role.trim().to_ascii_lowercase();
-        if matches!(role_lc.as_str(), "viewer" | "read_only" | "metrics") {
-            return Some(AuthRejection::new(
-                StatusCode::FORBIDDEN,
-                "Insufficient role for mutation",
-            ));
+    let auth_cfg = state.config.read().await.auth.clone();
+    if auth_cfg.enabled {
+        warm_auth_cache_for_request(state, jar, headers, &auth_cfg).await;
+        match extract_authenticated_user_with_cfg(state, jar, headers, &auth_cfg) {
+            Some((_, role)) => {
+                let role_lc = role.trim().to_ascii_lowercase();
+                if matches!(role_lc.as_str(), "viewer" | "read_only" | "metrics") {
+                    return Some(AuthRejection::new(
+                        StatusCode::FORBIDDEN,
+                        "Insufficient role for mutation",
+                    ));
+                }
+            }
+            None if request_requires_strict_auth(headers, jar, &auth_cfg) => {
+                return Some(AuthRejection::new(StatusCode::UNAUTHORIZED, "Unauthorized"));
+            }
+            None => {}
         }
     }
     None
@@ -3492,27 +4313,33 @@ pub async fn verify_camera_mutation_access(
             "Cross-origin cookie request rejected (Origin/Host mismatch)",
         ));
     }
-    let cfg = state.config.read().await;
-    if cfg.auth.enabled
-        && let Some((user, role)) =
-            extract_authenticated_user_with_cfg(state, jar, headers, &cfg.auth)
-    {
-        let role_lc = role.to_ascii_lowercase();
-        if matches!(role_lc.as_str(), "viewer" | "read_only" | "metrics") {
-            return Some(AuthRejection::new(
-                StatusCode::FORBIDDEN,
-                "Insufficient role for camera mutation",
-            ));
-        }
-        if role_lc != "admin"
-            && let Some(allowed) =
-                resolve_user_allowed_cameras(state, jar, headers, &cfg.auth, &user, &role)
-            && !allowed.iter().any(|a| a == camera || a == "*")
-        {
-            return Some(AuthRejection::with_message(
-                StatusCode::FORBIDDEN,
-                format!("Camera '{camera}' is not permitted for this user"),
-            ));
+    let auth_cfg = state.config.read().await.auth.clone();
+    if auth_cfg.enabled {
+        warm_auth_cache_for_request(state, jar, headers, &auth_cfg).await;
+        match extract_authenticated_user_with_cfg(state, jar, headers, &auth_cfg) {
+            Some((user, role)) => {
+                let role_lc = role.to_ascii_lowercase();
+                if matches!(role_lc.as_str(), "viewer" | "read_only" | "metrics") {
+                    return Some(AuthRejection::new(
+                        StatusCode::FORBIDDEN,
+                        "Insufficient role for camera mutation",
+                    ));
+                }
+                if role_lc != "admin"
+                    && let Some(allowed) =
+                        resolve_user_allowed_cameras(state, jar, headers, &auth_cfg, &user, &role)
+                    && !allowed.iter().any(|a| a == camera || a == "*")
+                {
+                    return Some(AuthRejection::with_message(
+                        StatusCode::FORBIDDEN,
+                        format!("Camera '{camera}' is not permitted for this user"),
+                    ));
+                }
+            }
+            None if request_requires_strict_auth(headers, jar, &auth_cfg) => {
+                return Some(AuthRejection::new(StatusCode::UNAUTHORIZED, "Unauthorized"));
+            }
+            None => {}
         }
     }
     None
@@ -3708,6 +4535,38 @@ pub fn filter_ws_message_for_allowed_cameras(
     if clean_topic == "profile" || clean_topic.starts_with("profile/") {
         return Some(msg.to_string());
     }
+    if clean_topic == "config" {
+        let mut payload_val: Value = match parsed.get("payload") {
+            Some(Value::String(s)) => serde_json::from_str(s).ok()?,
+            Some(v @ Value::Object(_)) => v.clone(),
+            _ => {
+                return Some(
+                    json!({ "topic": topic, "payload": { "type": "updated" } }).to_string(),
+                );
+            }
+        };
+        if let Some(arr) = payload_val
+            .get_mut("invalidated_cameras")
+            .and_then(Value::as_array_mut)
+        {
+            arr.retain(|v| {
+                v.as_str()
+                    .is_some_and(|c| allow_list.iter().any(|a| a == c.trim()))
+            });
+        }
+        let filtered_payload = if parsed.get("payload").is_some_and(Value::is_string) {
+            Value::String(serde_json::to_string(&payload_val).unwrap_or_else(|_| "{}".to_string()))
+        } else {
+            payload_val
+        };
+        return Some(
+            json!({
+                "topic": topic,
+                "payload": filtered_payload
+            })
+            .to_string(),
+        );
+    }
     if clean_topic == "stats" {
         let mut payload_val: Value = match parsed.get("payload") {
             Some(Value::String(s)) => serde_json::from_str(s).ok()?,
@@ -3797,6 +4656,35 @@ pub fn filter_ws_message_for_allowed_cameras(
     }
 }
 
+fn map_cached_ws_user_access(
+    db_u: &CachedDbUser,
+    session_iat: Option<i64>,
+) -> Option<(String, Option<Vec<String>>)> {
+    if let (Some(iat), Some(changed_epoch)) = (session_iat, db_u.password_changed_at_epoch)
+        && iat < changed_epoch
+    {
+        return None;
+    }
+    let role = db_u.role.trim().to_string();
+    if role.eq_ignore_ascii_case("admin") {
+        return Some((role, None));
+    }
+    let raw = db_u.allowed_cameras.trim();
+    if raw.is_empty() || raw == "*" {
+        return Some((role, None));
+    }
+    let list: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if list.is_empty() || list.iter().any(|c| c == "*") {
+        Some((role, None))
+    } else {
+        Some((role, Some(list)))
+    }
+}
+
 pub fn reverify_ws_caller_access(
     state: &AppState,
     caller_user: Option<&str>,
@@ -3804,40 +4692,68 @@ pub fn reverify_ws_caller_access(
     fallback_role: &str,
     fallback_allowed: &Option<Vec<String>>,
 ) -> Option<(String, Option<Vec<String>>)> {
+    reverify_ws_caller_access_with_iat(
+        state,
+        caller_user,
+        had_db_user_at_connect,
+        fallback_role,
+        fallback_allowed,
+        None,
+    )
+}
+
+pub fn reverify_ws_caller_access_with_iat(
+    state: &AppState,
+    caller_user: Option<&str>,
+    had_db_user_at_connect: bool,
+    fallback_role: &str,
+    fallback_allowed: &Option<Vec<String>>,
+    session_iat: Option<i64>,
+) -> Option<(String, Option<Vec<String>>)> {
+    let Some(user) = caller_user else {
+        return Some((fallback_role.to_string(), fallback_allowed.clone()));
+    };
+    if let Some(token_name) = user.strip_prefix("token:") {
+        if !state.auth_gate.is_api_token_active_cached_sync(
+            &state.db,
+            token_name.trim(),
+            unix_now() as f64,
+        ) {
+            return None;
+        }
+        return Some((fallback_role.to_string(), fallback_allowed.clone()));
+    }
+    match state.auth_gate.get_user_cached_sync(&state.db, user) {
+        Ok(Some(db_u)) => map_cached_ws_user_access(&db_u, session_iat),
+        Ok(None) if had_db_user_at_connect => None,
+        Ok(None) => Some((fallback_role.to_string(), fallback_allowed.clone())),
+        Err(_) => None,
+    }
+}
+
+pub async fn reverify_ws_caller_access_async(
+    state: &AppState,
+    caller_user: Option<&str>,
+    had_db_user_at_connect: bool,
+    fallback_role: &str,
+    fallback_allowed: &Option<Vec<String>>,
+    session_iat: Option<i64>,
+) -> Option<(String, Option<Vec<String>>)> {
     let Some(user) = caller_user else {
         return Some((fallback_role.to_string(), fallback_allowed.clone()));
     };
     if let Some(token_name) = user.strip_prefix("token:") {
         if !state
-            .db
-            .is_api_token_active_by_name(token_name.trim(), unix_now() as f64)
-            .unwrap_or(false)
+            .auth_gate
+            .is_api_token_active_cached_async(&state.db, token_name.trim(), unix_now() as f64)
+            .await
         {
             return None;
         }
         return Some((fallback_role.to_string(), fallback_allowed.clone()));
     }
-    match state.db.get_user(user) {
-        Ok(Some(db_u)) => {
-            let role = db_u.role.trim().to_string();
-            if role.eq_ignore_ascii_case("admin") {
-                return Some((role, None));
-            }
-            let raw = db_u.allowed_cameras.trim();
-            if raw.is_empty() || raw == "*" {
-                return Some((role, None));
-            }
-            let list: Vec<String> = raw
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if list.is_empty() || list.iter().any(|c| c == "*") {
-                Some((role, None))
-            } else {
-                Some((role, Some(list)))
-            }
-        }
+    match state.auth_gate.get_user_cached_async(&state.db, user).await {
+        Ok(Some(db_u)) => map_cached_ws_user_access(&db_u, session_iat),
         Ok(None) if had_db_user_at_connect => None,
         Ok(None) => Some((fallback_role.to_string(), fallback_allowed.clone())),
         Err(_) => None,
