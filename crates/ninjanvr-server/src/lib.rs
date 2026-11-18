@@ -39,9 +39,10 @@ pub use media_redaction::MediaDeliveryGate;
 pub use ninjanvr_comms::{LogBufferHub, sanitize_logged_path};
 pub use share_engine::*;
 pub use telemetry::{
-    HostMetricsProbe, LinuxHostMetricsProbe, ProcCpuTracker, ProcessResourceSample,
-    RawPidProcReading, escape_prom_label_value, filter_stats_snapshot_for_allowed_cameras,
-    is_camera_stream_online, render_detector_inference_metrics, render_prometheus_exposition,
+    DEFAULT_METRICS_PORT, HostMetricsProbe, LinuxHostMetricsProbe, ProcCpuTracker,
+    ProcessResourceSample, RawPidProcReading, escape_prom_label_value,
+    filter_stats_snapshot_for_allowed_cameras, is_camera_stream_online,
+    render_detector_inference_metrics, render_prometheus_exposition,
 };
 pub use track_lifecycle::*;
 pub use vod_routes::*;
@@ -130,6 +131,9 @@ pub struct AppState {
     pub media_delivery_gate: MediaDeliveryGate,
     pub live_gateway: LiveStreamGateway,
     pub debug_reprocess_semaphore: Arc<tokio::sync::Semaphore>,
+    pub metrics_scrape_semaphore: Arc<tokio::sync::Semaphore>,
+    pub unscoped_metrics_cache: Arc<tokio::sync::Mutex<Option<(Instant, u64, String)>>>,
+    pub active_listener_ports: Arc<std::sync::RwLock<(u16, u16, u16)>>,
     #[doc(hidden)]
     pub allow_ephemeral_loopback_federation_for_test: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -139,6 +143,34 @@ impl AppState {
     pub fn enable_ephemeral_loopback_federation_for_test(&self) {
         self.allow_ephemeral_loopback_federation_for_test
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Records the active `(http_port, https_port, metrics_port)` bound by the server process
+    /// so SSRF guards also block custom CLI-configured listener ports.
+    pub fn set_active_listener_ports(&self, http_port: u16, https_port: u16, metrics_port: u16) {
+        if let Ok(mut guard) = self.active_listener_ports.write() {
+            *guard = (http_port, https_port, metrics_port);
+        }
+    }
+
+    /// Returns `true` when `port > 0` matches any active HTTP, HTTPS, or metrics listener port.
+    pub fn is_active_listener_port(&self, port: u16) -> bool {
+        if port == 0 {
+            return true;
+        }
+        self.active_listener_ports
+            .read()
+            .is_ok_and(|g| port == g.0 || port == g.1 || (g.2 > 0 && port == g.2))
+    }
+
+    /// Returns `true` when `port > 0` matches the active non-TLS HTTP or metrics listener port.
+    pub fn is_active_http_or_metrics_port(&self, port: u16) -> bool {
+        if port == 0 {
+            return true;
+        }
+        self.active_listener_ports
+            .read()
+            .is_ok_and(|g| port == g.0 || (g.2 > 0 && port == g.2))
     }
 }
 
@@ -255,6 +287,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
     let exports_dir = state.media_dir.join("exports");
 
     let api_router = Router::new()
+        .route("/healthz", get(api_healthz))
         .route("/version", get(api_version))
         .route("/ui/switch", get(api_ui_switch))
         .route("/ui/version", get(api_ui_version))
@@ -522,7 +555,9 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
     Router::new()
         .nest("/api", api_router)
         .route("/share/{token}", get(share_player_page))
+        .route("/healthz", get(api_healthz))
         .route("/version", get(api_version))
+        .route("/metrics", get(api_prometheus_metrics))
         .route("/auth", get(api_auth_verify))
         .route("/logout", get(api_logout).post(api_logout))
         .route("/ws", get(ws_state_handler))
@@ -584,6 +619,37 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         ))
         .layer(CorsLayer::new())
         .with_state(state)
+}
+
+/// Builds the dedicated, port-isolated OpenMetrics & health telemetry router (`:9091` by default).
+///
+/// Mounts **only** read-only operational endpoints (`/metrics`, `/api/metrics`, `/healthz`,
+/// `/api/healthz`, `/version`, `/api/version`) without authentication and exports full instance
+/// telemetry (`allowed = None`), completely decoupled from NVR API, config, auth, media, MCP,
+/// and WebSocket routes. Omits `CorsLayer` so cross-origin browser scripts cannot scrape telemetry.
+pub fn build_metrics_router(state: AppState) -> Router {
+    Router::new()
+        .route("/metrics", get(telemetry_prometheus_metrics))
+        .route("/api/metrics", get(telemetry_prometheus_metrics))
+        .route("/healthz", get(api_healthz))
+        .route("/api/healthz", get(api_healthz))
+        .route("/version", get(api_version))
+        .route("/api/version", get(api_version))
+        .fallback(telemetry_not_found)
+        .layer(CompressionLayer::new())
+        .with_state(state)
+}
+
+async fn telemetry_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "success": false,
+            "message": "Endpoint not available on dedicated metrics listener"
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -710,6 +776,17 @@ async fn serve_spa_fallback(State(state): State<AppState>, uri: axum::http::Uri)
         Some(html) => Html(html).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+async fn api_healthz() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        "ok\n",
+    )
+        .into_response()
 }
 
 async fn api_version() -> &'static str {
@@ -1785,30 +1862,91 @@ async fn api_stats_history(
     Json(Value::Array(items))
 }
 
+async fn compute_prometheus_exposition_text(
+    state: &AppState,
+    allowed: Option<Vec<String>>,
+) -> String {
+    let mut stats_val = compute_stats_snapshot(state).await;
+    if let Some(ref allow_list) = allowed {
+        filter_stats_snapshot_for_allowed_cameras(&mut stats_val, allow_list);
+    }
+    let db = state.db.clone();
+    let ev_counts = tokio::task::spawn_blocking(move || {
+        db.query_event_counts_by_camera_and_label()
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
+    render_prometheus_exposition(&stats_val, &ev_counts, allowed.as_deref())
+}
+
+fn prometheus_text_response(out: String) -> Response {
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            ),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        out,
+    )
+        .into_response()
+}
+
 async fn api_prometheus_metrics(
     State(state): State<AppState>,
     jar: CookieJar,
     headers: HeaderMap,
 ) -> Response {
     let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
-    let mut stats_val = compute_stats_snapshot(&state).await;
-    if let Some(ref allow_list) = allowed {
-        filter_stats_snapshot_for_allowed_cameras(&mut stats_val, allow_list);
-    }
-    let ev_counts = state
-        .db
-        .query_event_counts_by_camera_and_label()
-        .unwrap_or_default();
-    let out = render_prometheus_exposition(&stats_val, &ev_counts, allowed.as_deref());
+    let out = compute_prometheus_exposition_text(&state, allowed).await;
+    prometheus_text_response(out)
+}
 
-    (
-        [(
-            header::CONTENT_TYPE,
-            "text/plain; version=0.0.4; charset=utf-8",
-        )],
-        out,
+async fn telemetry_prometheus_metrics(State(state): State<AppState>) -> Response {
+    const UNSCOPED_METRICS_CACHE_TTL: Duration = Duration::from_secs(2);
+    let current_ev_seq = state.db.events_mutation_seq();
+    {
+        let cache = state.unscoped_metrics_cache.lock().await;
+        if let Some((cached_at, cached_seq, ref cached_body)) = *cache
+            && cached_seq == current_ev_seq
+            && cached_at.elapsed() < UNSCOPED_METRICS_CACHE_TTL
+        {
+            return prometheus_text_response(cached_body.clone());
+        }
+    }
+
+    let _permit = match tokio::time::timeout(
+        Duration::from_secs(5),
+        state.metrics_scrape_semaphore.acquire(),
     )
-        .into_response()
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) | Err(_) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, "Metrics collector busy\n").into_response();
+        }
+    };
+
+    // Re-check cache after acquiring scrape semaphore so concurrent burst scrapes coalesce
+    let current_ev_seq = state.db.events_mutation_seq();
+    {
+        let cache = state.unscoped_metrics_cache.lock().await;
+        if let Some((cached_at, cached_seq, ref cached_body)) = *cache
+            && cached_seq == current_ev_seq
+            && cached_at.elapsed() < UNSCOPED_METRICS_CACHE_TTL
+        {
+            return prometheus_text_response(cached_body.clone());
+        }
+    }
+
+    let out = compute_prometheus_exposition_text(&state, None).await;
+    {
+        let mut cache = state.unscoped_metrics_cache.lock().await;
+        *cache = Some((Instant::now(), state.db.events_mutation_seq(), out.clone()));
+    }
+    prometheus_text_response(out)
 }
 
 #[derive(Debug, Deserialize)]
@@ -3117,10 +3255,11 @@ async fn compute_stats_snapshot(state: &AppState) -> Value {
         if cfg.record.storage_tiers.enabled
             && let Some(ref cold_dir) = cfg.record.storage_tiers.cold_dir
         {
-            storage_map.insert(
-                cold_dir.to_string_lossy().to_string(),
-                stat_mount_mb(cold_dir, "ext4"),
-            );
+            let mut cold_stat = stat_mount_mb(cold_dir, "ext4");
+            if let Some(obj) = cold_stat.as_object_mut() {
+                obj.insert("tier".to_string(), json!("cold"));
+            }
+            storage_map.insert(cold_dir.to_string_lossy().to_string(), cold_stat);
         }
         storage_map.insert(
             "/media/ninjanvr/clips".to_string(),
@@ -5732,8 +5871,23 @@ fn is_valid_rtsp_probe_url(raw: &str) -> bool {
     } else {
         (host_port, None)
     };
-    if matches!(port, Some(0 | 5000 | 8971 | 1984)) {
-        return false;
+    if let Some(p) = port {
+        if matches!(p, 0 | 5000 | 8971 | 9091 | 1984 | 8555) {
+            return false;
+        }
+        for env_key in [
+            "NINJANVR_HTTP_PORT",
+            "NINJANVR_HTTPS_PORT",
+            "NINJANVR_METRICS_PORT",
+        ] {
+            if let Ok(raw_env) = std::env::var(env_key)
+                && let Ok(env_port) = raw_env.trim().parse::<u16>()
+                && env_port > 0
+                && env_port == p
+            {
+                return false;
+            }
+        }
     }
     let clean_host = host.trim_end_matches('.').to_ascii_lowercase();
     if clean_host.is_empty()
@@ -5882,7 +6036,22 @@ async fn api_streams_probe(
         .into_response();
     }
 
-    if !is_valid_rtsp_probe_url(&resolved_url) {
+    let probe_explicit_port = resolved_url.split_once("://").and_then(|(_, after)| {
+        let auth_end = after.find(['/', '?', '#', '\\']).unwrap_or(after.len());
+        let host_port = match after[..auth_end].rfind('@') {
+            Some(idx) => &after[idx + 1..auth_end],
+            None => &after[..auth_end],
+        };
+        if host_port.starts_with('[') {
+            let end = host_port.find(']')?;
+            host_port[end + 1..].strip_prefix(':')?.parse::<u16>().ok()
+        } else {
+            host_port.rsplit_once(':')?.1.parse::<u16>().ok()
+        }
+    });
+    if !is_valid_rtsp_probe_url(&resolved_url)
+        || probe_explicit_port.is_some_and(|p| state.is_active_listener_port(p))
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -12372,6 +12541,9 @@ pub async fn new_app_state(
         media_delivery_gate,
         live_gateway,
         debug_reprocess_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+        metrics_scrape_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        unscoped_metrics_cache: Arc::new(tokio::sync::Mutex::new(None)),
+        active_listener_ports: Arc::new(std::sync::RwLock::new((5000, 8971, DEFAULT_METRICS_PORT))),
         allow_ephemeral_loopback_federation_for_test: Arc::new(std::sync::atomic::AtomicBool::new(
             false,
         )),

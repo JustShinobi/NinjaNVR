@@ -1218,7 +1218,9 @@ pub fn load_or_create_jwt_secret(config_dir: &Path) -> String {
 pub fn is_protected_path(path: &str) -> bool {
     if matches!(
         path,
-        "/api/version"
+        "/healthz"
+            | "/api/healthz"
+            | "/api/version"
             | "/api/login"
             | "/api/logout"
             | "/api/auth/first_time_login"
@@ -1235,6 +1237,7 @@ pub fn is_protected_path(path: &str) -> bool {
     let check_protected = |p: &str| {
         p.starts_with("/api/")
             || p == "/api"
+            || p == "/metrics"
             || p.starts_with("/vod/")
             || p == "/vod"
             || p.starts_with("/live/")
@@ -1839,7 +1842,10 @@ pub async fn auth_gate_middleware(
         let role_lc = role.to_ascii_lowercase();
         if role_lc == "metrics" {
             let is_metrics_route = (method == "GET" || method == "HEAD")
-                && (path == "/api/stats" || path == "/api/stats/history" || path == "/api/metrics");
+                && (path == "/api/stats"
+                    || path == "/api/stats/history"
+                    || path == "/api/metrics"
+                    || path == "/metrics");
             if !is_metrics_route {
                 state.log_hub.push_nginx(&method, &path, 403);
                 return (
@@ -1894,12 +1900,12 @@ pub async fn auth_gate_middleware(
         if role_lc == "read_only"
             && !path_matches_segment_prefix(&path, "/api/mcp")
             && ((method != "GET" && method != "HEAD")
-                || !(path.starts_with("/api/") || path == "/api"))
+                || !(path.starts_with("/api/") || path == "/api" || path == "/metrics"))
         {
             state.log_hub.push_nginx(&method, &path, 403);
             return (
                 StatusCode::FORBIDDEN,
-                Json(json!({ "message": "Token scope 'read_only' only permits GET /api/*" })),
+                Json(json!({ "message": "Token scope 'read_only' only permits GET /api/* and /metrics" })),
             )
                 .into_response();
         }

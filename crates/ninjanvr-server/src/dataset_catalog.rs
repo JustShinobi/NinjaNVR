@@ -426,7 +426,7 @@ pub fn validate_genai_base_url(raw: &str) -> Result<(), String> {
     } else {
         (authority, None)
     };
-    if matches!(port, Some(0 | 5000 | 8971 | 1984 | 8554)) {
+    if port.is_some_and(ninjanvr_config::is_disallowed_internal_service_port) {
         return Err("Disallowed or invalid GenAI base_url".to_string());
     }
     let host_lc = host.to_ascii_lowercase();
@@ -483,7 +483,9 @@ pub fn validate_genai_base_url(raw: &str) -> Result<(), String> {
     };
     if parsed_url.query().is_some()
         || parsed_url.fragment().is_some()
-        || matches!(parsed_url.port(), Some(0 | 5000 | 8971 | 1984 | 8554))
+        || parsed_url
+            .port()
+            .is_some_and(ninjanvr_config::is_disallowed_internal_service_port)
     {
         return Err("Disallowed or invalid GenAI base_url".to_string());
     }
@@ -1963,6 +1965,21 @@ pub async fn api_genai_models_post(
         Some(b) => Some(b) == saved.base_url.as_deref().map(str::trim),
     };
     let effective = build_effective_genai_config(&saved, &req);
+    if let Some(ref b) = effective.base_url
+        && let Some(p) = ninjanvr_config::extract_http_url_effective_port(b)
+        && state.is_active_listener_port(p)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "valid": false,
+                "provider": effective.provider,
+                "models": [],
+                "message": "Disallowed or invalid GenAI base_url"
+            })),
+        )
+            .into_response();
+    }
     match discover_genai_models(&effective).await {
         Ok(models) => {
             if provider_matches_saved

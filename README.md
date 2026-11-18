@@ -44,7 +44,8 @@ Open `https://localhost:8971`. The server generates a TLS certificate when none 
 | Port | Purpose |
 | :--- | :--- |
 | `8971/tcp` | HTTPS console and authenticated API |
-| `5000/tcp` | Internal HTTP API and container health checks; not published above |
+| `5000/tcp` | Internal authenticated HTTP API and container health checks; not published above |
+| `9091/tcp` | Dedicated unauthenticated OpenMetrics (`/metrics`) and `/healthz` listener (`NINJANVR_METRICS_PORT`, `0` to disable) |
 | `8554/tcp` | go2rtc RTSP restreaming |
 | `8555/tcp+udp` | WebRTC media |
 

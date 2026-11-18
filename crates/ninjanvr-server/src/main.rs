@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,8 +11,8 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoConnBuilder;
 use ninjanvr_config::{DEFAULT_CONFIG_PATH, DEFAULT_GO2RTC_SHM_PATH};
 use ninjanvr_server::{
-    build_router_with_auth, generate_self_signed_tls_config,
-    generate_self_signed_tls_config_with_sans, new_app_state,
+    DEFAULT_METRICS_PORT, build_metrics_router, build_router_with_auth,
+    generate_self_signed_tls_config, generate_self_signed_tls_config_with_sans, new_app_state,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
@@ -22,8 +22,10 @@ use tracing::{error, info, warn};
 
 pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const HTTP1_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+pub const METRICS_CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
 pub const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 pub const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
+pub const METRICS_MAX_CONCURRENT_CONNECTIONS: usize = 64;
 pub const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 128;
 pub const HTTP2_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
 pub const MAX_PRIVATE_KEY_FILE_BYTES: u64 = 256 * 1024;
@@ -76,6 +78,99 @@ pub fn resolve_enforce_http_auth(
         }
     }
     true
+}
+
+/// Resolves the dedicated OpenMetrics listener port (`9091` by default; `0` / `false` / `off` /
+/// `no` / `none` / `disabled` disables the listener). Fails closed on invalid values so a typo
+/// never unexpectedly opens or leaves the unauthenticated listener on a default port.
+pub fn resolve_metrics_port(raw: Option<&str>) -> Result<u16> {
+    let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(DEFAULT_METRICS_PORT);
+    };
+    if matches!(
+        s.to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off" | "none" | "disabled"
+    ) {
+        return Ok(0);
+    }
+    s.parse::<u16>().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid metrics port {:?}: expected 0..=65535 or false/off/disabled",
+            s
+        )
+    })
+}
+
+/// Resolves the bind IP address for the dedicated OpenMetrics listener (`0.0.0.0` by default;
+/// `"localhost"` maps to `127.0.0.1`). Fails closed on invalid values so a misconfigured
+/// restriction never falls back to `0.0.0.0`.
+pub fn resolve_metrics_bind_addr(raw: Option<&str>) -> Result<IpAddr> {
+    let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    };
+    if s.eq_ignore_ascii_case("localhost") {
+        return Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+    let unbracketed = s
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(s);
+    unbracketed.parse::<IpAddr>().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid metrics bind address {:?}: expected IPv4, IPv6, or 'localhost'",
+            s
+        )
+    })
+}
+
+/// Ensures HTTP, HTTPS, and (when enabled) dedicated metrics ports do not collide with one another
+/// or with reserved `go2rtc` (`1984`, `8554`, `8555`) or local Ollama (`11434`) ports.
+pub fn validate_listener_ports(http_port: u16, https_port: u16, metrics_port: u16) -> Result<()> {
+    if http_port == https_port {
+        anyhow::bail!("HTTP port ({http_port}) and HTTPS port ({https_port}) must be distinct");
+    }
+    if metrics_port > 0 {
+        if metrics_port == http_port || metrics_port == https_port {
+            anyhow::bail!(
+                "Metrics port ({metrics_port}) must be distinct from HTTP port ({http_port}) and HTTPS port ({https_port})"
+            );
+        }
+        if matches!(metrics_port, 1984 | 8554 | 8555 | 11434) {
+            anyhow::bail!(
+                "Metrics port ({metrics_port}) conflicts with reserved service port (1984, 8554, 8555, 11434)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Serves one connection on the dedicated HTTP/1.1 metrics listener with header-read timeout armed
+/// from byte 0 (`keep_alive(false)`) and a bounded total connection lifetime so 0-byte Slowloris
+/// or `TCP ZeroWindow` peers cannot hold semaphore permits indefinitely.
+pub async fn serve_metrics_tcp_connection(
+    tcp_stream: TcpStream,
+    remote_addr: SocketAddr,
+    app: axum::Router,
+    header_read_timeout: Duration,
+    connection_timeout: Duration,
+) {
+    let io = TokioIo::new(tcp_stream);
+    let hyper_service =
+        hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
+            sanitize_peer_ip_and_host_headers(&mut req, remote_addr);
+            let mut svc = app.clone();
+            async move { svc.call(req).await }
+        });
+    let mut http1 = hyper::server::conn::http1::Builder::new();
+    http1
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout)
+        .keep_alive(false);
+    let _ = tokio::time::timeout(
+        connection_timeout,
+        http1.serve_connection(io, hyper_service),
+    )
+    .await;
 }
 
 /// Completes a TLS handshake within `timeout_dur`, aborting stalled/slowloris handshakes.
@@ -329,28 +424,46 @@ pub fn validate_config_file_path(config_path: &Path) -> Result<()> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliArgDefaults {
+    pub config_path: PathBuf,
+    pub web_dir: PathBuf,
+    pub media_dir: PathBuf,
+    pub http_port: u16,
+    pub https_port: u16,
+    pub metrics_port: u16,
+    pub metrics_bind: IpAddr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedCliArgs {
     pub config_path: PathBuf,
     pub web_dir: PathBuf,
     pub media_dir: PathBuf,
     pub http_port: u16,
     pub https_port: u16,
+    pub metrics_port: u16,
+    pub metrics_bind: IpAddr,
     pub validate_only: bool,
 }
 
-/// Parses CLI flags (`--config`, `--web-dir`, `--media-dir`, `--http-port`, `--https-port`, `--validate-config`)
-/// independently of argument ordering so `--validate-config --config <path>` always validates `<path>`.
-pub fn parse_cli_args<I>(
-    raw_args: I,
-    mut config_path: PathBuf,
-    mut web_dir: PathBuf,
-    mut media_dir: PathBuf,
-    mut http_port: u16,
-    mut https_port: u16,
-) -> ParsedCliArgs
+/// Parses CLI flags (`--config`, `--web-dir`, `--media-dir`, `--http-port`, `--https-port`,
+/// `--metrics-port`, `--metrics-bind`, `--validate-config`) independently of argument ordering
+/// so `--validate-config --config <path>` always validates `<path>`.
+/// Fails closed when `--metrics-port`, `--metrics-bind`, `--http-port`, or `--https-port`
+/// receives a missing or invalid value.
+pub fn parse_cli_args<I>(raw_args: I, defaults: CliArgDefaults) -> Result<ParsedCliArgs>
 where
     I: IntoIterator<Item = String>,
 {
+    let CliArgDefaults {
+        mut config_path,
+        mut web_dir,
+        mut media_dir,
+        mut http_port,
+        mut https_port,
+        mut metrics_port,
+        mut metrics_bind,
+    } = defaults;
     let mut validate_only = false;
     let mut args = raw_args.into_iter().peekable();
     while let Some(arg) = args.next() {
@@ -374,19 +487,39 @@ where
             continue;
         }
         if let Some(v) = trimmed_arg.strip_prefix("--http-port=") {
-            if let Ok(p) = v.trim().parse::<u16>()
-                && p > 0
-            {
-                http_port = p;
-            }
+            let p = v
+                .trim()
+                .parse::<u16>()
+                .ok()
+                .filter(|&p| p > 0)
+                .ok_or_else(|| anyhow::anyhow!("invalid --http-port value {:?}", v.trim()))?;
+            http_port = p;
             continue;
         }
         if let Some(v) = trimmed_arg.strip_prefix("--https-port=") {
-            if let Ok(p) = v.trim().parse::<u16>()
-                && p > 0
-            {
-                https_port = p;
+            let p = v
+                .trim()
+                .parse::<u16>()
+                .ok()
+                .filter(|&p| p > 0)
+                .ok_or_else(|| anyhow::anyhow!("invalid --https-port value {:?}", v.trim()))?;
+            https_port = p;
+            continue;
+        }
+        if let Some(v) = trimmed_arg.strip_prefix("--metrics-port=") {
+            let trimmed_v = v.trim();
+            if trimmed_v.is_empty() {
+                anyhow::bail!("--metrics-port requires a value");
             }
+            metrics_port = resolve_metrics_port(Some(trimmed_v))?;
+            continue;
+        }
+        if let Some(v) = trimmed_arg.strip_prefix("--metrics-bind=") {
+            let trimmed_v = v.trim();
+            if trimmed_v.is_empty() {
+                anyhow::bail!("--metrics-bind requires an IP address or 'localhost'");
+            }
+            metrics_bind = resolve_metrics_bind_addr(Some(trimmed_v))?;
             continue;
         }
         match trimmed_arg {
@@ -412,20 +545,46 @@ where
                 }
             }
             "--http-port" => {
-                if let Some(v) = args.next_if(|next| !next.trim().starts_with("--"))
-                    && let Ok(p) = v.trim().parse::<u16>()
-                    && p > 0
-                {
-                    http_port = p;
-                }
+                let v = args
+                    .next_if(|next| !next.trim().starts_with("--"))
+                    .ok_or_else(|| anyhow::anyhow!("--http-port requires a port value"))?;
+                http_port = v
+                    .trim()
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|&p| p > 0)
+                    .ok_or_else(|| anyhow::anyhow!("invalid --http-port value {:?}", v.trim()))?;
             }
             "--https-port" => {
-                if let Some(v) = args.next_if(|next| !next.trim().starts_with("--"))
-                    && let Ok(p) = v.trim().parse::<u16>()
-                    && p > 0
-                {
-                    https_port = p;
+                let v = args
+                    .next_if(|next| !next.trim().starts_with("--"))
+                    .ok_or_else(|| anyhow::anyhow!("--https-port requires a port value"))?;
+                https_port = v
+                    .trim()
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|&p| p > 0)
+                    .ok_or_else(|| anyhow::anyhow!("invalid --https-port value {:?}", v.trim()))?;
+            }
+            "--metrics-port" => {
+                let v = args
+                    .next_if(|next| !next.trim().starts_with("--"))
+                    .ok_or_else(|| anyhow::anyhow!("--metrics-port requires a value"))?;
+                if v.trim().is_empty() {
+                    anyhow::bail!("--metrics-port requires a value");
                 }
+                metrics_port = resolve_metrics_port(Some(v.trim()))?;
+            }
+            "--metrics-bind" => {
+                let v = args
+                    .next_if(|next| !next.trim().starts_with("--"))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("--metrics-bind requires an IP address or 'localhost'")
+                    })?;
+                if v.trim().is_empty() {
+                    anyhow::bail!("--metrics-bind requires an IP address or 'localhost'");
+                }
+                metrics_bind = resolve_metrics_bind_addr(Some(v.trim()))?;
             }
             "--validate-config" => {
                 validate_only = true;
@@ -433,14 +592,16 @@ where
             _ => {}
         }
     }
-    ParsedCliArgs {
+    Ok(ParsedCliArgs {
         config_path,
         web_dir,
         media_dir,
         http_port,
         https_port,
+        metrics_port,
+        metrics_bind,
         validate_only,
-    }
+    })
 }
 
 /// Terminates supervised child processes (`go2rtc` and camera decoder `ffmpeg` PIDs) and removes
@@ -542,20 +703,30 @@ async fn main() -> Result<()> {
         .and_then(|s| s.parse::<u16>().ok())
         .filter(|&p| p > 0)
         .unwrap_or(8971);
+    let default_metrics_port =
+        resolve_metrics_port(std::env::var("NINJANVR_METRICS_PORT").ok().as_deref())?;
+    let default_metrics_bind =
+        resolve_metrics_bind_addr(std::env::var("NINJANVR_METRICS_BIND").ok().as_deref())?;
 
     let parsed = parse_cli_args(
         std::env::args().skip(1),
-        default_config_path,
-        default_web_dir,
-        default_media_dir,
-        default_http_port,
-        default_https_port,
-    );
+        CliArgDefaults {
+            config_path: default_config_path,
+            web_dir: default_web_dir,
+            media_dir: default_media_dir,
+            http_port: default_http_port,
+            https_port: default_https_port,
+            metrics_port: default_metrics_port,
+            metrics_bind: default_metrics_bind,
+        },
+    )?;
     let config_path = parsed.config_path;
     let mut web_dir = parsed.web_dir;
     let media_dir = parsed.media_dir;
     let http_port = parsed.http_port;
     let https_port = parsed.https_port;
+    let metrics_port = parsed.metrics_port;
+    let metrics_bind = parsed.metrics_bind;
 
     validate_config_file_path(&config_path)?;
     if parsed.validate_only {
@@ -564,9 +735,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if http_port == https_port {
-        anyhow::bail!("HTTP port ({http_port}) and HTTPS port ({https_port}) must be distinct");
-    }
+    validate_listener_ports(http_port, https_port, metrics_port)?;
 
     if !web_dir.exists() {
         let fallback_dist = PathBuf::from("web/dist");
@@ -588,6 +757,7 @@ async fn main() -> Result<()> {
     );
 
     let state = new_app_state(&config_path, web_dir, media_dir, spawn_go2rtc).await?;
+    state.set_active_listener_ports(http_port, https_port, metrics_port);
     let (raw_san_hosts, mqtt_client_key) = {
         let cfg = state.config.read().await;
         (cfg.tls.san_hosts.clone(), cfg.mqtt.tls_client_key.clone())
@@ -610,10 +780,66 @@ async fn main() -> Result<()> {
     );
     let state_for_shutdown = state.clone();
     let app_http = build_router_with_auth(state.clone(), enforce_http_auth);
+    let app_metrics = (metrics_port > 0).then(|| build_metrics_router(state.clone()));
     let app_https = build_router_with_auth(state, true);
     let (shutdown_tx, mut http_shutdown_rx) = watch::channel(false);
 
-    // 1. Spawn HTTP server on :5000 (internal / healthcheck port) with strict x-peer-ip sanitization
+    // 1. Spawn dedicated OpenMetrics & health telemetry listener on :9091 (unless disabled with 0)
+    if let Some(app_metrics) = app_metrics {
+        let metrics_addr = SocketAddr::new(metrics_bind, metrics_port);
+        let metrics_listener = TcpListener::bind(metrics_addr)
+            .await
+            .with_context(|| format!("failed to bind metrics listener on {metrics_addr}"))?;
+        let metrics_conn_sem = Arc::new(Semaphore::new(METRICS_MAX_CONCURRENT_CONNECTIONS));
+        let mut metrics_shutdown_rx = shutdown_tx.subscribe();
+        info!(
+            "Listening on dedicated OpenMetrics telemetry HTTP http://{metrics_addr}/metrics (unauthenticated)"
+        );
+        tokio::spawn(async move {
+            loop {
+                if *metrics_shutdown_rx.borrow() {
+                    break;
+                }
+                let (tcp_stream, remote_addr) = tokio::select! {
+                    biased;
+                    _ = metrics_shutdown_rx.changed() => {
+                        if *metrics_shutdown_rx.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    res = metrics_listener.accept() => match res {
+                        Ok(conn) => conn,
+                        Err(err) => {
+                            error!("Metrics listener accept error: {err:#}");
+                            tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                            continue;
+                        }
+                    }
+                };
+                let Ok(permit) = metrics_conn_sem.clone().try_acquire_owned() else {
+                    continue;
+                };
+                let _ = tcp_stream.set_nodelay(true);
+                let app_clone = app_metrics.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    serve_metrics_tcp_connection(
+                        tcp_stream,
+                        remote_addr,
+                        app_clone,
+                        HTTP1_HEADER_READ_TIMEOUT,
+                        METRICS_CONNECTION_TIMEOUT,
+                    )
+                    .await;
+                });
+            }
+        });
+    } else {
+        info!("Dedicated OpenMetrics telemetry listener disabled (metrics_port=0)");
+    }
+
+    // 2. Spawn HTTP server on :5000 (internal / healthcheck port) with strict x-peer-ip sanitization
     let http_addr = SocketAddr::from(([0, 0, 0, 0], http_port));
     let http_listener = TcpListener::bind(http_addr).await?;
     let http_conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
@@ -925,16 +1151,22 @@ mod tests {
                 "--https-port".to_string(),
                 "8443".to_string(),
             ],
-            PathBuf::from("/config/config.yml"),
-            PathBuf::from("/opt/ninjanvr/web"),
-            PathBuf::from("/media/ninjanvr"),
-            5000,
-            8971,
-        );
+            CliArgDefaults {
+                config_path: PathBuf::from("/config/config.yml"),
+                web_dir: PathBuf::from("/opt/ninjanvr/web"),
+                media_dir: PathBuf::from("/media/ninjanvr"),
+                http_port: 5000,
+                https_port: 8971,
+                metrics_port: DEFAULT_METRICS_PORT,
+                metrics_bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            },
+        )
+        .unwrap();
         assert!(cli.validate_only);
         assert_eq!(cli.config_path, PathBuf::from("/custom/ninjanvr.yml"));
         assert_eq!(cli.http_port, 5080);
         assert_eq!(cli.https_port, 8443);
+        assert_eq!(cli.metrics_port, DEFAULT_METRICS_PORT);
 
         // 4. MAIN-C2-02c: Empty private key file and parent-traversal paths must be rejected
         let tmp_dir =
@@ -1002,14 +1234,20 @@ mod tests {
 
         // 2. MAIN-C3-02: "--config --validate-config" must not swallow "--validate-config" as the config path,
         //    and "--config=/path" equals-syntax must be parsed properly
+        let test_defaults = CliArgDefaults {
+            config_path: PathBuf::from("/config/default.yml"),
+            web_dir: PathBuf::from("/opt/ninjanvr/web"),
+            media_dir: PathBuf::from("/media/ninjanvr"),
+            http_port: 5000,
+            https_port: 8971,
+            metrics_port: DEFAULT_METRICS_PORT,
+            metrics_bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        };
         let cli_missing_val = parse_cli_args(
             vec!["--config".to_string(), "--validate-config".to_string()],
-            PathBuf::from("/config/default.yml"),
-            PathBuf::from("/opt/ninjanvr/web"),
-            PathBuf::from("/media/ninjanvr"),
-            5000,
-            8971,
-        );
+            test_defaults.clone(),
+        )
+        .unwrap();
         assert!(
             cli_missing_val.validate_only,
             "--validate-config after bare --config must still set validate_only = true"
@@ -1025,14 +1263,13 @@ mod tests {
                 "--config=/etc/ninjanvr/custom.yml".to_string(),
                 "--http-port=5090".to_string(),
                 "--https-port=8999".to_string(),
+                "--metrics-port=9191".to_string(),
+                "--metrics-bind=[::1]".to_string(),
                 "--validate-config".to_string(),
             ],
-            PathBuf::from("/config/default.yml"),
-            PathBuf::from("/opt/ninjanvr/web"),
-            PathBuf::from("/media/ninjanvr"),
-            5000,
-            8971,
-        );
+            test_defaults,
+        )
+        .unwrap();
         assert!(cli_eq.validate_only);
         assert_eq!(
             cli_eq.config_path,
@@ -1040,6 +1277,153 @@ mod tests {
         );
         assert_eq!(cli_eq.http_port, 5090);
         assert_eq!(cli_eq.https_port, 8999);
+        assert_eq!(cli_eq.metrics_port, 9191);
+        assert_eq!(cli_eq.metrics_bind, "::1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn metrics_listener_cli_env_and_port_collision_guards_work() {
+        assert_eq!(resolve_metrics_port(None).unwrap(), DEFAULT_METRICS_PORT);
+        assert_eq!(
+            resolve_metrics_port(Some("")).unwrap(),
+            DEFAULT_METRICS_PORT
+        );
+        assert_eq!(
+            resolve_metrics_port(Some("   ")).unwrap(),
+            DEFAULT_METRICS_PORT
+        );
+        assert_eq!(resolve_metrics_port(Some("0")).unwrap(), 0);
+        assert_eq!(resolve_metrics_port(Some("false")).unwrap(), 0);
+        assert_eq!(resolve_metrics_port(Some("OFF")).unwrap(), 0);
+        assert_eq!(resolve_metrics_port(Some("disabled")).unwrap(), 0);
+        assert_eq!(resolve_metrics_port(Some("no")).unwrap(), 0);
+        assert_eq!(resolve_metrics_port(Some("none")).unwrap(), 0);
+        assert_eq!(resolve_metrics_port(Some(" 9095 ")).unwrap(), 9095);
+        assert!(resolve_metrics_port(Some("not-a-port")).is_err());
+
+        assert_eq!(
+            resolve_metrics_bind_addr(None).unwrap(),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
+        assert_eq!(
+            resolve_metrics_bind_addr(Some("localhost")).unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(
+            resolve_metrics_bind_addr(Some("LOCALHOST")).unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(
+            resolve_metrics_bind_addr(Some("127.0.0.1")).unwrap(),
+            "127.0.0.1".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            resolve_metrics_bind_addr(Some("[::1]")).unwrap(),
+            "::1".parse::<IpAddr>().unwrap()
+        );
+        assert!(
+            resolve_metrics_bind_addr(Some("invalid-ip")).is_err(),
+            "invalid bind address must fail closed rather than falling back to 0.0.0.0"
+        );
+        assert!(resolve_metrics_bind_addr(Some("127.0.0.1:9091")).is_err());
+
+        let test_defaults = CliArgDefaults {
+            config_path: PathBuf::from("/config/default.yml"),
+            web_dir: PathBuf::from("/opt/ninjanvr/web"),
+            media_dir: PathBuf::from("/media/ninjanvr"),
+            http_port: 5000,
+            https_port: 8971,
+            metrics_port: DEFAULT_METRICS_PORT,
+            metrics_bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        };
+        let cli_disabled = parse_cli_args(
+            vec![
+                "--metrics-port".to_string(),
+                "off".to_string(),
+                "--metrics-bind".to_string(),
+                "localhost".to_string(),
+            ],
+            test_defaults.clone(),
+        )
+        .unwrap();
+        assert_eq!(cli_disabled.metrics_port, 0);
+        assert_eq!(cli_disabled.metrics_bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        // Missing or malformed --metrics-bind / --metrics-port flags must fail closed
+        assert!(
+            parse_cli_args(
+                vec![
+                    "--metrics-bind".to_string(),
+                    "--validate-config".to_string()
+                ],
+                test_defaults.clone(),
+            )
+            .is_err()
+        );
+        assert!(
+            parse_cli_args(
+                vec!["--metrics-bind=typo-host".to_string()],
+                test_defaults.clone(),
+            )
+            .is_err()
+        );
+        assert!(parse_cli_args(vec!["--metrics-port=abc".to_string()], test_defaults).is_err());
+
+        assert!(validate_listener_ports(5000, 8971, 9091).is_ok());
+        assert!(validate_listener_ports(5000, 8971, 0).is_ok());
+        assert!(validate_listener_ports(5000, 5000, 9091).is_err());
+        assert!(validate_listener_ports(5000, 8971, 5000).is_err());
+        assert!(validate_listener_ports(5000, 8971, 8971).is_err());
+        assert!(validate_listener_ports(5000, 8971, 1984).is_err());
+        assert!(validate_listener_ports(5000, 8971, 8554).is_err());
+        assert!(validate_listener_ports(5000, 8971, 8555).is_err());
+        assert!(validate_listener_ports(5000, 8971, 11434).is_err());
+    }
+
+    #[tokio::test]
+    async fn serve_metrics_tcp_connection_aborts_zero_byte_slowloris_and_releases_permits() {
+        let app = axum::Router::new().route("/metrics", axum::routing::get(|| async { "ok\n" }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sem = Arc::new(Semaphore::new(4));
+
+        // Open 4 stalled TCP connections that send 0 bytes (classic ReadVersion / Slowloris stall)
+        let mut clients = Vec::new();
+        let mut server_tasks = Vec::new();
+        for _ in 0..4 {
+            let client = TcpStream::connect(addr).await.unwrap();
+            clients.push(client);
+            let (srv_stream, remote) = listener.accept().await.unwrap();
+            let permit = sem.clone().try_acquire_owned().unwrap();
+            let app_clone = app.clone();
+            server_tasks.push(tokio::spawn(async move {
+                let _permit = permit;
+                serve_metrics_tcp_connection(
+                    srv_stream,
+                    remote,
+                    app_clone,
+                    Duration::from_millis(60),
+                    Duration::from_millis(120),
+                )
+                .await;
+            }));
+        }
+        assert_eq!(sem.available_permits(), 0);
+
+        let started = std::time::Instant::now();
+        for task in server_tasks {
+            task.await.unwrap();
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "0-byte stalled connections on metrics listener must time out quickly"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            4,
+            "all metrics listener permits must be reclaimed after Slowloris timeout"
+        );
+        drop(clients);
     }
 
     #[tokio::test]

@@ -11,6 +11,9 @@ use ninjanvr_media::probe_storage_writable;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+/// Default port for the dedicated unauthenticated OpenMetrics (`/metrics`) listener (`0` disables it).
+pub const DEFAULT_METRICS_PORT: u16 = 9091;
+
 type PidTickEntry = (u64, Instant, f64);
 
 /// Typed resource sample for an individual OS process, preserving both normalized percentage
@@ -361,6 +364,11 @@ pub fn render_prometheus_exposition(
 
     if let Some(cams) = stats_val.get("cameras").and_then(Value::as_object) {
         for (cam, c_stat) in cams {
+            if let Some(allow_list) = allowed
+                && !allow_list.iter().any(|a| a == cam || a == "*")
+            {
+                continue;
+            }
             let safe_cam = escape_prom_label_value(cam);
             let cam_fps = c_stat
                 .get("camera_fps")
@@ -428,16 +436,26 @@ pub fn render_prometheus_exposition(
         .and_then(Value::as_object)
     {
         for (mount_path, st) in storages {
-            let raw_label = if mount_path.contains("recordings") {
+            let raw_label = if st.get("tier").and_then(Value::as_str) == Some("cold") {
+                "cold"
+            } else if mount_path == "/media/ninjanvr/recordings" {
                 "recordings"
+            } else if mount_path == "/media/ninjanvr/clips" {
+                "clips"
+            } else if mount_path == "/tmp/cache" {
+                "cache"
+            } else if mount_path == "/dev/shm" {
+                "shm"
             } else if mount_path.contains("clips") {
                 "clips"
             } else if mount_path.contains("cache") {
                 "cache"
             } else if mount_path.contains("shm") {
                 "shm"
+            } else if mount_path.contains("recordings") && !mount_path.contains("cold") {
+                "recordings"
             } else {
-                mount_path.as_str()
+                "cold"
             };
             let label = escape_prom_label_value(raw_label);
             let used_mb = st.get("used").and_then(Value::as_f64).unwrap_or(0.0);

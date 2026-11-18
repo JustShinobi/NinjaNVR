@@ -22,7 +22,7 @@ use crate::auth_gate::{
     verify_cookie_csrf_origin,
 };
 
-pub const DISALLOWED_FEDERATION_PORTS: &[u16] = &[0, 1984, 5000, 8554, 8555];
+pub const DISALLOWED_FEDERATION_PORTS: &[u16] = &[0, 1984, 5000, 8554, 8555, 9091];
 
 pub fn is_allowed_peer_token_env(name: &str) -> bool {
     let trimmed = name.trim();
@@ -30,7 +30,20 @@ pub fn is_allowed_peer_token_env(name: &str) -> bool {
 }
 
 pub fn is_disallowed_federation_port(port: u16) -> bool {
-    DISALLOWED_FEDERATION_PORTS.contains(&port)
+    if DISALLOWED_FEDERATION_PORTS.contains(&port) {
+        return true;
+    }
+    for env_key in ["NINJANVR_HTTP_PORT", "NINJANVR_METRICS_PORT"] {
+        if let Ok(raw) = std::env::var(env_key)
+            && let Ok(env_port) = raw.trim().parse::<u16>()
+            && env_port > 0
+            && env_port != 8971
+            && env_port == port
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Blocks loopback (`127.0.0.0/8`, `::1`), unspecified (`0.0.0.0/8`, `::`), link-local / cloud
@@ -306,9 +319,13 @@ pub async fn api_federation_nodes(
         let tok_env_trimmed = peer_cfg.token_env.trim();
         let tok_env_valid =
             tok_env_trimmed.is_empty() || is_allowed_peer_token_env(tok_env_trimmed);
+        let hits_active_non_tls_listener =
+            ninjanvr_config::extract_http_url_effective_port(&base_url)
+                .is_some_and(|p| state.is_active_http_or_metrics_port(p));
 
         if peer_cfg.enabled
             && tok_env_valid
+            && !hits_active_non_tls_listener
             && let Ok(client) =
                 build_verified_federation_client(&base_url, Duration::from_secs(3), allow_loopback)
                     .await
@@ -442,6 +459,18 @@ pub async fn api_federation_proxy(
     }
 
     let base_url = peer_cfg.url.trim().trim_end_matches('/');
+    if ninjanvr_config::extract_http_url_effective_port(base_url)
+        .is_some_and(|p| state.is_active_http_or_metrics_port(p))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "message": format!("Federated peer node '{node}' has an invalid or disallowed base URL")
+            })),
+        )
+            .into_response();
+    }
     let allow_loopback = state
         .allow_ephemeral_loopback_federation_for_test
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -628,6 +657,82 @@ pub async fn api_camera_proxy_subpath(
     handle_camera_webui_proxy(&state, &camera, &subpath, uri.query()).await
 }
 
+/// Resolves DNS (or literal IP) for a camera WebUI `base_url`, verifies every resolved
+/// `SocketAddr` against `is_disallowed_federation_peer_ip` and internal NinjaNVR / `go2rtc` /
+/// OpenMetrics ports, and returns a pinned `reqwest::Client` to prevent DNS rebinding SSRF.
+async fn build_verified_camera_webui_client(
+    base_url: &str,
+    state: &AppState,
+    timeout_dur: Duration,
+) -> Result<reqwest::Client, StatusCode> {
+    let parsed = reqwest::Url::parse(base_url).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let port = parsed
+        .port_or_known_default()
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    if parsed.port() == Some(0)
+        || ninjanvr_config::is_disallowed_internal_service_port(port)
+        || state.is_active_listener_port(port)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout_dur)
+        .redirect(reqwest::redirect::Policy::none());
+
+    let raw_host = parsed.host_str().ok_or(StatusCode::BAD_REQUEST)?;
+    let clean_host = raw_host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    if clean_host.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if let Ok(ip) = clean_host.parse::<IpAddr>() {
+        if is_disallowed_federation_peer_ip(ip) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    } else {
+        if is_disallowed_federation_hostname(&clean_host.to_ascii_lowercase()) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let resolved: Vec<SocketAddr> = tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::net::lookup_host((clean_host, port)),
+        )
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?
+        .map_err(|_| StatusCode::BAD_GATEWAY)?
+        .collect();
+        if resolved.is_empty() {
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+        for addr in &resolved {
+            if ninjanvr_config::is_disallowed_internal_service_port(addr.port())
+                || state.is_active_listener_port(addr.port())
+                || is_disallowed_federation_peer_ip(addr.ip())
+            {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+        builder = builder.resolve_to_addrs(raw_host, &resolved);
+    }
+
+    builder
+        .build()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 pub(crate) async fn handle_camera_webui_proxy(
     state: &AppState,
     camera: &str,
@@ -696,13 +801,31 @@ pub(crate) async fn handle_camera_webui_proxy(
         target_url.push_str(q);
     }
 
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(Duration::from_secs(4))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    let client = match build_verified_camera_webui_client(&base_url, state, Duration::from_secs(4))
+        .await
+    {
+        Ok(c) => c,
+        Err(StatusCode::BAD_REQUEST) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "success": false,
+                    "message": format!("Camera '{camera}' Web UI URL targets a disallowed address or port")
+                })),
+            )
+                .into_response();
+        }
+        Err(status) => {
+            return (
+                status,
+                Json(json!({
+                    "success": false,
+                    "camera": camera,
+                    "message": format!("Camera '{camera}' Web UI DNS resolution or client setup failed")
+                })),
+            )
+                .into_response();
+        }
     };
 
     match client.get(&target_url).send().await {

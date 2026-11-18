@@ -2437,7 +2437,7 @@ pub fn is_safe_onvif_endpoint_url(raw: &str) -> bool {
         }
         (authority, None)
     };
-    if matches!(port, Some(0 | 5000 | 8971 | 1984 | 8554 | 8555)) {
+    if port.is_some_and(ninjanvr_config::is_disallowed_internal_service_port) {
         return false;
     }
     if host.ends_with("..") {

@@ -1594,10 +1594,14 @@ describe("Phase 4C Cycle-3 — Adversarial SSRF, traversal, secret-mask, CLI inj
     expect(validateFederationPeerUrl("http://node1.localhost:8971").valid).toBe(
       false
     );
+    expect(
+      validateFederationPeerUrl("https://nvr-remote.example.test:9091").valid
+    ).toBe(false);
 
-    // GenAI custom base URL allows local Ollama (:11434) but rejects other localhost ports and IPv6-mapped metadata
+    // GenAI custom base URL allows local Ollama (:11434) but rejects other localhost ports, metrics (:9091), and IPv6-mapped metadata
     expect(isSafeGenAiCustomBaseUrl("http://127.0.0.1:11434")).toBe(true);
     expect(isSafeGenAiCustomBaseUrl("http://localhost:11434")).toBe(true);
+    expect(isSafeGenAiCustomBaseUrl("http://198.51.100.20:9091/v1")).toBe(false);
     expect(isSafeGenAiCustomBaseUrl("http://127.0.0.1:6379")).toBe(false);
     expect(isSafeGenAiCustomBaseUrl("http://localhost")).toBe(false);
     expect(isSafeGenAiCustomBaseUrl("http://[::1]:8080")).toBe(false);

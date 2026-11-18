@@ -8,8 +8,9 @@ O **NinjaNVR** oferece uma arquitetura de segurança em múltiplas camadas proje
 
 | Porta | Protocolo | Comportamento Padrão |
 | :--- | :--- | :--- |
-| **`:5000`** | HTTP | Porta interna de baixa latência (usada por serviços no mesmo pod/container ou rede interna confiável). |
+| **`:5000`** | HTTP | Porta interna autenticada (*fail-closed* por padrão) e probes de saúde (`/healthz`, `/api/version`). |
 | **`:8971`** | HTTPS / TLS | Porta externa autenticada (exige cookie JWT válido, sessão OIDC, cabeçalho ForwardAuth de proxy confiável ou `Bearer nnvr_*`). |
+| **`:9091`** | HTTP | Listener dedicado de observabilidade **sem autenticação** (`GET /metrics`, `GET /api/metrics`, `GET /healthz`, `GET /api/version`), isolado das rotas da API/mídia/WebSocket (`NINJANVR_METRICS_PORT`, `0` desativa; `NINJANVR_METRICS_BIND` ajusta o IP de *bind*). |
 
 ::: tip Certificado TLS Auto-Gerado Compatível com Apple (iOS/macOS)
 Se nenhum certificado TLS customizado for montado, o NinjaNVR gera automaticamente um certificado ECDSA P-256 em memória/disco com `Subject Alternative Names (SAN)` (`DNS:localhost`, `IP:127.0.0.1`), `ExtendedKeyUsage::ServerAuth` e validade $\le 398$ dias.
@@ -151,11 +152,11 @@ Em **Settings $\rightarrow$ MQTT, Auth & Users $\rightarrow$ Operator Accounts**
 ## 5. Tokens de API Scoped (`nnvr_*`) e Links Compartilháveis Assinados
 
 ### Tokens de API (`Bearer nnvr_*`)
-Para integrações externas (Prometheus/VictoriaMetrics, scripts de automação, clientes MCP como OpenCode/Claude):
+Para coleta padrão de telemetria em redes internas ou clusters Kubernetes, utilize o listener dedicado **`:9091/metrics`** (sem autenticação e isolado no nível de porta/serviço, sem expor rotas de API, mídia ou WebSocket). Para integrações autenticadas sobre `:8971` / `:5000` (scripts de automação, clientes MCP como OpenCode/Claude ou scraping autenticado via TLS):
 1. Vá em **Settings $\rightarrow$ MQTT, Auth & Users $\rightarrow$ Scoped API Bearer Tokens**.
 2. Escolha o escopo:
-   * `read_only`: permite apenas `GET /api/*` e consultas MCP de leitura;
-   * `metrics`: restrito exclusivamente a `GET /api/stats` e `GET /api/metrics`;
+   * `read_only`: permite apenas `GET /api/*`, `GET /metrics` e consultas MCP de leitura;
+   * `metrics`: restrito exclusivamente a `GET /api/stats`, `GET /api/metrics` e `GET /metrics`;
    * `full`: permissão administrativa completa.
 3. O token em texto puro (`nnvr_...`) é exibido **uma única vez** no momento da criação; o banco SQLite armazena apenas o hash **SHA-256** e o prefixo de identificação.
 
