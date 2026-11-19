@@ -1,18 +1,37 @@
 import type React from "react";
 import {
   LiveLayoutMode,
+  LiveStreamQualityMode,
   MatrixDensity,
   SpotlightTimelineMode,
 } from "./format";
 import { prewarmStream } from "./msePlayerEngine";
 
 export type LiveLayout = LiveLayoutMode;
+export type { LiveStreamQualityMode };
 
 export type StageTileRole = "grid" | "hero" | "dock";
 export type StageTileRenderMode = "mse" | "vod" | "snapshot";
 
 export const DEFAULT_MAX_DOCK_LIVE_DECODERS = 6;
 export const DEFAULT_MAX_GRID_LIVE_DECODERS = 8;
+
+/**
+ * Resolves whether a live tile should request `{cam}` (main stream) or `{cam}_sub` (substream).
+ * - Explicit `"main"` / `"sub"` policies apply uniformly to EVERY live tile with zero hidden layout overrides.
+ * - `"auto"` uses Main stream on hero/full stage and Substream on grid/dock tiles.
+ * - When `streamQualityMode` is omitted by legacy callers, preserves legacy `useMainStream` behavior.
+ */
+export function resolveTileUseMainStream(
+  role: StageTileRole,
+  streamQualityMode: LiveStreamQualityMode | undefined,
+  legacyUseMainStream: boolean
+): boolean {
+  if (streamQualityMode === "main") return true;
+  if (streamQualityMode === "sub") return false;
+  if (streamQualityMode === "auto") return role === "hero";
+  return role === "hero" ? true : role === "dock" ? false : legacyUseMainStream;
+}
 
 export interface LiveStageTileDescriptor {
   camera: string;
@@ -34,6 +53,7 @@ export interface ComputeLiveStageDescriptorsParams {
   spotlightPromotedCams?: string[];
   hoveredDockCam: string | null;
   useMainStream: boolean;
+  streamQualityMode?: LiveStreamQualityMode;
   timeShiftTs: number | null;
   maxDockLiveDecoders?: number;
   maxGridLiveDecoders?: number;
@@ -71,6 +91,7 @@ export function computeLiveStageDescriptors(
     spotlightPromotedCams = [],
     hoveredDockCam,
     useMainStream,
+    streamQualityMode,
     timeShiftTs,
     maxDockLiveDecoders = DEFAULT_MAX_DOCK_LIVE_DECODERS,
     maxGridLiveDecoders = DEFAULT_MAX_GRID_LIVE_DECODERS,
@@ -103,7 +124,7 @@ export function computeLiveStageDescriptors(
           : isLiveGridTile
           ? "mse"
           : "snapshot",
-        useMainStream,
+        useMainStream: resolveTileUseMainStream("grid", streamQualityMode, useMainStream),
         dockIndex: -1,
         dockTotal: 0,
         isTimelineSelected,
@@ -120,7 +141,7 @@ export function computeLiveStageDescriptors(
         camera: heroCam,
         role: "hero",
         renderMode: timeShiftTs !== null ? "vod" : "mse",
-        useMainStream: true,
+        useMainStream: resolveTileUseMainStream("hero", streamQualityMode, useMainStream),
         dockIndex: -1,
         dockTotal: 0,
         isTimelineSelected: true,
@@ -144,7 +165,7 @@ export function computeLiveStageDescriptors(
           camera: cam,
           role: "hero",
           renderMode: timeShiftTs !== null ? "vod" : "mse",
-          useMainStream: true,
+          useMainStream: resolveTileUseMainStream("hero", streamQualityMode, useMainStream),
           dockIndex: -1,
           dockTotal,
           isTimelineSelected: true,
@@ -158,7 +179,7 @@ export function computeLiveStageDescriptors(
         camera: cam,
         role: "dock",
         renderMode: isLiveDock ? "mse" : "snapshot",
-        useMainStream: false,
+        useMainStream: resolveTileUseMainStream("dock", streamQualityMode, useMainStream),
         dockIndex,
         dockTotal,
         isTimelineSelected: false,
@@ -180,7 +201,7 @@ export function computeLiveStageDescriptors(
         camera: cam,
         role: "hero",
         renderMode: timeShiftTs !== null ? "vod" : "mse",
-        useMainStream: true,
+        useMainStream: resolveTileUseMainStream("hero", streamQualityMode, useMainStream),
         dockIndex: -1,
         dockTotal,
         isTimelineSelected: true,
@@ -194,7 +215,7 @@ export function computeLiveStageDescriptors(
       camera: cam,
       role: "dock",
       renderMode: isLiveDock ? "mse" : "snapshot",
-      useMainStream: false,
+      useMainStream: resolveTileUseMainStream("dock", streamQualityMode, useMainStream),
       dockIndex,
       dockTotal,
       isTimelineSelected: false,
@@ -209,6 +230,7 @@ export interface ResolveTileClickActionParams {
   camera: string;
   selectedCamera: string;
   isDoubleClick?: boolean;
+  streamQualityMode?: LiveStreamQualityMode;
 }
 
 export interface TileClickActionResult {
@@ -222,13 +244,21 @@ export interface TileClickActionResult {
  * Resolves ergonomic single-click and double-click tile actions across all live layouts:
  * - In `2x2` grid: single-clicking the already-focused camera or double-clicking any camera
  *   promotes directly to `focus` stage; single-clicking an unfocused camera selects its timeline
- *   and proactively pre-warms its main stream.
+ *   and proactively pre-warms its main stream (unless `streamQualityMode === "sub"`).
  * - In `focus` / `spotlight` dock: single-clicking promotes the dock camera to hero in-place.
  */
 export function resolveTileClickAction(
   params: ResolveTileClickActionParams
 ): TileClickActionResult {
-  const { liveLayout, role, camera, selectedCamera, isDoubleClick = false } = params;
+  const {
+    liveLayout,
+    role,
+    camera,
+    selectedCamera,
+    isDoubleClick = false,
+    streamQualityMode,
+  } = params;
+  const allowMainPrewarm = streamQualityMode !== "sub";
 
   if (liveLayout === "2x2") {
     if (isDoubleClick || camera === selectedCamera) {
@@ -236,14 +266,14 @@ export function resolveTileClickAction(
         nextLayout: "focus",
         nextSelectedCamera: camera,
         promotedToFocus: true,
-        shouldPrewarmMainStream: true,
+        shouldPrewarmMainStream: allowMainPrewarm,
       };
     }
     return {
       nextLayout: "2x2",
       nextSelectedCamera: camera,
       promotedToFocus: false,
-      shouldPrewarmMainStream: true,
+      shouldPrewarmMainStream: allowMainPrewarm,
     };
   }
 
@@ -252,7 +282,7 @@ export function resolveTileClickAction(
       nextLayout: liveLayout === "spotlight" ? "spotlight" : "focus",
       nextSelectedCamera: camera,
       promotedToFocus: true,
-      shouldPrewarmMainStream: true,
+      shouldPrewarmMainStream: allowMainPrewarm,
     };
   }
 
@@ -261,7 +291,7 @@ export function resolveTileClickAction(
       nextLayout: "focus",
       nextSelectedCamera: camera,
       promotedToFocus: true,
-      shouldPrewarmMainStream: true,
+      shouldPrewarmMainStream: allowMainPrewarm,
     };
   }
 

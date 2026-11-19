@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useSheetDismiss } from "../utils/useSheetDismiss";
 import { X } from "lucide-react";
+import type { LiveStreamQualityMode } from "../utils/format";
 import type { CameraRuntimeFlag, CameraTelemetryRow } from "../utils/liveTileHud";
 
 /**
@@ -18,6 +19,9 @@ export interface CameraDetailsSheetProps {
   onToggleFlag: (flag: CameraRuntimeFlag, next: boolean) => void;
   useMainStream: boolean;
   onSetMainStream: (next: boolean) => void;
+  streamQualityMode?: LiveStreamQualityMode;
+  onSetStreamQualityMode?: (next: LiveStreamQualityMode) => void;
+  hasIndependentSubstream?: boolean;
   showVectors: boolean;
   onSetShowVectors: (next: boolean) => void;
   onClose: () => void;
@@ -70,6 +74,9 @@ export const CameraDetailsSheet: React.FC<CameraDetailsSheetProps> = ({
   onToggleFlag,
   useMainStream,
   onSetMainStream,
+  streamQualityMode,
+  onSetStreamQualityMode,
+  hasIndependentSubstream = true,
   showVectors,
   onSetShowVectors,
   onClose,
@@ -81,6 +88,17 @@ export const CameraDetailsSheet: React.FC<CameraDetailsSheetProps> = ({
   const sheetRef = useSheetDismiss<HTMLElement>(true, onClose);
   const [confirmReboot, setConfirmReboot] = useState(false);
   const confirmTimerRef = useRef<number | null>(null);
+
+  const effectiveMode: LiveStreamQualityMode =
+    streamQualityMode ?? (useMainStream ? "main" : "sub");
+
+  const selectQualityMode = (next: LiveStreamQualityMode) => {
+    if (onSetStreamQualityMode) {
+      onSetStreamQualityMode(next);
+    } else {
+      onSetMainStream(next === "main");
+    }
+  };
 
   useEffect(() => {
     return () => {
@@ -127,6 +145,11 @@ export const CameraDetailsSheet: React.FC<CameraDetailsSheetProps> = ({
             <div key={row.key} className="nvr-sheet-stat" data-testid={`telemetry-${row.key}`}>
               <span className="nvr-sheet-k">{row.label}</span>
               <span className="nvr-sheet-v mono">{row.value}</span>
+              {row.subValue && (
+                <span className="nvr-sheet-subval mono" data-testid={`telemetry-${row.key}-sub`}>
+                  {row.subValue}
+                </span>
+              )}
             </div>
           ))}
         </div>
@@ -149,24 +172,56 @@ export const CameraDetailsSheet: React.FC<CameraDetailsSheetProps> = ({
 
         <div className="nvr-sheet-group">
           <span className="nvr-sheet-k">{isPt ? "Qualidade do stream" : "Stream quality"}</span>
-          <div className="nvr-segmented nvr-sheet-seg" role="group" aria-label="Stream quality">
+          <div
+            className="nvr-segmented nvr-sheet-seg"
+            role="group"
+            aria-label={isPt ? "Qualidade do stream" : "Stream quality"}
+          >
             <button
               type="button"
-              className={`nvr-btn ${!useMainStream ? "active" : ""}`}
-              aria-pressed={!useMainStream}
-              onClick={() => onSetMainStream(false)}
+              data-testid="sheet-quality-auto"
+              className={`nvr-btn ${effectiveMode === "auto" ? "active" : ""}`}
+              aria-pressed={effectiveMode === "auto"}
+              onClick={() => selectQualityMode("auto")}
+            >
+              Auto
+            </button>
+            <button
+              type="button"
+              data-testid="sheet-quality-sub"
+              className={`nvr-btn ${effectiveMode === "sub" ? "active" : ""}`}
+              aria-pressed={effectiveMode === "sub"}
+              onClick={() => selectQualityMode("sub")}
             >
               {isPt ? "Sub (leve)" : "Sub (light)"}
             </button>
             <button
               type="button"
-              className={`nvr-btn ${useMainStream ? "active" : ""}`}
-              aria-pressed={useMainStream}
-              onClick={() => onSetMainStream(true)}
+              data-testid="sheet-quality-main"
+              className={`nvr-btn ${effectiveMode === "main" ? "active" : ""}`}
+              aria-pressed={effectiveMode === "main"}
+              onClick={() => selectQualityMode("main")}
             >
-              {isPt ? "Principal (HD)" : "Main (HD)"}
+              {isPt ? "Principal" : "Main"}
             </button>
           </div>
+          <p className="nvr-sheet-hint" data-testid="sheet-quality-hint">
+            {!hasIndependentSubstream
+              ? isPt
+                ? "Esta câmera não possui substream separado — usa sempre o stream principal."
+                : "This camera has no separate substream — it always uses the main stream."
+              : effectiveMode === "auto"
+              ? isPt
+                ? "Auto usa Stream Principal na câmera em destaque e Substream na grade."
+                : "Auto uses Main stream on hero views and Substream in grid thumbnails."
+              : effectiveMode === "sub"
+              ? isPt
+                ? "Forçando Substream em todas as câmeras ao vivo."
+                : "Forcing Substream across all live cameras."
+              : isPt
+              ? "Forçando Stream Principal (resolução máxima) em todas as câmeras ao vivo."
+              : "Forcing Main stream (full native resolution) across all live cameras."}
+          </p>
           <div className="nvr-sheet-row">
             <span>{isPt ? "Zonas e máscaras" : "Zones and masks overlay"}</span>
             <SheetSwitch

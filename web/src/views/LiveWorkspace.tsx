@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Camera,
   Check,
@@ -89,6 +89,7 @@ export {
 import {
   HudPosition,
   LiveLayoutMode,
+  LiveStreamQualityMode,
   MatrixDensity,
   SpotlightFilter,
   formatTs,
@@ -100,6 +101,7 @@ import {
   PushToTalkButton,
   StageTrimOverlay,
   VodHlsPlayer,
+  cameraHasIndependentSubstream,
 } from "../components/VideoPlayers";
 import {
   CAMERA_HUD_CONTROL_DESCRIPTORS,
@@ -140,13 +142,16 @@ import {
   buildCameraSnapshotUrl,
   filterCompactStageDescriptors,
   formatCameraTelemetryRows,
+  formatDisplayedQualityBadge,
   resolveCameraRuntimeFlags,
   resolveCompactStageContainerStyle,
+  resolveEffectiveDisplayedMedia,
   resolveTileException,
   resolveTileIdentityTone,
   sanitizeCompactGridColumns,
   type CameraRuntimeFlag,
   type CompactGridColumns,
+  type DisplayedMediaInfo,
 } from "../utils/liveTileHud";
 import { useCompactViewport } from "../utils/useCompactViewport";
 import {
@@ -1331,6 +1336,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const toggleLiveCameraAudio = useNvrStore((s) => s.toggleLiveCameraAudio);
   const hudPosition = useNvrStore((s) => s.hudPosition);
   const setHudPosition = useNvrStore((s) => s.setHudPosition);
+  const streamQualityMode = useNvrStore((s) => s.streamQualityMode);
+  const setStreamQualityMode = useNvrStore((s) => s.setStreamQualityMode);
   const useMainStream = useNvrStore((s) => s.useMainStream);
   const setUseMainStream = useNvrStore((s) => s.setUseMainStream);
   const showVectors = useNvrStore((s) => s.showVectors);
@@ -1372,6 +1379,31 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const lastSurgeRef = useRef<Record<string, number>>({});
   const prevMatchRef = useRef<Record<string, boolean>>({});
   const [spotlightTrail, setSpotlightTrail] = useState<Array<{ cam: string; ts: number }>>([]);
+  const [displayedMediaByCam, setDisplayedMediaByCam] = useState<
+    Record<string, DisplayedMediaInfo>
+  >({});
+
+  const updateCameraDisplayedMedia = useCallback(
+    (camKey: string, info: DisplayedMediaInfo) => {
+      setDisplayedMediaByCam((prev) => {
+        const cur = prev[camKey];
+        if (
+          cur &&
+          cur.width === info.width &&
+          cur.height === info.height &&
+          cur.delivery === info.delivery &&
+          cur.variant === info.variant &&
+          cur.streamSrc === info.streamSrc &&
+          cur.switchingToVariant === info.switchingToVariant &&
+          cur.substreamAliasedToMain === info.substreamAliasedToMain
+        ) {
+          return prev;
+        }
+        return { ...prev, [camKey]: info };
+      });
+    },
+    []
+  );
   const [lockedSpotlightCam, setLockedSpotlightCam] = useState<string | null>(null);
   const [nowTick, setNowTick] = useState<number>(() => Math.floor(Date.now() / 1000));
   const [ptzInfoByCam, setPtzInfoByCam] = useState<Record<string, CameraPtzInfoResponse>>(
@@ -1831,6 +1863,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
     spotlightPromotedCams,
     hoveredDockCam,
     useMainStream,
+    streamQualityMode,
     timeShiftTs,
     maxDockLiveDecoders: MAX_DOCK_LIVE_DECODERS,
   });
@@ -2159,13 +2192,32 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
             <option value="bottom-left">{t.live.hudBottomLeft}</option>
             <option value="hidden">{t.live.hudHidden}</option>
           </select>
-          <button
-            className={`nvr-btn ${useMainStream ? "active" : ""}`}
-            onClick={() => setUseMainStream((v) => !v)}
-            title="Switch between 1080p Main Stream and 720p Substream"
+          <div
+            className="nvr-segmented mono"
+            role="group"
+            aria-label={t.live.streamQualityLabel}
+            data-testid="live-stream-quality-selector"
           >
-            {useMainStream ? t.live.hdStream : t.live.subStream}
-          </button>
+            {(
+              [
+                ["auto", t.live.streamQualityAuto, t.live.streamQualityAutoHint],
+                ["sub", t.live.streamQualitySub, t.live.streamQualitySubHint],
+                ["main", t.live.streamQualityMain, t.live.streamQualityMainHint],
+              ] as Array<[LiveStreamQualityMode, string, string]>
+            ).map(([qMode, qLabel, qHint]) => (
+              <button
+                key={qMode}
+                type="button"
+                data-testid={`stream-quality-${qMode}`}
+                className={`nvr-btn ${streamQualityMode === qMode ? "active" : ""}`}
+                aria-pressed={streamQualityMode === qMode}
+                title={qHint}
+                onClick={() => setStreamQualityMode(qMode)}
+              >
+                {qLabel}
+              </button>
+            ))}
+          </div>
           <button
             className={`nvr-btn ${showVectors ? "active" : ""}`}
             onClick={() => setShowVectors((v) => !v)}
@@ -2475,7 +2527,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               if (isCompact && isGrid) {
                 // Phones: one tap opens the camera screen (no hover, no double-tap).
                 lastLayoutSwitchMsRef.current = nowMs;
-                triggerMainStreamPrewarmIfNeeded(realCam, true);
+                triggerMainStreamPrewarmIfNeeded(
+                  realCam,
+                  streamQualityMode !== "sub"
+                );
                 setSelectedCamera(cam);
                 setLiveLayout("focus");
                 return;
@@ -2486,6 +2541,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 camera: cam,
                 selectedCamera,
                 isDoubleClick,
+                streamQualityMode,
               });
               triggerMainStreamPrewarmIfNeeded(
                 realCam,
@@ -2630,6 +2686,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         }
                         playbackRate={playbackSpeed}
                         enableKeyboardStep={descriptor.isTimelineSelected}
+                        onDisplayedMediaChange={(info) =>
+                          updateCameraDisplayedMedia(cam, info)
+                        }
                       />
                     );
                   }
@@ -2640,6 +2699,14 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         src={`/api/${encodeURIComponent(realCam)}/latest.webp?height=360&cache=${nowTick}`}
                         alt={`${cam} dock snapshot`}
                         loading="lazy"
+                        onLoad={(e) =>
+                          updateCameraDisplayedMedia(cam, {
+                            width: e.currentTarget.naturalWidth,
+                            height: e.currentTarget.naturalHeight,
+                            delivery: "snapshot",
+                            variant: "snapshot",
+                          })
+                        }
                         onClick={() => handleTileActivate(false)}
                       />
                     );
@@ -2653,6 +2720,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         showVectors={showVectors}
                         muted={unmutedLiveCamera !== cam}
                         hideInlinePttHud={true}
+                        onDisplayedMediaChange={(info) =>
+                          updateCameraDisplayedMedia(cam, info)
+                        }
                         pushToTalkSupported={
                           resolveCameraPushToTalkCapability(
                             camCfg,
@@ -2685,21 +2755,48 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 })()}
 
                 {isDock ? (
-                  <div className={`nvr-cam-hud pos-${hudPosition}`}>
-                    <span
-                      className={`nvr-badge ${
-                        liveLayout === "spotlight" ? "mono" : "live"
-                      }`}
+                  <div className={`nvr-cam-hud nvr-tile-bar pos-${hudPosition}`}>
+                    <div
+                      className="nvr-tile-identity-group is-clickable"
+                      onClick={() => handleTileActivate(false)}
                     >
-                      {cam.toUpperCase()}
-                      {liveLayout === "spotlight"
-                        ? ` · ${
-                            descriptor.renderMode === "mse"
-                              ? "STANDBY"
-                              : "SNAPSHOT"
-                          }`
-                        : ""}
-                    </span>
+                      <span
+                        className={`nvr-badge nvr-tile-identity ${
+                          liveLayout === "spotlight" ? "mono" : "live"
+                        }`}
+                      >
+                        {cam.toUpperCase()}
+                        {liveLayout === "spotlight"
+                          ? ` · ${
+                              descriptor.renderMode === "mse"
+                                ? "STANDBY"
+                                : "SNAPSHOT"
+                            }`
+                          : ""}
+                      </span>
+                      {identityTone !== "offline" &&
+                        (() => {
+                          const effMedia = resolveEffectiveDisplayedMedia(
+                            descriptor.renderMode,
+                            displayedMediaByCam[cam]
+                          );
+                          const qBadge = formatDisplayedQualityBadge(effMedia, {
+                            detailed: false,
+                            isPt: locale === "pt",
+                          });
+                          return qBadge ? (
+                            <span
+                              data-testid={`tile-quality-${cam}`}
+                              className={`nvr-badge mono nvr-tile-quality ${
+                                qBadge.isPendingSwitch ? "is-switching" : ""
+                              }`}
+                              title={qBadge.title}
+                            >
+                              {qBadge.label}
+                            </span>
+                          ) : null;
+                        })()}
+                    </div>
                   </div>
                 ) : (
                   <>
@@ -2722,51 +2819,80 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         isCompact && hudPosition !== "hidden" ? "bottom-left" : hudPosition
                       }`}
                     >
-                      <span
-                        data-testid={`tile-identity-${cam}`}
-                        className={`nvr-badge nvr-tile-identity ${
-                          identityTone === "rewind"
-                            ? "rewind"
-                            : descriptor.isSpotlightHeld || identityTone === "offline"
-                            ? "alert"
-                            : "live"
+                      <div
+                        className={`nvr-tile-identity-group ${
+                          !isHero ? "is-clickable" : ""
                         }`}
+                        onClick={isHero ? undefined : () => handleTileActivate(false)}
                       >
                         <span
-                          className={`nvr-dot ${
-                            identityTone === "live" && !descriptor.isSpotlightHeld
-                              ? "live"
-                              : identityTone === "offline"
+                          data-testid={`tile-identity-${cam}`}
+                          className={`nvr-badge nvr-tile-identity ${
+                            identityTone === "rewind"
+                              ? "rewind"
+                              : descriptor.isSpotlightHeld || identityTone === "offline"
                               ? "alert"
-                              : "motion"
+                              : "live"
                           }`}
-                        />
-                        {liveLayout === "spotlight"
-                        ? isTimeShifted && timeShiftTs !== null
-                          ? `SPOTLIGHT // ${cam.toUpperCase()} // ${
-                              t.live.timeShiftBadge
-                            } @ ${formatTs(timeShiftTs)}`
-                          : identityTone === "offline"
-                          ? `SPOTLIGHT // ${cam.toUpperCase()} // OFFLINE`
-                          : `SPOTLIGHT // ${cam.toUpperCase()}`
-                        : isHero
-                        ? `${cam.toUpperCase()} // ${
-                            isTimeShifted && timeShiftTs !== null
-                              ? `${t.live.timeShiftBadge} @ ${formatTs(
-                                  timeShiftTs
-                                )}`
-                              : identityTone === "offline"
-                              ? "OFFLINE"
-                              : t.live.liveBadge
-                          }`
-                        : `${cam.toUpperCase()}${
-                            isTimeShifted && timeShiftTs !== null
-                              ? ` @ ${formatTs(timeShiftTs)}`
-                              : identityTone === "offline"
-                              ? " · OFFLINE"
-                              : ""
-                          }`}
-                      </span>
+                        >
+                          <span
+                            className={`nvr-dot ${
+                              identityTone === "live" && !descriptor.isSpotlightHeld
+                                ? "live"
+                                : identityTone === "offline"
+                                ? "alert"
+                                : "motion"
+                            }`}
+                          />
+                          {liveLayout === "spotlight"
+                          ? isTimeShifted && timeShiftTs !== null
+                            ? `SPOTLIGHT // ${cam.toUpperCase()} // ${
+                                t.live.timeShiftBadge
+                              } @ ${formatTs(timeShiftTs)}`
+                            : identityTone === "offline"
+                            ? `SPOTLIGHT // ${cam.toUpperCase()} // OFFLINE`
+                            : `SPOTLIGHT // ${cam.toUpperCase()}`
+                          : isHero
+                          ? `${cam.toUpperCase()} // ${
+                              isTimeShifted && timeShiftTs !== null
+                                ? `${t.live.timeShiftBadge} @ ${formatTs(
+                                    timeShiftTs
+                                  )}`
+                                : identityTone === "offline"
+                                ? "OFFLINE"
+                                : t.live.liveBadge
+                            }`
+                          : `${cam.toUpperCase()}${
+                              isTimeShifted && timeShiftTs !== null
+                                ? ` @ ${formatTs(timeShiftTs)}`
+                                : identityTone === "offline"
+                                ? " · OFFLINE"
+                                : ""
+                            }`}
+                        </span>
+                        {identityTone !== "offline" &&
+                          (() => {
+                            const effMedia = resolveEffectiveDisplayedMedia(
+                              descriptor.renderMode,
+                              displayedMediaByCam[cam]
+                            );
+                            const qBadge = formatDisplayedQualityBadge(effMedia, {
+                              detailed: isHero && !isCompact,
+                              isPt: locale === "pt",
+                            });
+                            return qBadge ? (
+                              <span
+                                data-testid={`tile-quality-${cam}`}
+                                className={`nvr-badge mono nvr-tile-quality ${
+                                  qBadge.isPendingSwitch ? "is-switching" : ""
+                                }`}
+                                title={qBadge.title}
+                              >
+                                {qBadge.label}
+                              </span>
+                            ) : null;
+                          })()}
+                      </div>
                       <div
                         className="nvr-tile-actions"
                         onClick={(e) => e.stopPropagation()}
@@ -2810,7 +2936,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                               data-testid="spotlight-hero-focus"
                               className="nvr-btn mono sm"
                               onClick={() => {
-                                triggerMainStreamPrewarmIfNeeded(realCam, true);
+                                triggerMainStreamPrewarmIfNeeded(
+                                  realCam,
+                                  streamQualityMode !== "sub"
+                                );
                                 setSelectedCamera(cam);
                                 setLiveLayout("focus");
                               }}
@@ -2826,7 +2955,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                             title={t.live.focusCameraBtn}
                             aria-label={`${t.live.focusCameraBtn}: ${cam}`}
                             onClick={() => {
-                              triggerMainStreamPrewarmIfNeeded(realCam, true);
+                              triggerMainStreamPrewarmIfNeeded(
+                                realCam,
+                                streamQualityMode !== "sub"
+                              );
                               setSelectedCamera(cam);
                               setLiveLayout("focus");
                             }}
@@ -3125,6 +3257,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               telemetry={formatCameraTelemetryRows({
                 detectWidth: camCfg?.detect?.width,
                 detectHeight: camCfg?.detect?.height,
+                displayedMedia: resolveEffectiveDisplayedMedia(
+                  allStageDescriptors.find((d) => d.camera === detailsCam)?.renderMode ?? "mse",
+                  displayedMediaByCam[detailsCam]
+                ),
                 cameraFps: camStat?.camera_fps,
                 detectionFps: camStat?.detection_fps,
                 nightMode: Boolean(act?.night_mode || camStat?.night_mode),
@@ -3134,6 +3270,13 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               onToggleFlag={(flag, next) => toggleCameraRuntimeFlag(realCam, flag, next)}
               useMainStream={useMainStream}
               onSetMainStream={setUseMainStream}
+              streamQualityMode={streamQualityMode}
+              onSetStreamQualityMode={setStreamQualityMode}
+              hasIndependentSubstream={cameraHasIndependentSubstream(
+                realCam,
+                config?.cameras,
+                config?.go2rtc?.streams
+              )}
               showVectors={showVectors}
               onSetShowVectors={setShowVectors}
               canReboot={Boolean(hardwareInfoByCam[realCam]?.capabilities?.reboot)}
@@ -3171,7 +3314,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               ? (cam) => {
                   triggerMainStreamPrewarmIfNeeded(
                     resolveRealCameraSource(cam, config?.cameras || cameraNames),
-                    true
+                    streamQualityMode !== "sub"
                   );
                   setSelectedCamera(cam);
                   setLiveLayout("focus");

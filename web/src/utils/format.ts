@@ -17,12 +17,26 @@ export type WorkspaceTab =
   | "system";
 
 export type LiveLayoutMode = "2x2" | "focus" | "single" | "spotlight" | "map";
+export type LiveStreamQualityMode = "auto" | "sub" | "main";
 export type MatrixDensity = "2x2" | "3x3" | "4x4";
 export type SpotlightFilter = "all_activity" | "objects" | "person" | "vehicle";
 export type SpotlightTimelineMode = "reactive" | "wall";
 export type FirstWeekday = "sunday" | "monday";
 export type ThemeMode = "dark" | "light" | "system";
 export type EffectiveTheme = "dark" | "light";
+
+export function sanitizeLiveStreamQualityMode(
+  raw: unknown,
+  legacyUseMainStream?: unknown
+): LiveStreamQualityMode {
+  if (raw === "auto" || raw === "sub" || raw === "main") {
+    return raw;
+  }
+  if (legacyUseMainStream === true || legacyUseMainStream === "true") {
+    return "main";
+  }
+  return "auto";
+}
 
 export function resolveInitialThemeMode(
   fallback: ThemeMode = "dark"

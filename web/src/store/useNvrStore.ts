@@ -10,6 +10,7 @@ import {
   FirstWeekday,
   HudPosition,
   LiveLayoutMode,
+  LiveStreamQualityMode,
   MatrixDensity,
   SpotlightFilter,
   SpotlightTimelineMode,
@@ -25,6 +26,7 @@ import {
   resolveInitialSpotlightTimelineMode,
   resolveInitialTab,
   resolveInitialThemeMode,
+  sanitizeLiveStreamQualityMode,
 } from "../utils/format";
 
 export type SimulatedFleetCount = 0 | 12 | 36 | 100;
@@ -129,6 +131,13 @@ export function resolveInitialSimulatedFleetCount(): SimulatedFleetCount {
     return raw;
   }
   return 0;
+}
+
+export function resolveInitialStreamQualityMode(): LiveStreamQualityMode {
+  return sanitizeLiveStreamQualityMode(
+    safeStorageGet("ninjanvr_stream_quality_mode"),
+    safeStorageGet("ninjanvr_use_main_stream")
+  );
 }
 
 /**
@@ -326,6 +335,7 @@ interface NvrRealtimeState {
   unmutedLiveCamera: string | null;
   pttAudioOverride: PttAudioReturnOverride | null;
   hudPosition: HudPosition;
+  streamQualityMode: LiveStreamQualityMode;
   useMainStream: boolean;
   showVectors: boolean;
   showAlertRibbon: boolean;
@@ -367,6 +377,7 @@ interface NvrRealtimeState {
   beginPttAudioReturn: (camera: string) => void;
   endPttAudioReturn: (camera: string) => void;
   setHudPosition: (pos: HudPosition) => void;
+  setStreamQualityMode: (mode: LiveStreamQualityMode) => void;
   setUseMainStream: (fnOrVal: boolean | ((prev: boolean) => boolean)) => void;
   setShowVectors: (fnOrVal: boolean | ((prev: boolean) => boolean)) => void;
   setShowAlertRibbon: (val: boolean) => void;
@@ -412,7 +423,8 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
   unmutedLiveCamera: null,
   pttAudioOverride: null,
   hudPosition: resolveInitialHudPosition(),
-  useMainStream: resolveInitialBool("ninjanvr_use_main_stream", false),
+  streamQualityMode: resolveInitialStreamQualityMode(),
+  useMainStream: resolveInitialStreamQualityMode() === "main",
   showVectors: resolveInitialBool("ninjanvr_show_vectors", false),
   showAlertRibbon: resolveInitialBool("ninjanvr_show_alert_ribbon", true),
   audibleAlertChime: resolveInitialBool("ninjanvr_audible_chime", false),
@@ -538,11 +550,20 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
     safeStorageSet("ninjanvr_hud_position", hudPosition);
     set({ hudPosition });
   },
+  setStreamQualityMode: (mode) => {
+    const streamQualityMode = sanitizeLiveStreamQualityMode(mode);
+    const useMainStream = streamQualityMode === "main";
+    safeStorageSet("ninjanvr_stream_quality_mode", streamQualityMode);
+    safeStorageSet("ninjanvr_use_main_stream", String(useMainStream));
+    set({ streamQualityMode, useMainStream });
+  },
   setUseMainStream: (fnOrVal) =>
     set((s) => {
       const next = typeof fnOrVal === "function" ? fnOrVal(s.useMainStream) : fnOrVal;
+      const streamQualityMode: LiveStreamQualityMode = next ? "main" : "sub";
       safeStorageSet("ninjanvr_use_main_stream", String(next));
-      return { useMainStream: next };
+      safeStorageSet("ninjanvr_stream_quality_mode", streamQualityMode);
+      return { useMainStream: next, streamQualityMode };
     }),
   setShowVectors: (fnOrVal) =>
     set((s) => {
@@ -660,6 +681,7 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
       "ninjanvr_matrix_density",
       "ninjanvr_spotlight_timeline_mode",
       "ninjanvr_hud_position",
+      "ninjanvr_stream_quality_mode",
       "ninjanvr_use_main_stream",
       "ninjanvr_show_vectors",
       "ninjanvr_show_alert_ribbon",
@@ -685,6 +707,7 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
       unmutedLiveCamera: null,
       pttAudioOverride: null,
       hudPosition: "bottom-right",
+      streamQualityMode: "auto",
       useMainStream: false,
       showVectors: false,
       showAlertRibbon: true,

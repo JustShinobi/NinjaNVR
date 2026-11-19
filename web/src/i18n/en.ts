@@ -115,6 +115,16 @@ export const en = {
     zonesOverlay: "Vectors",
     hdStream: "1080p Main",
     subStream: "720p Sub",
+    streamQualityLabel: "Live stream quality",
+    streamQualityAuto: "Auto",
+    streamQualitySub: "Sub",
+    streamQualityMain: "Main",
+    streamQualityAutoHint:
+      "Auto: Main stream on hero/full stage and Substream in grid/dock thumbnails",
+    streamQualitySubHint:
+      "Force Substream across every live camera view (lowest CPU and bandwidth)",
+    streamQualityMainHint:
+      "Force Main stream (native full resolution) across every live camera view",
     motionActive: "MOTION",
     idleState: "NOMINAL",
     spotlightTimelineReactive: "Timeline: Auto-Pause",

@@ -87,15 +87,161 @@ export function buildCameraSnapshotUrl(camera: string): string {
   return `/api/${encodeURIComponent(camera)}/snapshot.jpg`;
 }
 
+export type DisplayedMediaDelivery = "mse" | "vod" | "poster" | "snapshot";
+export type DisplayedStreamVariant = "main" | "sub" | "vod" | "snapshot";
+
+export interface DisplayedMediaInfo {
+  width: number;
+  height: number;
+  delivery: DisplayedMediaDelivery;
+  variant: DisplayedStreamVariant;
+  /** Active go2rtc stream identifier when MSE is connected (e.g. "escritorio" or "escritorio_sub"). */
+  streamSrc?: string;
+  /** Non-null while standby MSE slot is connecting/awaiting IDR keyframe for a requested switch. */
+  switchingToVariant?: "main" | "sub" | null;
+  /** True when substream was requested on a camera that has no independent substream and aliases to main. */
+  substreamAliasedToMain?: boolean;
+}
+
+export interface DisplayedQualityBadge {
+  label: string;
+  title: string;
+  isPendingSwitch: boolean;
+}
+
+/**
+ * Reconciles cached per-camera media telemetry with the tile's active `renderMode` so switching
+ * `mse -> vod` or `mse -> snapshot` never leaves a stale live `MAIN` / `SUB` badge visible
+ * while VOD or snapshot media is still loading (or if upstream 404s).
+ */
+export function resolveEffectiveDisplayedMedia(
+  renderMode: "mse" | "vod" | "snapshot",
+  stored?: DisplayedMediaInfo | null
+): DisplayedMediaInfo | null {
+  if (renderMode === "vod") {
+    return stored?.delivery === "vod"
+      ? stored
+      : { width: 0, height: 0, delivery: "vod", variant: "vod" };
+  }
+  if (renderMode === "snapshot") {
+    return stored?.delivery === "snapshot"
+      ? stored
+      : { width: 0, height: 0, delivery: "snapshot", variant: "snapshot" };
+  }
+  if (stored?.delivery === "mse" || stored?.delivery === "poster") {
+    return stored;
+  }
+  return null;
+}
+
+export function formatResolutionShorthand(width?: number, height?: number): string {
+  const w = typeof width === "number" && Number.isFinite(width) ? Math.round(width) : 0;
+  const h = typeof height === "number" && Number.isFinite(height) ? Math.round(height) : 0;
+  if (w <= 0 || h <= 0) return "";
+  const shortEdge = Math.min(w, h);
+  const longEdge = Math.max(w, h);
+  if (longEdge >= 3800 && shortEdge >= 2100) return "4K";
+  if (shortEdge === 1440 && longEdge === 2560) return "1440p";
+  if (shortEdge === 1080 && longEdge === 1920) return "1080p";
+  if (shortEdge === 720 && longEdge === 1280) return "720p";
+  if (shortEdge === 480 && (longEdge === 640 || longEdge === 704 || longEdge === 854)) {
+    return "480p";
+  }
+  if (shortEdge === 360 && longEdge === 640) return "360p";
+  return `${w}×${h}`;
+}
+
+export function formatDisplayedQualityBadge(
+  info: DisplayedMediaInfo | null | undefined,
+  options?: { detailed?: boolean; isPt?: boolean }
+): DisplayedQualityBadge | null {
+  if (!info) return null;
+  const pt = Boolean(options?.isPt);
+  const detailed = Boolean(options?.detailed);
+  const w = Number.isFinite(info.width) && info.width > 0 ? Math.round(info.width) : 0;
+  const h = Number.isFinite(info.height) && info.height > 0 ? Math.round(info.height) : 0;
+  const exactDims = w > 0 && h > 0 ? `${w}×${h}` : "";
+  const shortRes = formatResolutionShorthand(w, h);
+
+  const variantTag =
+    info.delivery === "vod"
+      ? "VOD"
+      : info.delivery === "snapshot" || info.delivery === "poster"
+      ? "SNAP"
+      : info.variant === "sub"
+      ? "SUB"
+      : "MAIN";
+
+  const resDisplay = detailed ? exactDims : shortRes;
+  const baseLabel = resDisplay
+    ? detailed
+      ? `${variantTag} · ${resDisplay}`
+      : `${variantTag} ${resDisplay}`
+    : `${variantTag}…`;
+
+  const switchTarget =
+    info.switchingToVariant && info.switchingToVariant !== info.variant
+      ? info.switchingToVariant === "main"
+        ? "MAIN"
+        : "SUB"
+      : null;
+
+  const isPendingSwitch = Boolean(switchTarget) || !exactDims;
+  const label = switchTarget && exactDims ? `${baseLabel} → ${switchTarget}…` : baseLabel;
+
+  const channelDesc =
+    info.delivery === "vod"
+      ? pt
+        ? "Gravação reproduzida (VOD)"
+        : "Recorded playback (VOD)"
+      : info.delivery === "snapshot" || info.delivery === "poster"
+      ? pt
+        ? "Quadro estático (Snapshot)"
+        : "Static frame (Snapshot)"
+      : info.variant === "sub"
+      ? pt
+        ? `Substream ao vivo${info.streamSrc ? ` (${info.streamSrc})` : ""}`
+        : `Live substream${info.streamSrc ? ` (${info.streamSrc})` : ""}`
+      : pt
+      ? `Stream principal ao vivo${info.streamSrc ? ` (${info.streamSrc})` : ""}`
+      : `Live main stream${info.streamSrc ? ` (${info.streamSrc})` : ""}`;
+
+  const dimsDesc = exactDims
+    ? shortRes && shortRes !== exactDims
+      ? `${exactDims} (${shortRes}) — `
+      : `${exactDims} — `
+    : "";
+
+  const aliasNote = info.substreamAliasedToMain
+    ? pt
+      ? " · Esta câmera não possui substream separado; exibindo stream principal"
+      : " · Camera has no separate substream; showing main stream"
+    : "";
+
+  const switchNote = switchTarget
+    ? pt
+      ? ` · Trocando para ${switchTarget} (aguardando quadro-chave…)`
+      : ` · Switching to ${switchTarget} (awaiting keyframe…)`
+    : "";
+
+  return {
+    label,
+    title: `${dimsDesc}${channelDesc}${aliasNote}${switchNote}`,
+    isPendingSwitch,
+  };
+}
+
 export interface CameraTelemetryRow {
   key: "resolution" | "camera_fps" | "ai_fps" | "image";
   label: string;
   value: string;
+  subValue?: string;
 }
 
 export function formatCameraTelemetryRows(params: {
   detectWidth?: number;
   detectHeight?: number;
+  displayedMedia?: DisplayedMediaInfo | null;
   cameraFps?: number;
   detectionFps?: number;
   nightMode?: boolean;
@@ -104,15 +250,55 @@ export function formatCameraTelemetryRows(params: {
   const pt = Boolean(params.isPt);
   const fmt = (v: number | undefined) =>
     Number.isFinite(v) ? `${(v as number).toFixed(1)} FPS` : "—";
-  return [
-    {
+
+  const media = params.displayedMedia;
+  const mediaW =
+    media && Number.isFinite(media.width) && media.width > 0 ? Math.round(media.width) : 0;
+  const mediaH =
+    media && Number.isFinite(media.height) && media.height > 0 ? Math.round(media.height) : 0;
+  const detDims =
+    params.detectWidth && params.detectHeight
+      ? `${params.detectWidth}×${params.detectHeight}`
+      : "";
+
+  let resolutionRow: CameraTelemetryRow;
+  if (media) {
+    const sourceLabel =
+      media.delivery === "vod"
+        ? pt
+          ? "Gravação VOD"
+          : "VOD recording"
+        : media.delivery === "snapshot" || media.delivery === "poster"
+        ? "Snapshot"
+        : media.variant === "sub"
+        ? "Substream"
+        : media.substreamAliasedToMain
+        ? pt
+          ? "Principal (sem sub)"
+          : "Main (no sub)"
+        : pt
+        ? "Stream principal"
+        : "Main stream";
+    const subParts = [sourceLabel];
+    if (detDims) {
+      subParts.push(`IA ${detDims}`);
+    }
+    resolutionRow = {
+      key: "resolution",
+      label: pt ? "Vídeo exibido" : "Displayed video",
+      value: mediaW > 0 && mediaH > 0 ? `${mediaW}×${mediaH}` : detDims || "—",
+      subValue: subParts.join(" · "),
+    };
+  } else {
+    resolutionRow = {
       key: "resolution",
       label: pt ? "Resolução" : "Resolution",
-      value:
-        params.detectWidth && params.detectHeight
-          ? `${params.detectWidth}×${params.detectHeight}`
-          : "—",
-    },
+      value: detDims || "—",
+    };
+  }
+
+  return [
+    resolutionRow,
     { key: "camera_fps", label: pt ? "Câmera" : "Camera", value: fmt(params.cameraFps) },
     { key: "ai_fps", label: pt ? "Detecção IA" : "AI detect", value: fmt(params.detectionFps) },
     {

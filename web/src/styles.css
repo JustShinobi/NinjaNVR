@@ -134,8 +134,13 @@
 [data-high-contrast="true"] .nvr-cfg-card,
 [data-high-contrast="true"] .nvr-subcard,
 [data-high-contrast="true"] .nvr-input,
-[data-high-contrast="true"] .nvr-select {
+[data-high-contrast="true"] .nvr-select,
+[data-high-contrast="true"] .nvr-segmented {
   border-width: 1.5px;
+}
+
+[data-high-contrast="true"] .nvr-segmented {
+  border-color: var(--border-input);
 }
 
 * {
@@ -425,14 +430,17 @@ body,
   display: inline-flex;
   align-items: center;
   gap: 2px;
-  padding: 2px;
+  padding: 1px;
   background: var(--bg-input);
   border: 1px solid var(--border-hairline);
   border-radius: 3px;
 }
 
 .nvr-segmented > .nvr-btn {
+  min-block-size: 24px;
   height: 24px;
+  padding-block: 0;
+  padding-inline: 8px;
   border-color: transparent;
   background: transparent;
 }
@@ -3675,11 +3683,41 @@ input[type="range"] {
   flex-direction: row-reverse;
 }
 
+.nvr-tile-identity-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.nvr-tile-identity-group.is-clickable {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.nvr-cam-hud.nvr-tile-bar.pos-bottom-right .nvr-tile-identity-group,
+.nvr-cam-hud.nvr-tile-bar.pos-top-right .nvr-tile-identity-group {
+  flex-direction: row-reverse;
+}
+
 .nvr-tile-identity {
   flex-shrink: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.nvr-tile-quality {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+  pointer-events: auto;
+  color: var(--text-secondary);
+}
+
+.nvr-tile-quality.is-switching {
+  border-color: var(--signal-accent-border);
+  color: var(--signal-accent-text);
 }
 
 .nvr-tile-actions {
@@ -3874,6 +3912,19 @@ input[type="range"] {
   font-variant-numeric: tabular-nums;
 }
 
+.nvr-sheet-subval {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.nvr-sheet-hint {
+  margin: 2px 0 0;
+  font-size: var(--text-xs);
+  line-height: 1.4;
+  color: var(--text-secondary);
+}
+
 .nvr-sheet-group {
   display: flex;
   flex-direction: column;
@@ -3900,7 +3951,8 @@ input[type="range"] {
 
 .nvr-sheet-seg .nvr-btn {
   flex: 1 1 0;
-  height: 40px;
+  min-block-size: 44px;
+  height: auto;
   justify-content: center;
 }
 

@@ -117,6 +117,16 @@ export const pt: TranslationDict = {
     zonesOverlay: "Vetores",
     hdStream: "1080p Principal",
     subStream: "720p Sub",
+    streamQualityLabel: "Qualidade do stream ao vivo",
+    streamQualityAuto: "Auto",
+    streamQualitySub: "Sub",
+    streamQualityMain: "Principal",
+    streamQualityAutoHint:
+      "Automático: Stream Principal na câmera em destaque e Substream na grade/miniaturas",
+    streamQualitySubHint:
+      "Forçar Substream em todas as câmeras ao vivo (menor uso de CPU e rede)",
+    streamQualityMainHint:
+      "Forçar Stream Principal (resolução máxima nativa) em todas as câmeras ao vivo",
     motionActive: "MOVIMENTO",
     idleState: "NOMINAL",
     spotlightTimelineReactive: "Timeline: Auto-Pausa",

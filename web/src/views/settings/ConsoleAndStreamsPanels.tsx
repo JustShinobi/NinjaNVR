@@ -13,6 +13,7 @@ import {
   FirstWeekday,
   HudPosition,
   LiveLayoutMode,
+  LiveStreamQualityMode,
   ThemeMode,
 } from "../../utils/format";
 import { SettingsScopeDivider } from "../../components/SettingsScopeDivider";
@@ -100,8 +101,8 @@ export const ConsoleUiSection: React.FC<{
   const setLiveLayout = useNvrStore((s) => s.setLiveLayout);
   const hudPosition = useNvrStore((s) => s.hudPosition);
   const setHudPosition = useNvrStore((s) => s.setHudPosition);
-  const useMainStream = useNvrStore((s) => s.useMainStream);
-  const setUseMainStream = useNvrStore((s) => s.setUseMainStream);
+  const streamQualityMode = useNvrStore((s) => s.streamQualityMode);
+  const setStreamQualityMode = useNvrStore((s) => s.setStreamQualityMode);
   const showVectors = useNvrStore((s) => s.showVectors);
   const setShowVectors = useNvrStore((s) => s.setShowVectors);
   const showAlertRibbon = useNvrStore((s) => s.showAlertRibbon);
@@ -207,31 +208,51 @@ export const ConsoleUiSection: React.FC<{
             <div className="nvr-field-meta">
               <div className="nvr-field-label">
                 {isPt
-                  ? "Preferir Stream Principal 1080p Ao Vivo"
-                  : "Prefer 1080p Main Stream on Live"}
+                  ? "Qualidade Padrão do Stream Ao Vivo"
+                  : "Default Live Stream Quality"}
               </div>
               <div className="nvr-field-desc">
                 {isPt
-                  ? "Reproduzir stream de alta resolução em vez do substream 720p por padrão."
-                  : "Stream full-resolution main feed instead of 720p substream by default."}
+                  ? "Auto usa Stream Principal no destaque e Substream na grade; Sub ou Principal aplicam a escolha em todas as câmeras."
+                  : "Auto uses Main stream on hero views and Substream in grids; Sub or Main applies across all live cameras."}
               </div>
             </div>
-            <ToggleSwitch
-              checked={useMainStream}
-              onChange={(v) => {
-                setUseMainStream(v);
+            <select
+              className="nvr-select mono"
+              aria-label={
+                isPt
+                  ? "Qualidade Padrão do Stream Ao Vivo"
+                  : "Default Live Stream Quality"
+              }
+              value={streamQualityMode}
+              onChange={(e) => {
+                const next = e.target.value as LiveStreamQualityMode;
+                setStreamQualityMode(next);
                 notify(
-                  v
+                  next === "auto"
                     ? isPt
-                      ? "Stream 1080p Principal ativado por padrão"
-                      : "1080p Main Stream enabled by default"
+                      ? "Qualidade ao vivo definida para Automático"
+                      : "Live stream quality set to Auto"
+                    : next === "main"
+                    ? isPt
+                      ? "Stream Principal ativado para todas as câmeras"
+                      : "Main stream enabled across all cameras"
                     : isPt
-                    ? "Substream 720p ativado por padrão"
-                    : "720p Substream enabled by default"
+                    ? "Substream ativado para todas as câmeras"
+                    : "Substream enabled across all cameras"
                 );
               }}
-              label="Prefer 1080p Main Stream"
-            />
+            >
+              <option value="auto">
+                {isPt ? "Automático (Foco Principal · Grade Sub)" : "Auto (Focus Main · Grid Sub)"}
+              </option>
+              <option value="sub">
+                {isPt ? "Sempre Substream (Leve)" : "Always Substream (Light)"}
+              </option>
+              <option value="main">
+                {isPt ? "Sempre Principal (Máxima)" : "Always Main (Full Native)"}
+              </option>
+            </select>
           </div>
 
           <div className="nvr-field-row">

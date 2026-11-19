@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
-import { resolveRealCameraSource } from "../store/useNvrStore";
+import { resolveRealCameraSource, useNvrStore } from "../store/useNvrStore";
+import { resolveTileUseMainStream } from "../utils/liveStageLayout";
 import {
   CameraConfig,
   CameraGroupConfig,
@@ -124,6 +125,8 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
 }) => {
   const { locale } = useI18n();
   const isPt = locale === "pt";
+  const streamQualityMode = useNvrStore((s) => s.streamQualityMode);
+  const useMainStream = useNvrStore((s) => s.useMainStream);
   const contextWorkbench = useConfigWorkbenchSession();
   const activeWorkbench = workbenchSession ?? contextWorkbench;
   const [mapEditMode, setMapEditMode] = useState(false);
@@ -2471,7 +2474,11 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
             return (
               <LiveMsePlayer
                 camera={selectedCamera}
-                useMainStream={false}
+                useMainStream={resolveTileUseMainStream(
+                  "dock",
+                  streamQualityMode,
+                  useMainStream
+                )}
                 cameraConfig={mapCamCfg}
                 showVectors={showVectors}
                 pushToTalkSupported={mapPttCap.supported}

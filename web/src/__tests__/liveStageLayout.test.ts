@@ -458,4 +458,76 @@ describe("liveStageLayout (#92 [UX-17])", () => {
       expect(shouldRenderLiveAlertRibbon(layout, false, 0)).toBe(false);
     }
   });
+
+  test("streamQualityMode_applies_sub_and_main_uniformly_across_all_layouts_without_hidden_overrides", () => {
+    for (const layout of ["2x2", "focus", "single", "spotlight"] as const) {
+      const forcedSub = computeLiveStageDescriptors({
+        liveLayout: layout,
+        visibleMatrixCams: fleet4,
+        groupCams: fleet4,
+        selectedCamera: "sala",
+        spotlightHeroCam: "garagem",
+        hoveredDockCam: null,
+        useMainStream: false,
+        streamQualityMode: "sub",
+        timeShiftTs: null,
+      });
+      expect(forcedSub.length).toBeGreaterThan(0);
+      expect(forcedSub.every((d) => d.useMainStream === false)).toBe(true);
+
+      const forcedMain = computeLiveStageDescriptors({
+        liveLayout: layout,
+        visibleMatrixCams: fleet4,
+        groupCams: fleet4,
+        selectedCamera: "sala",
+        spotlightHeroCam: "garagem",
+        hoveredDockCam: null,
+        useMainStream: true,
+        streamQualityMode: "main",
+        timeShiftTs: null,
+      });
+      expect(forcedMain.length).toBeGreaterThan(0);
+      expect(forcedMain.every((d) => d.useMainStream === true)).toBe(true);
+    }
+
+    // "auto" keeps 2x2 grid + dock on substream while promoting hero/single to main stream
+    const autoGrid = computeLiveStageDescriptors({
+      liveLayout: "2x2",
+      visibleMatrixCams: fleet4,
+      groupCams: fleet4,
+      selectedCamera: "sala",
+      hoveredDockCam: null,
+      useMainStream: false,
+      streamQualityMode: "auto",
+      timeShiftTs: null,
+    });
+    expect(autoGrid.every((d) => d.useMainStream === false)).toBe(true);
+
+    const autoFocus = computeLiveStageDescriptors({
+      liveLayout: "focus",
+      visibleMatrixCams: fleet4,
+      groupCams: fleet4,
+      selectedCamera: "sala",
+      hoveredDockCam: null,
+      useMainStream: false,
+      streamQualityMode: "auto",
+      timeShiftTs: null,
+    });
+    expect(autoFocus.find((d) => d.role === "hero")?.useMainStream).toBe(true);
+    expect(
+      autoFocus.filter((d) => d.role === "dock").every((d) => d.useMainStream === false)
+    ).toBe(true);
+
+    // Tile click skips main-stream prewarm when operator explicitly selected "sub"
+    expect(
+      resolveTileClickAction({
+        liveLayout: "2x2",
+        role: "grid",
+        camera: "sala",
+        selectedCamera: "sala",
+        isDoubleClick: false,
+        streamQualityMode: "sub",
+      }).shouldPrewarmMainStream
+    ).toBe(false);
+  });
 });

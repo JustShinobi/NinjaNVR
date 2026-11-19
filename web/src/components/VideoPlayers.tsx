@@ -4,7 +4,12 @@ import { Camera, ChevronLeft, ChevronRight, Mic, MicOff } from "lucide-react";
 import { useI18n } from "../i18n";
 import { CameraConfig } from "../types/nvr";
 import { resolveRealCameraSource, useNvrStore } from "../store/useNvrStore";
-import { formatRelTime, formatTs, resolveEffectiveTheme } from "../utils/format";
+import {
+  LiveStreamQualityMode,
+  formatRelTime,
+  formatTs,
+  resolveEffectiveTheme,
+} from "../utils/format";
 
 export { resolveRealCameraSource };
 import {
@@ -26,6 +31,7 @@ import {
 } from "../utils/msePlayerEngine";
 import { resolveVodSeekAction } from "../utils/archivePlayback";
 import type { TrimScrubChannel } from "../utils/exportClipFlow";
+import type { DisplayedMediaInfo, DisplayedStreamVariant } from "../utils/liveTileHud";
 
 export interface PushToTalkTrackLike {
   stop: () => void;
@@ -1059,6 +1065,8 @@ interface LiveMsePlayerProps {
   pushToTalkSupported?: boolean;
   pushToTalkMode?: "webrtc" | "cgi_alaw" | null;
   hideInlinePttHud?: boolean;
+  allowMainStreamPrewarm?: boolean;
+  onDisplayedMediaChange?: (info: DisplayedMediaInfo) => void;
 }
 
 /**
@@ -1199,6 +1207,97 @@ export function resolveDesiredLiveStreamSrc(
   return subName;
 }
 
+export function cameraHasIndependentSubstream(
+  realCamera: string,
+  configuredCameras?: Record<string, CameraConfig> | null,
+  go2rtcStreams?: Record<string, unknown> | null
+): boolean {
+  const trimmed = realCamera.trim();
+  if (!trimmed) return false;
+  return (
+    resolveDesiredLiveStreamSrc(trimmed, false, configuredCameras, go2rtcStreams) !==
+    trimmed
+  );
+}
+
+export function shouldHoverPrewarmMainStream(params: {
+  useMainStream: boolean;
+  hasOnClick: boolean;
+  streamQualityMode?: LiveStreamQualityMode;
+  allowMainStreamPrewarm?: boolean;
+}): boolean {
+  if (params.useMainStream || !params.hasOnClick) return false;
+  if (typeof params.allowMainStreamPrewarm === "boolean") {
+    return params.allowMainStreamPrewarm;
+  }
+  return params.streamQualityMode !== "sub";
+}
+
+export function isSubstreamIdentifierForCamera(
+  streamSrc: string,
+  realCamera: string
+): boolean {
+  const s = streamSrc.trim();
+  const c = realCamera.trim();
+  return Boolean(s && c && s !== c && s === `${c}_sub`);
+}
+
+export function buildLiveDisplayedMediaInfo(params: {
+  realCamera: string;
+  useMainStream: boolean;
+  desiredStreamSrc: string;
+  mseReady: boolean;
+  activeStreamSrc: string | null;
+  standbyConnectingStreamSrc: string | null;
+  videoWidth: number;
+  videoHeight: number;
+  posterWidth: number;
+  posterHeight: number;
+}): DisplayedMediaInfo {
+  const realCam = params.realCamera.trim();
+  const desired = params.desiredStreamSrc.trim();
+  if (params.mseReady) {
+    const activeSrc = (params.activeStreamSrc || desired || realCam).trim();
+    const isSub = isSubstreamIdentifierForCamera(activeSrc, realCam);
+    const variant: DisplayedStreamVariant = isSub ? "sub" : "main";
+    let switchingToVariant: "main" | "sub" | null = null;
+    if (params.standbyConnectingStreamSrc) {
+      const sbSrc = params.standbyConnectingStreamSrc.trim();
+      if (sbSrc && sbSrc !== activeSrc) {
+        switchingToVariant = isSubstreamIdentifierForCamera(sbSrc, realCam)
+          ? "sub"
+          : "main";
+      }
+    }
+    const substreamAliasedToMain =
+      !params.useMainStream &&
+      variant === "main" &&
+      switchingToVariant !== "sub";
+    return {
+      width: params.videoWidth > 0 ? params.videoWidth : 0,
+      height: params.videoHeight > 0 ? params.videoHeight : 0,
+      delivery: "mse",
+      variant,
+      streamSrc: activeSrc,
+      switchingToVariant,
+      substreamAliasedToMain,
+    };
+  }
+
+  const targetVariant: "main" | "sub" = isSubstreamIdentifierForCamera(desired, realCam)
+    ? "sub"
+    : "main";
+  return {
+    width: params.posterWidth > 0 ? params.posterWidth : 0,
+    height: params.posterHeight > 0 ? params.posterHeight : 0,
+    delivery: "poster",
+    variant: "snapshot",
+    streamSrc: desired || realCam,
+    switchingToVariant: targetVariant,
+    substreamAliasedToMain: !params.useMainStream && targetVariant === "main",
+  };
+}
+
 export interface VideoMuteTargetLike {
   muted: boolean;
   paused?: boolean;
@@ -1253,8 +1352,11 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   pushToTalkSupported,
   pushToTalkMode,
   hideInlinePttHud = false,
+  allowMainStreamPrewarm,
+  onDisplayedMediaChange,
 }) => {
   const storeIsUnmuted = useNvrStore((s) => Boolean(camera) && s.unmutedLiveCamera === camera);
+  const streamQualityMode = useNvrStore((s) => s.streamQualityMode);
   const resolvedMutedProp = muted !== undefined ? muted : !storeIsUnmuted;
   const containerRef = useRef<HTMLDivElement | null>(null);
   const videoRef0 = useRef<HTMLVideoElement | null>(null);
@@ -1274,9 +1376,19 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   const configuredCameras = useNvrStore((s) => s.config?.cameras);
   const go2rtcStreams = useNvrStore((s) => s.config?.go2rtc?.streams);
   const wsOnline = useNvrStore((s) => s.wsOnline);
+  const cameraRef = useRef<string>(camera);
+  cameraRef.current = camera;
   const realCamera = resolveRealCameraSource(camera, configuredCameras);
   const realCameraRef = useRef<string>(realCamera);
   realCameraRef.current = realCamera;
+  const useMainStreamRef = useRef<boolean>(useMainStream);
+  useMainStreamRef.current = useMainStream;
+  const onDisplayedMediaChangeRef = useRef<typeof onDisplayedMediaChange>(
+    onDisplayedMediaChange
+  );
+  onDisplayedMediaChangeRef.current = onDisplayedMediaChange;
+  const lastReportedMediaKeyRef = useRef<string>("");
+  const reportDisplayedMediaRef = useRef<() => void>(() => {});
   const desiredStreamSrc = resolveDesiredLiveStreamSrc(
     realCamera,
     useMainStream,
@@ -1311,9 +1423,49 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         setOutgoingSlot(snap.outgoingSlot);
         setMseReady(snap.mseReady);
         setStreamDisconnected(snap.streamDisconnected);
+        reportDisplayedMediaRef.current();
       },
     });
   }
+
+  const reportDisplayedMedia = useCallback(() => {
+    const cb = onDisplayedMediaChangeRef.current;
+    if (!cb || unmountedRef.current) return;
+    const snap = sessionControllerRef.current?.getSnapshot();
+    const curSlot = snap?.activeSlot ?? activeSlot;
+    const curMseReady = snap?.mseReady ?? mseReady;
+    const machine = snap?.machineState;
+    const activeStreamSrc = machine?.slots[curSlot]?.streamSrc ?? null;
+    const sbSlot = machine?.standbySlot ?? null;
+    const standbyConnectingStreamSrc =
+      sbSlot !== null && machine?.slots[sbSlot]?.status === "connecting"
+        ? machine.slots[sbSlot].streamSrc
+        : null;
+    const v = getSlotVideoEl(curSlot);
+    const im = imgRef.current;
+    const info = buildLiveDisplayedMediaInfo({
+      realCamera: realCameraRef.current,
+      useMainStream: useMainStreamRef.current,
+      desiredStreamSrc: desiredStreamSrcRef.current,
+      mseReady: curMseReady,
+      activeStreamSrc,
+      standbyConnectingStreamSrc,
+      videoWidth: v && v.videoWidth > 0 ? v.videoWidth : 0,
+      videoHeight: v && v.videoHeight > 0 ? v.videoHeight : 0,
+      posterWidth: im && im.naturalWidth > 0 ? im.naturalWidth : 0,
+      posterHeight: im && im.naturalHeight > 0 ? im.naturalHeight : 0,
+    });
+    const key = `${cameraRef.current}|${info.delivery}|${info.variant}|${
+      info.width
+    }x${info.height}|${info.streamSrc ?? ""}|${
+      info.switchingToVariant ?? ""
+    }|${info.substreamAliasedToMain ? 1 : 0}`;
+    if (key !== lastReportedMediaKeyRef.current) {
+      lastReportedMediaKeyRef.current = key;
+      cb(info);
+    }
+  }, [activeSlot, getSlotVideoEl, mseReady]);
+  reportDisplayedMediaRef.current = reportDisplayedMedia;
 
   const getActiveVideoEl = useCallback((): HTMLVideoElement | null => {
     const curSlot =
@@ -1347,7 +1499,8 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
       (im && im.naturalHeight > 0 ? im.naturalHeight : 0) ||
       detH;
     setOverlayBox(computeContainedBox(cw, ch, mw, mh));
-  }, [detW, detH, getActiveVideoEl]);
+    reportDisplayedMedia();
+  }, [detW, detH, getActiveVideoEl, reportDisplayedMedia]);
   updateOverlayGeometryRef.current = updateOverlayGeometry;
 
   // The picture's aspect ratio can change once the live stream (or the other MSE slot) takes
@@ -1409,7 +1562,8 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
     sessionControllerRef.current?.connectStream(desiredStreamSrc, {
       isCameraOrModeSwitch: true,
     });
-  }, [desiredStreamSrc]);
+    reportDisplayedMediaRef.current();
+  }, [camera, desiredStreamSrc, useMainStream]);
 
   // Fast-path MSE recovery when global telemetry WebSocket (/ws) or camera FPS comes back online after pod rollout
   useEffect(() => {
@@ -1516,7 +1670,14 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         cursor: onPlotPoint ? "crosshair" : onClick ? "pointer" : "default",
       }}
       onPointerEnter={() => {
-        if (!useMainStream && Boolean(onClick)) {
+        if (
+          shouldHoverPrewarmMainStream({
+            useMainStream,
+            hasOnClick: Boolean(onClick),
+            streamQualityMode,
+            allowMainStreamPrewarm,
+          })
+        ) {
           prewarmStream(realCamera);
         }
       }}
@@ -1644,6 +1805,8 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         <video
           ref={videoRef0}
           onLoadedMetadata={updateOverlayGeometry}
+          onLoadedData={reportDisplayedMedia}
+          onResize={updateOverlayGeometry}
           data-slot="0"
           autoPlay
           playsInline
@@ -1665,6 +1828,8 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         <video
           ref={videoRef1}
           onLoadedMetadata={updateOverlayGeometry}
+          onLoadedData={reportDisplayedMedia}
+          onResize={updateOverlayGeometry}
           data-slot="1"
           autoPlay
           playsInline
@@ -1994,6 +2159,7 @@ export interface VodHlsPlayerProps {
   controls?: boolean;
   onTimeUpdate?: (currentSec: number, absoluteTsSec?: number) => void;
   onEnded?: () => void;
+  onDisplayedMediaChange?: (info: DisplayedMediaInfo) => void;
 }
 
 export function resolveVodFrameStepDurationSec(
@@ -2174,11 +2340,36 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
   controls = true,
   onTimeUpdate,
   onEnded,
+  onDisplayedMediaChange,
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const endedFiredRef = useRef(false);
   const pendingScrubOffsetRef = useRef<number | null>(null);
   const [vodBufferReady, setVodBufferReady] = useState(false);
+  const vodCameraRef = useRef<string>(camera);
+  vodCameraRef.current = camera;
+  const onDisplayedMediaChangeRef = useRef<typeof onDisplayedMediaChange>(
+    onDisplayedMediaChange
+  );
+  onDisplayedMediaChangeRef.current = onDisplayedMediaChange;
+  const lastVodMediaKeyRef = useRef<string>("");
+  const reportVodMedia = useCallback(() => {
+    const cb = onDisplayedMediaChangeRef.current;
+    if (!cb) return;
+    const vid = videoRef.current;
+    const w = vid && vid.videoWidth > 0 ? vid.videoWidth : 0;
+    const h = vid && vid.videoHeight > 0 ? vid.videoHeight : 0;
+    const key = `${vodCameraRef.current}|vod|${w}x${h}`;
+    if (key !== lastVodMediaKeyRef.current) {
+      lastVodMediaKeyRef.current = key;
+      cb({
+        width: w,
+        height: h,
+        delivery: "vod",
+        variant: "vod",
+      });
+    }
+  }, []);
   const playheadTsRef = useRef<number | null | undefined>(playheadTs);
   playheadTsRef.current = playheadTs;
   const pauseOnSeekRef = useRef<boolean>(pauseOnSeek);
@@ -2249,7 +2440,17 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
     setVodBufferReady(false);
     pendingScrubOffsetRef.current = null;
     endedFiredRef.current = false;
-  }, [realCamera, safeStart, safeEnd, fallbackPreviewId]);
+    const resetKey = `${camera}|vod|0x0`;
+    if (lastVodMediaKeyRef.current !== resetKey) {
+      lastVodMediaKeyRef.current = resetKey;
+      onDisplayedMediaChangeRef.current?.({
+        width: 0,
+        height: 0,
+        delivery: "vod",
+        variant: "vod",
+      });
+    }
+  }, [camera, realCamera, safeStart, safeEnd, fallbackPreviewId]);
 
   useEffect(() => {
     const videoEl = videoRef.current;
@@ -2706,7 +2907,12 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
           playsInline
           muted={effectiveVodMuted}
           loop={!onEnded && !clipBounds}
-          onLoadedData={() => setVodBufferReady(true)}
+          onLoadedMetadata={reportVodMedia}
+          onLoadedData={() => {
+            setVodBufferReady(true);
+            reportVodMedia();
+          }}
+          onResize={reportVodMedia}
           onSeeked={handleVideoSeeked}
           onVolumeChange={(e) => {
             if (typeof controlledMuted === "boolean") return;
@@ -2739,7 +2945,12 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
         autoPlay={autoPlay && !pauseOnSeek && paused !== true}
         playsInline
         muted={effectiveVodMuted}
-        onLoadedData={() => setVodBufferReady(true)}
+        onLoadedMetadata={reportVodMedia}
+        onLoadedData={() => {
+          setVodBufferReady(true);
+          reportVodMedia();
+        }}
+        onResize={reportVodMedia}
         onSeeked={handleVideoSeeked}
         onVolumeChange={(e) => {
           if (typeof controlledMuted === "boolean") return;

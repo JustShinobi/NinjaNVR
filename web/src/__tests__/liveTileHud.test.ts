@@ -264,3 +264,264 @@ describe("countActiveExploreFilters", () => {
     ).toBe(5);
   });
 });
+
+import React from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { CameraDetailsSheet } from "../components/CameraDetailsSheet";
+import {
+  buildLiveDisplayedMediaInfo,
+  cameraHasIndependentSubstream,
+  isSubstreamIdentifierForCamera,
+  shouldHoverPrewarmMainStream,
+} from "../components/VideoPlayers";
+import {
+  formatDisplayedQualityBadge,
+  formatResolutionShorthand,
+  resolveEffectiveDisplayedMedia,
+} from "../utils/liveTileHud";
+import { sanitizeLiveStreamQualityMode } from "../utils/format";
+
+describe("real displayed stream quality telemetry and 3-way selector", () => {
+  test("formatResolutionShorthand handles standard, portrait-rotated, and custom resolutions", () => {
+    expect(formatResolutionShorthand(1920, 1080)).toBe("1080p");
+    expect(formatResolutionShorthand(1080, 1920)).toBe("1080p");
+    expect(formatResolutionShorthand(3840, 2160)).toBe("4K");
+    expect(formatResolutionShorthand(2560, 1440)).toBe("1440p");
+    expect(formatResolutionShorthand(1280, 720)).toBe("720p");
+    expect(formatResolutionShorthand(640, 480)).toBe("480p");
+    expect(formatResolutionShorthand(640, 360)).toBe("360p");
+    expect(formatResolutionShorthand(2304, 1296)).toBe("2304×1296");
+    expect(formatResolutionShorthand(0, 0)).toBe("");
+  });
+
+  test("buildLiveDisplayedMediaInfo and formatDisplayedQualityBadge report real decoded stream, pending keyframe transitions, and aliased substreams", () => {
+    // 1. Live substream playing at native 640x360
+    const subInfo = buildLiveDisplayedMediaInfo({
+      realCamera: "escritorio",
+      useMainStream: false,
+      desiredStreamSrc: "escritorio_sub",
+      mseReady: true,
+      activeStreamSrc: "escritorio_sub",
+      standbyConnectingStreamSrc: null,
+      videoWidth: 640,
+      videoHeight: 360,
+      posterWidth: 640,
+      posterHeight: 360,
+    });
+    expect(subInfo.variant).toBe("sub");
+    expect(subInfo.substreamAliasedToMain).toBe(false);
+    expect(formatDisplayedQualityBadge(subInfo, { detailed: false, isPt: true })?.label).toBe(
+      "SUB 360p"
+    );
+    expect(formatDisplayedQualityBadge(subInfo, { detailed: true, isPt: true })?.label).toBe(
+      "SUB · 640×360"
+    );
+
+    // 2. Double-buffered upgrade in flight (waiting for main-stream IDR keyframe)
+    const upgradingInfo = buildLiveDisplayedMediaInfo({
+      realCamera: "escritorio",
+      useMainStream: true,
+      desiredStreamSrc: "escritorio",
+      mseReady: true,
+      activeStreamSrc: "escritorio_sub",
+      standbyConnectingStreamSrc: "escritorio",
+      videoWidth: 640,
+      videoHeight: 360,
+      posterWidth: 640,
+      posterHeight: 360,
+    });
+    const upgBadge = formatDisplayedQualityBadge(upgradingInfo, {
+      detailed: false,
+      isPt: true,
+    });
+    expect(upgBadge?.label).toBe("SUB 360p → MAIN…");
+    expect(upgBadge?.isPendingSwitch).toBe(true);
+
+    // 3. Promoted to main stream at 1920x1080
+    const mainInfo = buildLiveDisplayedMediaInfo({
+      realCamera: "escritorio",
+      useMainStream: true,
+      desiredStreamSrc: "escritorio",
+      mseReady: true,
+      activeStreamSrc: "escritorio",
+      standbyConnectingStreamSrc: null,
+      videoWidth: 1920,
+      videoHeight: 1080,
+      posterWidth: 1920,
+      posterHeight: 1080,
+    });
+    expect(formatDisplayedQualityBadge(mainInfo, { detailed: false })?.label).toBe(
+      "MAIN 1080p"
+    );
+    expect(formatDisplayedQualityBadge(mainInfo, { detailed: true })?.label).toBe(
+      "MAIN · 1920×1080"
+    );
+
+    // 4. Camera without independent substream (e.g. "sala" aliased to main)
+    const aliasedInfo = buildLiveDisplayedMediaInfo({
+      realCamera: "sala",
+      useMainStream: false,
+      desiredStreamSrc: "sala",
+      mseReady: true,
+      activeStreamSrc: "sala",
+      standbyConnectingStreamSrc: null,
+      videoWidth: 1920,
+      videoHeight: 1080,
+      posterWidth: 1920,
+      posterHeight: 1080,
+    });
+    expect(aliasedInfo.variant).toBe("main");
+    expect(aliasedInfo.substreamAliasedToMain).toBe(true);
+    const aliasedBadge = formatDisplayedQualityBadge(aliasedInfo, {
+      detailed: false,
+      isPt: true,
+    });
+    expect(aliasedBadge?.label).toBe("MAIN 1080p");
+    expect(aliasedBadge?.title).toContain("não possui substream separado");
+
+    // 5. Underscored camera key ("lobby_sub") is never misclassified as its own substream
+    expect(isSubstreamIdentifierForCamera("lobby_sub", "lobby_sub")).toBe(false);
+    expect(isSubstreamIdentifierForCamera("lobby_sub_sub", "lobby_sub")).toBe(true);
+
+    // 6. Substream capability detection
+    expect(
+      cameraHasIndependentSubstream(
+        "sala",
+        undefined,
+        { sala: ["rtsp://127.0.0.1:8554/sala"], sala_sub: ["rtsp://127.0.0.1:8554/sala"] }
+      )
+    ).toBe(false);
+    expect(
+      cameraHasIndependentSubstream(
+        "escritorio",
+        undefined,
+        {
+          escritorio: ["rtsp://cam.example/stream1"],
+          escritorio_sub: ["rtsp://cam.example/stream2"],
+        }
+      )
+    ).toBe(true);
+  });
+
+  test("formatCameraTelemetryRows and CameraDetailsSheet surface real displayed video dimensions alongside AI detect dims", () => {
+    const rows = formatCameraTelemetryRows({
+      detectWidth: 1280,
+      detectHeight: 720,
+      displayedMedia: {
+        width: 1920,
+        height: 1080,
+        delivery: "mse",
+        variant: "main",
+        streamSrc: "sala",
+        substreamAliasedToMain: true,
+      },
+      cameraFps: 5,
+      detectionFps: 4.5,
+      nightMode: false,
+      isPt: true,
+    });
+    expect(rows[0]).toEqual({
+      key: "resolution",
+      label: "Vídeo exibido",
+      value: "1920×1080",
+      subValue: "Principal (sem sub) · IA 1280×720",
+    });
+
+    const html = renderToStaticMarkup(
+      React.createElement(CameraDetailsSheet, {
+        camera: "sala",
+        telemetry: rows,
+        flags: { enabled: true, detect: true, record: true, alerts: true },
+        onToggleFlag: () => {},
+        useMainStream: false,
+        onSetMainStream: () => {},
+        streamQualityMode: "sub",
+        onSetStreamQualityMode: () => {},
+        hasIndependentSubstream: false,
+        showVectors: false,
+        onSetShowVectors: () => {},
+        onClose: () => {},
+        isPt: true,
+      })
+    );
+    expect(html).toContain("1920×1080");
+    expect(html).toContain("Principal (sem sub) · IA 1280×720");
+    expect(html).toContain('data-testid="sheet-quality-auto"');
+    expect(html).toContain('data-testid="sheet-quality-sub"');
+    expect(html).toContain('data-testid="sheet-quality-main"');
+    expect(html).toContain('aria-label="Qualidade do stream"');
+    expect(html).toContain("não possui substream separado");
+
+    expect(sanitizeLiveStreamQualityMode(null, "true")).toBe("main");
+    expect(sanitizeLiveStreamQualityMode(null, "false")).toBe("auto");
+    expect(sanitizeLiveStreamQualityMode("sub", "true")).toBe("sub");
+  });
+
+  test("shouldHoverPrewarmMainStream blocks main-stream prewarm when streamQualityMode is sub", () => {
+    expect(
+      shouldHoverPrewarmMainStream({
+        useMainStream: false,
+        hasOnClick: true,
+        streamQualityMode: "auto",
+      })
+    ).toBe(true);
+    expect(
+      shouldHoverPrewarmMainStream({
+        useMainStream: false,
+        hasOnClick: true,
+        streamQualityMode: "sub",
+      })
+    ).toBe(false);
+    expect(
+      shouldHoverPrewarmMainStream({
+        useMainStream: true,
+        hasOnClick: true,
+        streamQualityMode: "main",
+      })
+    ).toBe(false);
+    expect(
+      shouldHoverPrewarmMainStream({
+        useMainStream: false,
+        hasOnClick: false,
+        streamQualityMode: "auto",
+      })
+    ).toBe(false);
+  });
+
+  test("resolveEffectiveDisplayedMedia clears stale MSE telemetry on mse->vod and mse->snapshot transitions", () => {
+    const staleMse = {
+      width: 1920,
+      height: 1080,
+      delivery: "mse" as const,
+      variant: "main" as const,
+      streamSrc: "escritorio",
+    };
+    const vodPending = resolveEffectiveDisplayedMedia("vod", staleMse);
+    expect(vodPending).toEqual({
+      width: 0,
+      height: 0,
+      delivery: "vod",
+      variant: "vod",
+    });
+    expect(formatDisplayedQualityBadge(vodPending)?.label).toBe("VOD…");
+
+    const snapPending = resolveEffectiveDisplayedMedia("snapshot", staleMse);
+    expect(snapPending).toEqual({
+      width: 0,
+      height: 0,
+      delivery: "snapshot",
+      variant: "snapshot",
+    });
+    expect(formatDisplayedQualityBadge(snapPending)?.label).toBe("SNAP…");
+
+    const loadedVod = {
+      width: 1920,
+      height: 1080,
+      delivery: "vod" as const,
+      variant: "vod" as const,
+    };
+    expect(resolveEffectiveDisplayedMedia("vod", loadedVod)).toEqual(loadedVod);
+    expect(resolveEffectiveDisplayedMedia("mse", loadedVod)).toBeNull();
+    expect(resolveEffectiveDisplayedMedia("mse", staleMse)).toEqual(staleMse);
+  });
+});
