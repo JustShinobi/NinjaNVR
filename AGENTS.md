@@ -35,6 +35,9 @@ Run commands from the repository root:
 - **Public Repo Hygiene (`./scripts/ci/check-privacy`):** This repository is public open-source and gated by `check-privacy`:
   - Keep private domains, internal IPs/hostnames, and secrets out of tracked files (use gitignored `.env` or `.agents/` for local environment overrides).
   - Do not create `DESIGN.md` or `CLAUDE.md` in the repository root (`check-privacy` fails if either exists; agent guidelines live in `AGENTS.md` and design tokens live in `web/src/styles.css`).
+- **Visual QA & K3s Runtime Inspection (Zero-SSH):**
+  - Validate `web/` UI changes across `dark`, `light`, and `high-contrast` themes using `ui-qa-verifier`.
+  - When inspecting a live K3s deployment or camera telemetry, load the global `platform-runtime-observability` skill (and the `ninjanvr` MCP server) — never write private deployment URLs or internal IPs into repository files.
 
 <!-- CODEGRAPH_START -->
 ## CodeGraph
