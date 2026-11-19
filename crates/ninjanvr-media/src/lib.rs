@@ -5458,10 +5458,14 @@ async fn build_mp4_export_inner(
         tmp_thumb_file: PathBuf,
         thumb_file: PathBuf,
         out_file: PathBuf,
+        cancelled: Arc<AtomicBool>,
         disarmed: bool,
     }
     impl Drop for ExportTempGuard {
         fn drop(&mut self) {
+            if !self.disarmed {
+                self.cancelled.store(true, Ordering::SeqCst);
+            }
             let _ = std::fs::remove_file(&self.list_file);
             let _ = std::fs::remove_file(&self.tmp_out_file);
             let _ = std::fs::remove_file(&self.tmp_thumb_file);
@@ -5495,6 +5499,7 @@ async fn build_mp4_export_inner(
         tmp_thumb_file: tmp_thumb_file.clone(),
         thumb_file: thumb_file.clone(),
         out_file: out_file.clone(),
+        cancelled: cancelled.clone(),
         disarmed: false,
     };
 
@@ -5713,21 +5718,47 @@ async fn build_mp4_export_inner(
     } else {
         "scale=320:-1".to_string()
     };
+    struct ThumbChildGuard {
+        child: Option<tokio::process::Child>,
+        tmp_thumb_path: PathBuf,
+    }
+    impl Drop for ThumbChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut c) = self.child.take() {
+                let _ = c.start_kill();
+                for _ in 0..40 {
+                    if matches!(c.try_wait(), Ok(Some(_)) | Err(_)) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                let _ = std::fs::remove_file(&self.tmp_thumb_path);
+            }
+        }
+    }
+
     let mut thumb_cmd = Command::new(&ffmpeg_bin);
     thumb_cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let thumb_status = thumb_cmd
+        .kill_on_drop(true)
         .args(["-y", "-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
         .arg(sanitize_ffmpeg_path_arg(&tmp_out_file))
         .args(["-frames:v", "1", "-vf", &thumb_vf])
-        .arg(sanitize_ffmpeg_path_arg(&tmp_thumb_file))
-        .status()
-        .await;
-
-    let thumb_ok = thumb_status.is_ok_and(|s| s.success());
+        .arg(sanitize_ffmpeg_path_arg(&tmp_thumb_file));
+    let thumb_ok = match thumb_cmd.spawn() {
+        Ok(child) => {
+            let mut guard = ThumbChildGuard {
+                child: Some(child),
+                tmp_thumb_path: tmp_thumb_file.clone(),
+            };
+            let res = guard.child.as_mut().unwrap().wait().await;
+            guard.child = None;
+            res.is_ok_and(|s| s.success())
+        }
+        Err(_) => false,
+    };
     let db_fin = db.clone();
     let exp_id_fin = export_id.to_string();
     let cam_fin = camera.to_string();
