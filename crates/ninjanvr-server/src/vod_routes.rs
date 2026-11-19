@@ -395,16 +395,35 @@ pub async fn vod_master_m3u8(
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    if let Some(gate_resp) = state
-        .media_delivery_gate
-        .untranscoded_video_gate_response(&camera)
-        .await
+    let cold_dir_opt = {
+        let cfg = state.config.read().await;
+        if MediaDeliveryGate::blocks_untranscoded_video_in_config(&cfg, &camera) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        resolve_configured_cold_dir(&cfg)
+    };
+    let profile_opt = if let Some(segs) =
+        get_or_resolve_vod_window(&state, cold_dir_opt, &camera, start, end).await
     {
-        return gate_resp;
-    }
+        let candidate_paths: Vec<_> = segs.iter().take(8).map(|s| s.disk_path.clone()).collect();
+        if candidate_paths.is_empty() {
+            None
+        } else {
+            tokio::task::spawn_blocking(move || {
+                candidate_paths
+                    .iter()
+                    .find_map(|p| ninjanvr_vod::probe_mp4_stream_profile(p))
+            })
+            .await
+            .ok()
+            .flatten()
+        }
+    } else {
+        None
+    };
     (
         [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
-        ninjanvr_vod::build_master_playlist(),
+        ninjanvr_vod::build_master_playlist_for_profile(profile_opt.as_ref()),
     )
         .into_response()
 }
@@ -451,29 +470,57 @@ pub async fn vod_index_m3u8(
             end,
         );
         let mut cached_res: Option<(u32, u32)> = None;
+        let mut prev_end: Option<f64> = None;
+        let mut prev_rate: Option<f64> = None;
+        let mut prev_had_objects: Option<bool> = None;
         let mut probes_done = 0usize;
-        let mut resolutions = Vec::with_capacity(resolved.len());
+        let mut resolutions: Vec<Option<(u32, u32)>> = Vec::with_capacity(resolved.len());
         for seg in &resolved {
-            let res = if probes_done < 16 {
+            let dur = if seg.recording.duration.is_finite() && seg.recording.duration > 0.0 {
+                seg.recording.duration.clamp(0.1, 3600.0)
+            } else {
+                10.0
+            };
+            let safe_size =
+                if seg.recording.segment_size.is_finite() && seg.recording.segment_size >= 0.0 {
+                    seg.recording.segment_size
+                } else {
+                    0.0
+                };
+            let cur_rate = safe_size / dur;
+            let cur_has_objects = seg.recording.objects > 0;
+            let time_gap = prev_end.is_some_and(|pe| (seg.recording.start_time - pe).abs() > 1.5);
+            let objects_flipped = prev_had_objects.is_some_and(|po| po != cur_has_objects);
+            let rate_shifted = prev_rate.is_some_and(|pr| {
+                pr > 0.001 && cur_rate > 0.001 && ((cur_rate / pr) > 1.75 || (pr / cur_rate) > 1.75)
+            });
+            let should_probe = probes_done < 16
+                || time_gap
+                || objects_flipped
+                || rate_shifted
+                || cached_res.is_none();
+
+            let res_opt = if should_probe && probes_done < 256 {
                 probes_done += 1;
                 if let Some(probed) = ninjanvr_vod::probe_mp4_resolution(&seg.disk_path) {
                     cached_res = Some(probed);
-                    probed
-                } else if let Some(c) = cached_res {
-                    c
-                } else if seg.recording.objects > 0 {
-                    (1920, 1080)
+                    Some(probed)
+                } else if rate_shifted || objects_flipped {
+                    cached_res = None;
+                    None
                 } else {
-                    (640, 360)
+                    cached_res
                 }
-            } else if let Some(c) = cached_res {
-                c
-            } else if seg.recording.objects > 0 {
-                (1920, 1080)
+            } else if rate_shifted || objects_flipped {
+                cached_res = None;
+                None
             } else {
-                (640, 360)
+                cached_res
             };
-            resolutions.push(res);
+            resolutions.push(res_opt);
+            prev_end = Some(seg.recording.end_time);
+            prev_rate = Some(cur_rate);
+            prev_had_objects = Some(cur_has_objects);
         }
         (Arc::new(resolved), resolutions)
     })
@@ -489,7 +536,7 @@ pub async fn vod_index_m3u8(
         .vod_cache
         .insert_with_mutation_seq(cache_key, inv_seq, Arc::clone(&segs_arc));
     let recs: Vec<RecordingRow> = segs_arc.iter().map(|s| s.recording.clone()).collect();
-    match ninjanvr_vod::build_media_playlist_with_resolutions(&recs, Some(&resolutions)) {
+    match ninjanvr_vod::build_media_playlist_with_optional_resolutions(&recs, &resolutions) {
         Ok(m3u8) => (
             [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
             m3u8,

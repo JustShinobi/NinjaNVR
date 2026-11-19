@@ -1345,7 +1345,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const highContrast = useNvrStore((s) => s.highContrast);
   const effectiveTheme = resolveEffectiveTheme(themeMode);
   const mapTheme = useMemo(
-    () => resolveCanvasThemePalette(effectiveTheme),
+    () => resolveCanvasThemePalette(effectiveTheme, highContrast),
     [effectiveTheme, highContrast]
   );
   const config = useNvrStore((s) => s.config);

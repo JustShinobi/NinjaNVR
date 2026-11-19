@@ -9,7 +9,11 @@ import {
   NinjaConfigResponse,
   NinjaStatsResponse,
 } from "../types/nvr";
-import { formatUptime } from "../utils/format";
+import { formatUptime, resolveEffectiveTheme } from "../utils/format";
+import {
+  resolveCanvasThemePalette,
+  subscribePrefersLightScheme,
+} from "../utils/themeTokens";
 import { CanvasSparkline } from "../components/VideoPlayers";
 
 export type HealthStatusFilter = "all" | "offline" | "active_ai";
@@ -508,6 +512,20 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
   const config = useNvrStore((s) => s.config);
   const stats = useNvrStore((s) => s.stats);
   const statsHistory = useNvrStore((s) => s.statsHistory);
+  const themeMode = useNvrStore((s) => s.themeMode);
+  const highContrast = useNvrStore((s) => s.highContrast);
+  const [systemThemeTick, setSystemThemeTick] = React.useState(0);
+  React.useEffect(() => {
+    if (themeMode !== "system") return;
+    return subscribePrefersLightScheme(() =>
+      setSystemThemeTick((tick) => tick + 1)
+    );
+  }, [themeMode]);
+  const effectiveTheme = resolveEffectiveTheme(themeMode);
+  const canvasPalette = React.useMemo(
+    () => resolveCanvasThemePalette(effectiveTheme, highContrast),
+    [effectiveTheme, highContrast, systemThemeTick]
+  );
 
   const sysCpu = formatMeasured(parseMeasured(stats?.cpu_usages?.["ninjanvr.full_system"]?.cpu), 1, "%");
   const sysMem = formatMeasured(parseMeasured(stats?.cpu_usages?.["ninjanvr.full_system"]?.mem), 1, "%");
@@ -607,7 +625,10 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
   const optCount = heuristicAlerts.filter((a) => a.severity === "optimization").length;
 
   return (
-    <div className="nvr-workbench" style={{ gridTemplateColumns: "1.1fr 1fr" }}>
+    <div
+      className="nvr-workbench nvr-system-workbench"
+      style={{ gridTemplateColumns: "1.1fr 1fr" }}
+    >
       {/* Left Telemetry Column */}
       <div className="nvr-panel">
         <div className="nvr-panel-header">
@@ -735,7 +756,7 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
           >
             <div
               style={{
-                background: "var(--bg-canvas)",
+                background: "var(--bg-subcard)",
                 border: "1px solid var(--border-hairline)",
                 borderRadius: 3,
                 padding: 10,
@@ -767,14 +788,14 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
               </div>
               <CanvasSparkline
                 values={inferHistory.map((v) => v ?? 0)}
-                color="#0ea5e9"
+                color={canvasPalette.sparklineAccentStroke}
                 maxVal={sparklineCeiling(inferHistory)}
               />
             </div>
 
             <div
               style={{
-                background: "var(--bg-canvas)",
+                background: "var(--bg-subcard)",
                 border: "1px solid var(--border-hairline)",
                 borderRadius: 3,
                 padding: 10,
@@ -802,14 +823,14 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                 values={statsHistory.map((s) =>
                   toFiniteNumber(s.cpu_usages?.["ninjanvr.full_system"]?.cpu, 0)
                 )}
-                color="#10b981"
+                color={canvasPalette.sparklineLiveStroke}
                 maxVal={100}
               />
             </div>
 
             <div
               style={{
-                background: "var(--bg-canvas)",
+                background: "var(--bg-subcard)",
                 border: "1px solid var(--border-hairline)",
                 borderRadius: 3,
                 padding: 10,
@@ -837,7 +858,7 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                 values={statsHistory.map((s) =>
                   toFiniteNumber(s.cpu_usages?.["ninjanvr.full_system"]?.mem, 0)
                 )}
-                color="#f59e0b"
+                color={canvasPalette.sparklineMotionStroke}
                 maxVal={100}
               />
             </div>
@@ -874,8 +895,8 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
               >
                 <input
                   type="text"
-                  className="nvr-input mono"
-                  style={{ height: 22, width: 136, fontSize: "var(--text-xs)" }}
+                  className="nvr-input mono nvr-system-filter-input"
+                  style={{ width: 136 }}
                   placeholder={isPt ? "Buscar câmera..." : "Search camera..."}
                   aria-label="Search camera health"
                   value={healthSearch}
@@ -891,10 +912,9 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                   <button
                     key={flt}
                     type="button"
-                    className={`nvr-btn mono ${
+                    className={`nvr-btn mono nvr-system-chip-btn ${
                       healthStatusFilter === flt ? "active" : ""
                     }`}
-                    style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
                     onClick={() => setHealthStatusFilter(flt)}
                   >
                     {label}
@@ -906,69 +926,143 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
               <thead>
                 <tr>
                   <th
-                    style={{ cursor: "pointer" }}
-                    onClick={() => toggleHealthSort("channel")}
+                    scope="col"
+                    aria-sort={
+                      healthSortCol === "channel"
+                        ? healthSortDir === "asc"
+                          ? "ascending"
+                          : "descending"
+                        : "none"
+                    }
                   >
-                    {isPt ? "Canal" : "Channel"}{" "}
-                    {healthSortCol === "channel"
-                      ? healthSortDir === "asc"
-                        ? "▲"
-                        : "▼"
-                      : ""}
+                    <button
+                      type="button"
+                      className="nvr-table-sort-btn mono"
+                      onClick={() => toggleHealthSort("channel")}
+                    >
+                      <span>{isPt ? "Canal" : "Channel"}</span>
+                      <span aria-hidden="true">
+                        {healthSortCol === "channel"
+                          ? healthSortDir === "asc"
+                            ? "▲"
+                            : "▼"
+                          : ""}
+                      </span>
+                    </button>
                   </th>
                   <th
-                    style={{ cursor: "pointer" }}
-                    onClick={() => toggleHealthSort("camera_fps")}
+                    scope="col"
+                    aria-sort={
+                      healthSortCol === "camera_fps"
+                        ? healthSortDir === "asc"
+                          ? "ascending"
+                          : "descending"
+                        : "none"
+                    }
                   >
-                    Cam FPS{" "}
-                    {healthSortCol === "camera_fps"
-                      ? healthSortDir === "asc"
-                        ? "▲"
-                        : "▼"
-                      : ""}
+                    <button
+                      type="button"
+                      className="nvr-table-sort-btn mono"
+                      onClick={() => toggleHealthSort("camera_fps")}
+                    >
+                      <span>Cam FPS</span>
+                      <span aria-hidden="true">
+                        {healthSortCol === "camera_fps"
+                          ? healthSortDir === "asc"
+                            ? "▲"
+                            : "▼"
+                          : ""}
+                      </span>
+                    </button>
                   </th>
-                  <th>Proc FPS</th>
+                  <th scope="col">Proc FPS</th>
                   <th
-                    style={{ cursor: "pointer" }}
-                    onClick={() => toggleHealthSort("detection_fps")}
+                    scope="col"
+                    aria-sort={
+                      healthSortCol === "detection_fps"
+                        ? healthSortDir === "asc"
+                          ? "ascending"
+                          : "descending"
+                        : "none"
+                    }
                   >
-                    {isPt ? "FPS IA" : "AI Detect FPS"}{" "}
-                    {healthSortCol === "detection_fps"
-                      ? healthSortDir === "asc"
-                        ? "▲"
-                        : "▼"
-                      : ""}
+                    <button
+                      type="button"
+                      className="nvr-table-sort-btn mono"
+                      onClick={() => toggleHealthSort("detection_fps")}
+                    >
+                      <span>{isPt ? "FPS IA" : "AI Detect FPS"}</span>
+                      <span aria-hidden="true">
+                        {healthSortCol === "detection_fps"
+                          ? healthSortDir === "asc"
+                            ? "▲"
+                            : "▼"
+                          : ""}
+                      </span>
+                    </button>
                   </th>
                   <th
-                    style={{ cursor: "pointer" }}
-                    onClick={() => toggleHealthSort("ffmpeg_cpu")}
+                    scope="col"
+                    aria-sort={
+                      healthSortCol === "ffmpeg_cpu"
+                        ? healthSortDir === "asc"
+                          ? "ascending"
+                          : "descending"
+                        : "none"
+                    }
                   >
-                    FFmpeg CPU{" "}
-                    {healthSortCol === "ffmpeg_cpu"
-                      ? healthSortDir === "asc"
-                        ? "▲"
-                        : "▼"
-                      : ""}
+                    <button
+                      type="button"
+                      className="nvr-table-sort-btn mono"
+                      onClick={() => toggleHealthSort("ffmpeg_cpu")}
+                    >
+                      <span>FFmpeg CPU</span>
+                      <span aria-hidden="true">
+                        {healthSortCol === "ffmpeg_cpu"
+                          ? healthSortDir === "asc"
+                            ? "▲"
+                            : "▼"
+                          : ""}
+                      </span>
+                    </button>
                   </th>
-                  <th>{isPt ? "CPU Captura" : "Capture CPU"}</th>
+                  <th scope="col">{isPt ? "CPU Captura" : "Capture CPU"}</th>
                 </tr>
               </thead>
               <tbody>
-                {filteredHealthCameras.map((cam) => {
-                  const cs = stats?.cameras?.[cam];
-                  return (
-                    <tr key={cam}>
-                      <td style={{ fontWeight: 700, textTransform: "uppercase" }}>{cam}</td>
-                      <td>{formatCameraTelemetryValue(cs?.camera_fps, 1)}</td>
-                      <td>{formatCameraTelemetryValue(cs?.process_fps, 1)}</td>
-                      <td style={{ color: "var(--signal-accent-text)" }}>
-                        {formatCameraTelemetryValue(cs?.detection_fps, 1)}
-                      </td>
-                      <td>{formatCameraTelemetryValue(cs?.ffmpeg_cpu, 1, "%")}</td>
-                      <td>{formatCameraTelemetryValue(cs?.capture_cpu, 1, "%")}</td>
-                    </tr>
-                  );
-                })}
+                {filteredHealthCameras.length === 0 ? (
+                  <tr>
+                    <td
+                      colSpan={6}
+                      style={{
+                        textAlign: "center",
+                        padding: "16px 12px",
+                        color: "var(--text-muted)",
+                        whiteSpace: "normal",
+                      }}
+                    >
+                      {isPt
+                        ? "Nenhuma câmera corresponde aos filtros selecionados."
+                        : "No cameras match the active health filters."}
+                    </td>
+                  </tr>
+                ) : (
+                  filteredHealthCameras.map((cam) => {
+                    const cs = stats?.cameras?.[cam];
+                    return (
+                      <tr key={cam}>
+                        <td style={{ fontWeight: 700, textTransform: "uppercase" }}>{cam}</td>
+                        <td>{formatCameraTelemetryValue(cs?.camera_fps, 1)}</td>
+                        <td>{formatCameraTelemetryValue(cs?.process_fps, 1)}</td>
+                        <td style={{ color: "var(--signal-accent-text)" }}>
+                          {formatCameraTelemetryValue(cs?.detection_fps, 1)}
+                        </td>
+                        <td>{formatCameraTelemetryValue(cs?.ffmpeg_cpu, 1, "%")}</td>
+                        <td>{formatCameraTelemetryValue(cs?.capture_cpu, 1, "%")}</td>
+                      </tr>
+                    );
+                  })
+                )}
               </tbody>
             </table>
           </div>
@@ -1032,11 +1126,11 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
             <table className="nvr-table mono">
               <thead>
                 <tr>
-                  <th>{isPt ? "Ponto de Montagem" : "Mount Path"}</th>
-                  <th>FS</th>
-                  <th>{isPt ? "Usado" : "Used"}</th>
-                  <th>{isPt ? "Total" : "Total"}</th>
-                  <th>{isPt ? "Utilização" : "Utilization"}</th>
+                  <th scope="col">{isPt ? "Ponto de Montagem" : "Mount Path"}</th>
+                  <th scope="col">FS</th>
+                  <th scope="col">{isPt ? "Usado" : "Used"}</th>
+                  <th scope="col">{isPt ? "Total" : "Total"}</th>
+                  <th scope="col">{isPt ? "Utilização" : "Utilization"}</th>
                 </tr>
               </thead>
               <tbody>
@@ -1105,10 +1199,10 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                 <table className="nvr-table mono" style={{ borderTop: "1px solid var(--border-hairline)" }}>
                   <thead>
                     <tr>
-                      <th>{isPt ? "Canal" : "Camera Channel"}</th>
-                      <th>{isPt ? "Uso de Disco" : "Disk Usage"}</th>
-                      <th>{isPt ? "Taxa de Escrita" : "Write Rate"}</th>
-                      <th>{isPt ? "Retenção Est." : "Est. Runway"}</th>
+                      <th scope="col">{isPt ? "Canal" : "Camera Channel"}</th>
+                      <th scope="col">{isPt ? "Uso de Disco" : "Disk Usage"}</th>
+                      <th scope="col">{isPt ? "Taxa de Escrita" : "Write Rate"}</th>
+                      <th scope="col">{isPt ? "Retenção Est." : "Est. Runway"}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1179,10 +1273,9 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
               <button
                 key={svc}
                 type="button"
-                className={`nvr-btn mono ${
+                className={`nvr-btn mono nvr-system-chip-btn ${
                   rightMode === "logs" && logService === svc ? "active" : ""
                 }`}
-                style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
                 onClick={() => {
                   setRightMode("logs");
                   setLogService(svc);
@@ -1201,8 +1294,8 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
             <input
-              className="nvr-input"
-              style={{ height: 22, width: 130, fontSize: "var(--text-xs)" }}
+              className="nvr-input nvr-system-filter-input"
+              style={{ width: 130 }}
               aria-label="Filter service logs"
               placeholder={
                 rightMode === "alerts"

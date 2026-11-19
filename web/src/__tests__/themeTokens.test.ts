@@ -29,6 +29,7 @@ import {
   rgbToHex,
   simulateGamma24Transfer,
   srgbChannelToLinear,
+  toCanvasTranslucentFill,
   wcagContrastRatio,
 } from "../utils/themeTokens";
 
@@ -459,10 +460,16 @@ describe("themeTokens colorimetric utilities & cross-monitor invariants (#88)", 
     expect(attrs.get("data-theme")).toBe("light");
     expect(attrs.get("data-high-contrast")).toBe("true");
 
-    const lightPalette = resolveCanvasThemePalette("light");
-    const darkPalette = resolveCanvasThemePalette("dark");
+    const lightPalette = resolveCanvasThemePalette("light", false);
+    const lightHcPalette = resolveCanvasThemePalette("light", true);
+    const darkPalette = resolveCanvasThemePalette("dark", false);
+    const darkHcPalette = resolveCanvasThemePalette("dark", true);
     expect(lightPalette.theme).toBe("light");
     expect(darkPalette.theme).toBe("dark");
+    expect(darkPalette.highContrast).toBe(false);
+    expect(darkHcPalette.highContrast).toBe(true);
+    expect(darkHcPalette.gridLineStroke).not.toBe(darkPalette.gridLineStroke);
+    expect(darkHcPalette.sparklineGridStroke).not.toBe(darkPalette.sparklineGridStroke);
     expect(lightPalette.floorplanRoomLabelFill.toLowerCase()).toBe(
       LIGHT_THEME_TOKENS["--text-primary"].toLowerCase()
     );
@@ -470,6 +477,80 @@ describe("themeTokens colorimetric utilities & cross-monitor invariants (#88)", 
       DARK_THEME_TOKENS["--text-primary"].toLowerCase()
     );
     expect(lightPalette.gridLineStroke).not.toBe(darkPalette.gridLineStroke);
+
+    // WCAG 2.1 AA SC 1.4.11 (>= 3.0:1) non-textual contrast for light & light-HC sparklines and timeline bars
+    for (const stroke of [
+      lightPalette.sparklineAccentStroke,
+      lightPalette.sparklineLiveStroke,
+      lightPalette.sparklineMotionStroke,
+      lightHcPalette.sparklineAccentStroke,
+      lightHcPalette.sparklineLiveStroke,
+      lightHcPalette.sparklineMotionStroke,
+    ]) {
+      expect(
+        wcagContrastRatio(stroke, LIGHT_THEME_TOKENS["--bg-canvas"])
+      ).toBeGreaterThanOrEqual(3.0);
+      expect(
+        wcagContrastRatio(stroke, LIGHT_THEME_TOKENS["--bg-subcard"])
+      ).toBeGreaterThanOrEqual(3.0);
+    }
+    expect(
+      wcagContrastRatio(lightPalette.alertPinFill, LIGHT_THEME_TOKENS["--bg-deep"])
+    ).toBeGreaterThanOrEqual(3.0);
+    expect(
+      wcagContrastRatio(lightPalette.motionPinFill, LIGHT_THEME_TOKENS["--bg-deep"])
+    ).toBeGreaterThanOrEqual(3.0);
+
+    const compositeRgbaOverHex = (rgbaStr: string, bgHex: string): string => {
+      const m = /^rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([0-9.]+)\s*\)$/.exec(
+        rgbaStr
+      );
+      expect(m).not.toBeNull();
+      const { r: bgR, g: bgG, b: bgB } = parseHexColor(bgHex);
+      const a = parseFloat(m![4]);
+      const r = Math.round(parseInt(m![1], 10) * a + bgR * (1 - a));
+      const g = Math.round(parseInt(m![2], 10) * a + bgG * (1 - a));
+      const b = Math.round(parseInt(m![3], 10) * a + bgB * (1 - a));
+      return rgbToHex({ r, g, b });
+    };
+    for (const barRgba of [
+      lightPalette.continuousBarFill,
+      lightPalette.audioWaveformFill,
+      lightPalette.objectBarFill,
+      lightPalette.motionBarFill,
+      lightHcPalette.continuousBarFill,
+      lightHcPalette.audioWaveformFill,
+      lightHcPalette.objectBarFill,
+      lightHcPalette.motionBarFill,
+    ]) {
+      const composited = compositeRgbaOverHex(barRgba, LIGHT_THEME_TOKENS["--bg-deep"]);
+      expect(
+        wcagContrastRatio(composited, LIGHT_THEME_TOKENS["--bg-deep"])
+      ).toBeGreaterThanOrEqual(3.0);
+    }
+
+    // Cross-theme CSS variable isolation: if DOM is still dark (`:root`) while resolving `light`,
+    // `getComputedStyle` must NOT leak dark `--text-primary` (`#f1f5f9`) into the light palette!
+    dataset.theme = "dark";
+    dataset.highContrast = "false";
+    (globalThis.window as unknown as Record<string, unknown>).getComputedStyle = () => ({
+      getPropertyValue: (prop: string) =>
+        (DARK_THEME_TOKENS as Record<string, string>)[prop] ?? "",
+    });
+    const unpoisonedLight = resolveCanvasThemePalette("light", false);
+    const unpoisonedLightHc = resolveCanvasThemePalette("light", true);
+    expect(unpoisonedLight.floorplanRoomLabelFill.toLowerCase()).toBe(
+      LIGHT_THEME_TOKENS["--text-primary"].toLowerCase()
+    );
+    expect(unpoisonedLightHc.floorplanRoomLabelFill.toLowerCase()).toBe(
+      LIGHT_HIGH_CONTRAST_TOKENS["--text-primary"].toLowerCase()
+    );
+    delete (globalThis.window as unknown as Record<string, unknown>).getComputedStyle;
+    applyThemeToDocument("light", true);
+
+    expect(toCanvasTranslucentFill("#0ea5e9", 0.14)).toBe("rgba(14, 165, 233, 0.14)");
+    expect(toCanvasTranslucentFill("#0af", 0.2)).toBe("rgba(0, 170, 255, 0.2)");
+    expect(toCanvasTranslucentFill("rgb(6, 95, 70)", 0.15)).toBe("rgba(6, 95, 70, 0.15)");
 
     // Store actions & server config fallback
     useNvrStore.getState().resetUiPreferences();

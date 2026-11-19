@@ -391,6 +391,10 @@ interface NvrRealtimeState {
   setCameraActivity: (activity: Record<string, CameraLiveActivity>) => void;
 }
 
+const initialThemeMode = resolveInitialThemeMode();
+const initialHighContrast = resolveInitialBool("ninjanvr_high_contrast", false);
+applyThemeToDocument(initialThemeMode, initialHighContrast);
+
 export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
   activeTab: resolveInitialTab(),
   liveLayout: resolveInitialLiveLayout(),
@@ -414,8 +418,8 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
   audibleAlertChime: resolveInitialBool("ninjanvr_audible_chime", false),
   browserNotifications: resolveInitialBool("ninjanvr_browser_notifications", false),
   firstWeekday: resolveInitialFirstWeekday(),
-  themeMode: resolveInitialThemeMode(),
-  highContrast: resolveInitialBool("ninjanvr_high_contrast", false),
+  themeMode: initialThemeMode,
+  highContrast: initialHighContrast,
   showYamlKeys: resolveInitialBool("ninjanvr_show_yaml_keys", false),
   timeShiftTs: null,
   playbackSpeed: resolveInitialPlaybackSpeed(),

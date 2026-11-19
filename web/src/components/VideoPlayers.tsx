@@ -7,7 +7,11 @@ import { resolveRealCameraSource, useNvrStore } from "../store/useNvrStore";
 import { formatRelTime, formatTs, resolveEffectiveTheme } from "../utils/format";
 
 export { resolveRealCameraSource };
-import { resolveCanvasThemePalette } from "../utils/themeTokens";
+import {
+  resolveCanvasThemePalette,
+  subscribePrefersLightScheme,
+  toCanvasTranslucentFill,
+} from "../utils/themeTokens";
 import {
   getCachedCameraHardware,
   resolveCameraPushToTalkCapability,
@@ -2779,6 +2783,13 @@ export const CanvasSparkline: React.FC<CanvasSparklineProps> = ({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const themeMode = useNvrStore((s) => s.themeMode);
   const highContrast = useNvrStore((s) => s.highContrast);
+  const [systemThemeTick, setSystemThemeTick] = useState(0);
+  useEffect(() => {
+    if (themeMode !== "system") return;
+    return subscribePrefersLightScheme(() =>
+      setSystemThemeTick((tick) => tick + 1)
+    );
+  }, [themeMode]);
   const effectiveTheme = resolveEffectiveTheme(themeMode);
 
   useEffect(() => {
@@ -2787,7 +2798,7 @@ export const CanvasSparkline: React.FC<CanvasSparklineProps> = ({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    const palette = resolveCanvasThemePalette(effectiveTheme);
+    const palette = resolveCanvasThemePalette(effectiveTheme, highContrast);
     const dpr = window.devicePixelRatio || 1;
     const w = canvas.clientWidth || 300;
     const h = height;
@@ -2829,9 +2840,9 @@ export const CanvasSparkline: React.FC<CanvasSparklineProps> = ({
     ctx.lineTo(w - 2, h - 2);
     ctx.lineTo(2, h - 2);
     ctx.closePath();
-    ctx.fillStyle = `${color}22`;
+    ctx.fillStyle = toCanvasTranslucentFill(color, 0.14);
     ctx.fill();
-  }, [values, color, maxVal, height, effectiveTheme, highContrast]);
+  }, [values, color, maxVal, height, effectiveTheme, highContrast, systemThemeTick]);
 
   return (
     <canvas

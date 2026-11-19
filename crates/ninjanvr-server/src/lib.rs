@@ -238,6 +238,7 @@ pub struct EventQueryParams {
     pub before: Option<f64>,
     pub after: Option<f64>,
     pub limit: Option<usize>,
+    pub include_thumbnails: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -3180,10 +3181,32 @@ async fn compute_stats_snapshot(state: &AppState) -> Value {
         let per_cam_detect_cpu = ((ninjanvr_cpu * 0.65) / num_cams * 10.0).round() / 10.0;
         let per_cam_capture_cpu = ((ninjanvr_cpu * 0.15) / num_cams * 10.0).round() / 10.0;
 
+        let now_f64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64());
+
         for (cam_name, cam_cfg) in &cfg.cameras {
             let m = metrics_map.get(cam_name);
-            let fps = m.map_or(0.0, |x| x.camera_fps);
-            let proc_fps = m.map_or(0.0, |x| if cam_cfg.enabled { x.process_fps } else { 0.0 });
+            let fps = m.map_or(0.0, |x| {
+                if !cam_cfg.enabled
+                    || (x.last_frame_ts > 0.0
+                        && now_f64 > x.last_frame_ts
+                        && (now_f64 - x.last_frame_ts) > 20.0)
+                {
+                    0.0
+                } else {
+                    x.camera_fps
+                }
+            });
+            let proc_fps = m.map_or(0.0, |x| {
+                if fps <= 0.0 || !cam_cfg.enabled {
+                    0.0
+                } else if x.process_fps > 0.0 {
+                    x.process_fps
+                } else {
+                    fps
+                }
+            });
             let skip_fps = m.map_or(0.0, |x| x.skipped_fps);
             let det_fps = m.map_or(0.0, |x| x.detection_fps);
             let total_inferences = m.map_or(0, |x| x.total_inferences);
@@ -3208,13 +3231,6 @@ async fn compute_stats_snapshot(state: &AppState) -> Value {
             } else {
                 (0.0, 0.0)
             };
-            let connection_quality = if !cam_cfg.enabled {
-                "disabled"
-            } else if fps > 0.0 {
-                "excellent"
-            } else {
-                "offline"
-            };
 
             let mut roi_states = BTreeMap::new();
             for (roi_name, roi_cfg) in &cam_cfg.state_rois {
@@ -3229,6 +3245,13 @@ async fn compute_stats_snapshot(state: &AppState) -> Value {
                 roi_states.insert(roi_name, live_state);
             }
 
+            let health = state.pipeline.snapshot_camera_health(
+                cam_name,
+                now_f64,
+                fps,
+                cam_cfg.detect.fps,
+                cam_cfg.enabled,
+            );
             total_cam_fps += fps;
             total_proc_fps += proc_fps;
             total_skip_fps += skip_fps;
@@ -3248,12 +3271,12 @@ async fn compute_stats_snapshot(state: &AppState) -> Value {
                     "pid": pid,
                     "capture_pid": pid,
                     "ffmpeg_pid": cam_pid,
-                    "audio_rms": 0,
-                    "audio_dBFS": 0,
-                    "connection_quality": connection_quality,
+                    "audio_rms": health.audio_rms,
+                    "audio_dBFS": health.audio_dbfs,
+                    "connection_quality": health.connection_quality,
                     "expected_fps": cam_cfg.detect.fps,
-                    "reconnects_last_hour": 0,
-                    "stalls_last_hour": 0,
+                    "reconnects_last_hour": health.reconnects_last_hour,
+                    "stalls_last_hour": health.stalls_last_hour,
                     "ffmpeg_cpu": format!("{ff_cpu:.1}"),
                     "capture_cpu": format!("{per_cam_capture_cpu:.1}"),
                     "detect_cpu": format!("{per_cam_detect_cpu:.1}")
@@ -4444,11 +4467,14 @@ async fn api_events(
         after: q.after,
         limit: q.limit,
     };
+    let include_thumbnails = q.include_thumbnails.is_none_or(|v| v != 0);
     let mut events = state
-        .run_db(move |db| db.query_events(&filter))
+        .run_db(move |db| db.query_events_with_thumbnails(&filter, include_thumbnails))
         .await
         .unwrap_or_default();
-    redact_event_slice_thumbnails_if_masked(&state.config, &mut events).await;
+    if include_thumbnails {
+        redact_event_slice_thumbnails_if_masked(&state.config, &mut events).await;
+    }
     Json(Value::Array(events))
 }
 
@@ -13273,17 +13299,6 @@ pub async fn new_app_state(
     let go2rtc_http_base = "http://127.0.0.1:1984".to_string();
     let go2rtc_ws_base = "ws://127.0.0.1:1984".to_string();
     let vod_cache = VodWindowCache::new();
-    let recorder = Arc::new(
-        RecordingEngine::with_storage_state(
-            shared_cfg.clone(),
-            db.clone(),
-            media_dir.clone(),
-            activity_ledger.clone(),
-            storage_degraded.clone(),
-            storage_error.clone(),
-        )
-        .with_go2rtc_relay(spawn_go2rtc),
-    );
     let pipeline = Arc::new(
         VisionPipeline::new(
             shared_cfg.clone(),
@@ -13300,6 +13315,23 @@ pub async fn new_app_state(
             camera_driver_runtime.clone(),
         )
         .with_go2rtc_endpoint(&go2rtc_http_base, spawn_go2rtc),
+    );
+    let audio_comms = comms.clone();
+    let audio_pipeline = pipeline.clone();
+    let recorder = Arc::new(
+        RecordingEngine::with_storage_state(
+            shared_cfg.clone(),
+            db.clone(),
+            media_dir.clone(),
+            activity_ledger.clone(),
+            storage_degraded.clone(),
+            storage_error.clone(),
+        )
+        .with_go2rtc_relay(spawn_go2rtc)
+        .with_audio_telemetry_sink(Arc::new(move |cam: &str, dbfs: i64, active: bool| {
+            audio_comms.publish_audio_activity(cam, dbfs, active);
+            audio_pipeline.record_camera_audio_dbfs(cam, dbfs);
+        })),
     );
 
     // Synchronize inbound MQTT `<camera>/<feature>/set` state changes with `activity_ledger`

@@ -2109,7 +2109,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    const palette = resolveCanvasThemePalette(effectiveTheme);
+    const palette = resolveCanvasThemePalette(effectiveTheme, highContrast);
     const w = Math.max(100, trackWidth);
     const h = 36;
     const dpr = window.devicePixelRatio || 1;

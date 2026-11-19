@@ -133,6 +133,206 @@ pub fn probe_mp4_resolution(mp4_path: &Path) -> Option<(u32, u32)> {
     None
 }
 
+/// Stream codec and resolution metadata probed from an MP4 segment's `moov` box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VodStreamProfile {
+    pub width: u32,
+    pub height: u32,
+    pub video_codec: String,
+    pub audio_codec: Option<String>,
+}
+
+/// Probes `(width, height)`, RFC 6381 video codec string (`avc1.*` / `hvc1.*` / `hev1.*`), and
+/// optional audio codec (`mp4a.40.2` / `opus`) from an MP4 file's `moov` box in pure Rust.
+/// Validates `soun` sample tables against `file_len` identically to [`build_init_mp4`] so
+/// `master.m3u8` never advertises an audio codec when a corrupted `soun` track is stripped.
+pub fn probe_mp4_stream_profile(mp4_path: &Path) -> Option<VodStreamProfile> {
+    let (moov_bytes, file_len) = read_moov_from_file(mp4_path).ok()?;
+    let valid_soun = parse_tracks_from_moov(&moov_bytes, file_len)
+        .ok()
+        .is_some_and(|(_, tracks)| tracks.iter().any(|t| &t.handler_type == b"soun"));
+    let moov_boxes = iter_boxes(&moov_bytes);
+    let mut video_res: Option<(u32, u32)> = None;
+    let mut video_codec: Option<String> = None;
+    let mut audio_codec: Option<String> = None;
+
+    for b in &moov_boxes {
+        if &b.box_type != b"trak" {
+            continue;
+        }
+        let trak_boxes = iter_boxes(b.payload);
+        let Some(mdia) = find_box(&trak_boxes, b"mdia") else {
+            continue;
+        };
+        let mdia_boxes = iter_boxes(mdia);
+        let Some(hdlr) = find_box(&mdia_boxes, b"hdlr") else {
+            continue;
+        };
+        if hdlr.len() < 12 {
+            continue;
+        }
+        let handler_kind = &hdlr[8..12];
+
+        if handler_kind == b"vide" && video_codec.is_none() {
+            if let Some(tkhd) = find_box(&trak_boxes, b"tkhd") {
+                let min_tkhd_len = match tkhd.first().copied() {
+                    Some(0) => Some(84usize),
+                    Some(1) => Some(96usize),
+                    _ => None,
+                };
+                if let Some(mlen) = min_tkhd_len
+                    && tkhd.len() >= mlen
+                {
+                    let w = u32::from_be_bytes([
+                        tkhd[mlen - 8],
+                        tkhd[mlen - 7],
+                        tkhd[mlen - 6],
+                        tkhd[mlen - 5],
+                    ]) >> 16;
+                    let h = u32::from_be_bytes([
+                        tkhd[mlen - 4],
+                        tkhd[mlen - 3],
+                        tkhd[mlen - 2],
+                        tkhd[mlen - 1],
+                    ]) >> 16;
+                    if w > 0 && h > 0 {
+                        video_res = Some((w, h));
+                    }
+                }
+            }
+
+            if let Some(minf) = find_box(&mdia_boxes, b"minf") {
+                let minf_boxes = iter_boxes(minf);
+                if let Some(stbl) = find_box(&minf_boxes, b"stbl") {
+                    let stbl_boxes = iter_boxes(stbl);
+                    if let Some(stsd) = find_box(&stbl_boxes, b"stsd")
+                        && stsd.len() > 8
+                    {
+                        for entry in iter_boxes(&stsd[8..]) {
+                            if entry.payload.len() >= 28 && video_res.is_none() {
+                                let ew = u16::from_be_bytes([entry.payload[24], entry.payload[25]])
+                                    as u32;
+                                let eh = u16::from_be_bytes([entry.payload[26], entry.payload[27]])
+                                    as u32;
+                                if ew > 0 && eh > 0 {
+                                    video_res = Some((ew, eh));
+                                }
+                            }
+                            match &entry.box_type {
+                                b"avc1" | b"avc3" => {
+                                    let codec_str = if entry.payload.len() > 78 {
+                                        let children = iter_boxes(&entry.payload[78..]);
+                                        if let Some(avcc) = find_box(&children, b"avcC")
+                                            && avcc.len() >= 4
+                                        {
+                                            format!(
+                                                "avc1.{:02x}{:02x}{:02x}",
+                                                avcc[1], avcc[2], avcc[3]
+                                            )
+                                        } else {
+                                            "avc1.640028".to_string()
+                                        }
+                                    } else {
+                                        "avc1.640028".to_string()
+                                    };
+                                    video_codec = Some(codec_str);
+                                }
+                                b"hvc1" | b"hev1" => {
+                                    let prefix = if &entry.box_type == b"hev1" {
+                                        "hev1"
+                                    } else {
+                                        "hvc1"
+                                    };
+                                    let codec_str = if entry.payload.len() > 78 {
+                                        let children = iter_boxes(&entry.payload[78..]);
+                                        if let Some(hvcc) = find_box(&children, b"hvcC")
+                                            && hvcc.len() >= 13
+                                        {
+                                            let profile_idc = (hvcc[1] & 0x1F).max(1);
+                                            let tier_char =
+                                                if (hvcc[1] & 0x20) != 0 { 'H' } else { 'L' };
+                                            let compat = match profile_idc {
+                                                2 => "4",
+                                                _ => "6",
+                                            };
+                                            let lvl = hvcc[12].max(30);
+                                            format!(
+                                                "{prefix}.{profile_idc}.{compat}.{tier_char}{lvl}.B0"
+                                            )
+                                        } else {
+                                            format!("{prefix}.1.6.L93.B0")
+                                        }
+                                    } else {
+                                        format!("{prefix}.1.6.L93.B0")
+                                    };
+                                    video_codec = Some(codec_str);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        } else if handler_kind == b"soun"
+            && valid_soun
+            && audio_codec.is_none()
+            && let Some(minf) = find_box(&mdia_boxes, b"minf")
+        {
+            let minf_boxes = iter_boxes(minf);
+            if let Some(stbl) = find_box(&minf_boxes, b"stbl") {
+                let stbl_boxes = iter_boxes(stbl);
+                let has_samples = find_box(&stbl_boxes, b"stsz").is_some_and(|stsz| {
+                    stsz.len() >= 12
+                        && u32::from_be_bytes([stsz[8], stsz[9], stsz[10], stsz[11]]) > 0
+                });
+                if has_samples
+                    && let Some(stsd) = find_box(&stbl_boxes, b"stsd")
+                    && stsd.len() > 8
+                {
+                    for entry in iter_boxes(&stsd[8..]) {
+                        match &entry.box_type {
+                            b"mp4a" => {
+                                audio_codec = Some("mp4a.40.2".to_string());
+                            }
+                            b"Opus" => {
+                                audio_codec = Some("opus".to_string());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let (width, height) = video_res?;
+    Some(VodStreamProfile {
+        width,
+        height,
+        video_codec: video_codec.unwrap_or_else(|| "avc1.640028".to_string()),
+        audio_codec,
+    })
+}
+
+/// Generates an HLS master playlist (`master.m3u8`) tailored to a probed [`VodStreamProfile`]
+/// (supporting HEVC `hvc1`/`hev1` cold-tier segments and video-only streams without `mp4a` audio),
+/// falling back to the standard 1080p H.264 + AAC declaration when `profile` is `None`.
+pub fn build_master_playlist_for_profile(profile: Option<&VodStreamProfile>) -> String {
+    let Some(p) = profile else {
+        return build_master_playlist();
+    };
+    let w = p.width.clamp(16, 7680);
+    let h = p.height.clamp(16, 4320);
+    let codecs = match p.audio_codec.as_deref() {
+        Some(aud) if !aud.is_empty() => format!("{},{aud}", p.video_codec),
+        _ => p.video_codec.clone(),
+    };
+    let stream_inf = format!(
+        "#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=1500000,RESOLUTION={w}x{h},FRAME-RATE=20.000,CODECS=\"{codecs}\",VIDEO-RANGE=SDR"
+    );
+    ["#EXTM3U", stream_inf.as_str(), "index-v1-a1.m3u8", ""].join("\n")
+}
+
 /// Generates an HLS master playlist (`master.m3u8`).
 ///
 /// # Examples
@@ -204,6 +404,21 @@ pub fn build_media_playlist_with_resolutions(
     segments: &[RecordingRow],
     resolutions: Option<&[(u32, u32)]>,
 ) -> Result<String> {
+    match resolutions {
+        Some(slice) => {
+            let mapped: Vec<Option<(u32, u32)>> = slice.iter().copied().map(Some).collect();
+            build_media_playlist_with_optional_resolutions(segments, &mapped)
+        }
+        None => build_media_playlist_with_optional_resolutions(segments, &[]),
+    }
+}
+
+/// Generates a VOD media playlist (`index-v1-a1.m3u8`) supporting sparse per-segment `(width, height)`
+/// probes (`Option<(u32, u32)>`) so unprobed segments still trigger bitrate-tier discontinuities.
+pub fn build_media_playlist_with_optional_resolutions(
+    segments: &[RecordingRow],
+    resolutions: &[Option<(u32, u32)>],
+) -> Result<String> {
     let max_dur = segments
         .iter()
         .map(|s| {
@@ -232,7 +447,7 @@ pub fn build_media_playlist_with_resolutions(
     let mut prev_res: Option<(u32, u32)> = None;
     let mut prev_rate: Option<f64> = None;
     for (idx, seg) in segments.iter().enumerate() {
-        let cur_res = resolutions.and_then(|r| r.get(idx).copied());
+        let cur_res = resolutions.get(idx).copied().flatten();
         let dur = if seg.duration.is_finite() && seg.duration > 0.0 {
             seg.duration.clamp(0.1, 3600.0)
         } else {
@@ -2189,6 +2404,25 @@ mod tests {
         let probe_tmp = std::env::temp_dir().join("ninjanvr-vod-patched-init-probe.mp4");
         std::fs::write(&probe_tmp, &patched).unwrap();
         assert_eq!(probe_mp4_resolution(&probe_tmp), Some((1920, 1080)));
+        let prof = probe_mp4_stream_profile(&probe_tmp).expect("stream profile must be probed");
+        assert_eq!(prof.width, 1920);
+        assert_eq!(prof.height, 1080);
+        assert_eq!(prof.video_codec, "avc1.42000a");
+        assert_eq!(prof.audio_codec, None);
+        let master_no_audio = build_master_playlist_for_profile(Some(&prof));
+        assert!(master_no_audio.contains("RESOLUTION=1920x1080"));
+        assert!(master_no_audio.contains("CODECS=\"avc1.42000a\""));
+        assert!(!master_no_audio.contains("mp4a"));
+
+        let hevc_prof = VodStreamProfile {
+            width: 2560,
+            height: 1440,
+            video_codec: "hvc1.1.6.L120.B0".to_string(),
+            audio_codec: Some("mp4a.40.2".to_string()),
+        };
+        let master_hevc = build_master_playlist_for_profile(Some(&hevc_prof));
+        assert!(master_hevc.contains("RESOLUTION=2560x1440"));
+        assert!(master_hevc.contains("CODECS=\"hvc1.1.6.L120.B0,mp4a.40.2\""));
         let _ = std::fs::remove_file(&probe_tmp);
     }
 }

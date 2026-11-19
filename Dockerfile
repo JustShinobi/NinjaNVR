@@ -60,7 +60,7 @@ RUN find /openvino-model -type d -exec chmod 0755 {} + \
 
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS runtime
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    ca-certificates tzdata curl libssl3 \
+    ca-certificates tzdata curl libssl3 tini ocl-icd-libopencl1 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 ninjanvr \
     && useradd --uid 10001 --gid 10001 --no-log-init --home-dir /config --no-create-home --shell /usr/sbin/nologin ninjanvr \
@@ -91,7 +91,8 @@ ENV OV_CPU_THREADS_NUM=1
 # 8555: go2rtc WebRTC media (TCP/UDP); go2rtc API (:1984) & RTSP relay (:8554) bind to 127.0.0.1 by default
 EXPOSE 5000 8971 9091 8555/tcp 8555/udp
 
-# Drops privileges to 10001:10001 (ninjanvr) by default on fresh/10001-writable mounts,
-# honors explicit Kubernetes securityContext.runAsNonRoot (--user 10001:10001), and
-# preserves drop-in compatibility when upgrading over legacy root-owned HostPath mounts.
-ENTRYPOINT ["/usr/local/bin/ninjanvr-entrypoint"]
+# Runs under tini (PID 1 zombie reaper for FFmpeg/ffprobe/go2rtc subprocesses), drops privileges
+# to 10001:10001 (ninjanvr) by default on fresh/10001-writable mounts, honors explicit Kubernetes
+# securityContext.runAsNonRoot (--user 10001:10001), and preserves drop-in compatibility when
+# upgrading over legacy root-owned HostPath mounts.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/ninjanvr-entrypoint"]
