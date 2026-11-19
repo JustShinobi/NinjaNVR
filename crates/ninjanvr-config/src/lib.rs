@@ -279,7 +279,7 @@ impl Default for CameraUiConfig {
 pub struct FloorplanRoom {
     #[serde(default)]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, alias = "name")]
     pub label: String,
     #[serde(default)]
     pub x: f32,
@@ -311,7 +311,7 @@ impl Default for FloorplanRoom {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Default)]
 pub struct FloorplanWall {
     #[serde(default)]
     pub points: [f32; 4],
@@ -319,6 +319,46 @@ pub struct FloorplanWall {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for FloorplanWall {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawFloorplanWall {
+            #[serde(default)]
+            points: Option<[f32; 4]>,
+            #[serde(default)]
+            x1: Option<f32>,
+            #[serde(default)]
+            y1: Option<f32>,
+            #[serde(default)]
+            x2: Option<f32>,
+            #[serde(default)]
+            y2: Option<f32>,
+            #[serde(default, alias = "name")]
+            label: Option<String>,
+            #[serde(default)]
+            kind: Option<String>,
+        }
+        let raw = RawFloorplanWall::deserialize(deserializer)?;
+        let points = match raw.points {
+            Some(pts) => pts,
+            None => [
+                raw.x1.unwrap_or(0.0),
+                raw.y1.unwrap_or(0.0),
+                raw.x2.unwrap_or(0.0),
+                raw.y2.unwrap_or(0.0),
+            ],
+        };
+        Ok(Self {
+            points,
+            label: raw.label,
+            kind: raw.kind,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -920,7 +960,7 @@ pub struct AuthConfig {
     pub enabled: bool,
     #[serde(default = "default_true")]
     pub local_login_enabled: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub reset_admin_password: bool,
     #[serde(default = "default_cookie_name")]
     pub cookie_name: String,
@@ -934,7 +974,7 @@ pub struct AuthConfig {
     pub hash_iterations: u32,
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub admin_first_time_login: bool,
     #[serde(default)]
     pub oidc: OidcAuthConfig,

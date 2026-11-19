@@ -47,7 +47,7 @@ pub(crate) async fn build_ai_context_digest(
     let cfg = state.config.read().await;
     let metrics_map = state.camera_metrics.read().await;
     let mut cameras_health = serde_json::Map::new();
-    for (cam_name, cam_cfg) in &cfg.cameras {
+    for cam_name in cfg.cameras.keys() {
         if let Some(allowed) = allowed_cameras
             && !allowed.iter().any(|a| a == cam_name || a == "*")
         {
@@ -55,14 +55,7 @@ pub(crate) async fn build_ai_context_digest(
         }
         let m = metrics_map.get(cam_name);
         let rt_flags = state.comms.get_camera_flags(cam_name);
-        let fps = m.map_or(
-            if cam_cfg.enabled {
-                cam_cfg.detect.fps as f64
-            } else {
-                0.0
-            },
-            |x| x.camera_fps,
-        );
+        let fps = m.map_or(0.0, |x| x.camera_fps);
         cameras_health.insert(
             cam_name.clone(),
             json!({

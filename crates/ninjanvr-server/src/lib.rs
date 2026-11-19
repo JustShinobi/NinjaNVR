@@ -475,6 +475,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/events/{id}/clip.mp4", get(api_event_clip_mp4))
         .route("/timeline", get(api_timeline))
         .route("/recordings/summary", get(api_all_recordings_summary))
+        .route("/recordings/days", get(api_all_recordings_days_summary))
         .route("/recordings/sync", post(api_recordings_sync))
         .route("/recordings/unavailable", get(api_empty_array))
         .route("/recordings/storage", get(api_recordings_storage))
@@ -485,12 +486,16 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/jobs/export", get(api_export_jobs_list))
         .route("/jobs/export/{id}/cancel", post(api_export_job_cancel))
         .route("/cases", get(api_cases).post(api_case_create))
+        .route("/cases/{id}", delete(api_case_delete))
         .route(
             "/export/{camera}/start/{start}/end/{end}",
             post(api_export_create),
         )
         .route("/export/{id}", delete(api_export_delete))
-        .route("/export/{id}/rename", patch(api_export_rename))
+        .route(
+            "/export/{id}/rename",
+            patch(api_export_rename).post(api_export_rename),
+        )
         .route(
             "/preview/{camera}/start/{start}/end/{end}",
             get(api_previews),
@@ -1136,7 +1141,14 @@ async fn api_user_password(
                 .auth_gate
                 .clear_all_login_failures_for_user(username.trim());
             if username.trim().eq_ignore_ascii_case("admin") && is_admin_role {
-                state.config.write().await.auth.admin_first_time_login = false;
+                let cfg_dir_opt = {
+                    let mut cfg_guard = state.config.write().await;
+                    cfg_guard.auth.admin_first_time_login = false;
+                    cfg_guard.config_path.parent().map(Path::to_path_buf)
+                };
+                if let Some(cfg_dir) = cfg_dir_opt {
+                    remove_initial_admin_password_file(&cfg_dir);
+                }
             }
             Json(json!({
                 "success": true,
@@ -1608,7 +1620,16 @@ async fn api_config_save(
                 return Err((StatusCode::INTERNAL_SERVER_ERROR, msg));
             }
         };
+        let mut api_cfg = outcome.api_config;
+        let mut raw_yaml = outcome.scrubbed_raw_yaml;
         let new_cfg = outcome.config;
+        if new_cfg.auth.reset_admin_password
+            && let Some((updated_api, updated_raw)) =
+                apply_runtime_admin_password_reset(&state, new_cfg.auth.hash_iterations).await
+        {
+            api_cfg = updated_api;
+            raw_yaml = updated_raw;
+        }
         let rec_dir = state.media_dir.join("recordings");
         let log_hub = state.log_hub.clone();
         if let Ok(heuristics) = tokio::task::spawn_blocking(move || {
@@ -1619,7 +1640,7 @@ async fn api_config_save(
         {
             emit_heuristics_to_logs(&log_hub, &heuristics);
         }
-        Ok((outcome.api_config, outcome.scrubbed_raw_yaml))
+        Ok((api_cfg, raw_yaml))
     })
     .await;
 
@@ -1671,7 +1692,16 @@ async fn api_config_structured(
                 return Err((StatusCode::INTERNAL_SERVER_ERROR, msg));
             }
         };
+        let mut api_cfg = outcome.api_config;
+        let mut raw_yaml = outcome.scrubbed_raw_yaml;
         let next_cfg = outcome.config;
+        if next_cfg.auth.reset_admin_password
+            && let Some((updated_api, updated_raw)) =
+                apply_runtime_admin_password_reset(&state, next_cfg.auth.hash_iterations).await
+        {
+            api_cfg = updated_api;
+            raw_yaml = updated_raw;
+        }
         let rec_dir = state.media_dir.join("recordings");
         let log_hub = state.log_hub.clone();
         if let Ok(heuristics) = tokio::task::spawn_blocking(move || {
@@ -1682,7 +1712,7 @@ async fn api_config_structured(
         {
             emit_heuristics_to_logs(&log_hub, &heuristics);
         }
-        Ok((outcome.api_config, outcome.scrubbed_raw_yaml))
+        Ok((api_cfg, raw_yaml))
     })
     .await;
 
@@ -1822,7 +1852,17 @@ async fn api_config_set(
                 return Err((StatusCode::INTERNAL_SERVER_ERROR, msg));
             }
         };
-        Ok((outcome.api_config, outcome.scrubbed_raw_yaml))
+        let mut api_cfg = outcome.api_config;
+        let mut raw_yaml = outcome.scrubbed_raw_yaml;
+        if outcome.config.auth.reset_admin_password
+            && let Some((updated_api, updated_raw)) =
+                apply_runtime_admin_password_reset(&state, outcome.config.auth.hash_iterations)
+                    .await
+        {
+            api_cfg = updated_api;
+            raw_yaml = updated_raw;
+        }
+        Ok((api_cfg, raw_yaml))
     })
     .await;
 
@@ -3142,25 +3182,12 @@ async fn compute_stats_snapshot(state: &AppState) -> Value {
 
         for (cam_name, cam_cfg) in &cfg.cameras {
             let m = metrics_map.get(cam_name);
-            let fps = m.map_or(
-                if cam_cfg.enabled {
-                    cam_cfg.detect.fps as f64
-                } else {
-                    0.0
-                },
-                |x| x.camera_fps,
-            );
-            let proc_fps = m.map_or(fps, |x| {
-                if x.process_fps > 0.0 || !cam_cfg.enabled {
-                    x.process_fps
-                } else {
-                    fps
-                }
-            });
+            let fps = m.map_or(0.0, |x| x.camera_fps);
+            let proc_fps = m.map_or(0.0, |x| if cam_cfg.enabled { x.process_fps } else { 0.0 });
             let skip_fps = m.map_or(0.0, |x| x.skipped_fps);
             let det_fps = m.map_or(0.0, |x| x.detection_fps);
             let total_inferences = m.map_or(0, |x| x.total_inferences);
-            let cam_pid = m.map_or(pid, |x| x.pid);
+            let cam_pid = m.map_or(0, |x| x.pid);
             let night_mode = m.is_some_and(|x| x.night_mode);
             let last_frame_ts = m
                 .map(|x| x.last_frame_ts)
@@ -3176,10 +3203,17 @@ async fn compute_stats_snapshot(state: &AppState) -> Value {
                         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                         .map_or(0.0, |d| d.as_secs_f64())
                 });
-            let (ff_cpu, _) = if cam_pid != pid {
-                state.cpu_tracker.sample_pid(cam_pid, 1.8, 4.5)
+            let (ff_cpu, _) = if cam_pid > 0 && cam_pid != pid {
+                state.cpu_tracker.sample_pid(cam_pid, 0.0, 0.0)
             } else {
-                (1.8, 4.5)
+                (0.0, 0.0)
+            };
+            let connection_quality = if !cam_cfg.enabled {
+                "disabled"
+            } else if fps > 0.0 {
+                "excellent"
+            } else {
+                "offline"
             };
 
             let mut roi_states = BTreeMap::new();
@@ -3216,7 +3250,7 @@ async fn compute_stats_snapshot(state: &AppState) -> Value {
                     "ffmpeg_pid": cam_pid,
                     "audio_rms": 0,
                     "audio_dBFS": 0,
-                    "connection_quality": "excellent",
+                    "connection_quality": connection_quality,
                     "expected_fps": cam_cfg.detect.fps,
                     "reconnects_last_hour": 0,
                     "stalls_last_hour": 0,
@@ -3404,7 +3438,7 @@ async fn compute_stats_snapshot(state: &AppState) -> Value {
             if let Some(obj) = cold_stat.as_object_mut() {
                 obj.insert("tier".to_string(), json!("cold"));
             }
-            storage_map.insert(cold_dir.to_string_lossy().to_string(), cold_stat);
+            storage_map.insert("/media/ninjanvr/cold".to_string(), cold_stat);
         }
         storage_map.insert(
             "/media/ninjanvr/clips".to_string(),
@@ -3623,23 +3657,41 @@ pub fn evaluate_system_heuristics(
         .filter(|(_, c)| c.enabled && c.record.enabled)
         .map(|(n, c)| (n.clone(), c.record.continuous.days))
         .collect();
-    if enabled_days.len() >= 2 {
+    if !enabled_days.is_empty() {
         let min_d = enabled_days
             .iter()
             .map(|(_, d)| *d)
             .fold(f64::INFINITY, f64::min);
         let max_d = enabled_days.iter().map(|(_, d)| *d).fold(0.0_f64, f64::max);
-        if (max_d - min_d) >= 3.0 || max_d > estimated_retention_days + 1.0 {
+        let has_asymmetry = enabled_days.len() >= 2 && (max_d - min_d) >= 3.0;
+        let exceeds_runway = max_d > estimated_retention_days + 1.0;
+        if has_asymmetry {
             alerts.push(HeuristicAlertDto {
                 id: "retention_runway_asymmetry".to_string(),
                 severity: "warning".to_string(),
                 category: "storage".to_string(),
                 target: "record.continuous.days".to_string(),
-                title: "Retention policy exceeds disk runway & camera asymmetry".to_string(),
+                title: if exceeds_runway {
+                    "Retention policy exceeds disk runway & camera asymmetry".to_string()
+                } else {
+                    "Camera continuous retention asymmetry detected".to_string()
+                },
                 detail: format!(
-                    "Configured continuous retention varies from {min_d:.0}d to {max_d:.0}d across cameras, while free storage only supports ~{estimated_retention_days:.1}d at current write rate."
+                    "Configured continuous retention varies from {min_d:.0}d to {max_d:.0}d across cameras, while free storage supports ~{estimated_retention_days:.1}d at current write rate."
                 ),
-                recommendation: "Standardize cameras.*.record.continuous.days (e.g. 3d across all cameras) or enable continuous_substream / mode_tiering.".to_string(),
+                recommendation: "Standardize cameras.*.record.continuous.days across cameras or enable continuous_substream / mode_tiering.".to_string(),
+            });
+        } else if exceeds_runway {
+            alerts.push(HeuristicAlertDto {
+                id: "retention_runway_shortfall".to_string(),
+                severity: "warning".to_string(),
+                category: "storage".to_string(),
+                target: "record.continuous.days".to_string(),
+                title: "Retention policy exceeds available disk runway".to_string(),
+                detail: format!(
+                    "Configured continuous retention is {max_d:.0}d, while free storage currently supports ~{estimated_retention_days:.1}d at the measured write rate."
+                ),
+                recommendation: "Lower record.continuous.days to match disk capacity, expand the recordings volume, or enable continuous_substream / mode_tiering.".to_string(),
             });
         }
     }
@@ -5952,21 +6004,43 @@ async fn api_event_clip_mp4(
     StatusCode::NOT_FOUND.into_response()
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct RecordingsSummaryQueryParams {
+    pub tz_offset_min: Option<i32>,
+}
+
 async fn api_all_recordings_summary(
     State(state): State<AppState>,
     jar: CookieJar,
     headers: HeaderMap,
+    Query(q): Query<RecordingsSummaryQueryParams>,
 ) -> Json<Value> {
-    let mut summary = state
-        .db
-        .query_all_recordings_summary()
+    let allow_list = effective_caller_allowed_cameras(&state, &jar, &headers).await;
+    let tz_offset_min = q.tz_offset_min;
+    let summary = state
+        .run_db(move |db| {
+            db.query_all_recordings_summary_scoped(allow_list.as_deref(), tz_offset_min)
+        })
+        .await
         .unwrap_or_else(|_| json!({}));
-    if let Some(allow_list) = effective_caller_allowed_cameras(&state, &jar, &headers).await
-        && let Some(obj) = summary.as_object_mut()
-    {
-        obj.retain(|k, _| allow_list.iter().any(|a| a == k));
-    }
     Json(summary)
+}
+
+async fn api_all_recordings_days_summary(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Query(q): Query<RecordingsSummaryQueryParams>,
+) -> Json<Value> {
+    let allow_list = effective_caller_allowed_cameras(&state, &jar, &headers).await;
+    let tz_offset_min = q.tz_offset_min;
+    let days = state
+        .run_db(move |db| {
+            db.query_recordings_days_summary_scoped(allow_list.as_deref(), tz_offset_min)
+        })
+        .await
+        .unwrap_or_default();
+    Json(Value::Array(days))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -6938,6 +7012,7 @@ async fn api_camera_recordings_summary(
     jar: CookieJar,
     headers: HeaderMap,
     AxumPath(camera): AxumPath<String>,
+    Query(q): Query<RecordingsSummaryQueryParams>,
 ) -> Response {
     if !is_safe_id(&camera) {
         return StatusCode::BAD_REQUEST.into_response();
@@ -6951,9 +7026,11 @@ async fn api_camera_recordings_summary(
         )
             .into_response();
     }
+    let tz_offset_min = q.tz_offset_min;
+    let cam_owned = camera.clone();
     let summary = state
-        .db
-        .query_recordings_summary(&camera)
+        .run_db(move |db| db.query_recordings_summary_with_tz(&cam_owned, tz_offset_min))
+        .await
         .unwrap_or_default();
     Json(Value::Array(summary)).into_response()
 }
@@ -7347,6 +7424,39 @@ async fn api_case_create(
             "case": case_val
         }))
         .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "success": false, "message": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_case_delete(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    uri: Uri,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
+        return err_resp.into_response();
+    }
+    if !is_safe_id(&id) || id.len() > 128 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Invalid case identifier" })),
+        )
+            .into_response();
+    }
+    let id_owned = id.clone();
+    match state.run_db(move |db| db.delete_case(&id_owned)).await {
+        Ok(true) => Json(json!({ "success": true, "id": id })).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": "Case not found" })),
+        )
+            .into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "success": false, "message": err.to_string() })),
@@ -12029,7 +12139,17 @@ fn placeholder_jpeg_response() -> Response {
     }
     let mut buf = std::io::Cursor::new(Vec::new());
     let _ = img.write_to(&mut buf, image::ImageFormat::Jpeg);
-    ([(header::CONTENT_TYPE, "image/jpeg")], buf.into_inner()).into_response()
+    (
+        [
+            (header::CONTENT_TYPE, "image/jpeg"),
+            (
+                header::HeaderName::from_static("x-ninjanvr-placeholder"),
+                "1",
+            ),
+        ],
+        buf.into_inner(),
+    )
+        .into_response()
 }
 
 async fn api_go2rtc_streams(
@@ -12689,6 +12809,183 @@ fn restore_persistent_clips_mirrors(media_dir: &Path, config_dir: &Path) {
     }
 }
 
+fn write_initial_admin_password_file(config_dir: &Path, password: &str) -> Option<PathBuf> {
+    if config_dir.as_os_str().is_empty()
+        || config_dir
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        warn!(
+            "Refusing to write initial_admin_password in unsafe config directory {}",
+            config_dir.display()
+        );
+        return None;
+    }
+    if std::fs::symlink_metadata(config_dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        warn!(
+            "Refusing to write initial_admin_password in symlinked config directory {}",
+            config_dir.display()
+        );
+        return None;
+    }
+    let _ = std::fs::create_dir_all(config_dir);
+    let pw_path = config_dir.join("initial_admin_password");
+    if let Ok(meta) = std::fs::symlink_metadata(&pw_path)
+        && (meta.file_type().is_symlink() || meta.is_dir())
+    {
+        warn!(
+            "Refusing to overwrite symlink or directory at {}",
+            pw_path.display()
+        );
+        return None;
+    }
+    let payload = format!("{password}\n");
+    let nonce: u64 = rand::random();
+    let tmp_path = config_dir.join(format!(
+        ".initial_admin_password.tmp.{}.{nonce:016x}",
+        std::process::id()
+    ));
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let open_res = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(&tmp_path);
+        let mut f = match open_res {
+            Ok(file) => file,
+            Err(err) => {
+                warn!(
+                    "Failed to create temporary initial admin password file {}: {err}",
+                    tmp_path.display()
+                );
+                return None;
+            }
+        };
+        if let Err(err) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp_path);
+            warn!(
+                "Failed to enforce 0600 permissions on {}: {err}",
+                tmp_path.display()
+            );
+            return None;
+        }
+        if let Err(err) = f.write_all(payload.as_bytes()).and_then(|()| f.sync_all()) {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp_path);
+            warn!(
+                "Failed to write initial admin password file {}: {err}",
+                tmp_path.display()
+            );
+            return None;
+        }
+        drop(f);
+        if let Ok(meta) = std::fs::symlink_metadata(&pw_path)
+            && (meta.file_type().is_symlink() || meta.is_dir())
+        {
+            let _ = std::fs::remove_file(&tmp_path);
+            return None;
+        }
+        if let Err(err) = std::fs::rename(&tmp_path, &pw_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            warn!(
+                "Failed to atomically publish initial admin password file {}: {err}",
+                pw_path.display()
+            );
+            return None;
+        }
+        Some(pw_path)
+    }
+    #[cfg(not(unix))]
+    {
+        if std::fs::write(&tmp_path, payload.as_bytes()).is_ok()
+            && std::fs::rename(&tmp_path, &pw_path).is_ok()
+        {
+            Some(pw_path)
+        } else {
+            let _ = std::fs::remove_file(&tmp_path);
+            None
+        }
+    }
+}
+
+fn remove_initial_admin_password_file(config_dir: &Path) {
+    let pw_path = config_dir.join("initial_admin_password");
+    if let Ok(meta) = std::fs::symlink_metadata(&pw_path)
+        && meta.file_type().is_file()
+        && !meta.file_type().is_symlink()
+    {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(nix::libc::O_NOFOLLOW)
+                .open(&pw_path)
+            {
+                let _ = file.set_len(0);
+            }
+        }
+        let _ = std::fs::remove_file(&pw_path);
+    }
+}
+
+async fn apply_runtime_admin_password_reset(
+    state: &AppState,
+    iterations: u32,
+) -> Option<(Value, String)> {
+    let Ok(_permit) = state.auth_gate.pbkdf2_semaphore().acquire().await else {
+        warn!("Skipped runtime admin password reset: PBKDF2 semaphore closed");
+        return None;
+    };
+    let db_clone = state.db.clone();
+    let reset_res = tokio::task::spawn_blocking(move || {
+        db_clone.ensure_default_admin_with_options(iterations, None, true)
+    })
+    .await;
+    drop(_permit);
+    if let Ok(Ok(Some(new_pw))) = reset_res {
+        state.auth_gate.invalidate_user("admin");
+        state.auth_gate.clear_all_login_failures_for_user("admin");
+        let (cfg_dir_opt, persist_pair, updated_pair) = {
+            let mut cfg_guard = state.config.write().await;
+            cfg_guard.auth.reset_admin_password = false;
+            cfg_guard.auth.admin_first_time_login = true;
+            let _ = cfg_guard.refresh_raw_yaml();
+            let persist_target = (!cfg_guard.config_path.as_os_str().is_empty())
+                .then(|| (cfg_guard.config_path.clone(), cfg_guard.raw_yaml.clone()));
+            let scrubbed_yaml =
+                config_coordinator::scrub_raw_yaml_secrets_strict(&cfg_guard.raw_yaml, &cfg_guard);
+            let api_val = cfg_guard.to_api_config();
+            (
+                cfg_guard.config_path.parent().map(Path::to_path_buf),
+                persist_target,
+                (api_val, scrubbed_yaml),
+            )
+        };
+        if let Some((cfg_path, raw_yaml_to_write)) = persist_pair {
+            let _ = tokio::task::spawn_blocking(move || {
+                config_coordinator::persist_config_yaml_atomically(&cfg_path, &raw_yaml_to_write)
+            })
+            .await;
+        }
+        if let Some(cfg_dir) = cfg_dir_opt
+            && let Some(written) = write_initial_admin_password_file(&cfg_dir, &new_pw)
+        {
+            info!(
+                "Reset admin password via auth.reset_admin_password; wrote recovery secret to {}",
+                written.display()
+            );
+        }
+        return Some(updated_pair);
+    }
+    None
+}
+
 pub async fn new_app_state(
     config_path: &Path,
     web_dir: PathBuf,
@@ -12696,7 +12993,7 @@ pub async fn new_app_state(
     spawn_go2rtc: bool,
 ) -> Result<AppState> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let cfg = NinjaConfig::load(config_path)?;
+    let mut cfg = NinjaConfig::load(config_path)?;
     let config_dir = config_path.parent().unwrap_or_else(|| Path::new("/config"));
     restore_persistent_clips_mirrors(&media_dir, config_dir);
     let (init_degraded, init_err) = match probe_storage_writable(&media_dir) {
@@ -12769,11 +13066,41 @@ pub async fn new_app_state(
             opened
         }
     };
-    if let Some(generated_pw) = db.ensure_default_admin(cfg.auth.hash_iterations)? {
-        info!(
-            "Initialized default admin user (password length: {})",
-            generated_pw.len()
-        );
+    let env_admin_pw = std::env::var("NINJANVR_ADMIN_PASSWORD")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let force_admin_reset = cfg.auth.reset_admin_password;
+    if let Some(generated_pw) = db.ensure_default_admin_with_options(
+        cfg.auth.hash_iterations,
+        env_admin_pw.as_deref(),
+        force_admin_reset,
+    )? {
+        cfg.auth.admin_first_time_login = true;
+        cfg.auth.reset_admin_password = false;
+        if force_admin_reset && cfg.refresh_raw_yaml().is_ok() {
+            let _ = config_coordinator::persist_config_yaml_atomically(config_path, &cfg.raw_yaml);
+        }
+        if let Some(written) = write_initial_admin_password_file(config_dir, &generated_pw) {
+            info!(
+                "Initialized default admin user; initial password saved at {} (mode 0600)",
+                written.display()
+            );
+        } else {
+            info!(
+                "Initialized default admin user (set NINJANVR_ADMIN_PASSWORD or writable config dir to retrieve bootstrap credentials)"
+            );
+        }
+    } else if env_admin_pw.is_some() {
+        cfg.auth.admin_first_time_login = false;
+        cfg.auth.reset_admin_password = false;
+        if force_admin_reset && cfg.refresh_raw_yaml().is_ok() {
+            let _ = config_coordinator::persist_config_yaml_atomically(config_path, &cfg.raw_yaml);
+        }
+        remove_initial_admin_password_file(config_dir);
+    } else if std::fs::symlink_metadata(config_dir.join("initial_admin_password"))
+        .is_ok_and(|m| m.file_type().is_file())
+    {
+        cfg.auth.admin_first_time_login = true;
     }
     let startup_now_ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)

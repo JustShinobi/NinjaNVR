@@ -146,3 +146,26 @@ export function formatUnsavedLabel(count: number, isPt = false): string {
   }
   return n === 1 ? "1 UNSAVED SECTION" : `${n} UNSAVED SECTIONS`;
 }
+
+const PROCESS_RESTART_TOP_SECTIONS = new Set(["tls", "database", "detectors"]);
+
+/**
+ * Returns top-level configuration sections (`tls`, `database`, `detectors`)
+ * whose modifications require a full OS process/container restart rather than
+ * hot pipeline reload (`POST /api/restart`).
+ */
+export function detectProcessRestartSections(
+  base: unknown,
+  draft: unknown
+): string[] {
+  const paths: string[][] = [];
+  collectChangedPaths(base, draft, [], paths, 0);
+  const found = new Set<string>();
+  for (const p of paths) {
+    const root = p[0] ?? "";
+    if (PROCESS_RESTART_TOP_SECTIONS.has(root)) {
+      found.add(root);
+    }
+  }
+  return Array.from(found);
+}

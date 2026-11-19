@@ -8,7 +8,7 @@ export const pt: TranslationDict = {
   },
   nav: {
     live: "Matriz Ao Vivo",
-    sync: "Sync Playback",
+    sync: "Reprodução Sync",
     review: "Revisão & Triagem",
     explore: "Explorar Objetos",
     exports: "Exportações",
@@ -303,7 +303,7 @@ export const pt: TranslationDict = {
     detectionZones: "Zonas de Detecção",
     streamProbe: "Sonda de Stream RTSP",
     saveOnly: "Salvar Config",
-    saveAndRestart: "Salvar & Reiniciar NVR",
+    saveAndRestart: "Salvar & Recarregar Pipelines",
     copyYaml: "Copiar YAML",
   },
   system: {

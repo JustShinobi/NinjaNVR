@@ -1154,6 +1154,7 @@ export interface ConfigWorkbenchSnapshot {
   rawYaml: string;
   isDirty: boolean;
   hasUnsavedRawEdits: boolean;
+  hasRemoteConflict?: boolean;
   isSaving: boolean;
   revision: number;
   yamlStale: boolean;
@@ -1274,6 +1275,7 @@ export function createConfigWorkbenchSession(
   let yamlStale = false;
   let saveOutcome: ConfigWorkbenchSaveOutcome | null = null;
   let hasUnsavedRawEdits = false;
+  let hasRemoteConflict = false;
   let sanitizedDraftCache: NinjaConfigResponse | null = null;
 
   const listeners = new Set<() => void>();
@@ -1285,6 +1287,7 @@ export function createConfigWorkbenchSession(
     rawYaml,
     isDirty,
     hasUnsavedRawEdits,
+    hasRemoteConflict,
     isSaving,
     revision,
     yamlStale,
@@ -1299,6 +1302,7 @@ export function createConfigWorkbenchSession(
       rawYaml,
       isDirty,
       hasUnsavedRawEdits,
+      hasRemoteConflict,
       isSaving,
       revision,
       yamlStale,
@@ -1370,6 +1374,7 @@ export function createConfigWorkbenchSession(
       draftConfig = cloneSafe(nextBaseline);
       sanitizedDraftCache = null;
       hasUnsavedRawEdits = false;
+      hasRemoteConflict = false;
       if (yamlProvided) {
         rawYaml = serverRawYaml!;
         yamlStale = false;
@@ -1388,6 +1393,8 @@ export function createConfigWorkbenchSession(
       sanitizedDraftCache = null;
       if (!hasUnsavedRawEdits) {
         yamlStale = true;
+      } else {
+        hasRemoteConflict = true;
       }
     }
 
@@ -1781,6 +1788,7 @@ export function createConfigWorkbenchSession(
             rawYaml = nextSavedYaml;
             yamlStale = false;
             hasUnsavedRawEdits = false;
+            hasRemoteConflict = false;
             isDirty = false;
           } else {
             draftConfig = rebaseDirtyConfigDraft(
@@ -1792,15 +1800,18 @@ export function createConfigWorkbenchSession(
             isDirty = true;
           }
 
+          let restartSucceeded = true;
           if (restartAfter) {
-            await transport.triggerRestart().catch(() => false);
+            restartSucceeded = await transport.triggerRestart().catch(() => false);
           }
 
           const okMsg = restartAfter
-            ? commitOptions?.restartedMessage ||
-              "Configuration saved and NVR restart triggered"
+            ? restartSucceeded
+              ? commitOptions?.restartedMessage ||
+                "Configuration saved and pipeline reload triggered"
+              : "Configuration saved, but pipeline reload failed (check server logs)"
             : commitOptions?.savedMessage || "Configuration saved to config.yml";
-          saveOutcome = { ok: true, message: okMsg, at: Date.now() };
+          saveOutcome = { ok: restartSucceeded, message: okMsg, at: Date.now() };
           notifyServerCommitted();
           return {
             ok: true,
@@ -1845,6 +1856,7 @@ export function createConfigWorkbenchSession(
           rawYaml = nextSavedYaml;
           yamlStale = false;
           hasUnsavedRawEdits = false;
+          hasRemoteConflict = false;
           isDirty = false;
         } else {
           draftConfig = rebaseDirtyConfigDraft(
@@ -1856,16 +1868,19 @@ export function createConfigWorkbenchSession(
           isDirty = true;
         }
 
+        let restartSucceeded = true;
         if (restartAfter) {
-          await transport.triggerRestart().catch(() => false);
+          restartSucceeded = await transport.triggerRestart().catch(() => false);
         }
 
         const okMsg = restartAfter
-          ? commitOptions?.restartedMessage ||
-            "Structured configuration saved and pipeline restart triggered"
+          ? restartSucceeded
+            ? commitOptions?.restartedMessage ||
+              "Structured configuration saved and pipeline reload triggered"
+            : "Structured configuration saved, but pipeline reload failed (check server logs)"
           : commitOptions?.savedMessage ||
             "Structured configuration saved to config.yml";
-        saveOutcome = { ok: true, message: okMsg, at: Date.now() };
+        saveOutcome = { ok: restartSucceeded, message: okMsg, at: Date.now() };
         notifyServerCommitted();
         return {
           ok: true,
@@ -1966,20 +1981,24 @@ export function createConfigWorkbenchSession(
           rawYaml = nextSavedYaml;
           yamlStale = false;
           hasUnsavedRawEdits = false;
+          hasRemoteConflict = false;
           isDirty = false;
         } else {
           isDirty = true;
         }
 
+        let restartSucceeded = true;
         if (restartAfter) {
-          await transport.triggerRestart().catch(() => false);
+          restartSucceeded = await transport.triggerRestart().catch(() => false);
         }
 
         const okMsg = restartAfter
-          ? rawOptions?.restartedMessage ||
-            "Configuration saved and NinjaNVR restarted"
+          ? restartSucceeded
+            ? rawOptions?.restartedMessage ||
+              "Configuration saved and pipelines reloaded"
+            : "Configuration saved, but pipeline reload failed (check server logs)"
           : rawOptions?.savedMessage || "Configuration saved to disk";
-        saveOutcome = { ok: true, message: okMsg, at: Date.now() };
+        saveOutcome = { ok: restartSucceeded, message: okMsg, at: Date.now() };
         notifyServerCommitted();
         return {
           ok: true,
@@ -2024,9 +2043,10 @@ export function createConfigWorkbenchSession(
   };
 
   const discardRawEdits = (): void => {
-    if (!hasUnsavedRawEdits) return;
+    if (!hasUnsavedRawEdits && !hasRemoteConflict) return;
     revision += 1;
     hasUnsavedRawEdits = false;
+    hasRemoteConflict = false;
     saveOutcome = null;
     const structuredDirty = Boolean(
       draftConfig && !deepEqualConfigValue(baselineConfig, draftConfig)
@@ -2048,6 +2068,7 @@ export function createConfigWorkbenchSession(
     sanitizedDraftCache = null;
     yamlStale = false;
     hasUnsavedRawEdits = false;
+    hasRemoteConflict = false;
     isDirty = false;
     saveOutcome = null;
     if (baselineConfig) {

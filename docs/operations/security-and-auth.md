@@ -16,6 +16,12 @@ O **NinjaNVR** oferece uma arquitetura de segurança em múltiplas camadas proje
 Se nenhum certificado TLS customizado for montado, o NinjaNVR gera automaticamente um certificado ECDSA P-256 em memória/disco com `Subject Alternative Names (SAN)` (`DNS:localhost`, `IP:127.0.0.1`), `ExtendedKeyUsage::ServerAuth` e validade $\le 398$ dias.
 :::
 
+### Primeiro Acesso & Bootstrap da Conta `admin`
+Em uma instalação limpa (`auth.enabled: true` por padrão):
+1. **Via Variável de Ambiente (12-Factor / Docker / K8s):** defina `NINJANVR_ADMIN_PASSWORD` antes do primeiro boot para provisionar a senha inicial do usuário `admin`.
+2. **Bootstrap Automático em Disco (`0600`):** se `NINJANVR_ADMIN_PASSWORD` não estiver definida e o banco ainda não possuir senha para `admin`, o NinjaNVR gera uma senha criptográfica aleatória de 32 caracteres e grava em `<diretório-do-config>/initial_admin_password` (permissão `0600`), removendo esse arquivo automaticamente assim que a senha do `admin` for alterada na interface (**Settings → 07 Comms, Auth & Users**).
+3. **Recuperação de Emergência (`auth.reset_admin_password: true`):** caso perca a senha local, defina `reset_admin_password: true` na seção `auth:` do `config.yml` e reinicie (ou recarregue) o servidor — uma nova senha será gravada em `initial_admin_password` e a flag retornará para `false`.
+
 ---
 
 ## 2. Single Sign-On (SSO) Nativo via OpenID Connect (OIDC)

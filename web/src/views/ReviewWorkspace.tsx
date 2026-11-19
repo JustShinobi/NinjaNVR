@@ -142,6 +142,11 @@ interface ReviewWorkspaceProps {
     reviewIds: string | ReadonlyArray<string>,
     patch: ReviewMutationPatch
   ) => void;
+  userRole?: string;
+  onLoadOlderReviews?: (
+    beforeTs: number,
+    filters: { excludeLabel?: string; zone?: string }
+  ) => Promise<number>;
 }
 
 export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
@@ -170,9 +175,15 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   setSyncMasterTs,
   switchTab,
   onReconcileReviews,
+  userRole = "admin",
+  onLoadOlderReviews,
 }) => {
   const { t, locale } = useI18n();
   const isPt = locale === "pt";
+  const isViewer = userRole === "viewer" || userRole === "read_only";
+  const isAdmin = userRole === "admin";
+  const [loadingOlder, setLoadingOlder] = React.useState(false);
+  const [olderExhausted, setOlderExhausted] = React.useState(false);
   const playbackSpeed = useNvrStore((s) => s.playbackSpeed);
   const setPlaybackSpeed = useNvrStore((s) => s.setPlaybackSpeed);
   const configuredCameras = useNvrStore((s) => s.config?.cameras);
@@ -641,6 +652,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
 
   React.useEffect(() => {
     setVisibleLimit(REVIEW_PAGE_STEP);
+    setOlderExhausted(false);
   }, [
     reviewCameraFilter,
     reviewSeverityFilter,
@@ -924,6 +936,12 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       if (isEditableKeyTarget(e.target)) return;
+      if (
+        typeof document !== "undefined" &&
+        document.querySelector('[role="dialog"][aria-modal="true"]')
+      ) {
+        return;
+      }
 
       if (e.shiftKey) {
         if (e.code === "Digit1" || e.key === "!") {
@@ -948,6 +966,13 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
       }
 
       if (e.key === "[" || e.key === "]") {
+        const tgtEl = e.target as HTMLElement | null;
+        if (
+          reviewTrimFeedback !== null ||
+          tgtEl?.closest?.(".nvr-timeline-bar, [role='slider']")
+        ) {
+          return;
+        }
         e.preventDefault();
         e.stopImmediatePropagation();
         const currIdx = REVIEW_SPEED_STEPS.findIndex(
@@ -988,14 +1013,14 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
         return;
       }
 
-      if (key === "r" && activeReview) {
+      if (key === "r" && activeReview && !isViewer) {
         e.preventDefault();
         e.stopImmediatePropagation();
         void handleAcknowledgeReviews([activeReview.id], true);
         return;
       }
 
-      if (key === "e" && activeReview) {
+      if (key === "e" && activeReview && !isViewer) {
         e.preventDefault();
         e.stopImmediatePropagation();
         triggerExportActiveReview();
@@ -1009,6 +1034,8 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     visibleFilteredReviews,
     visibleLimit,
     playbackSpeed,
+    isViewer,
+    reviewTrimFeedback,
     setPlaybackSpeed,
     setActiveReview,
     handleAcknowledgeReviews,
@@ -1332,7 +1359,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
               {visibleFilteredReviews.length})
             </span>
             <div style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}>
-              {visibleFilteredReviews.length > 0 && (
+              {visibleFilteredReviews.length > 0 && !isViewer && (
                 <>
                   <button
                     type="button"
@@ -1349,8 +1376,12 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     }}
                   >
                     {selectedBatchReviewIds.length > 0
-                      ? `Clear (${selectedBatchReviewIds.length})`
-                      : "Select Page"}
+                      ? isPt
+                        ? `Limpar (${selectedBatchReviewIds.length})`
+                        : `Clear (${selectedBatchReviewIds.length})`
+                      : isPt
+                        ? "Selecionar Pág."
+                        : "Select Page"}
                   </button>
                   <button
                     type="button"
@@ -1370,14 +1401,18 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                   >
                     <Check size={11} />
                     {selectedBatchReviewIds.length > 0
-                      ? `Mark (${selectedBatchReviewIds.length}) Viewed`
-                      : "Mark Page Viewed"}
+                      ? isPt
+                        ? `Marcar (${selectedBatchReviewIds.length}) Vistos`
+                        : `Mark (${selectedBatchReviewIds.length}) Viewed`
+                      : isPt
+                        ? "Marcar Pág. Vista"
+                        : "Mark Page Viewed"}
                   </button>
                 </>
               )}
             </div>
           </div>
-          {selectedBatchReviewIds.length > 0 && (
+          {isAdmin && selectedBatchReviewIds.length > 0 && (
             <div
               style={{
                 padding: "6px 8px",
@@ -1478,22 +1513,24 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                         : "3px solid var(--signal-motion)" /* slop-lint-disable-line side-tab-border -- real detection severity indicator */,
                   }}
                 >
-                  <input
-                    type="checkbox"
-                    aria-label={`Select review ${item.id} for batch face assignment`}
-                    checked={isBatchChecked}
-                    onChange={(e) => {
-                      const checked = e.target.checked;
-                      setSelectedBatchReviewIds((prev) =>
-                        checked
-                          ? prev.includes(item.id)
-                            ? prev
-                            : [...prev, item.id]
-                          : prev.filter((id) => id !== item.id)
-                      );
-                    }}
-                    style={{ cursor: "pointer", flexShrink: 0 }}
-                  />
+                  {!isViewer && (
+                    <input
+                      type="checkbox"
+                      aria-label={`Select review ${item.id} for batch face assignment`}
+                      checked={isBatchChecked}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        setSelectedBatchReviewIds((prev) =>
+                          checked
+                            ? prev.includes(item.id)
+                              ? prev
+                              : [...prev, item.id]
+                            : prev.filter((id) => id !== item.id)
+                        );
+                      }}
+                      style={{ cursor: "pointer", flexShrink: 0 }}
+                    />
+                  )}
                   <button
                     type="button"
                     aria-pressed={isSelected}
@@ -1685,7 +1722,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                         EXPORTED
                       </button>
                     )}
-                    {!item.has_been_reviewed && (
+                    {!item.has_been_reviewed && !isViewer && (
                       <button
                         type="button"
                         className="nvr-btn success"
@@ -1699,36 +1736,38 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                         <Check size={11} />
                       </button>
                     )}
-                    <button
-                      type="button"
-                      className="nvr-btn danger mono"
-                      style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
-                      aria-label={
-                        deleteArmed
-                          ? isPt
-                            ? `Confirmar exclusão de ${item.camera}`
-                            : `Click again to confirm deleting ${item.camera}`
-                          : `Delete ${item.camera} review item`
-                      }
-                      title={
-                        deleteArmed
-                          ? isPt
-                            ? "Clique novamente para confirmar"
-                            : "Click again to confirm"
-                          : t.review.deleteSelected
-                      }
-                      onClick={() => {
-                        confirmOrArm(deleteKey, () => {
-                          void handleConfirmDeleteReviews([item.id]);
-                        });
-                      }}
-                    >
-                      {deleteArmed ? (
-                        isPt ? "Confirmar?" : "Confirm?"
-                      ) : (
-                        <Trash2 size={11} />
-                      )}
-                    </button>
+                    {isAdmin && (
+                      <button
+                        type="button"
+                        className="nvr-btn danger mono"
+                        style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                        aria-label={
+                          deleteArmed
+                            ? isPt
+                              ? `Confirmar exclusão de ${item.camera}`
+                              : `Click again to confirm deleting ${item.camera}`
+                            : `Delete ${item.camera} review item`
+                        }
+                        title={
+                          deleteArmed
+                            ? isPt
+                              ? "Clique novamente para confirmar"
+                              : "Click again to confirm"
+                            : t.review.deleteSelected
+                        }
+                        onClick={() => {
+                          confirmOrArm(deleteKey, () => {
+                            void handleConfirmDeleteReviews([item.id]);
+                          });
+                        }}
+                      >
+                        {deleteArmed ? (
+                          isPt ? "Confirmar?" : "Confirm?"
+                        ) : (
+                          <Trash2 size={11} />
+                        )}
+                      </button>
+                    )}
                   </div>
                 </div>
               );
@@ -1747,6 +1786,42 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                 </button>
               </div>
             )}
+            {remainingReviewsCount === 0 &&
+              visibleFilteredReviews.length > 0 &&
+              onLoadOlderReviews &&
+              !olderExhausted && (
+                <div style={{ padding: "10px 12px", textAlign: "center" }}>
+                  <button
+                    type="button"
+                    className="nvr-btn mono sm"
+                    data-testid="review-load-older-server"
+                    disabled={loadingOlder}
+                    onClick={async () => {
+                      const oldest = visibleFilteredReviews[visibleFilteredReviews.length - 1];
+                      if (!oldest || loadingOlder) return;
+                      setLoadingOlder(true);
+                      try {
+                        const added = await onLoadOlderReviews(oldest.start_time, {
+                          excludeLabel: excludeObjectFilter,
+                          zone: zoneFilter,
+                        });
+                        if (added === 0) setOlderExhausted(true);
+                        else setVisibleLimit((prev) => prev + added);
+                      } finally {
+                        setLoadingOlder(false);
+                      }
+                    }}
+                  >
+                    {loadingOlder
+                      ? isPt
+                        ? "Carregando histórico..."
+                        : "Loading older..."
+                      : isPt
+                        ? "Carregar mais antigos do servidor"
+                        : "Load older from server"}
+                  </button>
+                </div>
+              )}
             {visibleFilteredReviews.length === 0 && (
               <div
                 style={{
@@ -1880,11 +1955,11 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     ID: {activeReview.id}
                   </span>
                   <span className="mono" style={{ color: "var(--text-muted)", flexShrink: 0 }}>
-                    ({formatRelTime(activeReview.start_time)})
+                    ({formatRelTime(activeReview.start_time, locale)})
                   </span>
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, maxWidth: "100%", flexWrap: "wrap" }}>
-                  {primaryDetectionEventId && (
+                  {!isViewer && primaryDetectionEventId && (
                     <>
                       <button
                         type="button"
@@ -1959,11 +2034,16 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     type="button"
                     className={`nvr-btn mono ${showForensic ? "active" : ""}`}
                     onClick={() => setShowForensic((v) => !v)}
-                    title="Inspect exact score, threshold, pixel area, aspect ratio, and zone provenance"
+                    title={
+                      isPt
+                        ? "Inspecionar confiança, limiar, área em pixels, proporção e zona"
+                        : "Inspect exact score, threshold, pixel area, aspect ratio, and zone provenance"
+                    }
                   >
-                    Explain Alert
+                    {isPt ? "Explicar Alerta" : "Explain Alert"}
                   </button>
                   <button
+                    type="button"
                     className="nvr-btn"
                     onClick={() => {
                       const safeTs =
@@ -1976,173 +2056,188 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                       switchTab("sync");
                     }}
                   >
-                    Open in 4-Cam Sync
+                    {isPt ? "Abrir no Sync 4-Câm" : "Open in 4-Cam Sync"}
                   </button>
-                  <select
-                    className="nvr-select mono"
-                    aria-label="Share link expiration"
-                    style={{ height: 28, fontSize: "var(--text-xs)" }}
-                    value={shareTtlSec}
-                    onChange={(e) => setShareTtlSec(Number(e.target.value))}
-                  >
-                    <option value={3600}>TTL: 1h</option>
-                    <option value={86400}>TTL: 24h</option>
-                    <option value={604800}>TTL: 7d</option>
-                  </select>
-                  <select
-                    className="nvr-select mono"
-                    aria-label="Share link maximum views"
-                    style={{ height: 28, fontSize: "var(--text-xs)" }}
-                    value={shareMaxViews}
-                    onChange={(e) => setShareMaxViews(Number(e.target.value))}
-                  >
-                    <option value={0}>Views: Unlimited</option>
-                    <option value={1}>Views: 1</option>
-                    <option value={5}>Views: 5</option>
-                    <option value={25}>Views: 25</option>
-                  </select>
-                  <button
-                    className={`nvr-btn mono ${shareError ? "danger" : shareCopied ? "success" : ""}`}
-                    disabled={shareCreating}
-                    onClick={async () => {
-                      if (shareCreating) return;
-                      const requestReviewId = activeReview.id;
-                      activeReviewIdRef.current = requestReviewId;
-                      if (shareCopiedTimerRef.current !== null) {
-                        window.clearTimeout(shareCopiedTimerRef.current);
-                        shareCopiedTimerRef.current = null;
-                      }
-                      setShareError(null);
-                      setShareFallbackUrl(null);
-                      setShareCopied(false);
-                      setShareCreating(true);
-                      try {
-                        const res = await fetch("/api/share", {
-                          method: "POST",
-                          headers: { "Content-Type": "application/json" },
-                          credentials: "include",
-                          body: JSON.stringify({
-                            kind: "review",
-                            target_id: requestReviewId,
-                            expires_in_sec: shareTtlSec,
-                            ...(shareMaxViews > 0 ? { max_views: shareMaxViews } : {}),
-                          }),
-                        });
-                        const data = await res.json().catch(() => ({}));
-                        if (!isMountedRef.current || activeReviewIdRef.current !== requestReviewId) {
-                          return;
-                        }
-                        if (!res.ok || !(data?.url || data?.token)) {
-                          const errMsg =
-                            (typeof data?.message === "string" && data.message) ||
-                            (typeof data?.error === "string" && data.error) ||
-                            `${t.review.shareError} (${res.status})`;
-                          setShareError(errMsg);
-                          setShareCopied(false);
-                          return;
-                        }
-                        const fullUrl = buildSharePublicUrl(
-                          window.location.origin,
-                          data.url || data.token
-                        );
-                        if (!fullUrl) {
-                          setShareError(t.review.shareError);
-                          setShareCopied(false);
-                          return;
-                        }
-                        setShareFallbackUrl(fullUrl);
-                        let copiedOk = false;
-                        if (
-                          typeof navigator !== "undefined" &&
-                          navigator.clipboard &&
-                          typeof navigator.clipboard.writeText === "function"
-                        ) {
-                          try {
-                            await navigator.clipboard.writeText(fullUrl);
-                            copiedOk = true;
-                          } catch {
-                            copiedOk = false;
+                  {!isViewer && (
+                    <span style={{ display: "inline-flex", alignItems: "center", gap: 4, flexWrap: "wrap", flexShrink: 0 }}>
+                      <select
+                        className="nvr-select mono"
+                        aria-label={isPt ? "Expiração do link compartilhado" : "Share link expiration"}
+                        style={{ height: 28, fontSize: "var(--text-xs)" }}
+                        value={shareTtlSec}
+                        onChange={(e) => setShareTtlSec(Number(e.target.value))}
+                      >
+                        <option value={3600}>{isPt ? "Validade: 1h" : "TTL: 1h"}</option>
+                        <option value={86400}>{isPt ? "Validade: 24h" : "TTL: 24h"}</option>
+                        <option value={604800}>{isPt ? "Validade: 7d" : "TTL: 7d"}</option>
+                      </select>
+                      <select
+                        className="nvr-select mono"
+                        aria-label={isPt ? "Limite de visualizações" : "Share link maximum views"}
+                        style={{ height: 28, fontSize: "var(--text-xs)" }}
+                        value={shareMaxViews}
+                        onChange={(e) => setShareMaxViews(Number(e.target.value))}
+                      >
+                        <option value={0}>{isPt ? "Acessos: Ilimitados" : "Views: Unlimited"}</option>
+                        <option value={1}>{isPt ? "Acessos: 1" : "Views: 1"}</option>
+                        <option value={5}>{isPt ? "Acessos: 5" : "Views: 5"}</option>
+                        <option value={25}>{isPt ? "Acessos: 25" : "Views: 25"}</option>
+                      </select>
+                      <button
+                        type="button"
+                        className={`nvr-btn mono ${shareError ? "danger" : shareCopied ? "success" : ""}`}
+                        disabled={shareCreating}
+                        onClick={async () => {
+                          if (shareCreating) return;
+                          const requestReviewId = activeReview.id;
+                          activeReviewIdRef.current = requestReviewId;
+                          if (shareCopiedTimerRef.current !== null) {
+                            window.clearTimeout(shareCopiedTimerRef.current);
+                            shareCopiedTimerRef.current = null;
                           }
-                        }
-                        if (!isMountedRef.current || activeReviewIdRef.current !== requestReviewId) {
-                          return;
-                        }
-                        if (copiedOk) {
-                          setShareCopied(true);
-                          shareCopiedTimerRef.current = window.setTimeout(() => {
-                            if (isMountedRef.current && activeReviewIdRef.current === requestReviewId) {
+                          setShareError(null);
+                          setShareFallbackUrl(null);
+                          setShareCopied(false);
+                          setShareCreating(true);
+                          try {
+                            const res = await fetch("/api/share", {
+                              method: "POST",
+                              headers: { "Content-Type": "application/json" },
+                              credentials: "include",
+                              body: JSON.stringify({
+                                kind: "review",
+                                target_id: requestReviewId,
+                                expires_in_sec: shareTtlSec,
+                                ...(shareMaxViews > 0 ? { max_views: shareMaxViews } : {}),
+                              }),
+                            });
+                            const data = await res.json().catch(() => ({}));
+                            if (!isMountedRef.current || activeReviewIdRef.current !== requestReviewId) {
+                              return;
+                            }
+                            if (!res.ok || !(data?.url || data?.token)) {
+                              const errMsg =
+                                (typeof data?.message === "string" && data.message) ||
+                                (typeof data?.error === "string" && data.error) ||
+                                `${t.review.shareError} (${res.status})`;
+                              setShareError(errMsg);
+                              setShareCopied(false);
+                              return;
+                            }
+                            const fullUrl = buildSharePublicUrl(
+                              window.location.origin,
+                              data.url || data.token
+                            );
+                            if (!fullUrl) {
+                              setShareError(t.review.shareError);
+                              setShareCopied(false);
+                              return;
+                            }
+                            setShareFallbackUrl(fullUrl);
+                            let copiedOk = false;
+                            if (
+                              typeof navigator !== "undefined" &&
+                              navigator.clipboard &&
+                              typeof navigator.clipboard.writeText === "function"
+                            ) {
+                              try {
+                                await navigator.clipboard.writeText(fullUrl);
+                                copiedOk = true;
+                              } catch {
+                                copiedOk = false;
+                              }
+                            }
+                            if (!isMountedRef.current || activeReviewIdRef.current !== requestReviewId) {
+                              return;
+                            }
+                            if (copiedOk) {
+                              setShareCopied(true);
+                              shareCopiedTimerRef.current = window.setTimeout(() => {
+                                if (isMountedRef.current && activeReviewIdRef.current === requestReviewId) {
+                                  setShareCopied(false);
+                                }
+                                shareCopiedTimerRef.current = null;
+                              }, 2000);
+                            } else {
                               setShareCopied(false);
                             }
-                            shareCopiedTimerRef.current = null;
-                          }, 2000);
-                        } else {
-                          setShareCopied(false);
+                          } catch {
+                            if (!isMountedRef.current || activeReviewIdRef.current !== requestReviewId) {
+                              return;
+                            }
+                            setShareError(t.review.shareError);
+                            setShareCopied(false);
+                          } finally {
+                            if (isMountedRef.current && activeReviewIdRef.current === requestReviewId) {
+                              setShareCreating(false);
+                            }
+                          }
+                        }}
+                        title={
+                          isPt
+                            ? "Copiar link assinado por HMAC para este alerta"
+                            : "Copy HMAC-signed shareable link for this review event"
                         }
-                      } catch {
-                        if (!isMountedRef.current || activeReviewIdRef.current !== requestReviewId) {
-                          return;
-                        }
-                        setShareError(t.review.shareError);
-                        setShareCopied(false);
-                      } finally {
-                        if (isMountedRef.current && activeReviewIdRef.current === requestReviewId) {
-                          setShareCreating(false);
-                        }
+                      >
+                        {shareError
+                          ? t.review.shareError
+                          : shareCopied
+                            ? t.review.shareCopiedBtn
+                            : t.review.shareLinkBtn}
+                      </button>
+                    </span>
+                  )}
+                  {!isViewer && (
+                    <>
+                      <button
+                        type="button"
+                        className="nvr-btn primary"
+                        onClick={triggerExportActiveReview}
+                      >
+                        {t.review.exportClip}
+                      </button>
+                      <button
+                        type="button"
+                        className="nvr-btn success"
+                        onClick={() => void handleAcknowledgeReviews([activeReview.id], true)}
+                      >
+                        <Check size={12} />
+                        {t.review.markSelectedReviewed}
+                      </button>
+                    </>
+                  )}
+                  {isAdmin && (
+                    <button
+                      type="button"
+                      className="nvr-btn danger mono"
+                      aria-label={
+                        isArmed(`delete-active-review:${activeReview.id}`)
+                          ? isPt
+                            ? "Confirmar exclusão do segmento"
+                            : "Click again to confirm deleting review"
+                          : t.review.deleteSelected
                       }
-                    }}
-                    title="Copy HMAC-signed shareable link for this review event"
-                  >
-                    {shareError
-                      ? t.review.shareError
-                      : shareCopied
-                        ? t.review.shareCopiedBtn
-                        : t.review.shareLinkBtn}
-                  </button>
-                  <button
-                    type="button"
-                    className="nvr-btn primary"
-                    onClick={triggerExportActiveReview}
-                  >
-                    {t.review.exportClip}
-                  </button>
-                  <button
-                    type="button"
-                    className="nvr-btn success"
-                    onClick={() => void handleAcknowledgeReviews([activeReview.id], true)}
-                  >
-                    <Check size={12} />
-                    {t.review.markSelectedReviewed}
-                  </button>
-                  <button
-                    type="button"
-                    className="nvr-btn danger mono"
-                    aria-label={
-                      isArmed(`delete-active-review:${activeReview.id}`)
+                      title={
+                        isArmed(`delete-active-review:${activeReview.id}`)
+                          ? isPt
+                            ? "Clique novamente para confirmar"
+                            : "Click again to confirm"
+                          : t.review.deleteSelected
+                      }
+                      onClick={() => {
+                        confirmOrArm(`delete-active-review:${activeReview.id}`, () => {
+                          void handleConfirmDeleteReviews([activeReview.id]);
+                        });
+                      }}
+                    >
+                      <Trash2 size={12} />
+                      {isArmed(`delete-active-review:${activeReview.id}`)
                         ? isPt
-                          ? "Confirmar exclusão do segmento"
-                          : "Click again to confirm deleting review"
-                        : t.review.deleteSelected
-                    }
-                    title={
-                      isArmed(`delete-active-review:${activeReview.id}`)
-                        ? isPt
-                          ? "Clique novamente para confirmar"
+                          ? "Confirmar?"
                           : "Click again to confirm"
-                        : t.review.deleteSelected
-                    }
-                    onClick={() => {
-                      confirmOrArm(`delete-active-review:${activeReview.id}`, () => {
-                        void handleConfirmDeleteReviews([activeReview.id]);
-                      });
-                    }}
-                  >
-                    <Trash2 size={12} />
-                    {isArmed(`delete-active-review:${activeReview.id}`)
-                      ? isPt
-                        ? "Confirmar?"
-                        : "Click again to confirm"
-                      : null}
-                  </button>
+                        : null}
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -2466,7 +2561,13 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                 </div>
               )}
 
-              <div className="nvr-cam-tile" style={{ flex: 1 }}>
+              <div
+                className="nvr-cam-tile"
+                style={{
+                  flex: 1,
+                  ...(isCompact ? { order: -1, minHeight: 215 } : {}),
+                }}
+              >
                 {(() => {
                   const rawMock = String(
                     (activeReview.data as Record<string, unknown> | undefined)
@@ -2586,122 +2687,136 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                 })()}
               </div>
 
-              <div
-                style={{
-                  padding: "6px 10px",
-                  background: "var(--bg-panel)",
-                  borderTop: "1px solid var(--border-hairline)",
-                  display: "flex",
-                  alignItems: "center",
-                  flexWrap: "wrap",
-                  gap: 8,
-                }}
-              >
-                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                  FACE ID / SUB-LABEL:
-                </span>
-                <input
-                  className="nvr-input mono"
-                  style={{ width: 145, height: 26, fontSize: "var(--text-xs)" }}
-                  aria-label="Assign Face Name"
-                  placeholder="Person name (e.g. Bruno)..."
-                  value={reviewFaceDraft}
-                  onChange={(e) => setReviewFaceDraft(e.target.value)}
-                />
-                <button
-                  type="button"
-                  className="nvr-btn primary mono"
-                  style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
-                  disabled={Boolean(batchReviewFaceProgress?.active)}
-                  onClick={() => void handleAssignReviewFace()}
-                  title="Assigns person name to selected review(s) and automatically enrolls 112x112 face crop into Face Gallery"
-                >
-                  {batchReviewFaceProgress?.active
-                    ? `Enrolling ${batchReviewFaceProgress.completed}/${batchReviewFaceProgress.total}...`
-                    : selectedBatchReviewIds.length > 0
-                    ? `Assign & Enroll (${selectedBatchReviewIds.length} Selected)`
-                    : "Assign & Enroll Face"}
-                </button>
-                {enrolledFaces.map((p) => (
-                  <button
-                    key={`rev-quick-face-${p.name}`}
-                    type="button"
-                    className={`nvr-btn mono ${
-                      (activeReview.data?.sub_labels || []).some(
-                        (s) => s.trim().toLowerCase() === p.name.trim().toLowerCase()
-                      )
-                        ? "active"
-                        : ""
-                    }`}
-                    style={{ height: 26, padding: "0 8px", fontSize: "var(--text-xs)" }}
-                    onClick={() => {
-                      setReviewFaceDraft(p.name);
-                      void handleAssignReviewFace(p.name);
-                    }}
-                    title={`1-click assign & enroll face sample into '${p.name}' gallery (${p.sample_count} samples)`}
-                  >
-                    + {p.name} ({p.sample_count})
-                  </button>
-                ))}
-                {(activeReview.data?.sub_labels?.length ?? 0) > 0 && (
-                  <button
-                    type="button"
-                    className="nvr-btn danger mono"
-                    style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
-                    aria-label="Clear or unassign review face sub-label"
-                    onClick={() => {
-                      setReviewFaceDraft("");
-                      void handleAssignReviewFace(null);
-                    }}
-                  >
-                    Clear / Unassign Face
-                  </button>
-                )}
-                <span className="nvr-divider" aria-hidden="true" />
-                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                  LICENSE PLATE:
-                </span>
-                <input
-                  className="nvr-input mono"
-                  aria-label="Manual review license plate override"
+              {!isViewer && (
+                <div
                   style={{
-                    width: 120,
-                    height: 26,
-                    fontSize: "var(--text-xs)",
-                    fontFamily: "var(--font-mono)",
+                    padding: "6px 10px",
+                    background: "var(--bg-panel)",
+                    borderTop: "1px solid var(--border-hairline)",
+                    display: "flex",
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                    gap: 8,
                   }}
-                  placeholder="ABC1D23"
-                  value={reviewPlateDraft}
-                  onChange={(e) => setReviewPlateDraft(e.target.value.toUpperCase())}
-                />
-                <button
-                  type="button"
-                  className="nvr-btn mono"
-                  style={{ height: 26, padding: "0 8px", fontSize: "var(--text-xs)" }}
-                  onClick={handleSaveReviewLicensePlate}
                 >
-                  Save Plate
-                </button>
-                <span className="nvr-divider" aria-hidden="true" />
-                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                  FORENSIC NOTE:
-                </span>
-                <input
-                  className="nvr-input mono"
-                  style={{ flex: 1, minWidth: 160, height: 26, fontSize: "var(--text-xs)" }}
-                  placeholder="Attach operator annotation to this review segment..."
-                  value={reviewNoteDraft}
-                  onChange={(e) => setReviewNoteDraft(e.target.value)}
-                />
-                <button
-                  type="button"
-                  className="nvr-btn primary mono"
-                  style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
-                  onClick={handleSaveReviewNote}
-                >
-                  Save Note
-                </button>
-              </div>
+                  {isAdmin && (
+                    <>
+                  <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                    {isPt ? "ROSTO / SUB-RÓTULO:" : "FACE ID / SUB-LABEL:"}
+                  </span>
+                  <input
+                    className="nvr-input mono"
+                    style={{ width: 195, height: 26, fontSize: "var(--text-xs)" }}
+                    aria-label={isPt ? "Atribuir nome da pessoa" : "Assign Face Name"}
+                    placeholder={isPt ? "Nome (ex.: Bruno)..." : "Person name (e.g. Bruno)..."}
+                    value={reviewFaceDraft}
+                    onChange={(e) => setReviewFaceDraft(e.target.value)}
+                  />
+                  <button
+                    type="button"
+                    className="nvr-btn primary mono"
+                    style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
+                    disabled={Boolean(batchReviewFaceProgress?.active)}
+                    onClick={() => void handleAssignReviewFace()}
+                    title="Assigns person name to selected review(s) and automatically enrolls 112x112 face crop into Face Gallery"
+                  >
+                    {batchReviewFaceProgress?.active
+                      ? `Enrolling ${batchReviewFaceProgress.completed}/${batchReviewFaceProgress.total}...`
+                      : selectedBatchReviewIds.length > 0
+                      ? isPt
+                        ? `Atribuir (${selectedBatchReviewIds.length} sel.)`
+                        : `Assign & Enroll (${selectedBatchReviewIds.length} Selected)`
+                      : isPt
+                        ? "Atribuir & Cadastrar Rosto"
+                        : "Assign & Enroll Face"}
+                  </button>
+                  {enrolledFaces.map((p) => (
+                    <button
+                      key={`rev-quick-face-${p.name}`}
+                      type="button"
+                      className={`nvr-btn mono ${
+                        (activeReview.data?.sub_labels || []).some(
+                          (s) => s.trim().toLowerCase() === p.name.trim().toLowerCase()
+                        )
+                          ? "active"
+                          : ""
+                      }`}
+                      style={{ height: 26, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                      onClick={() => {
+                        setReviewFaceDraft(p.name);
+                        void handleAssignReviewFace(p.name);
+                      }}
+                      title={`1-click assign & enroll face sample into '${p.name}' gallery (${p.sample_count} samples)`}
+                    >
+                      + {p.name} ({p.sample_count})
+                    </button>
+                  ))}
+                  {(activeReview.data?.sub_labels?.length ?? 0) > 0 && (
+                    <button
+                      type="button"
+                      className="nvr-btn danger mono"
+                      style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
+                      aria-label="Clear or unassign review face sub-label"
+                      onClick={() => {
+                        setReviewFaceDraft("");
+                        void handleAssignReviewFace(null);
+                      }}
+                    >
+                      {isPt ? "Limpar Rosto" : "Clear / Unassign Face"}
+                    </button>
+                  )}
+                  <span className="nvr-divider" aria-hidden="true" />
+                    </>
+                  )}
+                  <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                    {isPt ? "PLACA:" : "LICENSE PLATE:"}
+                  </span>
+                  <input
+                    className="nvr-input mono"
+                    aria-label="Manual review license plate override"
+                    style={{
+                      width: 120,
+                      height: 26,
+                      fontSize: "var(--text-xs)",
+                      fontFamily: "var(--font-mono)",
+                    }}
+                    placeholder="ABC1D23"
+                    value={reviewPlateDraft}
+                    onChange={(e) => setReviewPlateDraft(e.target.value.toUpperCase())}
+                  />
+                  <button
+                    type="button"
+                    className="nvr-btn mono"
+                    style={{ height: 26, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                    onClick={handleSaveReviewLicensePlate}
+                  >
+                    {isPt ? "Salvar Placa" : "Save Plate"}
+                  </button>
+                  <span className="nvr-divider" aria-hidden="true" />
+                  <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                    {isPt ? "NOTA FORENSE:" : "FORENSIC NOTE:"}
+                  </span>
+                  <input
+                    className="nvr-input mono"
+                    style={{ flex: 1, minWidth: 160, height: 26, fontSize: "var(--text-xs)" }}
+                    placeholder={
+                      isPt
+                        ? "Anexar observação forense a este segmento..."
+                        : "Attach operator annotation to this review segment..."
+                    }
+                    value={reviewNoteDraft}
+                    onChange={(e) => setReviewNoteDraft(e.target.value)}
+                  />
+                  <button
+                    type="button"
+                    className="nvr-btn primary mono"
+                    style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
+                    onClick={handleSaveReviewNote}
+                  >
+                    {isPt ? "Salvar Nota" : "Save Note"}
+                  </button>
+                </div>
+              )}
 
               <TimelineScrubber
                 camera={activeReview.camera}

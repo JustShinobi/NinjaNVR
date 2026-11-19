@@ -360,6 +360,7 @@ export interface CameraMapPlacement {
 export interface FloorplanRoom {
   id: string;
   label: string;
+  name?: string;
   x: number;
   y: number;
   w: number;
@@ -369,6 +370,10 @@ export interface FloorplanRoom {
 
 export interface FloorplanWall {
   points: [number, number, number, number];
+  x1?: number;
+  y1?: number;
+  x2?: number;
+  y2?: number;
   label?: string | null;
   kind?: "wall" | "door" | "window" | string | null;
 }
@@ -743,6 +748,7 @@ export interface CameraRuntimeStats {
   ffmpeg_cpu?: string;
   capture_cpu?: string;
   detect_cpu?: string;
+  connection_quality?: "excellent" | "offline" | "disabled" | string;
 }
 
 export type CameraStats = CameraRuntimeStats;
@@ -979,6 +985,17 @@ export interface ExportItem {
   video_path: string;
   thumb_path: string;
   in_progress: boolean;
+  export_case_id?: string | null;
+}
+
+export interface ExportCaseItem {
+  id: string;
+  name: string;
+  description?: string | null;
+  created_at: number;
+  updated_at: number;
+  event_ids: string[];
+  export_ids: string[];
 }
 
 export interface ShareLinkItem {

@@ -1,10 +1,13 @@
 import React from "react";
 import {
   AlertTriangle,
+  Check,
   Copy,
   Download,
+  FolderKanban,
   Link2,
   Loader2,
+  Pencil,
   Scissors,
   ShieldOff,
   Trash2,
@@ -14,6 +17,7 @@ import {
 } from "lucide-react";
 import { useI18n } from "../i18n";
 import {
+  ExportCaseItem,
   ExportItem,
   ExportJobItem,
   NinjaConfigResponse,
@@ -52,6 +56,16 @@ import {
   sanitizeTimelineThumbUrl,
 } from "../components/TimelineScrubber";
 import { createTrimScrubChannel } from "../utils/exportClipFlow";
+import { useTwoStepConfirm } from "./settings/vision/useTwoStepConfirm";
+
+function sanitizeExportDownloadName(rawName: string, fallbackId: string): string {
+  const cleaned = (rawName || "")
+    .replace(/[\u0000-\u001f\u007f\u0080-\u009f\u202a-\u202e\u2066-\u2069<>:"/\\|?*]+/g, "_")
+    .replace(/\s+/g, "_")
+    .replace(/^[._]+|[._]+$/g, "")
+    .slice(0, 96);
+  return cleaned || fallbackId || "clip";
+}
 
 export const MAX_EXPORT_WINDOW_SEC = MAX_ARCHIVE_EXPORT_SPAN_SEC;
 
@@ -109,6 +123,7 @@ interface ExportsWorkspaceProps {
     includeAudio?: boolean
   ) => Promise<{ exportId?: string; videoUrl?: string; queued?: boolean } | void>;
   notify: (msg: string) => void;
+  userRole?: string;
 }
 
 export interface CopyExistingShareLinkDeps {
@@ -185,9 +200,20 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
   reviews,
   handleQuickExport,
   notify,
+  userRole = "admin",
 }) => {
   const { t, locale } = useI18n();
   const isPt = locale === "pt";
+  const isViewer = userRole === "viewer" || userRole === "read_only";
+  const isAdmin = userRole === "admin";
+  const { isArmed, confirmOrArm } = useTwoStepConfirm(3000);
+  const [renamingExportId, setRenamingExportId] = React.useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = React.useState("");
+  const [renameBusy, setRenameBusy] = React.useState(false);
+  const [lowerPanelTab, setLowerPanelTab] = React.useState<"links" | "cases">("links");
+  const [casesList, setCasesList] = React.useState<ExportCaseItem[]>([]);
+  const [newCaseName, setNewCaseName] = React.useState("");
+  const [caseBusy, setCaseBusy] = React.useState(false);
   const unmutedLiveCamera = useNvrStore((s) => s.unmutedLiveCamera);
   const toggleLiveCameraAudio = useNvrStore((s) => s.toggleLiveCameraAudio);
   const [includeAudio, setIncludeAudio] = React.useState(true);
@@ -248,6 +274,14 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
       }
     });
     void shareController.refresh();
+    fetch("/api/cases", { credentials: "include" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((arr: ExportCaseItem[] | null) => {
+        if (isMountedRef.current && Array.isArray(arr)) {
+          setCasesList(arr);
+        }
+      })
+      .catch(() => {});
     return () => {
       isMountedRef.current = false;
       unsub();
@@ -410,6 +444,134 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
     () => exportsList.filter((ex) => !ex.in_progress),
     [exportsList]
   );
+
+  const inProgressDbExports = React.useMemo(
+    () =>
+      exportsList.filter(
+        (ex) => ex.in_progress && !visibleJobs.some((j) => j.id === ex.id)
+      ),
+    [exportsList, visibleJobs]
+  );
+
+  const handleRenameExport = async (id: string, nextNameRaw: string) => {
+    const clean = nextNameRaw.trim();
+    if (!clean || renameBusy) return;
+    setRenameBusy(true);
+    try {
+      const res = await fetch(`/api/export/${encodeURIComponent(id)}/rename`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ name: clean }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!isMountedRef.current) return;
+      if (res.ok) {
+        setExportsList((prev) =>
+          prev.map((item) => (item.id === id ? { ...item, name: clean } : item))
+        );
+        if (activeExportPreview?.id === id) {
+          setActiveExportPreview({ ...activeExportPreview, name: clean });
+        }
+        setRenamingExportId(null);
+        notify(isPt ? "Exportação renomeada" : "Export renamed");
+      } else {
+        notify(
+          (typeof data?.message === "string" && data.message) ||
+            (isPt ? "Falha ao renomear exportação" : "Failed to rename export")
+        );
+      }
+    } catch {
+      if (isMountedRef.current) {
+        notify(isPt ? "Erro de rede ao renomear exportação" : "Network error renaming export");
+      }
+    } finally {
+      if (isMountedRef.current) {
+        setRenameBusy(false);
+      }
+    }
+  };
+
+  const handleCreateCase = async () => {
+    const cleanName = newCaseName.trim();
+    if (!cleanName || caseBusy) return;
+    setCaseBusy(true);
+    try {
+      const attachedExports = activeExportPreview ? [activeExportPreview.id] : [];
+      const res = await fetch("/api/cases", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          name: cleanName,
+          export_ids: attachedExports,
+          event_ids: [],
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!isMountedRef.current) return;
+      const unwrapped = (
+        data && typeof data === "object" && data.case && typeof data.case === "object"
+          ? data.case
+          : data
+      ) as Partial<ExportCaseItem> | null;
+      if (
+        res.ok &&
+        unwrapped &&
+        typeof unwrapped.id === "string" &&
+        typeof unwrapped.name === "string"
+      ) {
+        const createdItem: ExportCaseItem = {
+          id: unwrapped.id,
+          name: unwrapped.name,
+          description: unwrapped.description ?? null,
+          created_at: unwrapped.created_at ?? Math.floor(Date.now() / 1000),
+          updated_at: unwrapped.updated_at ?? Math.floor(Date.now() / 1000),
+          event_ids: Array.isArray(unwrapped.event_ids) ? unwrapped.event_ids : [],
+          export_ids: Array.isArray(unwrapped.export_ids) ? unwrapped.export_ids : attachedExports,
+        };
+        setCasesList((prev) => [
+          createdItem,
+          ...prev.filter((c) => c.id !== createdItem.id),
+        ]);
+        setNewCaseName("");
+        notify(isPt ? "Caso forense criado" : "Investigation case created");
+      } else {
+        notify(
+          (typeof data?.message === "string" && data.message) ||
+            (isPt ? "Falha ao criar caso" : "Failed to create case")
+        );
+      }
+    } catch {
+      if (isMountedRef.current) {
+        notify(isPt ? "Erro de rede ao criar caso" : "Network error creating case");
+      }
+    } finally {
+      if (isMountedRef.current) {
+        setCaseBusy(false);
+      }
+    }
+  };
+
+  const handleDeleteCase = async (caseId: string) => {
+    try {
+      const res = await fetch(`/api/cases/${encodeURIComponent(caseId)}`, {
+        method: "DELETE",
+        credentials: "include",
+      });
+      if (!isMountedRef.current) return;
+      if (res.ok) {
+        setCasesList((prev) => prev.filter((c) => c.id !== caseId));
+        notify(isPt ? "Caso removido" : "Investigation case deleted");
+      } else {
+        notify(isPt ? "Falha ao remover caso" : "Failed to delete case");
+      }
+    } catch {
+      if (isMountedRef.current) {
+        notify(isPt ? "Erro de rede ao remover caso" : "Network error deleting case");
+      }
+    }
+  };
 
   const handleSelectExportCamera = React.useCallback(
     (nextCam: string) => {
@@ -815,12 +977,43 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
               );
             })}
 
+            {/* Persisted In-Progress Exports (not already tracked in active job queue) */}
+            {inProgressDbExports.map((ex) => (
+              <div
+                key={`inprog-${ex.id}`}
+                className="nvr-list-row"
+                style={{
+                  padding: "8px 12px",
+                  flexDirection: "column",
+                  alignItems: "stretch",
+                  gap: 6,
+                  cursor: "default",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                  <span className="nvr-badge motion mono" style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+                    <Loader2 size={11} className="spin" />
+                    {isPt ? "EM PROCESSAMENTO" : "TRANSCODING"}
+                  </span>
+                  <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                    {ex.camera.toUpperCase()}
+                  </span>
+                </div>
+                <div className="mono" style={{ fontWeight: 700, wordBreak: "break-word" }}>
+                  {ex.name}
+                </div>
+              </div>
+            ))}
+
             {/* Saved Completed Exports */}
             {completedExports.map((ex) => {
               const safeThumb = ex.thumb_path
                 ? sanitizeTimelineThumbUrl(ex.thumb_path, ex.camera)
                 : "";
               const isPreviewSelected = activeExportPreview?.id === ex.id;
+              const isRenaming = renamingExportId === ex.id;
+              const delKey = `delete-export:${ex.id}`;
+              const delArmed = isArmed(delKey);
               return (
                 <div
                   key={ex.id}
@@ -829,8 +1022,9 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                   }`}
                   style={{
                     padding: "8px 12px",
-                    justifyContent: "space-between",
-                    gap: 10,
+                    flexDirection: "column",
+                    alignItems: "stretch",
+                    gap: 8,
                     cursor: "default",
                   }}
                 >
@@ -839,6 +1033,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                     className="nvr-row-primary-btn"
                     aria-pressed={isPreviewSelected}
                     onClick={() => setActiveExportPreview(ex)}
+                    style={{ width: "100%", alignItems: "flex-start" }}
                   >
                     {safeThumb && (
                       <img
@@ -864,9 +1059,12 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                         title={ex.name}
                         style={{
                           fontWeight: 700,
+                          lineHeight: 1.3,
+                          display: "-webkit-box",
+                          WebkitLineClamp: 2,
+                          WebkitBoxOrient: "vertical",
                           overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
+                          wordBreak: "break-word",
                         }}
                       >
                         {ex.name}
@@ -876,31 +1074,79 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                         style={{
                           fontSize: "var(--text-xs)",
                           color: "var(--text-secondary)",
-                          whiteSpace: "nowrap",
-                          marginTop: 2,
+                          marginTop: 3,
                         }}
                       >
-                        {ex.camera.toUpperCase()} · {formatDateTime(ex.date)}
+                        {ex.camera.toUpperCase()} · {formatDateTime(ex.date, { locale })}
                       </div>
                     </div>
                   </button>
-                  <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
-                    <button
-                      type="button"
-                      className="nvr-btn sm mono"
-                      title="Copy expiring HMAC-signed shareable link"
-                      disabled={
-                        creatingShareId !== null || revokingShareId !== null
-                      }
-                      onClick={() => {
-                        void handleCopyShareLink(ex.id);
+                  {isRenaming && !isViewer && (
+                    <form
+                      onSubmit={(ev) => {
+                        ev.preventDefault();
+                        void handleRenameExport(ex.id, renameDraft);
                       }}
+                      style={{ display: "flex", alignItems: "center", gap: 6 }}
                     >
-                      {t.review.shareLinkBtn}
-                    </button>
+                      <input
+                        className="nvr-input sm mono"
+                        style={{ flex: 1, minWidth: 0 }}
+                        aria-label={isPt ? "Novo nome do clipe" : "New export name"}
+                        value={renameDraft}
+                        onChange={(ev) => setRenameDraft(ev.target.value)}
+                        autoFocus
+                      />
+                      <button
+                        type="submit"
+                        className="nvr-btn sm primary mono"
+                        disabled={renameBusy || !renameDraft.trim()}
+                      >
+                        <Check size={12} />
+                      </button>
+                      <button
+                        type="button"
+                        className="nvr-btn sm mono"
+                        onClick={() => setRenamingExportId(null)}
+                      >
+                        <X size={12} />
+                      </button>
+                    </form>
+                  )}
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                    {!isViewer && (
+                      <button
+                        type="button"
+                        className="nvr-btn sm mono"
+                        aria-label={`${t.exports.renameBtn}: ${ex.name}`}
+                        title={t.exports.renameBtn}
+                        onClick={() => {
+                          setRenamingExportId(ex.id);
+                          setRenameDraft(ex.name);
+                        }}
+                      >
+                        <Pencil size={11} />
+                        {t.exports.renameBtn}
+                      </button>
+                    )}
+                    {!isViewer && (
+                      <button
+                        type="button"
+                        className="nvr-btn sm mono"
+                        title="Copy expiring HMAC-signed shareable link"
+                        disabled={
+                          creatingShareId !== null || revokingShareId !== null
+                        }
+                        onClick={() => {
+                          void handleCopyShareLink(ex.id);
+                        }}
+                      >
+                        {t.review.shareLinkBtn}
+                      </button>
+                    )}
                     <a
                       href={resolveSafeExportVideoUrl(ex.video_path, ex.id)}
-                      download={`${ex.id}.mp4`}
+                      download={`${sanitizeExportDownloadName(ex.name, ex.id)}.mp4`}
                       className="nvr-btn sm"
                       style={{ textDecoration: "none" }}
                       aria-label={`Download ${ex.name} MP4`}
@@ -908,62 +1154,80 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                     >
                       <Download size={12} />
                     </a>
-                    <button
-                      type="button"
-                      className="nvr-btn sm danger"
-                      aria-label={`Delete export ${ex.name}`}
-                      title={t.exports.deleteBtn}
-                      disabled={deletingExportId === ex.id}
-                      onClick={async () => {
-                        if (deletingExportId !== null) return;
-                        setDeletingExportId(ex.id);
-                        try {
-                          const res = await fetch(
-                            `/api/export/${encodeURIComponent(ex.id)}`,
-                            {
-                              method: "DELETE",
-                              credentials: "include",
-                            }
-                          );
-                          if (!isMountedRef.current) return;
-                          if (res.ok) {
-                            setExportsList((prev) =>
-                              prev.filter((i) => i.id !== ex.id)
-                            );
-                            if (activeExportPreview?.id === ex.id) {
-                              setActiveExportPreview(null);
-                            }
-                            shareController.evictTarget(ex.id, shareLinks);
-                            void shareController.refresh();
-                            notify("Export deleted");
-                          } else {
-                            const data = await res.json().catch(() => ({}));
-                            if (isMountedRef.current) {
-                              notify(
-                                (typeof data?.message === "string" &&
-                                  data.message) ||
-                                  "Failed to delete export"
-                              );
-                            }
-                          }
-                        } catch {
-                          if (isMountedRef.current) {
-                            notify("Failed to delete export");
-                          }
-                        } finally {
-                          if (isMountedRef.current) {
-                            setDeletingExportId(null);
-                          }
+                    {isAdmin && (
+                      <button
+                        type="button"
+                        className="nvr-btn sm danger mono"
+                        aria-label={
+                          delArmed
+                            ? isPt
+                              ? `Confirmar exclusão de ${ex.name}`
+                              : `Click again to confirm deleting ${ex.name}`
+                            : `Delete export ${ex.name}`
                         }
-                      }}
-                    >
-                      <Trash2 size={12} />
-                    </button>
+                        title={
+                          delArmed
+                            ? isPt
+                              ? "Clique novamente para confirmar exclusão permanente"
+                              : "Click again to confirm permanent deletion"
+                            : t.exports.deleteBtn
+                        }
+                        disabled={deletingExportId === ex.id}
+                        onClick={() => {
+                          if (deletingExportId !== null) return;
+                          confirmOrArm(delKey, async () => {
+                            setDeletingExportId(ex.id);
+                            try {
+                              const res = await fetch(
+                                `/api/export/${encodeURIComponent(ex.id)}`,
+                                {
+                                  method: "DELETE",
+                                  credentials: "include",
+                                }
+                              );
+                              if (!isMountedRef.current) return;
+                              if (res.ok) {
+                                setExportsList((prev) =>
+                                  prev.filter((i) => i.id !== ex.id)
+                                );
+                                if (activeExportPreview?.id === ex.id) {
+                                  setActiveExportPreview(null);
+                                }
+                                shareController.evictTarget(ex.id, shareLinks);
+                                void shareController.refresh();
+                                notify(isPt ? "Exportação excluída" : "Export deleted");
+                              } else {
+                                const data = await res.json().catch(() => ({}));
+                                if (isMountedRef.current) {
+                                  notify(
+                                    (typeof data?.message === "string" &&
+                                      data.message) ||
+                                      (isPt ? "Falha ao excluir exportação" : "Failed to delete export")
+                                  );
+                                }
+                              }
+                            } catch {
+                              if (isMountedRef.current) {
+                                notify(isPt ? "Falha ao excluir exportação" : "Failed to delete export");
+                              }
+                            } finally {
+                              if (isMountedRef.current) {
+                                setDeletingExportId(null);
+                              }
+                            }
+                          });
+                        }}
+                      >
+                        {delArmed ? (isPt ? "Confirmar?" : "Confirm?") : <Trash2 size={12} />}
+                      </button>
+                    )}
                   </div>
                 </div>
               );
             })}
-            {completedExports.length === 0 && visibleJobs.length === 0 && (
+            {completedExports.length === 0 &&
+              inProgressDbExports.length === 0 &&
+              visibleJobs.length === 0 && (
               <div
                 style={{
                   padding: 24,
@@ -997,32 +1261,132 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                 gap: 6,
               }}
             >
-              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                <span>{t.exports.activeShareLinks}</span>
-                <span className="mono">{visibleShareLinks.length}</span>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                <button
+                  type="button"
+                  className={`nvr-btn sm mono ${lowerPanelTab === "links" ? "active" : ""}`}
+                  onClick={() => setLowerPanelTab("links")}
+                >
+                  <Link2 size={11} />
+                  {t.exports.activeShareLinks} ({visibleShareLinks.length})
+                </button>
+                <button
+                  type="button"
+                  className={`nvr-btn sm mono ${lowerPanelTab === "cases" ? "active" : ""}`}
+                  data-testid="exports-cases-tab"
+                  onClick={() => setLowerPanelTab("cases")}
+                >
+                  <FolderKanban size={11} />
+                  {isPt ? "CASOS" : "CASES"} ({casesList.length})
+                </button>
               </div>
-              <label
-                className="mono"
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: 5,
-                  fontSize: "var(--text-xs)",
-                  color: "var(--text-secondary)",
-                  cursor: "pointer",
-                  userSelect: "none",
-                  textTransform: "none",
-                }}
-              >
-                <input
-                  type="checkbox"
-                  checked={showInactiveLinks}
-                  onChange={(e) => setShowInactiveLinks(e.target.checked)}
-                  aria-label={t.exports.showInactiveLinks}
-                />
-                {t.exports.showInactiveLinks}
-              </label>
+              {lowerPanelTab === "links" && (
+                <label
+                  className="mono"
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 5,
+                    fontSize: "var(--text-xs)",
+                    color: "var(--text-secondary)",
+                    cursor: "pointer",
+                    userSelect: "none",
+                    textTransform: "none",
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={showInactiveLinks}
+                    onChange={(e) => setShowInactiveLinks(e.target.checked)}
+                    aria-label={t.exports.showInactiveLinks}
+                  />
+                  {t.exports.showInactiveLinks}
+                </label>
+              )}
             </div>
+            {lowerPanelTab === "cases" ? (
+              <div className="nvr-scroll-y" style={{ padding: "8px 12px", display: "flex", flexDirection: "column", gap: 8 }}>
+                {!isViewer && (
+                  <form
+                    onSubmit={(ev) => {
+                      ev.preventDefault();
+                      void handleCreateCase();
+                    }}
+                    style={{ display: "flex", gap: 6 }}
+                  >
+                    <input
+                      className="nvr-input sm mono"
+                      style={{ flex: 1, minWidth: 0 }}
+                      placeholder={
+                        isPt
+                          ? "Novo caso (ex.: INC-2026-01)..."
+                          : "New case title (e.g. INC-2026-01)..."
+                      }
+                      value={newCaseName}
+                      onChange={(ev) => setNewCaseName(ev.target.value)}
+                    />
+                    <button
+                      type="submit"
+                      className="nvr-btn sm primary mono"
+                      disabled={caseBusy || !newCaseName.trim()}
+                    >
+                      + {isPt ? "Criar" : "Create"}
+                    </button>
+                  </form>
+                )}
+                {casesList.map((cs) => {
+                  const caseDelKey = `del-case:${cs.id}`;
+                  const caseDelArmed = isArmed(caseDelKey);
+                  return (
+                    <div
+                      key={cs.id}
+                      className="nvr-list-row"
+                      style={{
+                        padding: "8px 10px",
+                        flexDirection: "column",
+                        alignItems: "stretch",
+                        gap: 4,
+                        cursor: "default",
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6 }}>
+                        <span className="mono" style={{ fontWeight: 700, wordBreak: "break-word" }}>
+                          {cs.name}
+                        </span>
+                        {isAdmin && (
+                          <button
+                            type="button"
+                            className="nvr-btn sm danger mono"
+                            onClick={() => {
+                              confirmOrArm(caseDelKey, () => {
+                                void handleDeleteCase(cs.id);
+                              });
+                            }}
+                          >
+                            {caseDelArmed ? (isPt ? "Confirmar?" : "Confirm?") : <Trash2 size={11} />}
+                          </button>
+                        )}
+                      </div>
+                      {cs.description && (
+                        <div style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                          {cs.description}
+                        </div>
+                      )}
+                      <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                        {(cs.export_ids?.length || 0)} {isPt ? "clipe(s)" : "clip(s)"} · {(cs.event_ids?.length || 0)} {isPt ? "evento(s)" : "event(s)"}
+                      </div>
+                    </div>
+                  );
+                })}
+                {casesList.length === 0 && (
+                  <div style={{ padding: 14, textAlign: "center", color: "var(--text-muted)", fontSize: "var(--text-xs)" }}>
+                    {isPt
+                      ? "Nenhum caso forense criado ainda."
+                      : "No investigation cases created yet."}
+                  </div>
+                )}
+              </div>
+            ) : (
             <div className="nvr-scroll-y">
               {visibleShareLinks.map((link) => {
                 const status = computeShareLinkStatus(link);
@@ -1166,6 +1530,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                 </div>
               )}
             </div>
+            )}
           </div>
         </div>
 

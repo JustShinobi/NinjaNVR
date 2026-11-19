@@ -608,10 +608,13 @@ export function sanitizeFloorplanRoom(
     typeof room?.id === "string" && room.id.trim()
       ? room.id.trim()
       : `room_${safeIdx + 1}`;
-  const label =
+  const rawLabel =
     typeof room?.label === "string" && room.label.trim()
       ? room.label.trim()
-      : "ROOM";
+      : typeof room?.name === "string" && room.name.trim()
+        ? room.name.trim()
+        : "ROOM";
+  const label = rawLabel;
   const cleanColor =
     typeof room?.color === "string" && /^#[0-9a-fA-F]{3,8}$/.test(room.color.trim())
       ? room.color.trim()
@@ -635,7 +638,24 @@ export function sanitizeFloorplanRoom(
 export function sanitizeFloorplanWall(
   wall: Partial<FloorplanWall> | null | undefined
 ): FloorplanWall {
-  const p = Array.isArray(wall?.points) ? wall.points : [0.2, 0.2, 0.4, 0.2];
+  const hasNamedCoords =
+    wall !== null &&
+    wall !== undefined &&
+    !Array.isArray(wall.points) &&
+    (typeof wall.x1 === "number" ||
+      typeof wall.y1 === "number" ||
+      typeof wall.x2 === "number" ||
+      typeof wall.y2 === "number");
+  const p = Array.isArray(wall?.points)
+    ? wall.points
+    : hasNamedCoords
+      ? [
+          finiteOr(wall?.x1 ?? NaN, 0),
+          finiteOr(wall?.y1 ?? NaN, 0),
+          finiteOr(wall?.x2 ?? NaN, 0),
+          finiteOr(wall?.y2 ?? NaN, 0),
+        ]
+      : [0.2, 0.2, 0.4, 0.2];
   const x1 = Number(Math.max(0, Math.min(1, finiteOr(p[0], 0.2))).toFixed(3));
   const y1 = Number(Math.max(0, Math.min(1, finiteOr(p[1], 0.2))).toFixed(3));
   const x2 = Number(Math.max(0, Math.min(1, finiteOr(p[2], 0.4))).toFixed(3));

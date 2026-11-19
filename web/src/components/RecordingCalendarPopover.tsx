@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Calendar, ChevronDown, ChevronLeft, ChevronRight, Clock, X } from "lucide-react";
 import { useI18n } from "../i18n";
 import { useNvrStore } from "../store/useNvrStore";
@@ -84,7 +85,10 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
   const localeTag = isPt ? "pt-BR" : "en-US";
   const effectiveButtonPrefix = buttonLabelPrefix ?? t.calendar.jumpToDate;
   const wrapperRef = useRef<HTMLDivElement | null>(null);
+  const triggerBtnRef = useRef<HTMLButtonElement | null>(null);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
   const [isOpen, setIsOpen] = useState(false);
+  const [fixedPos, setFixedPos] = useState<React.CSSProperties | null>(null);
   const firstWeekday = useNvrStore((s) => s.firstWeekday);
   const weekdayLabels =
     firstWeekday === "monday"
@@ -131,24 +135,69 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
     }
   }, [selectedDate]);
 
-  // Close popover on outside click or Escape
+  // Close popover on outside click or Escape, and keep fixed portal position synced
   useEffect(() => {
     if (!isOpen) return;
+    const updateAnchor = () => {
+      if (typeof window === "undefined" || !triggerBtnRef.current) return;
+      const rect = triggerBtnRef.current.getBoundingClientRect();
+      const popW = Math.min(316, Math.max(240, window.innerWidth - 24));
+      const clampedLeft = Math.max(
+        12,
+        Math.min(rect.left, window.innerWidth - popW - 12)
+      );
+      const preferUp =
+        openUpward ||
+        (window.innerHeight - rect.bottom < 360 && rect.top > 360);
+      if (preferUp) {
+        setFixedPos({
+          position: "fixed",
+          top: "auto",
+          left: clampedLeft,
+          bottom: Math.max(12, window.innerHeight - rect.top + 6),
+          width: popW,
+          zIndex: 1300,
+        });
+      } else {
+        setFixedPos({
+          position: "fixed",
+          top: Math.max(12, rect.bottom + 6),
+          bottom: "auto",
+          left: clampedLeft,
+          width: popW,
+          zIndex: 1300,
+        });
+      }
+    };
+    updateAnchor();
     const onDocClick = (e: MouseEvent) => {
-      if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
+      const node = e.target as Node;
+      if (
+        wrapperRef.current &&
+        !wrapperRef.current.contains(node) &&
+        (!popoverRef.current || !popoverRef.current.contains(node))
+      ) {
         setIsOpen(false);
       }
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setIsOpen(false);
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        setIsOpen(false);
+        triggerBtnRef.current?.focus();
+      }
     };
     document.addEventListener("mousedown", onDocClick);
     document.addEventListener("keydown", onKey);
+    window.addEventListener("resize", updateAnchor);
+    window.addEventListener("scroll", updateAnchor, true);
     return () => {
       document.removeEventListener("mousedown", onDocClick);
       document.removeEventListener("keydown", onKey);
+      window.removeEventListener("resize", updateAnchor);
+      window.removeEventListener("scroll", updateAnchor, true);
     };
-  }, [isOpen]);
+  }, [isOpen, openUpward]);
 
   // Map "YYYY-MM-DD" -> RecordingDaySummary for O(1) lookup
   const dayMap = useMemo(() => {
@@ -206,6 +255,7 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
     <div ref={wrapperRef} style={{ position: "relative", display: "inline-flex" }}>
       {/* Calendar Trigger Button: neutral when closed, accent only when open or actively filtering */}
       <button
+        ref={triggerBtnRef}
         type="button"
         className={`nvr-btn sm ${isFilteredActive ? "active" : ""}`}
         aria-expanded={isOpen}
@@ -235,29 +285,33 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
         <ChevronDown size={12} color="var(--text-muted)" />
       </button>
 
-      {/* Calendar Popover */}
-      {isOpen && (
-        <div
-          role="dialog"
-          aria-label={t.calendar.dialogAria}
-          className="nvr-calendar-popover"
-          style={{
-            position: "absolute",
-            ...(openUpward ? { bottom: 32 } : { top: 32 }),
-            left: 0,
-            width: 316,
-            maxWidth: "calc(100vw - 24px)",
-            background: "var(--bg-panel)",
-            border: "1px solid var(--signal-accent)",
-            borderRadius: 4,
-            boxShadow: "0 14px 36px rgba(0, 0, 0, 0.85)",
-            padding: 12,
-            zIndex: 100,
-            display: "flex",
-            flexDirection: "column",
-            gap: 10,
-          }}
-        >
+      {/* Calendar Popover (portaled to body when DOM is available so .nvr-subbar overflow never clips it) */}
+      {isOpen &&
+        (() => {
+          const dialogNode = (
+            <div
+              ref={popoverRef}
+              role="dialog"
+              aria-label={t.calendar.dialogAria}
+              className="nvr-calendar-popover"
+              style={{
+                position: fixedPos ? "fixed" : "absolute",
+                ...(fixedPos
+                  ? fixedPos
+                  : openUpward
+                    ? { bottom: 32, left: 0, width: 316, zIndex: 1300 }
+                    : { top: 32, left: 0, width: 316, zIndex: 1300 }),
+                maxWidth: "calc(100vw - 24px)",
+                background: "var(--bg-panel)",
+                border: "1px solid var(--signal-accent)",
+                borderRadius: 4,
+                boxShadow: "0 14px 36px rgba(0, 0, 0, 0.85)",
+                padding: 12,
+                display: "flex",
+                flexDirection: "column",
+                gap: 10,
+              }}
+            >
           {/* Header: Month Navigation */}
           <div
             style={{
@@ -530,8 +584,12 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
               {t.calendar.showAllDates}
             </button>
           )}
-        </div>
-      )}
+            </div>
+          );
+          return typeof document !== "undefined" && document.body
+            ? createPortal(dialogNode, document.body)
+            : dialogNode;
+        })()}
     </div>
   );
 };

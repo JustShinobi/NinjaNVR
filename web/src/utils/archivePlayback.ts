@@ -381,6 +381,7 @@ export type ArchiveMetadataTransportInput =
 export interface ArchiveMetadataQueryOptions {
   configuredCameras?: Record<string, unknown> | string[] | null;
   force?: boolean;
+  tzOffsetMin?: number;
 }
 
 export interface ArchiveMetadataCache {
@@ -582,27 +583,37 @@ export function createArchiveMetadataCache(
 
     async getSummary(camera, options) {
       const realCam = resolveCam(camera, options?.configuredCameras);
+      const hasTz =
+        typeof options?.tzOffsetMin === "number" &&
+        Number.isFinite(options.tzOffsetMin);
+      const safeTz = hasTz
+        ? Math.max(-840, Math.min(840, Math.trunc(options!.tzOffsetMin!)))
+        : null;
+      const cacheKey = safeTz !== null ? `${realCam}::tz:${safeTz}` : realCam;
       const now = nowMs();
 
       if (!options?.force && ttlMs > 0) {
-        const cached = summaryCache.get(realCam);
+        const cached = summaryCache.get(cacheKey);
         if (cached) {
           if (now - cached.fetchedAtMs <= ttlMs) {
             return [...cached.days];
           }
-          summaryCache.delete(realCam);
+          summaryCache.delete(cacheKey);
         }
       }
 
       if (!options?.force) {
-        const existingInflight = summaryInflight.get(realCam);
+        const existingInflight = summaryInflight.get(cacheKey);
         if (existingInflight) {
           const shared = await existingInflight;
           return shared.ok ? [...shared.days] : [];
         }
       }
 
-      const url = `/api/${encodeURIComponent(realCam)}/recordings/summary`;
+      const url =
+        safeTz !== null
+          ? `/api/${encodeURIComponent(realCam)}/recordings/summary?tz_offset_min=${safeTz}`
+          : `/api/${encodeURIComponent(realCam)}/recordings/summary`;
       let summaryRef: Promise<{
         ok: boolean;
         days: RecordingDaySummary[];
@@ -618,7 +629,7 @@ export function createArchiveMetadataCache(
           if (!Array.isArray(json)) return { ok: false, days: [] };
           const days = json as RecordingDaySummary[];
           if (ttlMs > 0) {
-            summaryCache.set(realCam, {
+            summaryCache.set(cacheKey, {
               fetchedAtMs: nowMs(),
               days,
             });
@@ -627,14 +638,14 @@ export function createArchiveMetadataCache(
         } catch {
           return { ok: false, days: [] };
         } finally {
-          if (summaryRef && summaryInflight.get(realCam) === summaryRef) {
-            summaryInflight.delete(realCam);
+          if (summaryRef && summaryInflight.get(cacheKey) === summaryRef) {
+            summaryInflight.delete(cacheKey);
           }
         }
       })();
 
       summaryRef = promise;
-      summaryInflight.set(realCam, promise);
+      summaryInflight.set(cacheKey, promise);
       const out = await promise;
       return out.ok ? [...out.days] : [];
     },
@@ -652,6 +663,17 @@ export function createArchiveMetadataCache(
       recordingsInflight.delete(realCam);
       summaryCache.delete(realCam);
       summaryInflight.delete(realCam);
+      const tzPrefix = `${realCam}::tz:`;
+      for (const k of Array.from(summaryCache.keys())) {
+        if (k.startsWith(tzPrefix)) {
+          summaryCache.delete(k);
+        }
+      }
+      for (const k of Array.from(summaryInflight.keys())) {
+        if (k.startsWith(tzPrefix)) {
+          summaryInflight.delete(k);
+        }
+      }
     },
 
     clear() {

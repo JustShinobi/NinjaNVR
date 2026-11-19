@@ -203,6 +203,7 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
   );
   const [mapSaveStatus, setMapSaveStatus] = useState<string | null>(null);
 
+  const [cadOpen, setCadOpen] = useState<boolean>(false);
   const isMountedRef = useRef<boolean>(true);
   const mapSaveTimerRef = useRef<number | null>(null);
   const mapSaveSeqRef = useRef<number>(0);
@@ -496,7 +497,7 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
 
   return (
     <div
-      className="nvr-focus-layout"
+      className="nvr-focus-layout nvr-floorplan-grid"
       style={{ display: "grid", gridTemplateColumns: "1fr 370px", gap: 8, flex: 1, minHeight: 0 }}
     >
       <div
@@ -2312,7 +2313,40 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
                   fill={hasObjects ? "#ef4444" : hasMotion ? "#f59e0b" : "#0ea5e9"}
                   stroke={mapTheme.floorplanCamNodeStroke}
                   strokeWidth="2"
-                  style={{ cursor: mapEditMode ? "grab" : "pointer" }}
+                  tabIndex={0}
+                  role="button"
+                  aria-label={`${cam.toUpperCase()} (${Math.round(place.angle_deg)}°, FOV ${Math.round(place.fov_deg)}°)`}
+                  style={{ cursor: mapEditMode ? "grab" : "pointer", outlineOffset: 3 }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      onSelectCamera(cam);
+                      return;
+                    }
+                    if (!mapEditMode) return;
+                    const step = e.shiftKey ? 0.05 : 0.015;
+                    let dx = 0;
+                    let dy = 0;
+                    if (e.key === "ArrowLeft") dx = -step;
+                    else if (e.key === "ArrowRight") dx = step;
+                    else if (e.key === "ArrowUp") dy = -step;
+                    else if (e.key === "ArrowDown") dy = step;
+                    if (dx !== 0 || dy !== 0) {
+                      e.preventDefault();
+                      onSelectCamera(cam);
+                      setMapPlacements((prev) => {
+                        const cur = prev[cam] ?? place;
+                        return {
+                          ...prev,
+                          [cam]: {
+                            ...cur,
+                            x: Number(Math.max(0.02, Math.min(0.98, cur.x + dx)).toFixed(3)),
+                            y: Number(Math.max(0.02, Math.min(0.98, cur.y + dy)).toFixed(3)),
+                          },
+                        };
+                      });
+                    }
+                  }}
                   onPointerDown={(e) => {
                     if (isDrawingMode) return;
                     e.stopPropagation();
@@ -2323,15 +2357,26 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
                     }
                   }}
                 />
-                <text
-                  x={cx + 12}
-                  y={cy + 4}
-                  fill={mapTheme.floorplanCamLabelFill}
-                  fontSize="12"
-                  fontFamily="JetBrains Mono, monospace"
-                  fontWeight="700"
-                  style={{ cursor: mapEditMode ? "grab" : "pointer" }}
-                  onPointerDown={(e) => {
+                {(() => {
+                  const collidesWithRoomCenter = floorplanRooms.some((rm) => {
+                    const rcx = (rm.x + rm.w / 2) * 1000;
+                    const rcy = (rm.y + rm.h / 2) * 600;
+                    return Math.abs(cy - rcy) < 24 && Math.abs(cx + 42 - rcx) < 95;
+                  });
+                  const labelY = collidesWithRoomCenter ? Math.max(16, cy - 14) : cy + 4;
+                  return (
+                    <text
+                      x={cx + 12}
+                      y={labelY}
+                      fill={mapTheme.floorplanCamLabelFill}
+                      stroke={mapTheme.floorplanCamNodeStroke}
+                      strokeWidth="3.5"
+                      paintOrder="stroke"
+                      fontSize="12"
+                      fontFamily="JetBrains Mono, monospace"
+                      fontWeight="700"
+                      style={{ cursor: mapEditMode ? "grab" : "pointer" }}
+                      onPointerDown={(e) => {
                     if (isDrawingMode) return;
                     e.stopPropagation();
                     onSelectCamera(cam);
@@ -2340,9 +2385,11 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
                       setDraggingCam(cam);
                     }
                   }}
-                >
-                  {cam.toUpperCase()}
-                </text>
+                    >
+                      {cam.toUpperCase()}
+                    </text>
+                  );
+                })()}
                 {objs.slice(0, 2).map((obj, oIdx) => (
                   <text
                     key={`${obj.id}-${oIdx}`}
@@ -2437,12 +2484,26 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
         {mapPlacements[selectedCamera] && (
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-              HEADING ANGLE: {Math.round(mapPlacements[selectedCamera].angle_deg)}° · FOV:{" "}
-              {Math.round(mapPlacements[selectedCamera].fov_deg)}° · RANGE:{" "}
-              {(mapPlacements[selectedCamera].range * floorplanWidthM).toFixed(1)}m (
-              {Math.round(mapPlacements[selectedCamera].range * 100)}%)
+              {isPt ? "ÂNGULO" : "HEADING ANGLE"}: {Math.round(mapPlacements[selectedCamera].angle_deg)}° · FOV:{" "}
+              {Math.round(mapPlacements[selectedCamera].fov_deg)}° · {isPt ? "ALCANCE" : "RANGE"}:{" "}
+              {config?.ui?.unit_system === "imperial"
+                ? `${(mapPlacements[selectedCamera].range * floorplanWidthM * 3.28084).toFixed(1)}ft`
+                : `${(mapPlacements[selectedCamera].range * floorplanWidthM).toFixed(1)}m`}{" "}
+              ({Math.round(mapPlacements[selectedCamera].range * 100)}%)
             </div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
+            <details open={mapEditMode}>
+              <summary
+                className="mono"
+                style={{
+                  cursor: "pointer",
+                  fontSize: "var(--text-xs)",
+                  color: "var(--signal-accent-text)",
+                  paddingBottom: 4,
+                }}
+              >
+                {isPt ? "Ajustar Ângulo / FOV / Alcance ▾" : "Adjust Heading / FOV / Range ▾"}
+              </summary>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
               <label className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                 <div>Heading (°)</div>
                 <input
@@ -2497,15 +2558,58 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
                   }}
                 />
               </label>
-            </div>
+              </div>
+            </details>
           </div>
         )}
 
-        {/* Vector Floorplan Rooms & Walls Metric Inspector */}
-        <div
+        {/* Vector Floorplan Rooms & Walls Metric Inspector (auto-expanded in Edit Map mode, compact disclosure in Operate mode) */}
+        <details
+          open={mapEditMode || cadOpen}
+          onToggle={(e) => {
+            if (!mapEditMode) {
+              setCadOpen((e.currentTarget as HTMLDetailsElement).open);
+            }
+          }}
           style={{
             borderTop: "1px solid var(--border-hairline)",
             paddingTop: 8,
+          }}
+        >
+          <summary
+            className="mono"
+            style={{
+              cursor: "pointer",
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              fontSize: "var(--text-xs)",
+              fontWeight: 700,
+              color: "var(--text-secondary)",
+              paddingBottom: 6,
+            }}
+          >
+            <span>
+              {isPt
+                ? `CAD PLANTA // SALAS (${floorplanRooms.length}) · PAREDES (${floorplanWalls.length})`
+                : `CAD AUTHORING // ROOMS (${floorplanRooms.length}) · WALLS (${floorplanWalls.length})`}
+            </span>
+            <span style={{ color: "var(--signal-accent-text)" }}>
+              {mapEditMode
+                ? isPt
+                  ? "EDITANDO"
+                  : "EDITING"
+                : cadOpen
+                ? isPt
+                  ? "Recolher ▴"
+                  : "Collapse ▴"
+                : isPt
+                ? "Expandir ▾"
+                : "Expand ▾"}
+            </span>
+          </summary>
+        <div
+          style={{
             display: "flex",
             flexDirection: "column",
             gap: 6,
@@ -2889,6 +2993,7 @@ export const FloorplanStudioCanvas: React.FC<FloorplanStudioCanvasProps> = ({
             );
           })}
         </div>
+        </details>
       </div>
     </div>
   );

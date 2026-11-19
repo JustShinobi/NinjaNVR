@@ -394,21 +394,38 @@ export function buildClientFallbackHeuristics(
   const daysList = enabledEntries
     .filter(([, c]) => c.record?.enabled !== false)
     .map(([, c]) => toFiniteNumber(c.record?.continuous?.days, 14));
-  if (daysList.length >= 2) {
+  if (daysList.length > 0) {
     const minD = Math.min(...daysList);
     const maxD = Math.max(...daysList);
-    if (maxD - minD >= 3 || maxD > estDays + 1) {
+    const hasAsymmetry = daysList.length >= 2 && maxD - minD >= 3;
+    const exceedsRunway = maxD > estDays + 1;
+    if (hasAsymmetry) {
       out.push({
         id: "retention_runway_asymmetry",
         severity: "warning",
         category: "storage",
         target: "record.continuous.days",
-        title: "Retention policy exceeds disk runway & camera asymmetry",
-        detail: `Configured continuous retention varies from ${minD}d to ${maxD}d across cameras, while free storage only supports ~${estDays.toFixed(
+        title: exceedsRunway
+          ? "Retention policy exceeds disk runway & camera asymmetry"
+          : "Camera continuous retention asymmetry detected",
+        detail: `Configured continuous retention varies from ${minD}d to ${maxD}d across cameras, while free storage supports ~${estDays.toFixed(
           1
         )}d at current write rate.`,
         recommendation:
-          "Standardize cameras.*.record.continuous.days (e.g. 3d across all cameras) or enable continuous_substream / mode_tiering.",
+          "Standardize cameras.*.record.continuous.days across cameras or enable continuous_substream / mode_tiering.",
+      });
+    } else if (exceedsRunway) {
+      out.push({
+        id: "retention_runway_shortfall",
+        severity: "warning",
+        category: "storage",
+        target: "record.continuous.days",
+        title: "Retention policy exceeds available disk runway",
+        detail: `Configured continuous retention is ${maxD}d, while free storage currently supports ~${estDays.toFixed(
+          1
+        )}d at the measured write rate.`,
+        recommendation:
+          "Lower record.continuous.days to match disk capacity, expand the recordings volume, or enable continuous_substream / mode_tiering.",
       });
     }
   }

@@ -19407,3 +19407,330 @@ async fn async_export_jobs_and_timeline_preview_frames_enforce_scoping_and_lifec
 
     let _ = std::fs::remove_dir_all(&cold_root);
 }
+
+#[tokio::test]
+async fn ux_remediation_bootstrap_offline_telemetry_tz_calendar_and_floorplan_work() {
+    // 1. FloorplanRoom `name` alias & FloorplanWall `{x1, y1, x2, y2}` YAML deserialization
+    let fp_yaml = r#"
+version: "0.18-0"
+ui:
+  floorplan:
+    width_m: 20.0
+    height_m: 12.0
+    rooms:
+      - id: r1
+        name: "Main Lobby"
+        x: 0.1
+        y: 0.1
+        w: 0.4
+        h: 0.4
+    walls:
+      - x1: 0.1
+        y1: 0.1
+        x2: 0.5
+        y2: 0.1
+        kind: wall
+cameras: {}
+"#;
+    let fp_cfg = NinjaConfig::from_yaml_str(fp_yaml, PathBuf::from("/tmp/fp.yml")).unwrap();
+    assert_eq!(fp_cfg.ui.floorplan.rooms[0].label, "Main Lobby");
+    assert_eq!(fp_cfg.ui.floorplan.walls[0].points, [0.1, 0.1, 0.5, 0.1]);
+
+    // 2. Honest offline telemetry (`0.0` FPS, `"offline"` quality, `x-ninjanvr-placeholder: 1`)
+    let ctx = setup_test_app().await;
+    let app = &ctx.app;
+    let state = &ctx.state;
+
+    let r_stats = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_stats.status(), StatusCode::OK);
+    let stats_val: Value =
+        serde_json::from_slice(&to_bytes(r_stats.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(stats_val["cameras"]["front_door"]["camera_fps"], 0.0);
+    assert_eq!(stats_val["cameras"]["front_door"]["ffmpeg_cpu"], "0.0");
+    assert_eq!(
+        stats_val["cameras"]["front_door"]["connection_quality"],
+        "offline"
+    );
+
+    let r_placeholder = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/front_door/latest.jpg")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_placeholder.status(), StatusCode::OK);
+    assert_eq!(
+        r_placeholder
+            .headers()
+            .get("x-ninjanvr-placeholder")
+            .and_then(|v| v.to_str().ok()),
+        Some("1")
+    );
+
+    // 3. Heuristic shortfall vs asymmetry split (uniform 14d retention must not claim "varies from 14d to 14d")
+    let uniform_yaml = r#"
+version: "0.18-0"
+cameras:
+  cam_1:
+    enabled: true
+    record:
+      enabled: true
+      continuous:
+        days: 14
+  cam_2:
+    enabled: true
+    record:
+      enabled: true
+      continuous:
+        days: 14
+"#;
+    let uni_cfg = NinjaConfig::from_yaml_str(uniform_yaml, PathBuf::from("/tmp/uni.yml")).unwrap();
+    let uni_mount = json!({ "total": 10_000.0, "used": 8_000.0, "free": 2_000.0 });
+    let uni_alerts = evaluate_system_heuristics(&uni_cfg, &serde_json::Map::new(), &uni_mount, 1.5);
+    assert!(
+        uni_alerts
+            .iter()
+            .any(|a| a.id == "retention_runway_shortfall"),
+        "uniform retention exceeding disk runway must emit retention_runway_shortfall"
+    );
+    assert!(
+        !uni_alerts
+            .iter()
+            .any(|a| a.id == "retention_runway_asymmetry"),
+        "uniform retention must not emit retention_runway_asymmetry"
+    );
+
+    // 4. Timezone-bucketed multi-camera `/api/recordings/days?tz_offset_min=180` (BRT UTC-3)
+    // Pick a recent UTC midnight + 01:30:00 (which is 22:30:00 on the PREVIOUS local day in UTC-3!)
+    let now_sec = unix_now() as i64;
+    let recent_utc_midnight = (now_sec / 86400) * 86400;
+    let utc_0130 = recent_utc_midnight + 5400; // 01:30 UTC today -> 22:30 BRT yesterday
+    let expected_brt_day = chrono::DateTime::from_timestamp(utc_0130 - 180 * 60, 0)
+        .unwrap()
+        .format("%Y-%m-%d")
+        .to_string();
+    let expected_utc_day = chrono::DateTime::from_timestamp(utc_0130, 0)
+        .unwrap()
+        .format("%Y-%m-%d")
+        .to_string();
+    assert_ne!(expected_brt_day, expected_utc_day);
+
+    state
+        .db
+        .insert_recording(&ninjanvr_db::RecordingRow {
+            id: "tz_seg_brt".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/ninjanvr/recordings/tz_seg_brt.mp4".to_string(),
+            start_time: utc_0130 as f64,
+            end_time: (utc_0130 + 60) as f64,
+            duration: 60.0,
+            motion: 3,
+            objects: 1,
+            dbfs: 0,
+            segment_size: 1.0,
+            regions: 0,
+            motion_heatmap: None,
+        })
+        .unwrap();
+
+    let r_days_brt = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/recordings/days?tz_offset_min=180")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_days_brt.status(), StatusCode::OK);
+    let days_brt: Value =
+        serde_json::from_slice(&to_bytes(r_days_brt.into_body(), 16384).await.unwrap()).unwrap();
+    assert!(
+        days_brt
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["day"] == expected_brt_day),
+        "BRT offset (+180) must bucket 01:30 UTC into previous local day {expected_brt_day}"
+    );
+
+    // Non-integer timezone (`UTC+5:30` -> `tz_offset_min=-330`): two segments at 18:15 UTC (23:45 IST) and 18:45 UTC (00:15 IST next day)
+    // share the same UTC hour `18:00..19:00` and must split cleanly into two distinct IST days via 15-min buckets!
+    let utc_1815 = recent_utc_midnight - 86400 + 18 * 3600 + 15 * 60;
+    let utc_1845 = recent_utc_midnight - 86400 + 18 * 3600 + 45 * 60;
+    let expected_ist_day_1 = chrono::DateTime::from_timestamp(utc_1815 + 330 * 60, 0)
+        .unwrap()
+        .format("%Y-%m-%d")
+        .to_string();
+    let expected_ist_day_2 = chrono::DateTime::from_timestamp(utc_1845 + 330 * 60, 0)
+        .unwrap()
+        .format("%Y-%m-%d")
+        .to_string();
+    assert_ne!(expected_ist_day_1, expected_ist_day_2);
+    state
+        .db
+        .insert_recording(&ninjanvr_db::RecordingRow {
+            id: "tz_seg_ist_1".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/ninjanvr/recordings/tz_seg_ist_1.mp4".to_string(),
+            start_time: utc_1815 as f64,
+            end_time: (utc_1815 + 60) as f64,
+            duration: 60.0,
+            motion: 5,
+            objects: 1,
+            dbfs: -22,
+            segment_size: 1.0,
+            regions: 0,
+            motion_heatmap: None,
+        })
+        .unwrap();
+    state
+        .db
+        .insert_recording(&ninjanvr_db::RecordingRow {
+            id: "tz_seg_ist_2".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/ninjanvr/recordings/tz_seg_ist_2.mp4".to_string(),
+            start_time: utc_1845 as f64,
+            end_time: (utc_1845 + 60) as f64,
+            duration: 60.0,
+            motion: 5,
+            objects: 1,
+            dbfs: -22,
+            segment_size: 1.0,
+            regions: 0,
+            motion_heatmap: None,
+        })
+        .unwrap();
+    let r_days_ist = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/recordings/days?tz_offset_min=-330")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_days_ist.status(), StatusCode::OK);
+    let days_ist: Value =
+        serde_json::from_slice(&to_bytes(r_days_ist.into_body(), 32768).await.unwrap()).unwrap();
+    let ist_arr = days_ist.as_array().unwrap();
+    assert!(
+        ist_arr.iter().any(|d| d["day"] == expected_ist_day_1)
+            && ist_arr.iter().any(|d| d["day"] == expected_ist_day_2),
+        "IST offset (-330) must split 18:15 UTC and 18:45 UTC across local midnight into {expected_ist_day_1} and {expected_ist_day_2}"
+    );
+
+    // 5. Initial admin bootstrap file (`0600`) + `force_reset` + `/api/auth/providers` authenticated status
+    let reset_pw = state
+        .db
+        .ensure_default_admin_with_options(10_000, None, true)
+        .unwrap()
+        .expect("force_reset without explicit password must generate a new secret");
+    assert_eq!(reset_pw.len(), 32);
+    let cfg_dir = ctx.tmp_dir.join("cfg_bootstrap_test");
+    let written_pw_file =
+        write_initial_admin_password_file(&cfg_dir, &reset_pw).expect("must write 0600 secret");
+    assert_eq!(
+        std::fs::read_to_string(&written_pw_file).unwrap().trim(),
+        reset_pw
+    );
+    remove_initial_admin_password_file(&cfg_dir);
+    assert!(!written_pw_file.exists());
+
+    let r_prov = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/providers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_prov.status(), StatusCode::OK);
+    let prov_j: Value =
+        serde_json::from_slice(&to_bytes(r_prov.into_body(), 4096).await.unwrap()).unwrap();
+    assert!(
+        prov_j
+            .get("authenticated")
+            .and_then(Value::as_bool)
+            .is_some()
+    );
+    assert!(
+        prov_j
+            .get("admin_first_time_login")
+            .and_then(Value::as_bool)
+            .is_some()
+    );
+
+    // 6. Case create + delete (`DELETE /api/cases/{id}`) & one-shot `reset_admin_password` clearing
+    let r_case_post = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/cases")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"id":"case_ux_test","name":"UX Audit Case","event_ids":[],"export_ids":[]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_case_post.status(), StatusCode::OK);
+    let case_post_j: Value =
+        serde_json::from_slice(&to_bytes(r_case_post.into_body(), 8192).await.unwrap()).unwrap();
+    assert_eq!(case_post_j["case"]["name"], "UX Audit Case");
+
+    let r_case_del = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/cases/case_ux_test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_case_del.status(), StatusCode::OK);
+    assert!(state.db.get_case("case_ux_test").unwrap().is_none());
+
+    // Verify `reset_admin_password: true` via `/api/config/set` structured patch resets once and clears flag in response + disk
+    let r_reset_patch = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/config/set")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"auth":{"reset_admin_password":true}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_reset_patch.status(), StatusCode::OK);
+    let reset_patch_j: Value =
+        serde_json::from_slice(&to_bytes(r_reset_patch.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(
+        reset_patch_j["config"]["auth"]["reset_admin_password"],
+        false
+    );
+    assert!(!state.config.read().await.auth.reset_admin_password);
+}

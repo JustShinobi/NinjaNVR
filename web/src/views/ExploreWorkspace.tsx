@@ -106,6 +106,17 @@ interface ExploreWorkspaceProps {
     eventIds: string | ReadonlyArray<string>,
     patch: EventMutationPatch
   ) => void;
+  userRole?: string;
+  onLoadOlderEvents?: (
+    beforeTs: number,
+    filters: {
+      excludeLabel?: string;
+      zone?: string;
+      minScore?: number;
+      stationary?: "all" | "moving" | "stationary";
+      plate?: string;
+    }
+  ) => Promise<number>;
 }
 
 const EXPLORE_PAGE_STEP = 50;
@@ -134,14 +145,22 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   switchTab,
   notify,
   onReconcileEvents,
+  userRole = "admin",
+  onLoadOlderEvents,
 }) => {
   const { t, locale } = useI18n();
   const isPt = locale === "pt";
+  const isViewer = userRole === "viewer" || userRole === "read_only";
+  const isAdmin = userRole === "admin";
+  const [loadingOlder, setLoadingOlder] = React.useState(false);
+  const [olderExhausted, setOlderExhausted] = React.useState(false);
   const { isArmed, confirmOrArm, clearArmed } = useTwoStepConfirm(3000);
   const [exploreDateFilter, setExploreDateFilter] = React.useState("");
   const [dateScopedEvents, setDateScopedEvents] = React.useState<EventItem[] | null>(
     null
   );
+  const dateScopedEventsRef = React.useRef<EventItem[] | null>(dateScopedEvents);
+  dateScopedEventsRef.current = dateScopedEvents;
   const [visibleLimit, setVisibleLimit] = React.useState<number>(EXPLORE_PAGE_STEP);
   const [showForensic, setShowForensic] = React.useState(false);
   const [eventNoteDraft, setEventNoteDraft] = React.useState("");
@@ -895,6 +914,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
 
   React.useEffect(() => {
     setVisibleLimit(EXPLORE_PAGE_STEP);
+    setOlderExhausted(false);
   }, [
     exploreQuery,
     exploreCamera,
@@ -1182,27 +1202,29 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
           <div className="nvr-panel-header" style={{ gap: 6, flexWrap: "wrap" }}>
             <span>TRACKED OBJECTS</span>
             <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-              <button
-                type="button"
-                className="nvr-btn mono sm"
-                style={{ height: 20, padding: "0 6px", fontSize: "var(--text-xs)" }}
-                onClick={() => {
-                  const pageIds = pagedEvents.map((e) => e.id);
-                  setSelectedBatchEventIds((prev) =>
-                    prev.length === pageIds.length ? [] : pageIds
-                  );
-                }}
-              >
-                {selectedBatchEventIds.length > 0
-                  ? `Clear (${selectedBatchEventIds.length})`
-                  : "Select Page"}
-              </button>
+              {isAdmin && (
+                <button
+                  type="button"
+                  className="nvr-btn mono sm"
+                  style={{ height: 20, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                  onClick={() => {
+                    const pageIds = pagedEvents.map((e) => e.id);
+                    setSelectedBatchEventIds((prev) =>
+                      prev.length === pageIds.length ? [] : pageIds
+                    );
+                  }}
+                >
+                  {selectedBatchEventIds.length > 0
+                    ? `Clear (${selectedBatchEventIds.length})`
+                    : "Select Page"}
+                </button>
+              )}
               <span className="mono">
                 {Math.min(visibleLimit, visibleEvents.length)}/{visibleEvents.length}
               </span>
             </div>
           </div>
-          {selectedBatchEventIds.length > 0 && (
+          {isAdmin && selectedBatchEventIds.length > 0 && (
             <div
               style={{
                 padding: "6px 8px",
@@ -1296,22 +1318,24 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                   className={`nvr-list-row ${isSelected ? "is-selected" : ""}`}
                   style={{ cursor: "default" }}
                 >
-                  <input
-                    type="checkbox"
-                    aria-label={`Select event ${ev.id} for batch face assignment`}
-                    checked={isBatchChecked}
-                    onChange={(e) => {
-                      const checked = e.target.checked;
-                      setSelectedBatchEventIds((prev) =>
-                        checked
-                          ? prev.includes(ev.id)
-                            ? prev
-                            : [...prev, ev.id]
-                          : prev.filter((id) => id !== ev.id)
-                      );
-                    }}
-                    style={{ cursor: "pointer", flexShrink: 0 }}
-                  />
+                  {isAdmin && (
+                    <input
+                      type="checkbox"
+                      aria-label={`Select event ${ev.id} for batch face assignment`}
+                      checked={isBatchChecked}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        setSelectedBatchEventIds((prev) =>
+                          checked
+                            ? prev.includes(ev.id)
+                              ? prev
+                              : [...prev, ev.id]
+                            : prev.filter((id) => id !== ev.id)
+                        );
+                      }}
+                      style={{ cursor: "pointer", flexShrink: 0 }}
+                    />
+                  )}
                   <button
                     type="button"
                     aria-pressed={isSelected}
@@ -1455,36 +1479,38 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                         EXPORTED
                       </button>
                     )}
-                    <button
-                      type="button"
-                      className="nvr-btn danger mono"
-                      style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
-                      aria-label={
-                        rowDeleteArmed
-                          ? isPt
-                            ? `Confirmar exclusão do evento ${ev.id}`
-                            : `Click again to confirm deleting event ${ev.id}`
-                          : `Delete event ${ev.id}`
-                      }
-                      title={
-                        rowDeleteArmed
-                          ? isPt
-                            ? "Clique novamente para confirmar"
-                            : "Click again to confirm"
-                          : "Delete tracked object event"
-                      }
-                      onClick={() => {
-                        confirmOrArm(rowDeleteKey, () => {
-                          void handleEventDelete(ev.id);
-                        });
-                      }}
-                    >
-                      {rowDeleteArmed ? (
-                        isPt ? "Confirmar?" : "Confirm?"
-                      ) : (
-                        <Trash2 size={11} />
-                      )}
-                    </button>
+                    {isAdmin && (
+                      <button
+                        type="button"
+                        className="nvr-btn danger mono"
+                        style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                        aria-label={
+                          rowDeleteArmed
+                            ? isPt
+                              ? `Confirmar exclusão do evento ${ev.id}`
+                              : `Click again to confirm deleting event ${ev.id}`
+                            : `Delete event ${ev.id}`
+                        }
+                        title={
+                          rowDeleteArmed
+                            ? isPt
+                              ? "Clique novamente para confirmar"
+                              : "Click again to confirm"
+                            : "Delete tracked object event"
+                        }
+                        onClick={() => {
+                          confirmOrArm(rowDeleteKey, () => {
+                            void handleEventDelete(ev.id);
+                          });
+                        }}
+                      >
+                        {rowDeleteArmed ? (
+                          isPt ? "Confirmar?" : "Confirm?"
+                        ) : (
+                          <Trash2 size={11} />
+                        )}
+                      </button>
+                    )}
                   </div>
                 </div>
               );
@@ -1503,6 +1529,77 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                 </button>
               </div>
             )}
+            {remainingEventsCount === 0 &&
+              visibleEvents.length > 0 &&
+              onLoadOlderEvents &&
+              !olderExhausted && (
+                <div style={{ padding: "10px 12px", textAlign: "center" }}>
+                  <button
+                    type="button"
+                    className="nvr-btn mono sm"
+                    data-testid="explore-load-older-server"
+                    disabled={loadingOlder}
+                    onClick={async () => {
+                      const oldest = visibleEvents[visibleEvents.length - 1];
+                      if (!oldest || loadingOlder) return;
+                      setLoadingOlder(true);
+                      try {
+                        let added = 0;
+                        if (exploreDateFilter.trim()) {
+                          const url = buildEventsFeedUrl(exploreDateFilter, 150, {
+                            before: oldest.start_time,
+                            camera: exploreCamera,
+                            label: exploreLabel,
+                            excludeLabel,
+                            zone: zoneFilter,
+                            minScore: minScoreFilter > 0 ? minScoreFilter / 100 : undefined,
+                            stationary: stationaryFilter,
+                            retainedOnly: exploreRetainedOnly,
+                            plate: plateFilter,
+                          });
+                          const res = await fetch(url, { credentials: "include" });
+                          if (res.ok) {
+                            const older: EventItem[] = await res.json();
+                            if (Array.isArray(older) && older.length > 0) {
+                              const prevList = dateScopedEventsRef.current ?? [];
+                              const existing = new Set(prevList.map((ev) => ev.id));
+                              const nextItems = older.filter((ev) => !existing.has(ev.id));
+                              added = nextItems.length;
+                              if (added > 0) {
+                                setDateScopedEvents((prev) => {
+                                  const cur = prev ?? [];
+                                  const curIds = new Set(cur.map((ev) => ev.id));
+                                  return [...cur, ...older.filter((ev) => !curIds.has(ev.id))];
+                                });
+                              }
+                            }
+                          }
+                        } else if (onLoadOlderEvents) {
+                          added = await onLoadOlderEvents(oldest.start_time, {
+                            excludeLabel,
+                            zone: zoneFilter,
+                            minScore: minScoreFilter > 0 ? minScoreFilter / 100 : undefined,
+                            stationary: stationaryFilter,
+                            plate: plateFilter,
+                          });
+                        }
+                        if (added === 0) setOlderExhausted(true);
+                        else setVisibleLimit((prev) => prev + added);
+                      } finally {
+                        setLoadingOlder(false);
+                      }
+                    }}
+                  >
+                    {loadingOlder
+                      ? isPt
+                        ? "Carregando histórico..."
+                        : "Loading older..."
+                      : isPt
+                        ? "Carregar mais antigos do servidor"
+                        : "Load older from server"}
+                  </button>
+                </div>
+              )}
             {visibleEvents.length === 0 && (
               <div
                 style={{
@@ -1545,7 +1642,9 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                     alignItems: "center",
                     gap: 8,
                     minWidth: 0,
-                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    flex: "1 1 200px",
+                    flexWrap: "wrap",
                   }}
                 >
                   <span className="nvr-badge alert">
@@ -1614,11 +1713,15 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                       color: "var(--text-secondary)",
                     }}
                   >
-                    {selectedEvent.camera.toUpperCase()} · #{selectedEvent.id.slice(-8)}
+                    {selectedEvent.camera.toUpperCase()} ·{" "}
+                    {selectedEvent.id.length > 16
+                      ? `#${selectedEvent.id.slice(-8)}`
+                      : selectedEvent.id}
                   </span>
                 </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", minWidth: 0 }}>
                   <button
+                    type="button"
                     className={`nvr-btn ${eventViewMode === "snapshot" ? "active" : ""}`}
                     onClick={() => setEventViewMode("snapshot")}
                   >
@@ -1626,49 +1729,81 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                     {t.explore.viewSnapshot}
                   </button>
                   <button
+                    type="button"
                     className={`nvr-btn ${eventViewMode === "clip" ? "active" : ""}`}
                     onClick={() => setEventViewMode("clip")}
                   >
                     <Play size={12} />
                     {t.explore.playClip}
                   </button>
+                  {!isViewer && (
+                    <>
+                      <button
+                        type="button"
+                        className={`nvr-btn ${selectedEvent.retain_indefinitely ? "active" : ""}`}
+                        onClick={() => handleEventRetain(selectedEvent)}
+                      >
+                        {t.explore.retainToggle}
+                      </button>
+                      <button
+                        type="button"
+                        className={`nvr-btn ${selectedEvent.false_positive ? "active danger" : ""}`}
+                        onClick={handleToggleFalsePositive}
+                        title={
+                          isPt
+                            ? "Alternar assinatura de supressão de falso positivo (IoU espacial + dhash64)"
+                            : "Toggle false-positive memory suppression signature (spatial IoU + dhash64)"
+                        }
+                      >
+                        {selectedEvent.false_positive
+                          ? isPt
+                            ? "Falso Positivo ✓"
+                            : "False Positive ✓"
+                          : isPt
+                            ? "Marcar Falso Positivo"
+                            : "Mark False Positive"}
+                      </button>
+                      <button
+                        type="button"
+                        className="nvr-btn mono"
+                        disabled={aiVerifyBusy}
+                        onClick={handleVerifyWithAi}
+                        title="Verify this detection snapshot using the configured Vision AI Judge (Gemini / OpenAI / Ollama)"
+                      >
+                        <Sparkles size={12} />
+                        {aiVerifyBusy
+                          ? isPt
+                            ? "Verificando..."
+                            : "Verifying..."
+                          : isPt
+                            ? "Verificar com IA"
+                            : "Verify with AI"}
+                      </button>
+                      {isAdmin && (
+                        <button
+                          type="button"
+                          className={`nvr-btn mono ${addedDatasetIds[selectedEvent.id] ? "active" : ""}`}
+                          disabled={datasetAddBusy}
+                          onClick={handleAddToDataset}
+                          title="Add clean event frame and normalized YOLO bounding box to Active Learning Dataset Studio"
+                        >
+                          {datasetAddBusy
+                            ? isPt
+                              ? "Adicionando..."
+                              : "Adding..."
+                            : addedDatasetIds[selectedEvent.id]
+                            ? isPt
+                              ? "No Dataset ✓"
+                              : "Added to Dataset ✓"
+                            : isPt
+                              ? "Adicionar ao Dataset"
+                              : "Add to Training Dataset"}
+                        </button>
+                      )}
+                    </>
+                  )}
                   <button
-                    className={`nvr-btn ${selectedEvent.retain_indefinitely ? "active" : ""}`}
-                    onClick={() => handleEventRetain(selectedEvent)}
-                  >
-                    {t.explore.retainToggle}
-                  </button>
-                  <button
-                    className={`nvr-btn ${selectedEvent.false_positive ? "active danger" : ""}`}
-                    onClick={handleToggleFalsePositive}
-                    title="Toggle false-positive memory suppression signature (spatial IoU + dhash64)"
-                  >
-                    {selectedEvent.false_positive
-                      ? "False Positive ✓"
-                      : "Mark False Positive"}
-                  </button>
-                  <button
-                    className="nvr-btn mono"
-                    disabled={aiVerifyBusy}
-                    onClick={handleVerifyWithAi}
-                    title="Verify this detection snapshot using the configured Vision AI Judge (Gemini / OpenAI / Ollama)"
-                  >
-                    <Sparkles size={12} />
-                    {aiVerifyBusy ? "Verifying..." : "Verify with AI"}
-                  </button>
-                  <button
-                    className={`nvr-btn mono ${addedDatasetIds[selectedEvent.id] ? "active" : ""}`}
-                    disabled={datasetAddBusy}
-                    onClick={handleAddToDataset}
-                    title="Add clean event frame and normalized YOLO bounding box to Active Learning Dataset Studio"
-                  >
-                    {datasetAddBusy
-                      ? "Adding..."
-                      : addedDatasetIds[selectedEvent.id]
-                      ? "Added to Dataset ✓"
-                      : "Add to Training Dataset"}
-                  </button>
-                  <button
+                    type="button"
                     className="nvr-btn"
                     onClick={() => {
                       const safeTs =
@@ -1681,58 +1816,64 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                       switchTab("sync");
                     }}
                   >
-                    4-Cam Sync
+                    {isPt ? "Sync 4-Câm" : "4-Cam Sync"}
                   </button>
                   <button
+                    type="button"
                     className={`nvr-btn mono ${showForensic ? "active" : ""}`}
                     onClick={() => setShowForensic((v) => !v)}
                     title="Inspect exact score, threshold, pixel area, aspect ratio, and zone provenance"
                   >
-                    Explain Alert
+                    {isPt ? "Explicar Alerta" : "Explain Alert"}
                   </button>
-                  <button
-                    className={`nvr-btn mono ${showDebugReplay ? "active" : ""}`}
-                    onClick={() => {
-                      const next = !showDebugReplay;
-                      setShowDebugReplay(next);
-                      if (next && !debugTrace) {
-                        void handleRunDebugReplay();
-                      }
-                    }}
-                    title="Re-run recorded clip through motion + AI detector pipeline with custom thresholds"
-                  >
-                    Debug Replay
-                  </button>
-                  <button
-                    type="button"
-                    className="nvr-btn danger mono"
-                    aria-label={
-                      isArmed(`delete-event:${selectedEvent.id}`)
-                        ? isPt
-                          ? "Confirmar exclusão do evento"
-                          : "Click again to confirm deleting event"
-                        : "Delete tracked object event"
-                    }
-                    title={
-                      isArmed(`delete-event:${selectedEvent.id}`)
-                        ? isPt
-                          ? "Clique novamente para confirmar"
-                          : "Click again to confirm"
-                        : "Delete tracked object event"
-                    }
-                    onClick={() => {
-                      confirmOrArm(`delete-event:${selectedEvent.id}`, () => {
-                        void handleEventDelete(selectedEvent.id);
-                      });
-                    }}
-                  >
-                    <Trash2 size={12} />
-                    {isArmed(`delete-event:${selectedEvent.id}`)
-                      ? isPt
-                        ? "Confirmar?"
-                        : "Click again to confirm"
-                      : null}
-                  </button>
+                  {isAdmin && (
+                    <>
+                      <button
+                        type="button"
+                        className={`nvr-btn mono ${showDebugReplay ? "active" : ""}`}
+                        onClick={() => {
+                          const next = !showDebugReplay;
+                          setShowDebugReplay(next);
+                          if (next && !debugTrace) {
+                            void handleRunDebugReplay();
+                          }
+                        }}
+                        title="Re-run recorded clip through motion + AI detector pipeline with custom thresholds"
+                      >
+                        {isPt ? "Replay Debug" : "Debug Replay"}
+                      </button>
+                      <button
+                        type="button"
+                        className="nvr-btn danger mono"
+                        aria-label={
+                          isArmed(`delete-event:${selectedEvent.id}`)
+                            ? isPt
+                              ? "Confirmar exclusão do evento"
+                              : "Click again to confirm deleting event"
+                            : "Delete tracked object event"
+                        }
+                        title={
+                          isArmed(`delete-event:${selectedEvent.id}`)
+                            ? isPt
+                              ? "Clique novamente para confirmar"
+                              : "Click again to confirm"
+                            : "Delete tracked object event"
+                        }
+                        onClick={() => {
+                          confirmOrArm(`delete-event:${selectedEvent.id}`, () => {
+                            void handleEventDelete(selectedEvent.id);
+                          });
+                        }}
+                      >
+                        <Trash2 size={12} />
+                        {isArmed(`delete-event:${selectedEvent.id}`)
+                          ? isPt
+                            ? "Confirmar?"
+                            : "Click again to confirm"
+                          : null}
+                      </button>
+                    </>
+                  )}
                 </div>
               </div>
 
@@ -2091,7 +2232,13 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                 </div>
               )}
 
-              <div className="nvr-cam-tile" style={{ flex: 1 }}>
+              <div
+                className="nvr-cam-tile"
+                style={{
+                  flex: 1,
+                  ...(isCompact ? { order: -1, minHeight: 205 } : {}),
+                }}
+              >
                 {eventViewMode === "snapshot" ? (
                   <img
                     src={`/api/events/${encodeURIComponent(selectedEvent.id)}/snapshot.jpg?bbox=1`}
@@ -2151,143 +2298,159 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                 )}
               </div>
 
-              <div
-                style={{
-                  padding: "6px 10px",
-                  background: "var(--bg-panel)",
-                  borderTop: "1px solid var(--border-hairline)",
-                  display: "flex",
-                  alignItems: "center",
-                  flexWrap: "wrap",
-                  gap: 8,
-                }}
-              >
-                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                  FACE ID / SUB-LABEL:
-                </span>
-                <input
-                  className="nvr-input mono"
-                  style={{ width: 150, height: 26, fontSize: "var(--text-xs)" }}
-                  aria-label="Assign Face Name"
-                  placeholder="Person name (e.g. Bruno)..."
-                  value={faceNameDraft}
-                  onChange={(e) => setFaceNameDraft(e.target.value)}
-                />
-                {enrolledFaces.length > 0 && (
-                  <select
-                    className="nvr-select mono"
-                    style={{ height: 26, fontSize: "var(--text-xs)" }}
-                    aria-label="Pick enrolled face profile"
-                    value=""
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      if (val) {
-                        setFaceNameDraft(val);
-                        void handleAssignFaceSubLabel(val);
-                      }
-                    }}
-                  >
-                    <option value="">Quick Assign Profile...</option>
-                    {enrolledFaces.map((p) => (
-                      <option key={p.name} value={p.name}>
-                        {p.name} ({p.sample_count})
-                      </option>
-                    ))}
-                  </select>
-                )}
-                <button
-                  type="button"
-                  className="nvr-btn primary mono"
-                  style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
-                  disabled={Boolean(batchFaceProgress?.active)}
-                  onClick={() => void handleAssignFaceSubLabel()}
-                  title="Assigns person name to selected event(s) and automatically enrolls 112x112 face crop into Face Gallery"
-                >
-                  {batchFaceProgress?.active
-                    ? `Enrolling ${batchFaceProgress.completed}/${batchFaceProgress.total}...`
-                    : selectedBatchEventIds.length > 0
-                    ? `Assign & Enroll (${selectedBatchEventIds.length} Selected)`
-                    : "Assign & Enroll Face"}
-                </button>
-                {enrolledFaces.map((p) => (
-                  <button
-                    key={`quick-face-${p.name}`}
-                    type="button"
-                    className={`nvr-btn mono ${
-                      (selectedEvent.sub_label || "").trim().toLowerCase() ===
-                      p.name.trim().toLowerCase()
-                        ? "active"
-                        : ""
-                    }`}
-                    style={{ height: 26, padding: "0 8px", fontSize: "var(--text-xs)" }}
-                    onClick={() => {
-                      setFaceNameDraft(p.name);
-                      void handleAssignFaceSubLabel(p.name);
-                    }}
-                    title={`1-click assign & enroll face sample into '${p.name}' gallery (${p.sample_count} samples)`}
-                  >
-                    + {p.name} ({p.sample_count})
-                  </button>
-                ))}
-                {(selectedEvent.sub_label || selectedEvent.data?.sub_label) && (
-                  <button
-                    type="button"
-                    className="nvr-btn danger mono"
-                    style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
-                    aria-label="Clear or unassign face sub-label"
-                    onClick={() => {
-                      setFaceNameDraft("");
-                      void handleAssignFaceSubLabel(null);
-                    }}
-                  >
-                    Clear / Unassign Face
-                  </button>
-                )}
-                <span className="nvr-divider" aria-hidden="true" />
-                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                  LICENSE PLATE:
-                </span>
-                <input
-                  className="nvr-input mono"
-                  aria-label="Manual license plate override"
+              {!isViewer && (
+                <div
                   style={{
-                    width: 120,
-                    height: 26,
-                    fontSize: "var(--text-xs)",
-                    fontFamily: "var(--font-mono)",
+                    padding: "6px 10px",
+                    background: "var(--bg-panel)",
+                    borderTop: "1px solid var(--border-hairline)",
+                    display: "flex",
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                    gap: 8,
                   }}
-                  placeholder="ABC1D23"
-                  value={eventPlateDraft}
-                  onChange={(e) => setEventPlateDraft(e.target.value.toUpperCase())}
-                />
-                <button
-                  type="button"
-                  className="nvr-btn mono"
-                  style={{ height: 26, padding: "0 8px", fontSize: "var(--text-xs)" }}
-                  onClick={handleSaveEventLicensePlate}
                 >
-                  Save Plate
-                </button>
-                <span className="nvr-divider" aria-hidden="true" />
-                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                  FORENSIC NOTE:
-                </span>
-                <input
-                  className="nvr-input mono"
-                  style={{ flex: 1, minWidth: 160, height: 26, fontSize: "var(--text-xs)" }}
-                  placeholder="Attach operator annotation (searchable in Explore)..."
-                  value={eventNoteDraft}
-                  onChange={(e) => setEventNoteDraft(e.target.value)}
-                />
-                <button
-                  type="button"
-                  className="nvr-btn primary mono"
-                  style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
-                  onClick={handleSaveEventNote}
-                >
-                  Save Note
-                </button>
-              </div>
+                  {isAdmin && (
+                    <>
+                  <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                    {isPt ? "ROSTO / SUB-RÓTULO:" : "FACE ID / SUB-LABEL:"}
+                  </span>
+                  <input
+                    className="nvr-input mono"
+                    style={{ width: 190, height: 26, fontSize: "var(--text-xs)" }}
+                    aria-label={isPt ? "Atribuir nome da pessoa" : "Assign Face Name"}
+                    placeholder={isPt ? "Nome (ex.: Bruno)..." : "Person name (e.g. Bruno)..."}
+                    value={faceNameDraft}
+                    onChange={(e) => setFaceNameDraft(e.target.value)}
+                  />
+                  {enrolledFaces.length > 0 && (
+                    <select
+                      className="nvr-select mono"
+                      style={{ height: 26, fontSize: "var(--text-xs)" }}
+                      aria-label="Pick enrolled face profile"
+                      value=""
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        if (val) {
+                          setFaceNameDraft(val);
+                          void handleAssignFaceSubLabel(val);
+                        }
+                      }}
+                    >
+                      <option value="">
+                        {isPt ? "Perfil Rápido..." : "Quick Assign Profile..."}
+                      </option>
+                      {enrolledFaces.map((p) => (
+                        <option key={p.name} value={p.name}>
+                          {p.name} ({p.sample_count})
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  <button
+                    type="button"
+                    className="nvr-btn primary mono"
+                    style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
+                    disabled={Boolean(batchFaceProgress?.active)}
+                    onClick={() => void handleAssignFaceSubLabel()}
+                    title="Assigns person name to selected event(s) and automatically enrolls 112x112 face crop into Face Gallery"
+                  >
+                    {batchFaceProgress?.active
+                      ? `Enrolling ${batchFaceProgress.completed}/${batchFaceProgress.total}...`
+                      : selectedBatchEventIds.length > 0
+                      ? isPt
+                        ? `Atribuir (${selectedBatchEventIds.length} sel.)`
+                        : `Assign & Enroll (${selectedBatchEventIds.length} Selected)`
+                      : isPt
+                        ? "Atribuir & Cadastrar Rosto"
+                        : "Assign & Enroll Face"}
+                  </button>
+                  {enrolledFaces.map((p) => (
+                    <button
+                      key={`quick-face-${p.name}`}
+                      type="button"
+                      className={`nvr-btn mono ${
+                        (selectedEvent.sub_label || "").trim().toLowerCase() ===
+                        p.name.trim().toLowerCase()
+                          ? "active"
+                          : ""
+                      }`}
+                      style={{ height: 26, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                      onClick={() => {
+                        setFaceNameDraft(p.name);
+                        void handleAssignFaceSubLabel(p.name);
+                      }}
+                      title={`1-click assign & enroll face sample into '${p.name}' gallery (${p.sample_count} samples)`}
+                    >
+                      + {p.name} ({p.sample_count})
+                    </button>
+                  ))}
+                  {(selectedEvent.sub_label || selectedEvent.data?.sub_label) && (
+                    <button
+                      type="button"
+                      className="nvr-btn danger mono"
+                      style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
+                      aria-label="Clear or unassign face sub-label"
+                      onClick={() => {
+                        setFaceNameDraft("");
+                        void handleAssignFaceSubLabel(null);
+                      }}
+                    >
+                      {isPt ? "Limpar Rosto" : "Clear / Unassign Face"}
+                    </button>
+                  )}
+                  <span className="nvr-divider" aria-hidden="true" />
+                    </>
+                  )}
+                  <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                    {isPt ? "PLACA:" : "LICENSE PLATE:"}
+                  </span>
+                  <input
+                    className="nvr-input mono"
+                    aria-label="Manual license plate override"
+                    style={{
+                      width: 120,
+                      height: 26,
+                      fontSize: "var(--text-xs)",
+                      fontFamily: "var(--font-mono)",
+                    }}
+                    placeholder="ABC1D23"
+                    value={eventPlateDraft}
+                    onChange={(e) => setEventPlateDraft(e.target.value.toUpperCase())}
+                  />
+                  <button
+                    type="button"
+                    className="nvr-btn mono"
+                    style={{ height: 26, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                    onClick={handleSaveEventLicensePlate}
+                  >
+                    {isPt ? "Salvar Placa" : "Save Plate"}
+                  </button>
+                  <span className="nvr-divider" aria-hidden="true" />
+                  <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                    {isPt ? "NOTA FORENSE:" : "FORENSIC NOTE:"}
+                  </span>
+                  <input
+                    className="nvr-input mono"
+                    style={{ flex: 1, minWidth: 160, height: 26, fontSize: "var(--text-xs)" }}
+                    placeholder={
+                      isPt
+                        ? "Anexar observação forense (pesquisável no Explorar)..."
+                        : "Attach operator annotation (searchable in Explore)..."
+                    }
+                    value={eventNoteDraft}
+                    onChange={(e) => setEventNoteDraft(e.target.value)}
+                  />
+                  <button
+                    type="button"
+                    className="nvr-btn primary mono"
+                    style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
+                    onClick={handleSaveEventNote}
+                  >
+                    {isPt ? "Salvar Nota" : "Save Note"}
+                  </button>
+                </div>
+              )}
             </>
           ) : (
             <div
@@ -2299,7 +2462,9 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                 color: "var(--text-muted)",
               }}
             >
-              Select a tracked object event on the left
+              {isPt
+                ? "Selecione um evento de objeto rastreado à esquerda"
+                : "Select a tracked object event on the left"}
             </div>
           )}
         </div>

@@ -23,7 +23,11 @@ import {
 } from "../utils/configWorkbench";
 import { TacticalCameraPicker } from "../components/TacticalCameraPicker";
 import { useNvrStore } from "../store/useNvrStore";
-import { countChangedSections, formatUnsavedLabel } from "../utils/settingsUx";
+import {
+  countChangedSections,
+  detectProcessRestartSections,
+  formatUnsavedLabel,
+} from "../utils/settingsUx";
 import {
   ChannelsStreamsSection,
   ConsoleUiSection,
@@ -113,7 +117,11 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   const { t, locale } = useI18n();
   const isPt = locale === "pt";
   const [activeCategory, setActiveCategory] = useState<SettingsCategory>(() =>
-    zonesSubTab === "yaml" ? "yaml" : "vision"
+    zonesSubTab === "yaml"
+      ? "yaml"
+      : cameraNames.length === 0
+        ? "channels"
+        : "vision"
   );
   const [scope, setScope] = useState<"global" | string>("camera");
   const [visionReviewOpen, setVisionReviewOpen] = useState(false);
@@ -150,9 +158,14 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
     yamlStale,
     isDirty,
     hasUnsavedRawEdits,
+    hasRemoteConflict,
     isSaving,
     saveOutcome,
   } = useConfigWorkbenchSnapshot(session);
+  const processRestartSections = useMemo(
+    () => detectProcessRestartSections(baselineConfig, draftConfig),
+    [baselineConfig, draftConfig]
+  );
   const effectiveRawYaml = sharedSession
     ? sessionRawYaml
     : sessionRawYaml || rawYaml;
@@ -616,7 +629,9 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                 <span className="nvr-divider" aria-hidden="true" />
                 <button
                   type="button"
-                  className={`nvr-btn mono ${scope === "global" ? "active" : ""} sm`}
+                  className={`nvr-btn mono ${
+                    displayCams.length === 0 || scope === "global" ? "active" : ""
+                  } sm`}
                   onClick={() => {
                     if (scope === "global") return;
                     if (draftPoints.length > 0) {
@@ -635,19 +650,21 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                 >
                   {isPt ? "PADRÃO GLOBAL" : "GLOBAL DEFAULTS"}
                 </button>
-                <TacticalCameraPicker
-                  cameras={displayCams}
-                  selectedCamera={scope === "global" ? "" : effectiveInspectorCam}
-                  onSelect={(cam) => {
-                    switchInspectorCamera(cam, true);
-                  }}
-                  cameraGroups={draftConfig?.camera_groups}
-                  ariaLabel="Settings camera scope selector"
-                />
+                {displayCams.length > 0 && (
+                  <TacticalCameraPicker
+                    cameras={displayCams}
+                    selectedCamera={scope === "global" ? "" : effectiveInspectorCam}
+                    onSelect={(cam) => {
+                      switchInspectorCamera(cam, true);
+                    }}
+                    cameraGroups={draftConfig?.camera_groups}
+                    ariaLabel="Settings camera scope selector"
+                  />
+                )}
               </>
             )}
 
-            {supportsCameraOnlyBar && (
+            {supportsCameraOnlyBar && displayCams.length > 0 && (
               <>
                 <span className="nvr-divider" aria-hidden="true" />
                 <TacticalCameraPicker
@@ -657,23 +674,25 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                   cameraGroups={draftConfig?.camera_groups}
                   ariaLabel="Settings channel selector"
                 />
-                <a
-                  href={`/api/camera-proxy/${encodeURIComponent(effectiveInspectorCam)}/`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="nvr-btn mono"
-                  style={{
-                    height: 24,
-                    padding: "0 8px",
-                    fontSize: "var(--text-xs)",
-                    textDecoration: "none",
-                    display: "inline-flex",
-                    alignItems: "center",
-                  }}
-                  title="Open camera's native Web UI via authenticated SSRF-safe reverse proxy"
-                >
-                  Open Camera Web UI ↗
-                </a>
+                {effectiveInspectorCam && (
+                  <a
+                    href={`/api/camera-proxy/${encodeURIComponent(effectiveInspectorCam)}/`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="nvr-btn mono"
+                    style={{
+                      height: 24,
+                      padding: "0 8px",
+                      fontSize: "var(--text-xs)",
+                      textDecoration: "none",
+                      display: "inline-flex",
+                      alignItems: "center",
+                    }}
+                    title="Open camera's native Web UI via authenticated SSRF-safe reverse proxy"
+                  >
+                    {isPt ? "Abrir Web UI da Câmera ↗" : "Open Camera Web UI ↗"}
+                  </a>
+                )}
               </>
             )}
           </div>
@@ -815,9 +834,71 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
           </div>
         </div>
 
+        {hasRemoteConflict && activeCategory === "yaml" && (
+          <div
+            role="alert"
+            data-testid="raw-yaml-remote-conflict"
+            className="mono"
+            style={{
+              padding: "10px 14px",
+              background: "rgba(239, 68, 68, 0.14)",
+              borderBottom: "1px solid var(--signal-alert)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              flexWrap: "wrap",
+              gap: 10,
+              fontSize: "var(--text-xs)",
+            }}
+          >
+            <span style={{ color: "var(--signal-alert-text)", fontWeight: 700 }}>
+              {isPt
+                ? "Conflito concorrente: a configuração no servidor foi alterada enquanto você editava o Raw config.yml."
+                : "Concurrent change detected: the server configuration changed while you had unsaved Raw config.yml edits."}
+            </span>
+            <button
+              type="button"
+              className="nvr-btn sm mono"
+              onClick={async () => {
+                session.discardRawEdits();
+                const fresh = await session.refreshFromServer();
+                if (!sharedSession && fresh.rawYaml) {
+                  setRawYaml(fresh.rawYaml);
+                }
+                notify(
+                  isPt
+                    ? "Raw config.yml recarregado com a versão mais recente do servidor"
+                    : "Reloaded latest server config.yml"
+                );
+              }}
+            >
+              {isPt ? "Recarregar YAML do Servidor" : "Reload Latest Server YAML"}
+            </button>
+          </div>
+        )}
+
+        {processRestartSections.length > 0 && activeCategory !== "console" && (
+          <div
+            role="status"
+            data-testid="process-restart-required-banner"
+            className="mono"
+            style={{
+              padding: "7px 14px",
+              background: "var(--signal-motion-tint)",
+              borderBottom: "1px solid var(--signal-motion-border)",
+              fontSize: "var(--text-xs)",
+              color: "var(--text-primary)",
+            }}
+          >
+            {isPt
+              ? `Atenção: alterações em [${processRestartSections.join(", ")}] exigem reinício do processo/container do NinjaNVR após salvar.`
+              : `Note: changes to [${processRestartSections.join(", ")}] require restarting the NinjaNVR process/container after saving.`}
+          </div>
+        )}
+
         {pendingYamlExitCategory && (
           <div
-            role="alertdialog"
+            role="alert"
             aria-label={
               isPt
                 ? "Edições não salvas no Raw config.yml"
@@ -890,7 +971,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
 
         {pendingDraftSwitch && draftPoints.length > 0 && (
           <div
-            role="alertdialog"
+            role="alert"
             aria-label={
               isPt
                 ? "Confirmar descarte de polígono em desenho"
@@ -988,7 +1069,11 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
               <AiDetectionObjectsSection
                 draftConfig={draftConfig}
                 updateDraft={updateDraft}
-                scope={scope === "global" ? "global" : effectiveInspectorCam}
+                scope={
+                  displayCams.length === 0 || scope === "global"
+                    ? "global"
+                    : effectiveInspectorCam
+                }
                 inspectorCam={effectiveInspectorCam}
                 notify={notify}
                 onOpenVectorStudio={(targetCam?: string) => {
@@ -1030,7 +1115,11 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
               <RecordingReviewSection
                 draftConfig={draftConfig}
                 updateDraft={updateDraft}
-                scope={scope === "global" ? "global" : effectiveInspectorCam}
+                scope={
+                  displayCams.length === 0 || scope === "global"
+                    ? "global"
+                    : effectiveInspectorCam
+                }
                 inspectorCam={effectiveInspectorCam}
                 notify={notify}
               />

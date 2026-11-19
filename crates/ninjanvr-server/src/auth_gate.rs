@@ -2474,7 +2474,12 @@ pub async fn api_first_time_login(State(state): State<AppState>) -> Json<Value> 
     }))
 }
 
-pub async fn api_auth_providers(State(state): State<AppState>) -> Json<Value> {
+pub async fn api_auth_providers(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Json<Value> {
+    let authenticated = authenticate_read(&state, &jar, &headers).await.is_ok();
     let cfg = state.config.read().await;
     let oidc = &cfg.auth.oidc;
     let issuer = if !oidc.issuer_url.trim().is_empty() {
@@ -2490,6 +2495,9 @@ pub async fn api_auth_providers(State(state): State<AppState>) -> Json<Value> {
     let oidc_ready = oidc.enabled && !issuer.is_empty() && !client_id.is_empty();
     Json(json!({
         "enabled": cfg.auth.enabled,
+        "authenticated": authenticated,
+        "admin_first_time_login": cfg.auth.admin_first_time_login,
+        "initial_password_file": cfg.auth.admin_first_time_login.then_some("initial_admin_password"),
         "local_login_enabled": cfg.auth.local_login_enabled,
         "oidc": {
             "enabled": oidc_ready,

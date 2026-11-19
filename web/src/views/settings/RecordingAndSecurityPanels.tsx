@@ -1587,7 +1587,7 @@ export const CommsAuthUsersSection: React.FC<{
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 8 }}>
             <div>
               <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                Broker Host / IP
+                {isPt ? "Host / IP do Broker" : "Broker Host / IP"}
               </div>
               <input
                 className="nvr-input mono"
@@ -1598,7 +1598,7 @@ export const CommsAuthUsersSection: React.FC<{
             </div>
             <div>
               <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                Broker Port
+                {isPt ? "Porta do Broker" : "Broker Port"}
               </div>
               <input
                 type="number"
@@ -1613,7 +1613,7 @@ export const CommsAuthUsersSection: React.FC<{
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 8 }}>
             <div>
               <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                Topic Prefix
+                {isPt ? "Prefixo do Tópico" : "Topic Prefix"}
               </div>
               <input
                 className="nvr-input mono"
@@ -1624,7 +1624,7 @@ export const CommsAuthUsersSection: React.FC<{
             </div>
             <div>
               <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                Client ID
+                {isPt ? "ID do Cliente" : "Client ID"}
               </div>
               <input
                 className="nvr-input mono"
@@ -1635,7 +1635,7 @@ export const CommsAuthUsersSection: React.FC<{
             </div>
             <div>
               <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                Stats Interval (s)
+                {isPt ? "Intervalo de Telemetria (s)" : "Stats Interval (s)"}
               </div>
               <input
                 type="number"
@@ -1770,7 +1770,7 @@ export const CommsAuthUsersSection: React.FC<{
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 8 }}>
             <div>
               <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                Session Length (s)
+                {isPt ? "Duração da Sessão (s)" : "Session Length (s)"}
               </div>
               <input
                 type="number"
@@ -1784,21 +1784,7 @@ export const CommsAuthUsersSection: React.FC<{
             </div>
             <div>
               <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                Refresh Window (s)
-              </div>
-              <input
-                type="number"
-                className="nvr-input mono"
-                style={{ width: "100%", marginTop: 3 }}
-                value={authCfg.refresh_time}
-                onChange={(e) =>
-                  mutateAuth({ refresh_time: Number(e.target.value) })
-                }
-              />
-            </div>
-            <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                PBKDF2 Iterations
+                {isPt ? "Iterações PBKDF2" : "PBKDF2 Iterations"}
               </div>
               <input
                 type="number"
@@ -1817,7 +1803,7 @@ export const CommsAuthUsersSection: React.FC<{
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 8 }}>
             <div>
               <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                JWT Cookie Name
+                {isPt ? "Nome do Cookie JWT" : "JWT Cookie Name"}
               </div>
               <input
                 className="nvr-input mono"
@@ -1828,7 +1814,7 @@ export const CommsAuthUsersSection: React.FC<{
             </div>
             <div>
               <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                SQLite WAL Database Path
+                {isPt ? "Caminho do Banco SQLite WAL" : "SQLite WAL Database Path"}
               </div>
               <input
                 className="nvr-input mono"
@@ -1853,7 +1839,12 @@ export const CommsAuthUsersSection: React.FC<{
               ? `CONTAS DE OPERADOR & PERMISSÕES (${users.length} USUÁRIOS)`
               : `OPERATOR ACCOUNTS & ROLE ACCESS (${users.length} USERS)`}
           </span>
-          <span className="nvr-badge live">SQLITE PBKDF2-SHA256</span>
+          <div style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span className="nvr-badge live">
+              {isPt ? "SALVO IMEDIATAMENTE" : "SAVED IMMEDIATELY"}
+            </span>
+            <span className="nvr-badge mono">SQLITE PBKDF2-SHA256</span>
+          </div>
         </div>
         <div className="nvr-cfg-card-body">
           <table className="nvr-table mono">
@@ -2053,7 +2044,12 @@ export const CommsAuthUsersSection: React.FC<{
               ? `TOKENS DE API SCOPED (${apiTokens.length})`
               : `SCOPED API BEARER TOKENS (${apiTokens.length})`}
           </span>
-          <span className="nvr-badge mono">SHA-256 HASHED // nnvr_*</span>
+          <div style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span className="nvr-badge live">
+              {isPt ? "SALVO IMEDIATAMENTE" : "SAVED IMMEDIATELY"}
+            </span>
+            <span className="nvr-badge mono">SHA-256 HASHED // nnvr_*</span>
+          </div>
         </div>
         <div className="nvr-cfg-card-body">
           {createdPlaintextToken && (
@@ -2136,7 +2132,7 @@ export const CommsAuthUsersSection: React.FC<{
             <input
               className="nvr-input mono"
               style={{ width: 240 }}
-              placeholder="Token name (e.g. prometheus)"
+              placeholder={isPt ? "Nome do token (ex.: prometheus)" : "Token name (e.g. prometheus)"}
               aria-label="API Token Name"
               value={newTokenName}
               onChange={(e) => setNewTokenName(e.target.value)}
@@ -2149,9 +2145,15 @@ export const CommsAuthUsersSection: React.FC<{
                 setNewTokenScope(e.target.value as "read_only" | "metrics" | "full")
               }
             >
-              <option value="read_only">Scope: read_only (GET /api/*)</option>
-              <option value="metrics">Scope: metrics (GET /api/stats*)</option>
-              <option value="full">Scope: full (Admin)</option>
+              <option value="read_only">
+                {isPt ? "Escopo: read_only (GET /api/*)" : "Scope: read_only (GET /api/*)"}
+              </option>
+              <option value="metrics">
+                {isPt ? "Escopo: metrics (GET /api/stats*)" : "Scope: metrics (GET /api/stats*)"}
+              </option>
+              <option value="full">
+                {isPt ? "Escopo: full (Admin)" : "Scope: full (Admin)"}
+              </option>
             </select>
             <button
               type="button"
@@ -2159,7 +2161,7 @@ export const CommsAuthUsersSection: React.FC<{
               onClick={handleCreateToken}
             >
               <Plus size={12} />
-              Generate API Token
+              {isPt ? "Gerar Token de API" : "Generate API Token"}
             </button>
           </div>
 
@@ -2396,9 +2398,12 @@ export const CommsAuthUsersSection: React.FC<{
       <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
         <div className="nvr-cfg-card-header">
           <span style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-            {isPt
-              ? `FEDERAÇÃO MULTI-NÓ NVR (${Object.keys(draftConfig.peers || {}).length + 1} NÓS)`
-              : `MULTI-NODE NVR FEDERATION (${Object.keys(draftConfig.peers || {}).length + 1} NODES)`}
+            {(() => {
+              const peerCount = Object.keys(draftConfig.peers || {}).length + 1;
+              return isPt
+                ? `FEDERAÇÃO MULTI-NÓ NVR (${peerCount} ${peerCount === 1 ? "NÓ" : "NÓS"})`
+                : `MULTI-NODE NVR FEDERATION (${peerCount} ${peerCount === 1 ? "NODE" : "NODES"})`;
+            })()}
             <span className="nvr-yaml-key-tag">peers</span>
           </span>
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>

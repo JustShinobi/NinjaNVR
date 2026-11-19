@@ -607,46 +607,57 @@ export const DatasetStudioSection: React.FC<{
     if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey || isTypingTarget(e.target)) return;
     const key = e.key.toLowerCase();
     if (key === "escape") {
-      setDraft(null);
-      setSelectedBox(null);
+      if (draft !== null || selectedBox !== null) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        setDraft(null);
+        setSelectedBox(null);
+      }
       return;
     }
     const quick = Number(e.key);
     if (Number.isInteger(quick) && quick >= 1 && quick <= QUICK_CLASS_IDS.length) {
       e.preventDefault();
+      e.stopImmediatePropagation();
       setActiveClassId(QUICK_CLASS_IDS[quick - 1]);
       return;
     }
     if (key === "j" || key === "arrowdown") {
       e.preventDefault();
+      e.stopImmediatePropagation();
       setSelectedId(stepQueue(1));
       return;
     }
     if (key === "k" || key === "arrowup") {
       e.preventDefault();
+      e.stopImmediatePropagation();
       setSelectedId(stepQueue(-1));
       return;
     }
     if (!selected || busyAction) return;
     if (key === "v") {
       e.preventDefault();
+      e.stopImmediatePropagation();
       if (canConfirmSample(selected)) void confirmManual(selected);
     } else if (key === "a") {
       e.preventDefault();
+      e.stopImmediatePropagation();
       void runAutoAnnotate(selected.id);
     } else if (key === "n") {
       e.preventDefault();
+      e.stopImmediatePropagation();
       void markBackground(selected);
     } else if ((key === "delete" || key === "backspace") && selectedBox !== null) {
       e.preventDefault();
+      e.stopImmediatePropagation();
       removeBox(selected, selectedBox);
     }
   };
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => keydownHandlerRef.current(e);
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
   }, []);
 
   // ---- drawing -----------------------------------------------------------

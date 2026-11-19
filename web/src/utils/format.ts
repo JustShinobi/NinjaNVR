@@ -205,7 +205,24 @@ export function resolveInitialFirstWeekday(): FirstWeekday {
   return "sunday";
 }
 
-export function formatTs(unixSec: number): string {
+export interface FormatTimeOptions {
+  locale?: "en" | "pt" | string;
+  timeFormat?: "24h" | "12h" | "browser" | string;
+}
+
+function resolveHour12Option(timeFormat?: string): boolean | undefined {
+  if (timeFormat === "12h") return true;
+  if (timeFormat === "browser") return undefined;
+  return false;
+}
+
+function resolveLocaleTag(locale?: string): string | string[] {
+  if (locale === "pt" || locale === "pt-BR") return "pt-BR";
+  if (locale === "en" || locale === "en-US") return "en-US";
+  return [];
+}
+
+export function formatTs(unixSec: number, options?: FormatTimeOptions): string {
   if (typeof unixSec !== "number" || !Number.isFinite(unixSec)) {
     return "--:--:--";
   }
@@ -213,16 +230,20 @@ export function formatTs(unixSec: number): string {
   if (Number.isNaN(d.getTime())) {
     return "--:--:--";
   }
-  return d.toLocaleTimeString([], {
+  const hour12 = resolveHour12Option(options?.timeFormat);
+  return d.toLocaleTimeString(resolveLocaleTag(options?.locale), {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
-    hour12: false,
+    ...(hour12 !== undefined ? { hour12 } : {}),
   });
 }
 
-export function formatClockTime(unixSec: number): string {
-  return formatTs(unixSec);
+export function formatClockTime(
+  unixSec: number,
+  options?: FormatTimeOptions
+): string {
+  return formatTs(unixSec, options);
 }
 
 export function formatDuration(sec: number): string {
@@ -236,7 +257,10 @@ export function formatDuration(sec: number): string {
   return `${m}m ${s.toString().padStart(2, "0")}s`;
 }
 
-export function formatDateTime(unixSec: number): string {
+export function formatDateTime(
+  unixSec: number,
+  options?: FormatTimeOptions
+): string {
   if (typeof unixSec !== "number" || !Number.isFinite(unixSec)) {
     return "--:--:--";
   }
@@ -244,25 +268,37 @@ export function formatDateTime(unixSec: number): string {
   if (Number.isNaN(d.getTime())) {
     return "--:--:--";
   }
-  return d.toLocaleString([], {
+  const hour12 = resolveHour12Option(options?.timeFormat);
+  return d.toLocaleString(resolveLocaleTag(options?.locale), {
     month: "short",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
-    hour12: false,
+    ...(hour12 !== undefined ? { hour12 } : {}),
   });
 }
 
-export function formatRelTime(unixSec: number): string {
+export function formatRelTime(
+  unixSec: number,
+  locale: "en" | "pt" | string = "en"
+): string {
+  const isPt = locale === "pt" || locale === "pt-BR";
   if (typeof unixSec !== "number" || !Number.isFinite(unixSec) || unixSec <= 0) {
-    return "0s ago";
+    return isPt ? "há 0s" : "0s ago";
   }
   const diff = Math.max(0, Math.round(Date.now() / 1000 - unixSec));
-  if (diff < 60) return `${diff}s ago`;
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  return `${Math.floor(diff / 86400)}d ago`;
+  if (diff < 60) return isPt ? `há ${diff}s` : `${diff}s ago`;
+  if (diff < 3600) {
+    const m = Math.floor(diff / 60);
+    return isPt ? `há ${m}m` : `${m}m ago`;
+  }
+  if (diff < 86400) {
+    const h = Math.floor(diff / 3600);
+    return isPt ? `há ${h}h` : `${h}h ago`;
+  }
+  const d = Math.floor(diff / 86400);
+  return isPt ? `há ${d}d` : `${d}d ago`;
 }
 
 export function formatUptime(sec: number): string {
@@ -294,8 +330,10 @@ export function formatDisplayVersion(
 
 export function resolveHeaderTelemetryMeta(
   wsOnline: boolean,
-  channelCount: number
+  channelCount: number,
+  locale: "en" | "pt" | string = "en"
 ): HeaderTelemetryMeta {
+  const isPt = locale === "pt" || locale === "pt-BR";
   const safeCount =
     typeof channelCount === "number" && Number.isFinite(channelCount)
       ? Math.max(0, Math.floor(channelCount))
@@ -303,13 +341,19 @@ export function resolveHeaderTelemetryMeta(
   const channelBadge = `${safeCount} CH`;
   const wsDotClass = wsOnline ? "live" : "motion";
   const wsStatusLabel = wsOnline
-    ? "Real-time WebSocket stream online"
-    : "WebSocket reconnecting (HTTP fallback active)";
+    ? isPt
+      ? "Stream WebSocket em tempo real ativo"
+      : "Real-time WebSocket stream online"
+    : isPt
+      ? "WebSocket reconectando (fallback HTTP ativo)"
+      : "WebSocket reconnecting (HTTP fallback active)";
   return {
     wsDotClass,
     wsStatusLabel,
-    channelBadge,
-    tooltip: `Inspect System Telemetry & OpenVINO Detector · ${channelBadge} · ${wsStatusLabel}`,
+    channelBadge: `${safeCount} CH`,
+    tooltip: isPt
+      ? `Telemetria do Sistema & Detector OpenVINO · ${safeCount} CH · ${wsStatusLabel}`
+      : `Inspect System Telemetry & OpenVINO Detector · ${channelBadge} · ${wsStatusLabel}`,
   };
 }
 

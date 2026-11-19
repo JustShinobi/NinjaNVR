@@ -647,20 +647,44 @@ dialog::backdrop {
   position: relative;
 }
 
+/* Visually-hidden semantic headings/labels for screen readers */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 /* Sub-toolbar */
 .nvr-subbar {
-  height: 38px;
+  height: auto;
   min-height: 38px;
   background: var(--bg-panel);
   border-bottom: 1px solid var(--border-hairline);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 12px;
-  gap: 10px;
-  overflow-x: auto;
-  overflow-y: hidden;
-  white-space: nowrap;
+  flex-wrap: wrap;
+  row-gap: 5px;
+  padding: 5px 12px;
+  gap: 8px;
+  overflow: visible;
+  white-space: normal;
+  position: relative;
+  z-index: 12;
+}
+
+.nvr-subbar > div {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
 }
 
 /* Alert Ribbon */
@@ -1205,8 +1229,15 @@ dialog::backdrop {
   gap: 5px;
   flex-wrap: wrap;
   z-index: 5;
-  pointer-events: auto;
+  pointer-events: none;
   max-width: 98%;
+}
+
+.nvr-cam-hud > button,
+.nvr-cam-hud > a,
+.nvr-cam-hud > .nvr-badge,
+.nvr-tile-identity {
+  pointer-events: auto;
 }
 
 /* Reveal secondary per-tile action buttons on hover or keyboard focus to keep 2x2 grid clean */
@@ -3625,6 +3656,13 @@ input[type="range"] {
   pointer-events: auto;
 }
 
+@media (hover: none), (pointer: coarse) {
+  .nvr-cam-tile .nvr-tile-actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
 .nvr-tile-icon {
   display: inline-flex;
   align-items: center;
@@ -4016,9 +4054,10 @@ input[type="range"] {
   }
 
   .nvr-subbar {
-    height: 48px;
+    height: auto;
     min-height: 48px;
-    padding: 0 8px;
+    padding: 4px 8px;
+    overflow: visible;
   }
 
   .nvr-subbar .nvr-btn {
@@ -4382,13 +4421,30 @@ input[type="range"] {
     flex-shrink: 0;
   }
 
-  /* Review: master/detail — the queue comes first, the player follows */
+  /* Review: master/detail — compact queue top slice so video player stays above the fold */
   .nvr-workbench.is-list-first > :not(:first-child) {
     order: 0;
   }
 
   .nvr-workbench.is-list-first > .nvr-panel:first-child {
-    max-height: 46dvh;
+    max-height: 26dvh;
+  }
+
+  .nvr-floorplan-grid {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+
+  .nvr-mobile-cam-strip {
+    display: flex !important;
+    flex-wrap: nowrap !important;
+    overflow-x: auto !important;
+    gap: 6px;
+    padding-bottom: 2px;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .nvr-mobile-cam-strip > * {
+    flex-shrink: 0;
   }
 
   .nvr-focus-stage {

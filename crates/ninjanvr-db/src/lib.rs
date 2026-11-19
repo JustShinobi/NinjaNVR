@@ -1137,6 +1137,7 @@ impl NinjaDatabase {
             CREATE INDEX IF NOT EXISTS "recordings_camera_start_time_end_time" ON "recordings" ("camera", "start_time" DESC, "end_time" DESC);
             CREATE INDEX IF NOT EXISTS "recordings_camera_end_time" ON "recordings" ("camera", "end_time" ASC);
             CREATE INDEX IF NOT EXISTS "recordings_camera_storage_agg" ON "recordings" ("camera", "start_time", "segment_size", "duration");
+            CREATE INDEX IF NOT EXISTS "recordings_start_time" ON "recordings" ("start_time" DESC);
             CREATE UNIQUE INDEX IF NOT EXISTS "recordings_path" ON "recordings" ("path");
             CREATE INDEX IF NOT EXISTS "idx_timeline_camera_ts" ON "timeline" ("camera", "timestamp");
             CREATE INDEX IF NOT EXISTS "idx_timeline_source_id_ts" ON "timeline" ("source_id", "timestamp");
@@ -1362,7 +1363,17 @@ impl NinjaDatabase {
     }
 
     pub fn ensure_default_admin(&self, iterations: u32) -> Result<Option<String>> {
-        {
+        self.ensure_default_admin_with_options(iterations, None, false)
+    }
+
+    pub fn ensure_default_admin_with_options(
+        &self,
+        iterations: u32,
+        explicit_password: Option<&str>,
+        force_reset: bool,
+    ) -> Result<Option<String>> {
+        let trimmed_explicit = explicit_password.map(str::trim).filter(|s| !s.is_empty());
+        if !force_reset {
             let conn = self.read_conn();
             let existing: Option<(String, String)> = conn
                 .query_row(
@@ -1379,10 +1390,19 @@ impl NinjaDatabase {
             }
         }
 
-        let mut bytes = [0u8; 16];
-        rand::fill(&mut bytes);
-        let password: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        let pw_hash = hash_password(&password, None, iterations.max(MIN_PBKDF2_ITERATIONS));
+        let (password_to_hash, generated_random) = if let Some(explicit) = trimmed_explicit {
+            (explicit.to_string(), false)
+        } else {
+            let mut bytes = [0u8; 16];
+            rand::fill(&mut bytes);
+            let password: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            (password, true)
+        };
+        let pw_hash = hash_password(
+            &password_to_hash,
+            None,
+            iterations.max(MIN_PBKDF2_ITERATIONS),
+        );
 
         let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
@@ -1393,33 +1413,40 @@ impl NinjaDatabase {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        if let Some((_, ref hash)) = existing
+        if !force_reset
+            && let Some((_, ref hash)) = existing
             && !hash.trim().is_empty()
         {
             return Ok(None);
         }
 
+        let now_epoch = Utc::now().timestamp();
         if let Some((existing_username, _)) = existing {
             tx.execute(
-                "UPDATE user SET role = 'admin', allowed_cameras = '*', password_hash = ?1 WHERE username = ?2 COLLATE NOCASE",
-                params![pw_hash, existing_username],
+                "UPDATE user SET role = 'admin', allowed_cameras = '*', password_hash = ?1, password_changed_at = ?2 WHERE username = ?3 COLLATE NOCASE",
+                params![pw_hash, now_epoch, existing_username],
             )?;
         } else {
             tx.execute(
                 r#"
-                INSERT INTO user (username, role, allowed_cameras, password_hash, notification_tokens)
-                VALUES ('admin', 'admin', '*', ?1, '[]')
+                INSERT INTO user (username, role, allowed_cameras, password_hash, notification_tokens, password_changed_at)
+                VALUES ('admin', 'admin', '*', ?1, '[]', ?2)
                 ON CONFLICT(username) DO UPDATE SET
                     role = 'admin',
                     allowed_cameras = '*',
-                    password_hash = excluded.password_hash
+                    password_hash = excluded.password_hash,
+                    password_changed_at = excluded.password_changed_at
                 "#,
-                params![pw_hash],
+                params![pw_hash, now_epoch],
             )?;
         }
         tx.commit()?;
-        info!("Created default admin user in SQLite database");
-        Ok(Some(password))
+        info!("Provisioned default admin user in SQLite database");
+        if generated_random {
+            Ok(Some(password_to_hash))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn get_user(&self, username: &str) -> Result<Option<DbUser>> {
@@ -4968,22 +4995,72 @@ impl NinjaDatabase {
     }
 
     pub fn query_all_recordings_summary(&self) -> Result<Value> {
+        self.query_all_recordings_summary_scoped(None, None)
+    }
+
+    pub fn query_all_recordings_summary_scoped(
+        &self,
+        allowed_cameras: Option<&[String]>,
+        tz_offset_min: Option<i32>,
+    ) -> Result<Value> {
         let conn = self.read_conn();
-        let cutoff = (Utc::now().timestamp() - 86400 * 60) as f64;
+        let cutoff = ((Utc::now().timestamp() - 86400 * 60) as f64).max(172_800.0);
         let max_valid_ts = 253_402_300_800.0f64;
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT CAST(start_time / 86400 AS INTEGER) * 86400 FROM recordings WHERE typeof(start_time) IN ('real', 'integer') AND start_time >= ?1 AND start_time <= ?2 ORDER BY start_time DESC",
-        )?;
-        let rows = stmt.query_map(params![cutoff, max_valid_ts], |r| {
-            Ok(value_to_f64(&r.get_ref(0)?))
-        })?;
+        let tz_shift_sec = f64::from(tz_offset_min.unwrap_or(0).clamp(-840, 840)) * 60.0;
+        let allow_wildcard = allowed_cameras.is_none_or(|list| list.iter().any(|c| c == "*"));
+        if !allow_wildcard && allowed_cameras.is_some_and(|list| list.is_empty()) {
+            return Ok(Value::Object(serde_json::Map::new()));
+        }
         let mut map = serde_json::Map::new();
-        for r in rows {
-            if let Some(day_ts_f) = r?
-                && day_ts_f.is_finite()
-                && let Some(dt) = Utc.timestamp_opt(day_ts_f as i64, 0).single()
-            {
-                map.insert(dt.format("%Y-%m-%d").to_string(), json!(true));
+        if let Some(allow) = allowed_cameras
+            && !allow_wildcard
+        {
+            let bounded_cams: Vec<&str> = allow
+                .iter()
+                .map(String::as_str)
+                .take(MAX_SQL_FILTER_ITEMS)
+                .collect();
+            if bounded_cams.is_empty() {
+                return Ok(Value::Object(map));
+            }
+            let placeholders = (0..bounded_cams.len())
+                .map(|i| format!("?{}", i + 4))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT DISTINCT CAST((start_time - ?3) / 86400.0 AS INTEGER) * 86400 FROM recordings WHERE camera IN ({placeholders}) AND typeof(start_time) IN ('real', 'integer') AND start_time >= ?1 AND start_time <= ?2"
+            );
+            let mut params_vec: Vec<&dyn rusqlite::ToSql> =
+                vec![&cutoff, &max_valid_ts, &tz_shift_sec];
+            for c in &bounded_cams {
+                params_vec.push(c);
+            }
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |r| {
+                Ok(value_to_f64(&r.get_ref(0)?))
+            })?;
+            for r in rows {
+                if let Some(day_ts_f) = r?
+                    && day_ts_f.is_finite()
+                    && let Some(dt) = Utc.timestamp_opt(day_ts_f as i64, 0).single()
+                {
+                    map.insert(dt.format("%Y-%m-%d").to_string(), json!(true));
+                }
+            }
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT CAST((start_time - ?3) / 86400.0 AS INTEGER) * 86400 FROM recordings WHERE typeof(start_time) IN ('real', 'integer') AND start_time >= ?1 AND start_time <= ?2",
+            )?;
+            let rows = stmt.query_map(params![cutoff, max_valid_ts, tz_shift_sec], |r| {
+                Ok(value_to_f64(&r.get_ref(0)?))
+            })?;
+            for r in rows {
+                if let Some(day_ts_f) = r?
+                    && day_ts_f.is_finite()
+                    && let Some(dt) = Utc.timestamp_opt(day_ts_f as i64, 0).single()
+                {
+                    map.insert(dt.format("%Y-%m-%d").to_string(), json!(true));
+                }
             }
         }
         Ok(Value::Object(map))
@@ -5131,25 +5208,58 @@ impl NinjaDatabase {
     }
 
     pub fn query_recordings_summary(&self, camera: &str) -> Result<Vec<Value>> {
+        self.query_recordings_summary_with_tz(camera, None)
+    }
+
+    pub fn query_recordings_summary_with_tz(
+        &self,
+        camera: &str,
+        tz_offset_min: Option<i32>,
+    ) -> Result<Vec<Value>> {
+        self.query_recordings_days_summary_internal(Some(camera), None, tz_offset_min)
+    }
+
+    pub fn query_recordings_days_summary_scoped(
+        &self,
+        allowed_cameras: Option<&[String]>,
+        tz_offset_min: Option<i32>,
+    ) -> Result<Vec<Value>> {
+        self.query_recordings_days_summary_internal(None, allowed_cameras, tz_offset_min)
+    }
+
+    fn query_recordings_days_summary_internal(
+        &self,
+        single_camera: Option<&str>,
+        allowed_cameras: Option<&[String]>,
+        tz_offset_min: Option<i32>,
+    ) -> Result<Vec<Value>> {
+        let allow_wildcard = allowed_cameras.is_none_or(|list| list.iter().any(|c| c == "*"));
+        if !allow_wildcard && allowed_cameras.is_some_and(|list| list.is_empty()) {
+            return Ok(Vec::new());
+        }
+        let clamped_tz = tz_offset_min.map(|m| i64::from(m.clamp(-840, 840)) * 60);
+        let format_day_hour = |epoch_sec: i64| -> Option<(String, String)> {
+            if let Some(shift_sec) = clamped_tz {
+                Utc.timestamp_opt(epoch_sec.saturating_sub(shift_sec), 0)
+                    .single()
+                    .map(|dt| {
+                        (
+                            dt.format("%Y-%m-%d").to_string(),
+                            dt.format("%H").to_string(),
+                        )
+                    })
+            } else {
+                Local.timestamp_opt(epoch_sec, 0).single().map(|dt| {
+                    (
+                        dt.format("%Y-%m-%d").to_string(),
+                        dt.format("%H").to_string(),
+                    )
+                })
+            }
+        };
+
         let conn = self.read_conn();
-        let cutoff = (Utc::now().timestamp() - 86400 * 30) as f64;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT start_time, duration, COALESCE(motion, 0), COALESCE(objects, 0), COALESCE(dbfs, 0)
-            FROM recordings
-            WHERE camera = ?1 AND start_time >= ?2
-            ORDER BY start_time DESC
-            "#,
-        )?;
-        let rows = stmt.query_map(params![camera, cutoff], |r| {
-            Ok((
-                value_to_f64(&r.get_ref(0)?).unwrap_or(0.0),
-                value_to_f64(&r.get_ref(1)?).unwrap_or(0.0),
-                r.get::<_, i64>(2).unwrap_or(0),
-                r.get::<_, i64>(3).unwrap_or(0),
-                r.get::<_, i64>(4).unwrap_or(0),
-            ))
-        })?;
+        let cutoff = (Utc::now().timestamp() - 86400 * 60) as f64;
 
         #[derive(Default)]
         struct HourAgg {
@@ -5163,21 +5273,33 @@ impl NinjaDatabase {
         }
         let mut day_hours: BTreeMap<String, BTreeMap<String, HourAgg>> = BTreeMap::new();
 
-        for r in rows {
-            let (ts, raw_dur, motion, objs, dbfs) = r?;
+        let mut ingest_rec_row = |cam: &str,
+                                  ts: f64,
+                                  raw_dur: f64,
+                                  motion: i64,
+                                  objs: i64,
+                                  dbfs: i64,
+                                  explicit_end_opt: Option<f64>| {
+            if let Some(allow) = allowed_cameras
+                && !allow_wildcard
+                && !allow.iter().any(|a| a == cam)
+            {
+                return;
+            }
             if !ts.is_finite() {
-                continue;
+                return;
             }
             let dur = if raw_dur.is_finite() && raw_dur > 0.0 && raw_dur < 1.0e12 {
                 raw_dur
             } else {
                 0.0
             };
-            if let Some(dt) = Local.timestamp_opt(ts as i64, 0).single() {
-                let day = dt.format("%Y-%m-%d").to_string();
-                let hour = dt.format("%H").to_string();
+            if let Some((day, hour)) = format_day_hour(ts as i64) {
                 let seg_start = ts as i64;
-                let seg_end_f = (ts + dur).ceil();
+                let seg_end_f = explicit_end_opt
+                    .filter(|e| e.is_finite() && *e >= ts)
+                    .unwrap_or(ts + dur)
+                    .ceil();
                 let seg_end = if seg_end_f.is_finite() {
                     seg_end_f as i64
                 } else {
@@ -5197,28 +5319,271 @@ impl NinjaDatabase {
                     h.end_ts = seg_end;
                 }
             }
+        };
+
+        if let Some(cam) = single_camera {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT start_time, duration, COALESCE(motion, 0), COALESCE(objects, 0), COALESCE(dbfs, 0)
+                FROM recordings
+                WHERE camera = ?1 AND start_time >= ?2
+                ORDER BY start_time DESC
+                "#,
+            )?;
+            let rows = stmt.query_map(params![cam, cutoff], |r| {
+                Ok((
+                    value_to_f64(&r.get_ref(0)?).unwrap_or(0.0),
+                    value_to_f64(&r.get_ref(1)?).unwrap_or(0.0),
+                    r.get::<_, i64>(2).unwrap_or(0),
+                    r.get::<_, i64>(3).unwrap_or(0),
+                    r.get::<_, i64>(4).unwrap_or(0),
+                ))
+            })?;
+            for r in rows {
+                let (ts, raw_dur, motion, objs, dbfs) = r?;
+                ingest_rec_row(cam, ts, raw_dur, motion, objs, dbfs, None);
+            }
+        } else if let Some(allow) = allowed_cameras
+            && !allow_wildcard
+        {
+            let bounded_cams: Vec<&str> = allow
+                .iter()
+                .map(String::as_str)
+                .take(MAX_SQL_FILTER_ITEMS)
+                .collect();
+            if !bounded_cams.is_empty() {
+                let placeholders = (0..bounded_cams.len())
+                    .map(|i| format!("?{}", i + 2))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    r#"
+                    SELECT
+                        camera,
+                        CAST(start_time / 900.0 AS INTEGER) * 900,
+                        COALESCE(SUM(CASE WHEN typeof(duration) IN ('real', 'integer') AND duration > 0.0 AND duration < 1.0e12 THEN duration ELSE 0.0 END), 0.0),
+                        COALESCE(SUM(CASE WHEN motion > 0 THEN motion ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN objects > 0 THEN objects ELSE 0 END), 0),
+                        COALESCE(MAX(CASE WHEN dbfs != 0 THEN dbfs ELSE NULL END), 0),
+                        MIN(start_time),
+                        MAX(start_time + CASE WHEN typeof(duration) IN ('real', 'integer') AND duration > 0.0 AND duration < 1.0e12 THEN duration ELSE 0.0 END)
+                    FROM recordings
+                    WHERE camera IN ({placeholders}) AND typeof(start_time) IN ('real', 'integer') AND start_time >= ?1
+                    GROUP BY camera, CAST(start_time / 900.0 AS INTEGER)
+                    "#
+                );
+                let mut params_vec: Vec<&dyn rusqlite::ToSql> = vec![&cutoff];
+                for c in &bounded_cams {
+                    params_vec.push(c);
+                }
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        value_to_f64(&r.get_ref(1)?).unwrap_or(0.0),
+                        value_to_f64(&r.get_ref(2)?).unwrap_or(0.0),
+                        r.get::<_, i64>(3).unwrap_or(0),
+                        r.get::<_, i64>(4).unwrap_or(0),
+                        r.get::<_, i64>(5).unwrap_or(0),
+                        value_to_f64(&r.get_ref(6)?).unwrap_or(0.0),
+                        value_to_f64(&r.get_ref(7)?).unwrap_or(0.0),
+                    ))
+                })?;
+                for r in rows {
+                    let (cam, bucket_ts, sum_dur, sum_motion, sum_objs, max_dbfs, min_s, max_e) =
+                        r?;
+                    let rep_ts = if min_s.is_finite() && min_s > 0.0 {
+                        min_s
+                    } else {
+                        bucket_ts
+                    };
+                    let span = (max_e - rep_ts).max(0.0);
+                    ingest_rec_row(
+                        &cam,
+                        rep_ts,
+                        sum_dur.max(0.0),
+                        sum_motion,
+                        sum_objs,
+                        max_dbfs,
+                        Some(rep_ts + span),
+                    );
+                }
+            }
+        } else {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT
+                    camera,
+                    CAST(start_time / 900.0 AS INTEGER) * 900,
+                    COALESCE(SUM(CASE WHEN typeof(duration) IN ('real', 'integer') AND duration > 0.0 AND duration < 1.0e12 THEN duration ELSE 0.0 END), 0.0),
+                    COALESCE(SUM(CASE WHEN motion > 0 THEN motion ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN objects > 0 THEN objects ELSE 0 END), 0),
+                    COALESCE(MAX(CASE WHEN dbfs != 0 THEN dbfs ELSE NULL END), 0),
+                    MIN(start_time),
+                    MAX(start_time + CASE WHEN typeof(duration) IN ('real', 'integer') AND duration > 0.0 AND duration < 1.0e12 THEN duration ELSE 0.0 END)
+                FROM recordings
+                WHERE typeof(start_time) IN ('real', 'integer') AND start_time >= ?1
+                GROUP BY camera, CAST(start_time / 900.0 AS INTEGER)
+                "#,
+            )?;
+            let rows = stmt.query_map(params![cutoff], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    value_to_f64(&r.get_ref(1)?).unwrap_or(0.0),
+                    value_to_f64(&r.get_ref(2)?).unwrap_or(0.0),
+                    r.get::<_, i64>(3).unwrap_or(0),
+                    r.get::<_, i64>(4).unwrap_or(0),
+                    r.get::<_, i64>(5).unwrap_or(0),
+                    value_to_f64(&r.get_ref(6)?).unwrap_or(0.0),
+                    value_to_f64(&r.get_ref(7)?).unwrap_or(0.0),
+                ))
+            })?;
+            for r in rows {
+                let (cam, bucket_ts, sum_dur, sum_motion, sum_objs, max_dbfs, min_s, max_e) = r?;
+                let rep_ts = if min_s.is_finite() && min_s > 0.0 {
+                    min_s
+                } else {
+                    bucket_ts
+                };
+                let span = (max_e - rep_ts).max(0.0);
+                ingest_rec_row(
+                    &cam,
+                    rep_ts,
+                    sum_dur.max(0.0),
+                    sum_motion,
+                    sum_objs,
+                    max_dbfs,
+                    Some(rep_ts + span),
+                );
+            }
         }
 
-        let mut ev_stmt = conn.prepare(
-            r#"
-            SELECT start_time FROM event WHERE camera = ?1 AND start_time >= ?2
-            "#,
-        )?;
-        let ev_rows = ev_stmt.query_map(params![camera, cutoff], |r| {
-            Ok(value_to_f64(&r.get_ref(0)?).unwrap_or(0.0))
-        })?;
-        for r in ev_rows {
-            let ts = r?;
-            if !ts.is_finite() {
-                continue;
+        let mut ingest_ev_row = |cam: &str, ts: f64| {
+            if let Some(allow) = allowed_cameras
+                && !allow_wildcard
+                && !allow.iter().any(|a| a == cam)
+            {
+                return;
             }
-            if let Some(dt) = Local.timestamp_opt(ts as i64, 0).single() {
-                let day = dt.format("%Y-%m-%d").to_string();
-                let hour = dt.format("%H").to_string();
-                if let Some(hours_map) = day_hours.get_mut(&day)
-                    && let Some(h) = hours_map.get_mut(&hour)
+            if !ts.is_finite() {
+                return;
+            }
+            if let Some((day, hour)) = format_day_hour(ts as i64) {
+                let h = day_hours.entry(day).or_default().entry(hour).or_default();
+                h.events = h.events.saturating_add(1);
+                if h.start_ts == 0 || (ts as i64) < h.start_ts {
+                    h.start_ts = ts as i64;
+                }
+                if (ts as i64) > h.end_ts {
+                    h.end_ts = ts as i64;
+                }
+            }
+        };
+
+        if let Some(cam) = single_camera {
+            let mut ev_stmt = conn
+                .prepare("SELECT start_time FROM event WHERE camera = ?1 AND start_time >= ?2")?;
+            let ev_rows = ev_stmt.query_map(params![cam, cutoff], |r| {
+                Ok(value_to_f64(&r.get_ref(0)?).unwrap_or(0.0))
+            })?;
+            for r in ev_rows {
+                ingest_ev_row(cam, r?);
+            }
+        } else if let Some(allow) = allowed_cameras
+            && !allow_wildcard
+        {
+            let bounded_cams: Vec<&str> = allow
+                .iter()
+                .map(String::as_str)
+                .take(MAX_SQL_FILTER_ITEMS)
+                .collect();
+            if !bounded_cams.is_empty() {
+                let placeholders = (0..bounded_cams.len())
+                    .map(|i| format!("?{}", i + 2))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT CAST(start_time / 900.0 AS INTEGER) * 900, COUNT(*), MIN(start_time), MAX(start_time) FROM event WHERE camera IN ({placeholders}) AND start_time >= ?1 GROUP BY CAST(start_time / 900.0 AS INTEGER)"
+                );
+                let mut params_vec: Vec<&dyn rusqlite::ToSql> = vec![&cutoff];
+                for c in &bounded_cams {
+                    params_vec.push(c);
+                }
+                let mut ev_stmt = conn.prepare(&sql)?;
+                let ev_rows = ev_stmt.query_map(rusqlite::params_from_iter(params_vec), |r| {
+                    Ok((
+                        value_to_f64(&r.get_ref(0)?).unwrap_or(0.0),
+                        r.get::<_, i64>(1).unwrap_or(0),
+                        value_to_f64(&r.get_ref(2)?).unwrap_or(0.0),
+                        value_to_f64(&r.get_ref(3)?).unwrap_or(0.0),
+                    ))
+                })?;
+                for r in ev_rows {
+                    let (bucket_ts, cnt, min_s, max_s) = r?;
+                    let rep_ts = if min_s.is_finite() && min_s > 0.0 {
+                        min_s
+                    } else {
+                        bucket_ts
+                    };
+                    let end_ev_ts = if max_s.is_finite() && max_s >= rep_ts {
+                        max_s
+                    } else {
+                        rep_ts
+                    };
+                    if cnt > 0
+                        && rep_ts.is_finite()
+                        && let Some((day, hour)) = format_day_hour(rep_ts as i64)
+                    {
+                        let h = day_hours.entry(day).or_default().entry(hour).or_default();
+                        h.events = h.events.saturating_add(cnt);
+                        if h.start_ts == 0 || (rep_ts as i64) < h.start_ts {
+                            h.start_ts = rep_ts as i64;
+                        }
+                        if (end_ev_ts.ceil() as i64) > h.end_ts {
+                            h.end_ts = end_ev_ts.ceil() as i64;
+                        }
+                    }
+                }
+            }
+        } else {
+            let mut ev_stmt = conn.prepare(
+                "SELECT camera, CAST(start_time / 900.0 AS INTEGER) * 900, COUNT(*), MIN(start_time), MAX(start_time) FROM event WHERE start_time >= ?1 GROUP BY camera, CAST(start_time / 900.0 AS INTEGER)",
+            )?;
+            let ev_rows = ev_stmt.query_map(params![cutoff], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    value_to_f64(&r.get_ref(1)?).unwrap_or(0.0),
+                    r.get::<_, i64>(2).unwrap_or(0),
+                    value_to_f64(&r.get_ref(3)?).unwrap_or(0.0),
+                    value_to_f64(&r.get_ref(4)?).unwrap_or(0.0),
+                ))
+            })?;
+            for r in ev_rows {
+                let (cam, bucket_ts, cnt, min_s, max_s) = r?;
+                let rep_ts = if min_s.is_finite() && min_s > 0.0 {
+                    min_s
+                } else {
+                    bucket_ts
+                };
+                let end_ev_ts = if max_s.is_finite() && max_s >= rep_ts {
+                    max_s
+                } else {
+                    rep_ts
+                };
+                if cnt > 0
+                    && rep_ts.is_finite()
+                    && (allow_wildcard
+                        || allowed_cameras.is_none_or(|allow| allow.iter().any(|a| a == &cam)))
+                    && let Some((day, hour)) = format_day_hour(rep_ts as i64)
                 {
-                    h.events = h.events.saturating_add(1);
+                    let h = day_hours.entry(day).or_default().entry(hour).or_default();
+                    h.events = h.events.saturating_add(cnt);
+                    if h.start_ts == 0 || (rep_ts as i64) < h.start_ts {
+                        h.start_ts = rep_ts as i64;
+                    }
+                    if (end_ev_ts.ceil() as i64) > h.end_ts {
+                        h.end_ts = end_ev_ts.ceil() as i64;
+                    }
                 }
             }
         }
@@ -6473,6 +6838,17 @@ impl NinjaDatabase {
             )
             .optional()?;
         Ok(row)
+    }
+
+    pub fn delete_case(&self, id: &str) -> Result<bool> {
+        let _ = self.revoke_share_links_for_target(Some("case"), id);
+        let conn = self.lock_conn();
+        let _ = conn.execute(
+            "UPDATE export SET export_case_id = NULL WHERE export_case_id = ?1",
+            params![id],
+        );
+        let deleted = conn.execute("DELETE FROM exportcase WHERE id = ?1", params![id])?;
+        Ok(deleted > 0)
     }
 
     pub fn query_previews(&self, camera: &str, after: f64, before: f64) -> Result<Vec<Value>> {

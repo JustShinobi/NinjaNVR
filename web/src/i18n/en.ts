@@ -301,7 +301,7 @@ export const en = {
     detectionZones: "Detection Zones",
     streamProbe: "RTSP Stream Probe",
     saveOnly: "Save Config",
-    saveAndRestart: "Save & Restart NVR",
+    saveAndRestart: "Save & Reload Pipelines",
     copyYaml: "Copy YAML",
   },
   system: {

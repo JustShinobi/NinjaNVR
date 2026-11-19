@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { ChevronDown, ChevronLeft, ChevronRight, Search, Video } from "lucide-react";
 import { useI18n } from "../i18n";
+import { useNvrStore } from "../store/useNvrStore";
 import {
   CameraGroupConfig,
   CameraLiveActivity,
@@ -138,6 +140,10 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
   openUpward = false,
 }) => {
   const { t } = useI18n();
+  const storeStats = useNvrStore((s) => s.stats?.cameras);
+  const storeActivity = useNvrStore((s) => s.cameraActivity);
+  const effectiveStats = cameraStats ?? storeStats;
+  const effectiveActivity = cameraActivity ?? storeActivity;
   const effectiveAriaLabel = ariaLabel ?? t.picker.defaultAria;
   const mode = resolvePickerMode(cameras.length, threshold);
   const [open, setOpen] = useState(false);
@@ -147,7 +153,10 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
   const [highlightedIdx, setHighlightedIdx] = useState<number>(0);
 
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const triggerBtnRef = useRef<HTMLButtonElement | null>(null);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const [fixedPos, setFixedPos] = useState<React.CSSProperties | null>(null);
 
   const filteredCameras = useMemo(
     () =>
@@ -156,10 +165,10 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
         statusFilter,
         groupFilter,
         cameraGroups,
-        cameraStats,
-        cameraActivity,
+        cameraStats: effectiveStats,
+        cameraActivity: effectiveActivity,
       }),
-    [cameras, query, statusFilter, groupFilter, cameraGroups, cameraStats, cameraActivity]
+    [cameras, query, statusFilter, groupFilter, cameraGroups, effectiveStats, effectiveActivity]
   );
 
   useEffect(() => {
@@ -179,14 +188,57 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
 
   useEffect(() => {
     if (!open || mode !== "combobox") return;
+    const updateAnchor = () => {
+      if (typeof window === "undefined" || !triggerBtnRef.current) return;
+      const rect = triggerBtnRef.current.getBoundingClientRect();
+      const popW = Math.min(340, Math.max(240, window.innerWidth - 24));
+      const clampedLeft = Math.max(
+        12,
+        Math.min(rect.left, window.innerWidth - popW - 12)
+      );
+      const preferUp =
+        openUpward ||
+        (window.innerHeight - rect.bottom < 320 && rect.top > 320);
+      setFixedPos(
+        preferUp
+          ? {
+              position: "fixed",
+              top: "auto",
+              left: clampedLeft,
+              bottom: Math.max(12, window.innerHeight - rect.top + 4),
+              width: popW,
+              zIndex: 1300,
+            }
+          : {
+              position: "fixed",
+              top: Math.max(12, rect.bottom + 4),
+              bottom: "auto",
+              left: clampedLeft,
+              width: popW,
+              zIndex: 1300,
+            }
+      );
+    };
+    updateAnchor();
     const handlePointerDown = (e: PointerEvent) => {
-      if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
+      const node = e.target as Node;
+      if (
+        rootRef.current &&
+        !rootRef.current.contains(node) &&
+        (!popoverRef.current || !popoverRef.current.contains(node))
+      ) {
         setOpen(false);
       }
     };
     window.addEventListener("pointerdown", handlePointerDown);
-    return () => window.removeEventListener("pointerdown", handlePointerDown);
-  }, [open, mode]);
+    window.addEventListener("resize", updateAnchor);
+    window.addEventListener("scroll", updateAnchor, true);
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("resize", updateAnchor);
+      window.removeEventListener("scroll", updateAnchor, true);
+    };
+  }, [open, mode, openUpward]);
 
   if (mode === "inline") {
     return (
@@ -196,19 +248,37 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
         aria-label={effectiveAriaLabel}
         style={{ display: "inline-flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}
       >
-        {cameras.map((cam) => (
-          <button
-            key={cam}
-            type="button"
-            className={`nvr-btn sm mono ${selectedCamera === cam ? "active" : ""}`}
-            style={{
-              textTransform: "uppercase",
-            }}
-            onClick={() => onSelect(cam)}
-          >
-            {cam}
-          </button>
-        ))}
+        {cameras.map((cam) => {
+          const hasCamStat = Boolean(
+            effectiveStats && Object.prototype.hasOwnProperty.call(effectiveStats, cam)
+          );
+          const hasCamAct = Boolean(
+            effectiveActivity && Object.prototype.hasOwnProperty.call(effectiveActivity, cam)
+          );
+          const st =
+            hasCamStat || hasCamAct
+              ? getCameraPickerStatus(cam, effectiveStats, effectiveActivity)
+              : null;
+          const itemDot =
+            st === "alert" ? "motion" : st === "offline" ? "alert" : "live";
+          return (
+            <button
+              key={cam}
+              type="button"
+              className={`nvr-btn sm mono ${selectedCamera === cam ? "active" : ""}`}
+              style={{
+                textTransform: "uppercase",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 5,
+              }}
+              onClick={() => onSelect(cam)}
+            >
+              {st && <span className={`nvr-dot ${itemDot}`} />}
+              {cam}
+            </button>
+          );
+        })}
       </div>
     );
   }
@@ -222,8 +292,8 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
       : 0;
   const activeStatus = getCameraPickerStatus(
     selectedCamera || cameras[0] || "",
-    cameraStats,
-    cameraActivity
+    effectiveStats,
+    effectiveActivity
   );
   const dotClass =
     activeStatus === "alert"
@@ -253,6 +323,7 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
       </button>
 
       <button
+        ref={triggerBtnRef}
         type="button"
         className={`nvr-btn sm mono nvr-picker-trigger ${open ? "active" : ""}`}
         aria-haspopup="listbox"
@@ -278,21 +349,28 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
         <ChevronRight size={12} />
       </button>
 
-      {open && (
-        <div
-          className="nvr-picker-popover"
-          role="dialog"
-          aria-label={t.picker.dialogAria}
-          style={
-            openUpward
-              ? { top: "auto", bottom: "calc(100% + 4px)" }
-              : undefined
-          }
-          onKeyDown={(e) => {
-            if (e.key === "Escape") {
-              e.preventDefault();
-              setOpen(false);
-            } else if (e.key === "ArrowDown") {
+      {open &&
+        (() => {
+          const popoverNode = (
+            <div
+              ref={popoverRef}
+              className="nvr-picker-popover"
+              role="dialog"
+              aria-label={t.picker.dialogAria}
+              style={
+                fixedPos
+                  ? fixedPos
+                  : openUpward
+                    ? { top: "auto", bottom: "calc(100% + 4px)" }
+                    : undefined
+              }
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setOpen(false);
+                  triggerBtnRef.current?.focus();
+                } else if (e.key === "ArrowDown") {
               e.preventDefault();
               setHighlightedIdx((idx) =>
                 filteredCameras.length > 0 ? (idx + 1) % filteredCameras.length : 0
@@ -392,12 +470,12 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
               filteredCameras.map((cam, idx) => {
                 const isSelected = cam === selectedCamera;
                 const isHighlighted = idx === safeHighlightedIdx;
-                const st = getCameraPickerStatus(cam, cameraStats, cameraActivity);
+                const st = getCameraPickerStatus(cam, effectiveStats, effectiveActivity);
                 const itemDot =
                   st === "alert" ? "motion" : st === "offline" ? "alert" : "live";
                 const fps =
-                  cameraStats && Object.prototype.hasOwnProperty.call(cameraStats, cam)
-                    ? cameraStats[cam]?.camera_fps
+                  effectiveStats && Object.prototype.hasOwnProperty.call(effectiveStats, cam)
+                    ? effectiveStats[cam]?.camera_fps
                     : undefined;
                 return (
                   <button
@@ -430,8 +508,12 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
               })
             )}
           </div>
-        </div>
-      )}
+            </div>
+          );
+          return typeof document !== "undefined" && document.body
+            ? createPortal(popoverNode, document.body)
+            : popoverNode;
+        })()}
     </div>
   );
 };

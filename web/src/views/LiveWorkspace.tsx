@@ -1251,6 +1251,9 @@ interface LiveWorkspaceProps {
     label?: string,
     includeAudio?: boolean
   ) => Promise<{ exportId?: string; videoUrl?: string; queued?: boolean } | void>;
+  userRole?: string;
+  notify?: (msg: string) => void;
+  onAddFirstCamera?: () => void;
 }
 
 export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
@@ -1260,8 +1263,13 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   focusSegments,
   handleMarkReviews,
   handleQuickExport,
+  userRole = "admin",
+  notify,
+  onAddFirstCamera,
 }) => {
   const { t, locale } = useI18n();
+  const isViewer = userRole === "viewer" || userRole === "read_only";
+  const isAdmin = userRole === "admin";
   const [hoveredAlertId, setHoveredAlertId] = useState<string | null>(null);
   const setActiveTab = useNvrStore((s) => s.setActiveTab);
   const [stripNowSec, setStripNowSec] = useState<number>(() => Math.floor(Date.now() / 1000));
@@ -1766,13 +1774,34 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
       // storage unavailable (private mode) — preference stays in memory
     }
   };
-  const toggleCameraRuntimeFlag = (realCam: string, flag: CameraRuntimeFlag, next: boolean) => {
-    fetch(`/api/${encodeURIComponent(realCam)}/state`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({ [flag]: next }),
-    }).catch(() => {});
+  const toggleCameraRuntimeFlag = async (
+    realCam: string,
+    flag: CameraRuntimeFlag,
+    next: boolean
+  ) => {
+    try {
+      const res = await fetch(`/api/${encodeURIComponent(realCam)}/state`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ [flag]: next }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        notify?.(
+          (typeof data?.message === "string" && data.message) ||
+            (locale === "pt"
+              ? "Falha ao atualizar estado da câmera"
+              : "Failed to update camera state")
+        );
+      }
+    } catch {
+      notify?.(
+        locale === "pt"
+          ? "Erro de rede ao atualizar estado da câmera"
+          : "Network error while updating camera state"
+      );
+    }
   };
 
   const stageGroupCams =
@@ -2213,19 +2242,21 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
             >
               {t.live.openReview} →
             </button>
-            <button
-              type="button"
-              className="nvr-btn sm success"
-              onClick={() =>
-                handleMarkReviews(
-                  unreviewedAlerts.map((r) => r.id),
-                  true
-                )
-              }
-            >
-              <Check size={12} />
-              {t.live.markAllReviewed}
-            </button>
+            {!isViewer && (
+              <button
+                type="button"
+                className="nvr-btn sm success"
+                onClick={() =>
+                  handleMarkReviews(
+                    unreviewedAlerts.map((r) => r.id),
+                    true
+                  )
+                }
+              >
+                <Check size={12} />
+                {t.live.markAllReviewed}
+              </button>
+            )}
           </div>
 
           {recentEvents.map((item) => {
@@ -2292,32 +2323,36 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       {formatRelativeAgo(stripNowSec, item.start_time, locale === "pt")}
                     </span>
                     <span className="nvr-event-card-actions" style={{ position: "relative", zIndex: 3 }}>
-                      <button
-                        type="button"
-                        className="nvr-btn sm"
-                        title={t.live.exportThisEvent}
-                        aria-label={`${t.live.exportThisEvent}: ${item.camera} ${formatTs(item.start_time)}`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          // Park the playhead on the event so "This event" and Preview line up.
-                          setTimeShiftTs(sanitizeTimeShiftSeek(item.start_time));
-                          requestClip(item.camera, item.start_time - 5, (item.end_time ?? item.start_time + 15) + 5);
-                        }}
-                      >
-                        <Scissors size={11} />
-                      </button>
-                      <button
-                        type="button"
-                        className="nvr-btn sm success"
-                        title={t.live.markReviewed}
-                        aria-label={`${t.live.markReviewed}: ${item.camera} ${formatTs(item.start_time)}`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          void handleMarkReviews([item.id], true);
-                        }}
-                      >
-                        <Check size={11} />
-                      </button>
+                      {!isViewer && (
+                        <>
+                          <button
+                            type="button"
+                            className="nvr-btn sm"
+                            title={t.live.exportThisEvent}
+                            aria-label={`${t.live.exportThisEvent}: ${item.camera} ${formatTs(item.start_time)}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              // Park the playhead on the event so "This event" and Preview line up.
+                              setTimeShiftTs(sanitizeTimeShiftSeek(item.start_time));
+                              requestClip(item.camera, item.start_time - 5, (item.end_time ?? item.start_time + 15) + 5);
+                            }}
+                          >
+                            <Scissors size={11} />
+                          </button>
+                          <button
+                            type="button"
+                            className="nvr-btn sm success"
+                            title={t.live.markReviewed}
+                            aria-label={`${t.live.markReviewed}: ${item.camera} ${formatTs(item.start_time)}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void handleMarkReviews([item.id], true);
+                            }}
+                          >
+                            <Check size={11} />
+                          </button>
+                        </>
+                      )}
                     </span>
                   </div>
                 </div>
@@ -2367,8 +2402,29 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
             className="nvr-live-empty-state mono"
             data-testid="live-empty-state"
             role="status"
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 14,
+            }}
           >
-            {config === null ? t.live.loadingCameras : t.live.noCamerasConfigured}
+            <span>
+              {config === null ? t.live.loadingCameras : t.live.noCamerasConfigured}
+            </span>
+            {config !== null && onAddFirstCamera && (
+              <button
+                type="button"
+                className="nvr-btn primary mono"
+                data-testid="live-add-first-camera-cta"
+                onClick={onAddFirstCamera}
+              >
+                {locale === "pt"
+                  ? "+ Adicionar Primeira Câmera"
+                  : "+ Add First Camera"}
+              </button>
+            )}
           </div>
         ) : (
           stageDescriptors.map((descriptor) => {
@@ -2596,6 +2652,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         cameraConfig={camCfg}
                         showVectors={showVectors}
                         muted={unmutedLiveCamera !== cam}
+                        hideInlinePttHud={true}
                         pushToTalkSupported={
                           resolveCameraPushToTalkCapability(
                             camCfg,
@@ -2689,6 +2746,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                           ? `SPOTLIGHT // ${cam.toUpperCase()} // ${
                               t.live.timeShiftBadge
                             } @ ${formatTs(timeShiftTs)}`
+                          : identityTone === "offline"
+                          ? `SPOTLIGHT // ${cam.toUpperCase()} // OFFLINE`
                           : `SPOTLIGHT // ${cam.toUpperCase()}`
                         : isHero
                         ? `${cam.toUpperCase()} // ${
@@ -2696,11 +2755,15 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                               ? `${t.live.timeShiftBadge} @ ${formatTs(
                                   timeShiftTs
                                 )}`
+                              : identityTone === "offline"
+                              ? "OFFLINE"
                               : t.live.liveBadge
                           }`
                         : `${cam.toUpperCase()}${
                             isTimeShifted && timeShiftTs !== null
                               ? ` @ ${formatTs(timeShiftTs)}`
+                              : identityTone === "offline"
+                              ? " · OFFLINE"
                               : ""
                           }`}
                       </span>
@@ -3055,9 +3118,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           const camStat = stats?.cameras?.[detailsCam] ?? stats?.cameras?.[realCam];
           const act = cameraActivity[detailsCam] ?? cameraActivity[realCam];
           return (
-            <CameraDetailsSheet
+              <CameraDetailsSheet
               camera={detailsCam}
               isPt={locale === "pt"}
+              canEdit={isAdmin}
               telemetry={formatCameraTelemetryRows({
                 detectWidth: camCfg?.detect?.width,
                 detectHeight: camCfg?.detect?.height,
@@ -3085,7 +3149,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           );
         })()}
 
-      {!(isCompact && liveLayout === "2x2") &&
+      {effectiveCameraNames.length > 0 &&
+        !(isCompact && liveLayout === "2x2") &&
         shouldRenderSpotlightTimeline(
         liveLayout,
         spotlightTimelineMode,
@@ -3094,7 +3159,11 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
         <TimelineScrubber
           camera={liveLayout === "spotlight" ? spotlightHeroCam : selectedCamera}
           cameras={groupCams}
-          stageCameras={liveLayout === "2x2" ? visibleMatrixCams : undefined}
+          stageCameras={
+            liveLayout === "2x2" && groupCams.length > 6
+              ? visibleMatrixCams
+              : undefined
+          }
           cameraGroups={effectiveCameraGroups}
           onSelectCamera={selectCameraAndRevealOnStage}
           onFocusCamera={

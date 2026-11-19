@@ -838,7 +838,9 @@ export const ZoomableVideoStage: React.FC<ZoomableVideoStageProps> = ({
     const distanceOf = (t: TouchList) =>
       Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
     const onStart = (e: TouchEvent) => {
-      if (e.touches.length === 2) {
+      if (e.touches.length >= 2) {
+        setIsDragging(false);
+        dragOriginRef.current = null;
         pinch = { dist: distanceOf(e.touches), scale: scaleRef.current };
       }
     };
@@ -1052,6 +1054,7 @@ interface LiveMsePlayerProps {
   stageOverlay?: React.ReactNode;
   pushToTalkSupported?: boolean;
   pushToTalkMode?: "webrtc" | "cgi_alaw" | null;
+  hideInlinePttHud?: boolean;
 }
 
 /**
@@ -1245,6 +1248,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   stageOverlay,
   pushToTalkSupported,
   pushToTalkMode,
+  hideInlinePttHud = false,
 }) => {
   const storeIsUnmuted = useNvrStore((s) => Boolean(camera) && s.unmutedLiveCamera === camera);
   const resolvedMutedProp = muted !== undefined ? muted : !storeIsUnmuted;
@@ -1542,7 +1546,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         disabled={Boolean(onPlotPoint)}
         forceHudVisible={pttState !== "idle"}
         extraHud={
-          resolvedPttSupported ? (
+          resolvedPttSupported && !hideInlinePttHud ? (
             <PushToTalkButton
               camera={realCamera}
               audioTargetCamera={camera}
@@ -1989,14 +1993,25 @@ export interface VodHlsPlayerProps {
 }
 
 export function resolveVodFrameStepDurationSec(
-  cameraConfig?: CameraConfig | null
+  cameraConfig?: CameraConfig | null,
+  measuredVideoFps?: number | null
 ): number {
+  if (
+    typeof measuredVideoFps === "number" &&
+    Number.isFinite(measuredVideoFps) &&
+    measuredVideoFps >= 12
+  ) {
+    return 1 / Math.min(120, measuredVideoFps);
+  }
   const rawFps = cameraConfig?.detect?.fps;
-  const safeFps =
-    typeof rawFps === "number" && Number.isFinite(rawFps) && rawFps > 0
-      ? Math.min(120, Math.max(1, rawFps))
-      : 15;
-  return 1 / safeFps;
+  if (typeof rawFps === "number" && Number.isFinite(rawFps) && rawFps > 0) {
+    // Substream AI detect.fps defaults to 5-8 FPS while recorded main-stream MP4 is 25-30 FPS
+    if (rawFps < 12 && cameraConfig?.record?.enabled === true) {
+      return 1 / 25;
+    }
+    return 1 / Math.min(120, Math.max(1, rawFps));
+  }
+  return 1 / 15;
 }
 
 export function quantizeVodWindowBounds(

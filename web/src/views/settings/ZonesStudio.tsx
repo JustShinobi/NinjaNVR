@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Bell } from "lucide-react";
 import { LiveMsePlayer, mapClientPointToFrame } from "../../components/VideoPlayers";
 import { useI18n } from "../../i18n";
 import { useNvrStore } from "../../store/useNvrStore";
@@ -462,7 +463,7 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
     <div className="nvr-zs">
       <aside className="nvr-zs-panel" aria-label={tr("Configuração da câmera", "Camera configuration")}>
         {pendingCamProp && shouldGuardDraftPolygonSwitch(draftPoints) && (
-          <div className="nvr-zs-status is-pending" role="alertdialog" data-testid="zs-camera-draft-guard">
+          <div className="nvr-zs-status is-pending" role="alert" data-testid="zs-camera-draft-guard">
             <span>
               {tr(
                 `Descartar ${draftPoints.length} ponto(s) e trocar para ${pendingCamProp}?`,
@@ -999,7 +1000,18 @@ const ItemList: React.FC<{
                         <i style={{ background: KIND_COLOR[item.ref.kind] }} aria-hidden="true" />
                         <span className="nvr-zs-item-text">
                           <strong>{item.title}</strong>
-                          <span>{item.summary}</span>
+                          <span style={{ display: "inline-flex", alignItems: "center", gap: 3, flexWrap: "wrap" }}>
+                            {item.summary.includes("🔔")
+                              ? item.summary.split("🔔").map((part, idx, arr) => (
+                                  <React.Fragment key={idx}>
+                                    {part}
+                                    {idx < arr.length - 1 && (
+                                      <Bell size={11} aria-hidden="true" style={{ flexShrink: 0 }} />
+                                    )}
+                                  </React.Fragment>
+                                ))
+                              : item.summary}
+                          </span>
                         </span>
                         {isUnsaved(item) && <span className="nvr-zs-unsaved">{pt ? "não salvo" : "unsaved"}</span>}
                       </button>

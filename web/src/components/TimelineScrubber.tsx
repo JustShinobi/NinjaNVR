@@ -837,7 +837,10 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     if (!realCamera) return;
     let cancelled = false;
     archiveMetadataCache
-      .getSummary(realCamera, { configuredCameras })
+      .getSummary(realCamera, {
+        configuredCameras,
+        tzOffsetMin: new Date().getTimezoneOffset(),
+      })
       .then((arr) => {
         if (!cancelled && Array.isArray(arr)) {
           setDaysSummary(arr);
@@ -3424,7 +3427,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             border: "1px solid var(--border-strong)",
             borderRadius: 3,
             cursor: draggingTarget === "track" ? "grabbing" : "grab",
-            touchAction: "none",
+            touchAction: draggingTarget !== null ? "none" : "pan-y",
             overflow: "visible",
           }}
           onKeyDown={(e) => {

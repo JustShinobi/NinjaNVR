@@ -347,7 +347,7 @@ export const ConsoleUiSection: React.FC<{
                   }
                 }}
               >
-                Send Test Notification
+                {isPt ? "Testar Notificação" : "Send Test Notification"}
               </button>
               <ToggleSwitch
                 checked={browserNotifications}
@@ -413,7 +413,7 @@ export const ConsoleUiSection: React.FC<{
                     );
                   }}
                 >
-                  {cnt} Cams
+                  {isPt ? `${cnt} Câms` : `${cnt} Cams`}
                 </button>
               ))}
               {simulatedFleetCount > 0 && (
@@ -429,7 +429,7 @@ export const ConsoleUiSection: React.FC<{
                     }}
                   >
                     {isPt
-                      ? `Abrir Matriz Ao Vivo (${simulatedFleetCount} Cams) →`
+                      ? `Abrir Matriz Ao Vivo (${simulatedFleetCount} Câms) →`
                       : `Open Live Matrix (${simulatedFleetCount} Cams) →`}
                   </button>
                   <button
@@ -440,7 +440,9 @@ export const ConsoleUiSection: React.FC<{
                       notify(`Restored ${realCameraCount} physical cameras`);
                     }}
                   >
-                    Exit Simulation (Restore {realCameraCount} Cameras)
+                    {isPt
+                      ? `Sair da Simulação (Restaurar ${realCameraCount} Câmeras)`
+                      : `Exit Simulation (Restore ${realCameraCount} Cameras)`}
                   </button>
                 </>
               )}
@@ -1107,6 +1109,16 @@ export const ChannelsStreamsSection: React.FC<{
             <span className="nvr-yaml-key-tag">cameras</span>
           </span>
         </div>
+        {camKeys.length === 0 ? (
+          <div
+            className="nvr-cfg-card-body mono"
+            style={{ color: "var(--text-secondary)", fontSize: "var(--text-xs)" }}
+          >
+            {isPt
+              ? "Nenhum canal de câmera configurado ainda. Preencha o formulário de Provisionamento Rápido abaixo e clique em Salvar Config no topo."
+              : "No camera channels configured yet. Fill in Quick Provision below and click Save Config in the top bar."}
+          </div>
+        ) : (
         <div style={{ overflowX: "auto" }}>
           <table className="nvr-table mono">
             <thead>
@@ -1264,16 +1276,19 @@ export const ChannelsStreamsSection: React.FC<{
             </tbody>
           </table>
         </div>
+        )}
       </div>
 
       <div className="nvr-card-grid">
-        <SettingsScopeDivider
-          group="camera"
-          scope={inspectorCam}
-          inspectorCam={inspectorCam}
-          cameraCount={camKeys.length}
-          isPt={isPt}
-        />
+        {activeCamCfg && (
+          <SettingsScopeDivider
+            group="camera"
+            scope={inspectorCam}
+            inspectorCam={inspectorCam}
+            cameraCount={camKeys.length}
+            isPt={isPt}
+          />
+        )}
         {/* Selected Camera FFmpeg Inputs & Live Stream Mapping */}
         {activeCamCfg && (
           <div className="nvr-cfg-card">
@@ -2978,8 +2993,13 @@ export const ChannelsStreamsSection: React.FC<{
                   onClick={handleAddCamera}
                 >
                   <Plus size={12} />
-                  {isPt ? "Adicionar Câmera" : "Stage Camera"}
+                  {isPt ? "Adicionar Câmera" : "Add Camera"}
                 </button>
+              </div>
+              <div className="nvr-field-desc" style={{ marginTop: 4 }}>
+                {isPt
+                  ? "Após adicionar ao rascunho, clique em Salvar Config no topo para gravar no config.yml."
+                  : "After adding to draft, click Save Config in the top bar to persist to config.yml."}
               </div>
             </div>
           </div>

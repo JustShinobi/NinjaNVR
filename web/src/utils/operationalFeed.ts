@@ -78,44 +78,138 @@ function normalizePositiveLimit(limit: number | undefined, fallback: number): nu
   return fallback;
 }
 
-/**
- * Builds the `/api/review` URL while honoring `reviewDateFilter` across both
- * initial bootstrap fetches and 5-second operational tab refreshes so date-filtered
- * triage views are never clobbered back to unfiltered `limit=80`.
- */
-export function buildReviewFeedUrl(
-  reviewDateFilter?: string | null,
-  limit?: number
-): string {
-  const bounds = parseOperationalDateBoundsSec(reviewDateFilter);
-  if (bounds) {
-    const resolvedLimit = normalizePositiveLimit(
-      limit,
-      DEFAULT_DATE_FILTERED_REVIEW_FEED_LIMIT
-    );
-    return `/api/review?after=${bounds.dayStart}&before=${bounds.dayEnd}&limit=${resolvedLimit}`;
-  }
-  const resolvedLimit = normalizePositiveLimit(limit, DEFAULT_REVIEW_FEED_LIMIT);
-  return `/api/review?limit=${resolvedLimit}`;
+export interface ReviewFeedQueryOptions {
+  camera?: string | null;
+  severity?: string | null;
+  label?: string | null;
+  excludeLabel?: string | null;
+  zone?: string | null;
+  status?: "unreviewed" | "reviewed" | "all";
+  before?: number | null;
+}
+
+export interface EventsFeedQueryOptions {
+  camera?: string | null;
+  label?: string | null;
+  excludeLabel?: string | null;
+  zone?: string | null;
+  minScore?: number | null;
+  stationary?: "all" | "moving" | "stationary";
+  retainedOnly?: boolean;
+  plate?: string | null;
+  before?: number | null;
 }
 
 /**
- * Builds the `/api/events` URL while honoring `reviewDateFilter`.
+ * Builds the `/api/review` URL while honoring `reviewDateFilter` and optional
+ * server-side filter / cursor parameters.
+ */
+export function buildReviewFeedUrl(
+  reviewDateFilter?: string | null,
+  limit?: number,
+  options?: ReviewFeedQueryOptions
+): string {
+  const bounds = parseOperationalDateBoundsSec(reviewDateFilter);
+  const resolvedLimit = normalizePositiveLimit(
+    limit,
+    bounds ? DEFAULT_DATE_FILTERED_REVIEW_FEED_LIMIT : DEFAULT_REVIEW_FEED_LIMIT
+  );
+  const params: string[] = [];
+  if (bounds) {
+    params.push(`after=${bounds.dayStart}`);
+    const effBefore =
+      typeof options?.before === "number" && Number.isFinite(options.before)
+        ? Math.min(bounds.dayEnd, options.before)
+        : bounds.dayEnd;
+    params.push(`before=${effBefore}`);
+  } else if (typeof options?.before === "number" && Number.isFinite(options.before)) {
+    params.push(`before=${options.before}`);
+  }
+  if (options?.camera && options.camera !== "all") {
+    params.push(`cameras=${encodeURIComponent(options.camera)}`);
+  }
+  if (options?.severity && options.severity !== "all") {
+    params.push(`severity=${encodeURIComponent(options.severity)}`);
+  }
+  if (options?.label && options.label !== "all") {
+    params.push(`labels=${encodeURIComponent(options.label)}`);
+  }
+  if (options?.excludeLabel && options.excludeLabel !== "none") {
+    params.push(`exclude_labels=${encodeURIComponent(options.excludeLabel)}`);
+  }
+  if (options?.zone && options.zone !== "all") {
+    params.push(`zones=${encodeURIComponent(options.zone)}`);
+  }
+  if (options?.status === "unreviewed") {
+    params.push("reviewed=0");
+  } else if (options?.status === "reviewed") {
+    params.push("reviewed=1");
+  }
+  params.push(`limit=${resolvedLimit}`);
+  return `/api/review?${params.join("&")}`;
+}
+
+/**
+ * Builds the `/api/events` URL while honoring `reviewDateFilter` and optional
+ * server-side filter / cursor parameters.
  */
 export function buildEventsFeedUrl(
   reviewDateFilter?: string | null,
-  limit?: number
+  limit?: number,
+  options?: EventsFeedQueryOptions
 ): string {
   const bounds = parseOperationalDateBoundsSec(reviewDateFilter);
+  const resolvedLimit = normalizePositiveLimit(
+    limit,
+    bounds ? DEFAULT_DATE_FILTERED_EVENTS_FEED_LIMIT : DEFAULT_EVENTS_FEED_LIMIT
+  );
+  const params: string[] = [];
   if (bounds) {
-    const resolvedLimit = normalizePositiveLimit(
-      limit,
-      DEFAULT_DATE_FILTERED_EVENTS_FEED_LIMIT
-    );
-    return `/api/events?after=${bounds.dayStart}&before=${bounds.dayEnd}&limit=${resolvedLimit}`;
+    params.push(`after=${bounds.dayStart}`);
+    const effBefore =
+      typeof options?.before === "number" && Number.isFinite(options.before)
+        ? Math.min(bounds.dayEnd, options.before)
+        : bounds.dayEnd;
+    params.push(`before=${effBefore}`);
+  } else if (typeof options?.before === "number" && Number.isFinite(options.before)) {
+    params.push(`before=${options.before}`);
   }
-  const resolvedLimit = normalizePositiveLimit(limit, DEFAULT_EVENTS_FEED_LIMIT);
-  return `/api/events?limit=${resolvedLimit}`;
+  if (options?.camera && options.camera !== "all") {
+    params.push(`cameras=${encodeURIComponent(options.camera)}`);
+  }
+  if (options?.label && options.label !== "all") {
+    params.push(`labels=${encodeURIComponent(options.label)}`);
+  }
+  if (options?.excludeLabel && options.excludeLabel !== "none") {
+    params.push(`exclude_labels=${encodeURIComponent(options.excludeLabel)}`);
+  }
+  if (options?.zone && options.zone !== "all") {
+    params.push(`zones=${encodeURIComponent(options.zone)}`);
+  }
+  if (
+    typeof options?.minScore === "number" &&
+    Number.isFinite(options.minScore) &&
+    options.minScore > 0
+  ) {
+    const normalizedScore =
+      options.minScore > 1
+        ? Math.min(1, options.minScore / 100)
+        : options.minScore;
+    params.push(`min_score=${Number(normalizedScore.toFixed(4))}`);
+  }
+  if (options?.stationary === "stationary") {
+    params.push("stationary=1");
+  } else if (options?.stationary === "moving") {
+    params.push("stationary=0");
+  }
+  if (options?.retainedOnly) {
+    params.push("favorites=1");
+  }
+  if (options?.plate && options.plate.trim()) {
+    params.push(`plate=${encodeURIComponent(options.plate.trim())}`);
+  }
+  params.push(`limit=${resolvedLimit}`);
+  return `/api/events?${params.join("&")}`;
 }
 
 export interface EventMutationPatch {
