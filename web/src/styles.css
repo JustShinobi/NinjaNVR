@@ -520,6 +520,11 @@ textarea:focus {
   outline-offset: 2px;
 }
 
+.nvr-table-sort-btn:focus-visible {
+  outline: 2px solid var(--signal-accent);
+  outline-offset: -2px;
+}
+
 dialog:modal {
   overscroll-behavior: contain;
 }
@@ -1477,6 +1482,44 @@ dialog::backdrop {
   letter-spacing: 0.05em;
   color: var(--text-muted);
   background: var(--bg-card-header);
+}
+
+.nvr-table th:has(> .nvr-table-sort-btn) {
+  padding: 0;
+}
+
+.nvr-table-sort-btn {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  width: 100%;
+  min-block-size: 28px;
+  padding: 7px 10px;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.nvr-table-sort-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.nvr-system-filter-input {
+  height: 24px;
+  font-size: var(--text-xs);
+}
+
+.nvr-system-chip-btn {
+  height: 24px;
+  padding: 0 8px;
+  font-size: var(--text-xs);
 }
 
 .nvr-util-cell {
@@ -4394,6 +4437,15 @@ input[type="range"] {
     -webkit-overflow-scrolling: touch;
   }
 
+  .nvr-workbench.nvr-system-workbench > :not(:first-child) {
+    order: 0;
+  }
+
+  .nvr-workbench.nvr-system-workbench > .nvr-panel:first-child {
+    max-height: none;
+    border-top: 0;
+  }
+
   .nvr-workbench .nvr-matrix-2x2 {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -4707,6 +4759,16 @@ input[type="range"] {
   .nvr-list-row input[type="checkbox"] {
     width: 22px;
     height: 22px;
+  }
+}
+
+@media (max-width: 767px), (pointer: coarse) {
+  .nvr-table-sort-btn,
+  .nvr-system-filter-input,
+  .nvr-system-chip-btn {
+    min-block-size: 44px;
+    min-inline-size: 44px;
+    height: auto;
   }
 }
 

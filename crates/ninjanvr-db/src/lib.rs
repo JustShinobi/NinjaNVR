@@ -1207,6 +1207,7 @@ impl NinjaDatabase {
                 "max_views" INTEGER NULL
             );
             CREATE INDEX IF NOT EXISTS "idx_share_link_target" ON "share_link" ("kind", "target_id");
+            CREATE INDEX IF NOT EXISTS "idx_share_link_target_id" ON "share_link" ("target_id");
             "#,
         )?;
         for alter_sql in [
@@ -2584,6 +2585,17 @@ impl NinjaDatabase {
     }
 
     pub fn query_events(&self, filter: &EventFilter) -> Result<Vec<Value>> {
+        self.query_events_with_thumbnails(filter, true)
+    }
+
+    /// Queries events matching `filter`, optionally omitting the inline base64 `thumbnail`
+    /// column (`NULL AS thumbnail`) so bulk console list endpoints avoid reading ~10 KB SQLite
+    /// overflow pages per row when thumbnails are loaded via `/api/events/{id}/thumbnail.webp`.
+    pub fn query_events_with_thumbnails(
+        &self,
+        filter: &EventFilter,
+        include_thumbnails: bool,
+    ) -> Result<Vec<Value>> {
         let requested_limit = filter.limit.unwrap_or(100).min(1000);
         if requested_limit == 0 {
             return Ok(Vec::new());
@@ -2646,15 +2658,20 @@ impl NinjaDatabase {
             .map(|z| z.iter().take(MAX_SQL_FILTER_ITEMS).cloned().collect());
 
         let conn = self.read_conn();
-        let mut sql = String::from(
+        let thumb_projection = if include_thumbnails {
+            "thumbnail"
+        } else {
+            "NULL AS thumbnail"
+        };
+        let mut sql = format!(
             r#"
             SELECT
                 id, camera, label, zones, start_time, end_time,
                 has_clip, has_snapshot, plus_id, retain_indefinitely,
-                sub_label, top_score, false_positive, box, data, thumbnail, sub_label_score
+                sub_label, top_score, false_positive, box, data, {thumb_projection}, sub_label_score
             FROM event
             WHERE 1=1
-            "#,
+            "#
         );
         let mut bind_vals: Vec<rusqlite::types::Value> = Vec::new();
 

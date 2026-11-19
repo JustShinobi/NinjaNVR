@@ -318,8 +318,12 @@ export function extractLightThemeCssVariables(cssContent: string): Record<string
 
 export interface CanvasThemePalette {
   theme: "dark" | "light";
+  highContrast: boolean;
   gridLineStroke: string;
   sparklineGridStroke: string;
+  sparklineAccentStroke: string;
+  sparklineLiveStroke: string;
+  sparklineMotionStroke: string;
   continuousBarFill: string;
   audioWaveformFill: string;
   objectBarFill: string;
@@ -341,18 +345,75 @@ export interface CanvasThemePalette {
   floorplanObjectLabelFill: string;
 }
 
+export function toCanvasTranslucentFill(
+  color: string,
+  alpha: number = 0.14
+): string {
+  const safeAlpha = Math.max(0, Math.min(1, Number.isFinite(alpha) ? alpha : 0.14));
+  const trimmed = (color || "").trim();
+  if (trimmed.startsWith("#")) {
+    try {
+      const { r, g, b } = parseHexColor(trimmed.length > 7 ? trimmed.slice(0, 7) : trimmed);
+      return `rgba(${r}, ${g}, ${b}, ${safeAlpha})`;
+    } catch {
+      // fall through to rgb() check or safe default
+    }
+  }
+  const rgbMatch = /^rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})/i.exec(
+    trimmed
+  );
+  if (rgbMatch) {
+    const r = Math.min(255, parseInt(rgbMatch[1], 10));
+    const g = Math.min(255, parseInt(rgbMatch[2], 10));
+    const b = Math.min(255, parseInt(rgbMatch[3], 10));
+    return `rgba(${r}, ${g}, ${b}, ${safeAlpha})`;
+  }
+  return `rgba(14, 165, 233, ${safeAlpha})`;
+}
+
+export function subscribePrefersLightScheme(onChange: () => void): () => void {
+  if (
+    typeof window === "undefined" ||
+    typeof window.matchMedia !== "function"
+  ) {
+    return () => {};
+  }
+  const mql = window.matchMedia("(prefers-color-scheme: light)");
+  if (typeof mql.addEventListener === "function") {
+    mql.addEventListener("change", onChange);
+    return () => mql.removeEventListener("change", onChange);
+  }
+  return () => {};
+}
+
 export function resolveCanvasThemePalette(
-  themeHint?: "dark" | "light"
+  themeHint?: "dark" | "light",
+  highContrastHint?: boolean
 ): CanvasThemePalette {
   const domTheme =
     typeof document !== "undefined"
       ? document.documentElement?.dataset?.theme
       : undefined;
+  const domHighContrast =
+    typeof document !== "undefined"
+      ? document.documentElement?.dataset?.highContrast === "true"
+      : false;
   const isLight =
     themeHint === "light" || (themeHint === undefined && domTheme === "light");
+  const isHighContrast = highContrastHint ?? domHighContrast;
+  const expectedTheme = isLight ? "light" : "dark";
+  const domMatchesResolved =
+    domTheme === expectedTheme && domHighContrast === isHighContrast;
   const baseTokens = isLight ? LIGHT_THEME_TOKENS : DARK_THEME_TOKENS;
+  const hcOverrides: Partial<Record<keyof typeof DARK_THEME_TOKENS, string>> =
+    isHighContrast
+      ? isLight
+        ? LIGHT_HIGH_CONTRAST_TOKENS
+        : DARK_HIGH_CONTRAST_TOKENS
+      : {};
 
   const computedStyle =
+    domMatchesResolved &&
     typeof window !== "undefined" &&
     typeof window.getComputedStyle === "function" &&
     typeof document !== "undefined" &&
@@ -362,30 +423,56 @@ export function resolveCanvasThemePalette(
 
   const readToken = (name: keyof typeof DARK_THEME_TOKENS): string => {
     const fromCss = computedStyle?.getPropertyValue(name)?.trim();
-    return fromCss || baseTokens[name];
+    return fromCss || hcOverrides[name] || baseTokens[name];
   };
 
   if (isLight) {
     return {
       theme: "light",
-      gridLineStroke: "rgba(15, 23, 42, 0.14)",
-      sparklineGridStroke: "rgba(15, 23, 42, 0.12)",
-      continuousBarFill: "rgba(5, 150, 105, 0.52)",
-      audioWaveformFill: "rgba(2, 132, 199, 0.82)",
-      objectBarFill: "rgba(220, 38, 38, 0.78)",
-      motionBarFill: "rgba(217, 119, 6, 0.58)",
-      gapFill: "rgba(220, 38, 38, 0.20)",
-      gapHatchStroke: "rgba(180, 83, 9, 0.72)",
-      alertPinFill: readToken("--signal-alert"),
-      motionPinFill: readToken("--signal-motion"),
+      highContrast: isHighContrast,
+      gridLineStroke: isHighContrast
+        ? "rgba(15, 23, 42, 0.28)"
+        : "rgba(15, 23, 42, 0.14)",
+      sparklineGridStroke: isHighContrast
+        ? "rgba(15, 23, 42, 0.24)"
+        : "rgba(15, 23, 42, 0.12)",
+      sparklineAccentStroke: isHighContrast
+        ? readToken("--signal-accent-text")
+        : readToken("--signal-accent"),
+      sparklineLiveStroke: readToken("--signal-live-text"),
+      sparklineMotionStroke: readToken("--signal-motion-text"),
+      continuousBarFill: isHighContrast
+        ? "rgba(6, 95, 70, 0.94)"
+        : "rgba(6, 95, 70, 0.86)",
+      audioWaveformFill: isHighContrast
+        ? "rgba(7, 89, 133, 0.95)"
+        : "rgba(7, 89, 133, 0.88)",
+      objectBarFill: isHighContrast
+        ? "rgba(153, 27, 27, 0.94)"
+        : "rgba(153, 27, 27, 0.86)",
+      motionBarFill: isHighContrast
+        ? "rgba(146, 64, 14, 0.94)"
+        : "rgba(146, 64, 14, 0.86)",
+      gapFill: isHighContrast
+        ? "rgba(185, 28, 28, 0.34)"
+        : "rgba(185, 28, 28, 0.24)",
+      gapHatchStroke: isHighContrast
+        ? "rgba(146, 64, 14, 0.92)"
+        : "rgba(146, 64, 14, 0.82)",
+      alertPinFill: readToken("--signal-alert-text"),
+      motionPinFill: readToken("--signal-motion-text"),
       floorplanStageBg:
         "radial-gradient(circle at 50% 50%, rgba(2, 132, 199, 0.08), rgba(220, 227, 238, 0.98))",
-      floorplanGridStroke: "rgba(71, 85, 105, 0.22)",
-      floorplanBorderStroke: "rgba(2, 132, 199, 0.42)",
+      floorplanGridStroke: isHighContrast
+        ? "rgba(51, 65, 85, 0.36)"
+        : "rgba(71, 85, 105, 0.22)",
+      floorplanBorderStroke: isHighContrast
+        ? "rgba(2, 132, 199, 0.62)"
+        : "rgba(2, 132, 199, 0.42)",
       floorplanRoomFill: "rgba(245, 247, 251, 0.84)",
       floorplanRoomSelectedFill: "rgba(2, 132, 199, 0.18)",
       floorplanRoomLabelFill: readToken("--text-primary"),
-      floorplanWallStroke: "#475569",
+      floorplanWallStroke: isHighContrast ? "#1e293b" : "#475569",
       floorplanWallNodeFill: "#334155",
       floorplanCamNodeStroke: readToken("--bg-panel"),
       floorplanCamLabelFill: readToken("--text-primary"),
@@ -395,24 +482,48 @@ export function resolveCanvasThemePalette(
 
   return {
     theme: "dark",
-    gridLineStroke: "rgba(255, 255, 255, 0.06)",
-    sparklineGridStroke: "rgba(255, 255, 255, 0.06)",
-    continuousBarFill: "rgba(16, 185, 129, 0.42)",
-    audioWaveformFill: "rgba(6, 182, 212, 0.78)",
-    objectBarFill: "rgba(239, 68, 68, 0.72)",
-    motionBarFill: "rgba(245, 158, 11, 0.48)",
-    gapFill: "rgba(239, 68, 68, 0.22)",
-    gapHatchStroke: "rgba(245, 158, 11, 0.65)",
+    highContrast: isHighContrast,
+    gridLineStroke: isHighContrast
+      ? "rgba(255, 255, 255, 0.18)"
+      : "rgba(255, 255, 255, 0.06)",
+    sparklineGridStroke: isHighContrast
+      ? "rgba(255, 255, 255, 0.16)"
+      : "rgba(255, 255, 255, 0.06)",
+    sparklineAccentStroke: readToken("--signal-accent"),
+    sparklineLiveStroke: readToken("--signal-live"),
+    sparklineMotionStroke: readToken("--signal-motion"),
+    continuousBarFill: isHighContrast
+      ? "rgba(16, 185, 129, 0.64)"
+      : "rgba(16, 185, 129, 0.42)",
+    audioWaveformFill: isHighContrast
+      ? "rgba(6, 182, 212, 0.92)"
+      : "rgba(6, 182, 212, 0.78)",
+    objectBarFill: isHighContrast
+      ? "rgba(239, 68, 68, 0.88)"
+      : "rgba(239, 68, 68, 0.72)",
+    motionBarFill: isHighContrast
+      ? "rgba(245, 158, 11, 0.68)"
+      : "rgba(245, 158, 11, 0.48)",
+    gapFill: isHighContrast
+      ? "rgba(239, 68, 68, 0.34)"
+      : "rgba(239, 68, 68, 0.22)",
+    gapHatchStroke: isHighContrast
+      ? "rgba(245, 158, 11, 0.84)"
+      : "rgba(245, 158, 11, 0.65)",
     alertPinFill: readToken("--signal-alert"),
     motionPinFill: readToken("--signal-motion"),
     floorplanStageBg:
       "radial-gradient(circle at 50% 50%, rgba(14, 165, 233, 0.06), rgba(7, 10, 15, 0.98))",
-    floorplanGridStroke: "rgba(148, 163, 184, 0.14)",
-    floorplanBorderStroke: "rgba(56, 189, 248, 0.25)",
+    floorplanGridStroke: isHighContrast
+      ? "rgba(203, 213, 225, 0.28)"
+      : "rgba(148, 163, 184, 0.14)",
+    floorplanBorderStroke: isHighContrast
+      ? "rgba(56, 189, 248, 0.48)"
+      : "rgba(56, 189, 248, 0.25)",
     floorplanRoomFill: "rgba(15, 23, 42, 0.55)",
     floorplanRoomSelectedFill: "rgba(56, 189, 248, 0.18)",
     floorplanRoomLabelFill: readToken("--text-primary"),
-    floorplanWallStroke: "#94a3b8",
+    floorplanWallStroke: isHighContrast ? "#cbd5e1" : "#94a3b8",
     floorplanWallNodeFill: "#cbd5e1",
     floorplanCamNodeStroke: "#070a0f",
     floorplanCamLabelFill: readToken("--text-primary"),

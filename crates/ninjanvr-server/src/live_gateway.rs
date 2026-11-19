@@ -335,16 +335,12 @@ pub fn sdp_has_send_capable_audio(sdp: &str) -> bool {
             }
         }
     }
-    if in_audio
+    in_audio
         && section_is_send_capable(
             audio_recv_or_inactive_count,
             audio_send_dir_count,
             session_has_send_dir,
         )
-    {
-        return true;
-    }
-    false
 }
 
 /// Strict allowlist validator for client-to-`go2rtc` WebSocket control frames from read-only

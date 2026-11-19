@@ -557,6 +557,335 @@ pub fn check_acoustic_event_trigger(dbfs: i64, cfg: &AudioConfig) -> Option<Stri
 
 const MAX_AUDIO_PROBE_PCM_BYTES: usize = 256 * 1024;
 const AUDIO_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const MAX_IN_PROCESS_MP4_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_IN_PROCESS_AUDIO_PACKETS: usize = 1_024;
+const MAX_IN_PROCESS_DEMUX_PACKETS: usize = 4_096;
+const MAX_IN_PROCESS_PACKET_BYTES: usize = 65_536;
+const MAX_IN_PROCESS_AUDIO_SECONDS: u64 = 15;
+const MAX_SOUN_SPANS: usize = 2_048;
+const MAX_SOUN_TABLE_ENTRIES: usize = 65_536;
+
+fn rms_sum_to_dbfs(sum_sq: f64, sample_count: u64) -> Option<i64> {
+    if sample_count == 0 {
+        return None;
+    }
+    let rms = (sum_sq / (sample_count as f64)).sqrt();
+    if !rms.is_finite() || rms <= 0.00005 {
+        return Some(0);
+    }
+    let db = (20.0 * rms.log10()).round() as i64;
+    Some(if db <= -90 { 0 } else { db.clamp(-89, -1) })
+}
+
+/// Decodes raw AAC-LC access units directly from validated `soun` `(offset, byte_len)` spans
+/// without demuxing or reading any `vide` track samples from disk.
+fn decode_aac_spans_in_process(
+    file: &mut std::fs::File,
+    file_len: u64,
+    spans: &[(u64, u32)],
+    sample_rate: u32,
+    asc: &[u8],
+) -> Option<i64> {
+    use std::io::{Read, Seek, SeekFrom};
+    use symphonia::core::codecs::audio::well_known::CODEC_ID_AAC;
+    use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoderOptions};
+    use symphonia::core::errors::Error as SymphoniaError;
+    use symphonia::core::packet::Packet;
+    use symphonia::core::units::{Duration as SymphoniaDuration, Timestamp};
+
+    if spans.is_empty() || asc.len() < 2 || asc.len() > 64 {
+        return None;
+    }
+    let clamped_sr = sample_rate.clamp(4_000, 96_000);
+    let mut params = AudioCodecParameters::new();
+    params
+        .for_codec(CODEC_ID_AAC)
+        .with_sample_rate(clamped_sr)
+        .with_extra_data(asc.to_vec().into_boxed_slice());
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(&params, &AudioDecoderOptions::default())
+        .ok()?;
+
+    let max_frames = (clamped_sr as u64).saturating_mul(MAX_IN_PROCESS_AUDIO_SECONDS);
+    let deadline = std::time::Instant::now() + AUDIO_PROBE_TIMEOUT;
+    let mut frames_decoded: u64 = 0;
+    let mut sum_sq: f64 = 0.0;
+    let mut sample_count: u64 = 0;
+    let mut sample_buf: Vec<i16> = Vec::with_capacity(2_048);
+
+    for &(off, sz) in spans.iter().take(MAX_IN_PROCESS_AUDIO_PACKETS) {
+        if frames_decoded >= max_frames || std::time::Instant::now() >= deadline {
+            break;
+        }
+        let pkt_len = sz as usize;
+        if pkt_len == 0 || pkt_len > MAX_IN_PROCESS_PACKET_BYTES {
+            continue;
+        }
+        if off.checked_add(sz as u64).is_none_or(|end| end > file_len) {
+            continue;
+        }
+        if file.seek(SeekFrom::Start(off)).is_err() {
+            break;
+        }
+        let mut pkt_bytes = vec![0u8; pkt_len];
+        if file.read_exact(&mut pkt_bytes).is_err() {
+            break;
+        }
+        let pkt = Packet::new(0, Timestamp::ZERO, SymphoniaDuration::ZERO, pkt_bytes);
+        match decoder.decode(&pkt) {
+            Ok(decoded) => {
+                let pkt_frames = decoded.frames() as u64;
+                if pkt_frames == 0 {
+                    continue;
+                }
+                frames_decoded = frames_decoded.saturating_add(pkt_frames);
+                sample_buf.clear();
+                decoded.copy_to_vec_interleaved::<i16>(&mut sample_buf);
+                for &s in &sample_buf {
+                    let norm = (s as f64) / 32768.0;
+                    sum_sq += norm * norm;
+                }
+                sample_count = sample_count.saturating_add(sample_buf.len() as u64);
+            }
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(_) => break,
+        }
+    }
+
+    rms_sum_to_dbfs(sum_sq, sample_count)
+}
+
+/// Rejects fragmented MP4s (`mvex`) or pathological `moov` containers with excessive tracks,
+/// malformed/truncated nested boxes, or multi-million-entry sample tables before passing a file
+/// to `symphonia-format-isomp4`.
+fn moov_is_safe_for_in_process_demux(moov: &[u8]) -> bool {
+    let (moov_boxes, malformed) = iter_mp4_boxes(moov);
+    if malformed {
+        return false;
+    }
+    let mut trak_count = 0usize;
+    for mb in moov_boxes {
+        if &mb.box_type == b"mvex" {
+            return false;
+        }
+        if &mb.box_type == b"trak" {
+            trak_count += 1;
+            if trak_count > 8 {
+                return false;
+            }
+            let (trak_boxes, trak_malformed) = iter_mp4_boxes(mb.payload);
+            if trak_malformed {
+                return false;
+            }
+            for tb in trak_boxes {
+                if &tb.box_type == b"mdia" {
+                    let (mdia_boxes, mdia_malformed) = iter_mp4_boxes(tb.payload);
+                    if mdia_malformed {
+                        return false;
+                    }
+                    for db in mdia_boxes {
+                        if &db.box_type == b"minf" {
+                            let (minf_boxes, minf_malformed) = iter_mp4_boxes(db.payload);
+                            if minf_malformed {
+                                return false;
+                            }
+                            for ib in minf_boxes {
+                                if &ib.box_type == b"stbl" {
+                                    let (stbl_boxes, stbl_malformed) = iter_mp4_boxes(ib.payload);
+                                    if stbl_malformed {
+                                        return false;
+                                    }
+                                    for sb in stbl_boxes {
+                                        let sbody = sb.payload;
+                                        match &sb.box_type {
+                                            b"stsz" if sbody.len() >= 12 => {
+                                                let cnt = u32::from_be_bytes([
+                                                    sbody[8], sbody[9], sbody[10], sbody[11],
+                                                ])
+                                                    as usize;
+                                                if cnt > MAX_SOUN_TABLE_ENTRIES {
+                                                    return false;
+                                                }
+                                            }
+                                            b"stts" | b"ctts" | b"stsc" | b"stco" | b"co64"
+                                                if sbody.len() >= 8 =>
+                                            {
+                                                let cnt = u32::from_be_bytes([
+                                                    sbody[4], sbody[5], sbody[6], sbody[7],
+                                                ])
+                                                    as usize;
+                                                if cnt > MAX_SOUN_TABLE_ENTRIES {
+                                                    return false;
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    trak_count > 0
+}
+
+/// Scans all top-level ISO-BMFF box headers from byte `0` to `file_len` and returns `true` only
+/// when the container is cleanly bounded, has **exactly one** `moov` box, and has **zero** `moof`
+/// boxes (preventing second-`moov` overwrite or top-level `moof`/`trun` smuggling).
+fn file_has_single_moov_and_no_moof(file: &mut std::fs::File, file_len: u64) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut pos = 0u64;
+    let mut hdr = [0u8; 8];
+    let mut boxes_seen = 0usize;
+    let mut moov_count = 0usize;
+    while pos < file_len {
+        if boxes_seen >= MAX_MP4_BOXES_PER_LEVEL || pos.checked_add(8).is_none_or(|e| e > file_len)
+        {
+            return false;
+        }
+        boxes_seen += 1;
+        if file.seek(SeekFrom::Start(pos)).is_err() || file.read_exact(&mut hdr).is_err() {
+            return false;
+        }
+        let size32 = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
+        let btype = [hdr[4], hdr[5], hdr[6], hdr[7]];
+        let (box_size, hdr_len) = if size32 == 1 {
+            if pos.checked_add(16).is_none_or(|e| e > file_len) {
+                return false;
+            }
+            let mut ext = [0u8; 8];
+            if file.read_exact(&mut ext).is_err() {
+                return false;
+            }
+            (u64::from_be_bytes(ext), 16u64)
+        } else if size32 == 0 {
+            (file_len - pos, 8u64)
+        } else {
+            (size32, 8u64)
+        };
+        let Some(next_pos) = pos.checked_add(box_size) else {
+            return false;
+        };
+        if box_size < hdr_len || next_pos > file_len {
+            return false;
+        }
+        if &btype == b"moof" {
+            return false;
+        }
+        if &btype == b"moov" {
+            moov_count += 1;
+            if moov_count > 1 || box_size - hdr_len > 16 * 1024 * 1024 {
+                return false;
+            }
+        }
+        pos = next_pos;
+    }
+    pos == file_len && moov_count == 1
+}
+
+/// Decodes an MP4 `soun` track (`mp4a` AAC-LC or linear PCM) in-process
+/// using pure-Rust `symphonia` (`#![forbid(unsafe_code)]`) without spawning `ffmpeg`.
+/// Returns `Some(dbfs)` when at least one valid audio sample was decoded, or `None` when
+/// the codec/container is unsupported or malformed (allowing optional `ffmpeg` fallback).
+fn decode_mp4_audio_dbfs_in_process(path: &Path) -> Option<i64> {
+    use symphonia::core::codecs::CodecParameters;
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
+    use symphonia::core::common::Limit;
+    use symphonia::core::errors::Error as SymphoniaError;
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::formats::{FormatOptions, TrackType};
+    use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
+    use symphonia::core::meta::MetadataOptions;
+
+    let (file, meta) = open_regular_file_nofollow(path).ok()?;
+    if meta.len() > MAX_IN_PROCESS_MP4_BYTES {
+        return None;
+    }
+    let mss = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
+    let mut hint = Hint::new();
+    hint.with_extension("mp4");
+
+    let meta_opts = MetadataOptions::default()
+        .limit_tag_bytes(Limit::Maximum(4_096))
+        .limit_visual_bytes(Limit::Maximum(0));
+
+    let mut format = symphonia::default::get_probe()
+        .probe(&hint, mss, FormatOptions::default(), meta_opts)
+        .ok()?;
+
+    let (track_id, audio_params, sample_rate) = {
+        let track = format.default_track(TrackType::Audio)?;
+        let Some(CodecParameters::Audio(params)) = &track.codec_params else {
+            return None;
+        };
+        let sr = params.sample_rate.unwrap_or(16_000).clamp(4_000, 96_000) as u64;
+        (track.id, params.clone(), sr)
+    };
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
+        .ok()?;
+
+    let max_frames = sample_rate.saturating_mul(MAX_IN_PROCESS_AUDIO_SECONDS);
+    let deadline = std::time::Instant::now() + AUDIO_PROBE_TIMEOUT;
+    let mut frames_decoded: u64 = 0;
+    let mut audio_packets_seen: usize = 0;
+    let mut total_packets_seen: usize = 0;
+    let mut sum_sq: f64 = 0.0;
+    let mut sample_count: u64 = 0;
+    let mut sample_buf: Vec<i16> = Vec::with_capacity(2_048);
+
+    while total_packets_seen < MAX_IN_PROCESS_DEMUX_PACKETS
+        && audio_packets_seen < MAX_IN_PROCESS_AUDIO_PACKETS
+        && frames_decoded < max_frames
+        && std::time::Instant::now() < deadline
+    {
+        let packet = match format.next_packet() {
+            Ok(Some(pkt)) => pkt,
+            Ok(None) => break,
+            Err(SymphoniaError::IoError(err))
+                if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(_) => break,
+        };
+        total_packets_seen += 1;
+        if packet.track_id != track_id {
+            continue;
+        }
+        if packet.data.len() > MAX_IN_PROCESS_PACKET_BYTES {
+            break;
+        }
+        audio_packets_seen += 1;
+
+        match decoder.decode(&packet) {
+            Ok(decoded) => {
+                let pkt_frames = decoded.frames() as u64;
+                if pkt_frames == 0 {
+                    continue;
+                }
+                frames_decoded = frames_decoded.saturating_add(pkt_frames);
+                sample_buf.clear();
+                decoded.copy_to_vec_interleaved::<i16>(&mut sample_buf);
+                for &s in &sample_buf {
+                    let norm = (s as f64) / 32768.0;
+                    sum_sq += norm * norm;
+                }
+                sample_count = sample_count.saturating_add(sample_buf.len() as u64);
+            }
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(_) => break,
+        }
+    }
+
+    rms_sum_to_dbfs(sum_sq, sample_count)
+}
 
 fn decode_audio_dbfs_with_bin_and_timeout(
     ffmpeg_bin: &Path,
@@ -686,6 +1015,28 @@ pub fn probe_mp4_audio_dbfs_with_policy(path: &Path, decode_compressed: bool) ->
     probe_mp4_audio_dbfs_with_bin(path, decode_compressed, None)
 }
 
+fn decode_g711_alaw_sample(alaw: u8) -> i16 {
+    let val = alaw ^ 0x55;
+    let sign = val & 0x80;
+    let exponent = (val >> 4) & 0x07;
+    let mantissa = (val & 0x0F) as i32;
+    let mag = if exponent == 0 {
+        (mantissa << 4) + 8
+    } else {
+        ((mantissa << 4) + 0x108) << (exponent - 1)
+    };
+    if sign != 0 { mag as i16 } else { -(mag as i16) }
+}
+
+fn decode_g711_ulaw_sample(ulaw: u8) -> i16 {
+    let val = !ulaw;
+    let sign = val & 0x80;
+    let exponent = (val >> 4) & 0x07;
+    let mantissa = (val & 0x0F) as i32;
+    let mag = (((mantissa << 3) + 0x84) << exponent) - 0x84;
+    if sign != 0 { -(mag as i16) } else { mag as i16 }
+}
+
 fn probe_mp4_audio_dbfs_with_bin(
     path: &Path,
     decode_compressed: bool,
@@ -737,15 +1088,87 @@ fn probe_mp4_audio_dbfs_with_bin(
             if file.read_exact(&mut moov).is_err() {
                 break;
             }
-            if let Some((offsets, total_audio_bytes, sample_count, is_compressed)) =
-                extract_soun_sample_stats(&moov)
-            {
+            if let Some(stats) = extract_soun_sample_stats(&moov) {
+                let SounSampleStats {
+                    spans,
+                    total_bytes: total_audio_bytes,
+                    sample_count,
+                    is_compressed,
+                    codec_fourcc: fourcc,
+                    sample_rate,
+                    aac_asc,
+                } = stats;
                 if sample_count == 0 || total_audio_bytes == 0 {
                     return 0;
                 }
                 if is_compressed {
                     if !decode_compressed {
                         return 0;
+                    }
+                    if matches!(&fourcc, b"alaw" | b"ulaw") {
+                        const MAX_G711_READ_BYTES: usize = 128 * 1024;
+                        let mut g711_bytes = Vec::with_capacity(16_384);
+                        for (off, span_len) in spans {
+                            if g711_bytes.len() as u64 >= total_audio_bytes
+                                || g711_bytes.len() >= MAX_G711_READ_BYTES
+                            {
+                                break;
+                            }
+                            if span_len == 0 || off >= file_len {
+                                continue;
+                            }
+                            if file.seek(SeekFrom::Start(off)).is_ok() {
+                                let rem_cap = (MAX_G711_READ_BYTES - g711_bytes.len()) as u64;
+                                let rem_tot =
+                                    total_audio_bytes.saturating_sub(g711_bytes.len() as u64);
+                                let to_read = (span_len as u64)
+                                    .min(file_len - off)
+                                    .min(rem_cap)
+                                    .min(rem_tot)
+                                    as usize;
+                                if to_read == 0 {
+                                    continue;
+                                }
+                                let mut chunk = vec![0u8; to_read];
+                                if file.read_exact(&mut chunk).is_ok() {
+                                    g711_bytes.extend_from_slice(&chunk);
+                                }
+                            }
+                        }
+                        if g711_bytes.is_empty() {
+                            return 0;
+                        }
+                        let is_alaw = &fourcc == b"alaw";
+                        let pcm_samples: Vec<i16> = g711_bytes
+                            .into_iter()
+                            .map(|b| {
+                                if is_alaw {
+                                    decode_g711_alaw_sample(b)
+                                } else {
+                                    decode_g711_ulaw_sample(b)
+                                }
+                            })
+                            .collect();
+                        return compute_pcm_rms_dbfs(&pcm_samples);
+                    }
+                    if &fourcc == b"mp4a" {
+                        if let Some(ref asc) = aac_asc
+                            && let Some(direct_db) = decode_aac_spans_in_process(
+                                &mut file,
+                                file_len,
+                                &spans,
+                                sample_rate,
+                                asc,
+                            )
+                        {
+                            return direct_db;
+                        }
+                        if moov_is_safe_for_in_process_demux(&moov)
+                            && file_has_single_moov_and_no_moof(&mut file, file_len)
+                            && let Some(in_proc_db) = decode_mp4_audio_dbfs_in_process(path)
+                        {
+                            return in_proc_db;
+                        }
                     }
                     return match ffmpeg_bin_override {
                         Some(bin) => {
@@ -754,17 +1177,26 @@ fn probe_mp4_audio_dbfs_with_bin(
                         None => decode_audio_dbfs_via_ffmpeg(path),
                     };
                 }
+                const MAX_PCM_READ_BYTES: usize = 32 * 1024;
                 let mut payload = Vec::with_capacity(8192);
-                for off in offsets.into_iter().take(8) {
-                    if payload.len() as u64 >= total_audio_bytes {
+                for (off, span_len) in spans {
+                    if payload.len() as u64 >= total_audio_bytes
+                        || payload.len() >= MAX_PCM_READ_BYTES
+                    {
                         break;
                     }
-                    if off < file_len && file.seek(SeekFrom::Start(off)).is_ok() {
-                        let remaining_audio =
-                            (total_audio_bytes.saturating_sub(payload.len() as u64)).min(2048);
-                        let to_read = (file_len - off).min(remaining_audio) as usize;
+                    if span_len == 0 || off >= file_len {
+                        continue;
+                    }
+                    if file.seek(SeekFrom::Start(off)).is_ok() {
+                        let rem_cap = (MAX_PCM_READ_BYTES - payload.len()) as u64;
+                        let remaining_audio = total_audio_bytes
+                            .saturating_sub(payload.len() as u64)
+                            .min(rem_cap);
+                        let to_read =
+                            (span_len as u64).min(file_len - off).min(remaining_audio) as usize;
                         if to_read == 0 {
-                            break;
+                            continue;
                         }
                         let mut chunk = vec![0u8; to_read];
                         if file.read_exact(&mut chunk).is_ok() {
@@ -1002,14 +1434,87 @@ fn moov_has_soun_trak(moov: &[u8]) -> bool {
     false
 }
 
-fn extract_soun_sample_stats(moov: &[u8]) -> Option<(Vec<u64>, u64, u32, bool)> {
+struct SounSampleStats {
+    spans: Vec<(u64, u32)>,
+    total_bytes: u64,
+    sample_count: u32,
+    is_compressed: bool,
+    codec_fourcc: [u8; 4],
+    sample_rate: u32,
+    aac_asc: Option<Vec<u8>>,
+}
+
+fn read_mp4_descr_len(buf: &[u8], pos: &mut usize) -> Option<usize> {
+    let mut len = 0usize;
+    for _ in 0..4 {
+        let &b = buf.get(*pos)?;
+        *pos += 1;
+        len = (len << 7) | ((b & 0x7F) as usize);
+        if (b & 0x80) == 0 {
+            return Some(len);
+        }
+    }
+    None
+}
+
+fn extract_aac_asc_from_esds(esds_payload: &[u8]) -> Option<Vec<u8>> {
+    if esds_payload.len() < 9 {
+        return None;
+    }
+    let mut pos = 4usize; // skip FullBox version + flags
+    while pos < esds_payload.len() {
+        let tag = *esds_payload.get(pos)?;
+        pos += 1;
+        let len = read_mp4_descr_len(esds_payload, &mut pos)?;
+        let end = pos.checked_add(len)?.min(esds_payload.len());
+        if tag == 0x03 {
+            // ES_Descriptor: ES_ID (2) + flags (1) + optional dependsOn/URL/OCR
+            if pos + 3 > end {
+                return None;
+            }
+            let flags = esds_payload[pos + 2];
+            pos += 3;
+            if (flags & 0x80) != 0 {
+                pos = pos.checked_add(2)?;
+            }
+            if (flags & 0x40) != 0 {
+                let url_len = *esds_payload.get(pos)? as usize;
+                pos = pos.checked_add(1 + url_len)?;
+            }
+            if (flags & 0x20) != 0 {
+                pos = pos.checked_add(2)?;
+            }
+        } else if tag == 0x04 {
+            // DecoderConfigDescriptor: 13-byte header followed by DecSpecificInfo (0x05)
+            if pos + 13 > end {
+                return None;
+            }
+            let oti = esds_payload[pos];
+            if !matches!(oti, 0x40 | 0x66 | 0x67 | 0x68) {
+                return None; // Only MPEG-4 / MPEG-2 AAC Audio carries AudioSpecificConfig for AAC-LC
+            }
+            pos += 13;
+        } else if tag == 0x05 {
+            let asc = &esds_payload[pos..end];
+            if (2..=64).contains(&asc.len()) {
+                return Some(asc.to_vec());
+            }
+            return None;
+        } else {
+            pos = end;
+        }
+    }
+    None
+}
+
+fn extract_soun_sample_stats(moov: &[u8]) -> Option<SounSampleStats> {
     let (moov_boxes, _) = iter_mp4_boxes(moov);
     let mut fallback_empty = None;
     for mb in moov_boxes {
         if &mb.box_type == b"trak"
             && let Some(stats) = parse_soun_trak(mb.payload)
         {
-            if stats.1 > 0 && stats.2 > 0 {
+            if stats.total_bytes > 0 && stats.sample_count > 0 {
                 return Some(stats);
             }
             if fallback_empty.is_none() {
@@ -1020,11 +1525,12 @@ fn extract_soun_sample_stats(moov: &[u8]) -> Option<(Vec<u64>, u64, u32, bool)> 
     fallback_empty
 }
 
-fn parse_soun_trak(trak: &[u8]) -> Option<(Vec<u64>, u64, u32, bool)> {
+fn parse_soun_trak(trak: &[u8]) -> Option<SounSampleStats> {
     let (trak_boxes, _) = iter_mp4_boxes(trak);
     for tb in trak_boxes {
         if &tb.box_type == b"mdia" {
             let mut is_soun = false;
+            let mut mdhd_timescale = 0u32;
             let mut stbl_slice: Option<&[u8]> = None;
             let (mdia_boxes, _) = iter_mp4_boxes(tb.payload);
             for db in mdia_boxes {
@@ -1033,6 +1539,23 @@ fn parse_soun_trak(trak: &[u8]) -> Option<(Vec<u64>, u64, u32, bool)> {
                     && &db.payload[8..12] == b"soun"
                 {
                     is_soun = true;
+                } else if &db.box_type == b"mdhd" && db.payload.len() >= 20 {
+                    let ver = db.payload[0];
+                    if ver == 1 && db.payload.len() >= 24 {
+                        mdhd_timescale = u32::from_be_bytes([
+                            db.payload[20],
+                            db.payload[21],
+                            db.payload[22],
+                            db.payload[23],
+                        ]);
+                    } else if ver == 0 {
+                        mdhd_timescale = u32::from_be_bytes([
+                            db.payload[12],
+                            db.payload[13],
+                            db.payload[14],
+                            db.payload[15],
+                        ]);
+                    }
                 } else if &db.box_type == b"minf" {
                     let (minf_boxes, _) = iter_mp4_boxes(db.payload);
                     for ib in minf_boxes {
@@ -1043,28 +1566,109 @@ fn parse_soun_trak(trak: &[u8]) -> Option<(Vec<u64>, u64, u32, bool)> {
                 }
             }
             if is_soun && let Some(stbl) = stbl_slice {
-                let mut offsets = Vec::new();
+                let mut chunk_offsets: Vec<u64> = Vec::new();
+                let mut stsc_entries: Vec<(u32, u32)> = Vec::new();
+                let mut sample_sizes: Vec<u32> = Vec::new();
+                let mut default_sample_size = 0u32;
                 let mut total_bytes = 0u64;
                 let mut sample_count = 0u32;
                 let mut is_compressed = false;
+                let mut codec_fourcc = *b"NONE";
+                let mut sample_rate = mdhd_timescale;
+                let mut aac_asc: Option<Vec<u8>> = None;
+
                 let (stbl_boxes, _) = iter_mp4_boxes(stbl);
                 for sb in stbl_boxes {
                     let stype = &sb.box_type;
                     let sbody = sb.payload;
                     if stype == b"stsd" && sbody.len() >= 16 {
-                        let fourcc = &sbody[12..16];
+                        let fourcc = [sbody[12], sbody[13], sbody[14], sbody[15]];
+                        codec_fourcc = fourcc;
                         is_compressed =
-                            !matches!(fourcc, b"sowt" | b"twos" | b"lpcm" | b"raw " | b"NONE");
+                            !matches!(&fourcc, b"sowt" | b"twos" | b"lpcm" | b"raw " | b"NONE");
+                        let (entries, _) = iter_mp4_boxes(&sbody[8..]);
+                        if let Some(entry) = entries.first() {
+                            codec_fourcc = entry.box_type;
+                            is_compressed = !matches!(
+                                &codec_fourcc,
+                                b"sowt" | b"twos" | b"lpcm" | b"raw " | b"NONE"
+                            );
+                            if entry.payload.len() >= 28 {
+                                let sr_hi =
+                                    u16::from_be_bytes([entry.payload[24], entry.payload[25]])
+                                        as u32;
+                                if sr_hi > 0 {
+                                    sample_rate = sr_hi;
+                                }
+                                let qt_ver =
+                                    u16::from_be_bytes([entry.payload[8], entry.payload[9]]);
+                                let child_off = match qt_ver {
+                                    1 => 44usize,
+                                    2 => 64usize,
+                                    _ => 28usize,
+                                };
+                                if &codec_fourcc == b"mp4a" && entry.payload.len() > child_off {
+                                    let (children, _) = iter_mp4_boxes(&entry.payload[child_off..]);
+                                    for ch in children {
+                                        if &ch.box_type == b"esds" {
+                                            aac_asc = extract_aac_asc_from_esds(ch.payload);
+                                            if aac_asc.is_some() {
+                                                break;
+                                            }
+                                        } else if &ch.box_type == b"wave" {
+                                            let (wchildren, _) = iter_mp4_boxes(ch.payload);
+                                            for wch in wchildren {
+                                                if &wch.box_type == b"esds" {
+                                                    aac_asc =
+                                                        extract_aac_asc_from_esds(wch.payload);
+                                                    if aac_asc.is_some() {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if stype == b"stsc" && sbody.len() >= 8 {
+                        let count =
+                            u32::from_be_bytes([sbody[4], sbody[5], sbody[6], sbody[7]]) as usize;
+                        let mut bpos = 8usize;
+                        for _ in 0..count.min(MAX_SOUN_TABLE_ENTRIES) {
+                            if bpos + 12 > sbody.len() {
+                                break;
+                            }
+                            let first_chunk = u32::from_be_bytes([
+                                sbody[bpos],
+                                sbody[bpos + 1],
+                                sbody[bpos + 2],
+                                sbody[bpos + 3],
+                            ]);
+                            let spc = u32::from_be_bytes([
+                                sbody[bpos + 4],
+                                sbody[bpos + 5],
+                                sbody[bpos + 6],
+                                sbody[bpos + 7],
+                            ]);
+                            if first_chunk > 0 {
+                                stsc_entries.push((first_chunk, spc));
+                            }
+                            bpos += 12;
+                        }
                     } else if stype == b"stsz" && sbody.len() >= 12 {
                         let default_size =
                             u32::from_be_bytes([sbody[4], sbody[5], sbody[6], sbody[7]]);
                         let count = u32::from_be_bytes([sbody[8], sbody[9], sbody[10], sbody[11]]);
+                        default_sample_size = default_size;
                         sample_count = count;
                         if default_size > 0 {
                             total_bytes = (default_size as u64).saturating_mul(count as u64);
                         } else {
+                            let cap = (count as usize).min(MAX_SOUN_TABLE_ENTRIES);
+                            sample_sizes.reserve(cap.min(4_096));
                             let mut bpos = 12usize;
-                            for _ in 0..count.min(65_536) {
+                            for _ in 0..cap {
                                 if bpos + 4 > sbody.len() {
                                     break;
                                 }
@@ -1073,8 +1677,9 @@ fn parse_soun_trak(trak: &[u8]) -> Option<(Vec<u64>, u64, u32, bool)> {
                                     sbody[bpos + 1],
                                     sbody[bpos + 2],
                                     sbody[bpos + 3],
-                                ]) as u64;
-                                total_bytes = total_bytes.saturating_add(sz);
+                                ]);
+                                sample_sizes.push(sz);
+                                total_bytes = total_bytes.saturating_add(sz as u64);
                                 bpos += 4;
                             }
                         }
@@ -1082,11 +1687,11 @@ fn parse_soun_trak(trak: &[u8]) -> Option<(Vec<u64>, u64, u32, bool)> {
                         let count =
                             u32::from_be_bytes([sbody[4], sbody[5], sbody[6], sbody[7]]) as usize;
                         let mut bpos = 8usize;
-                        for _ in 0..count.min(8) {
+                        for _ in 0..count.min(MAX_SOUN_SPANS) {
                             if bpos + 4 > sbody.len() {
                                 break;
                             }
-                            offsets.push(u32::from_be_bytes([
+                            chunk_offsets.push(u32::from_be_bytes([
                                 sbody[bpos],
                                 sbody[bpos + 1],
                                 sbody[bpos + 2],
@@ -1098,11 +1703,11 @@ fn parse_soun_trak(trak: &[u8]) -> Option<(Vec<u64>, u64, u32, bool)> {
                         let count =
                             u32::from_be_bytes([sbody[4], sbody[5], sbody[6], sbody[7]]) as usize;
                         let mut bpos = 8usize;
-                        for _ in 0..count.min(8) {
+                        for _ in 0..count.min(MAX_SOUN_SPANS) {
                             if bpos + 8 > sbody.len() {
                                 break;
                             }
-                            offsets.push(u64::from_be_bytes([
+                            chunk_offsets.push(u64::from_be_bytes([
                                 sbody[bpos],
                                 sbody[bpos + 1],
                                 sbody[bpos + 2],
@@ -1116,7 +1721,100 @@ fn parse_soun_trak(trak: &[u8]) -> Option<(Vec<u64>, u64, u32, bool)> {
                         }
                     }
                 }
-                return Some((offsets, total_bytes, sample_count, is_compressed));
+
+                // Expand exact `(offset, byte_len)` spans strictly belonging to the `soun` track:
+                // - Packetized `mp4a` emits one span per access unit so `AacDecoder` decodes frame-by-frame;
+                // - Byte-stream codecs (`alaw`, `ulaw`, PCM) coalesce contiguous samples per chunk so
+                //   interleaved `vide` NALs in `mdat` are NEVER read past the chunk boundary.
+                let packetized = matches!(&codec_fourcc, b"mp4a" | b"Opus");
+                let mut spans: Vec<(u64, u32)> = Vec::new();
+                let total_samples = if default_sample_size > 0 {
+                    sample_count as usize
+                } else {
+                    sample_sizes.len()
+                };
+
+                if !chunk_offsets.is_empty() && total_samples > 0 {
+                    let mut sample_idx = 0usize;
+                    let mut stsc_cursor = 0usize;
+                    let num_chunks = chunk_offsets.len();
+
+                    for (c_idx, &chunk_off) in chunk_offsets.iter().enumerate() {
+                        if sample_idx >= total_samples || spans.len() >= MAX_SOUN_SPANS {
+                            break;
+                        }
+                        let chunk_num_1based = (c_idx + 1) as u32;
+                        let spc = if stsc_entries.is_empty() {
+                            if num_chunks == 1 {
+                                total_samples
+                            } else {
+                                total_samples.div_ceil(num_chunks)
+                            }
+                        } else {
+                            while stsc_cursor + 1 < stsc_entries.len()
+                                && stsc_entries[stsc_cursor + 1].0 <= chunk_num_1based
+                            {
+                                stsc_cursor += 1;
+                            }
+                            stsc_entries[stsc_cursor].1 as usize
+                        };
+                        if spc == 0 {
+                            continue;
+                        }
+                        let n_in_chunk = spc.min(total_samples - sample_idx);
+                        if packetized {
+                            let mut cur_off = chunk_off;
+                            for _ in 0..n_in_chunk {
+                                if spans.len() >= MAX_SOUN_SPANS {
+                                    break;
+                                }
+                                let sz = if default_sample_size > 0 {
+                                    default_sample_size
+                                } else {
+                                    sample_sizes[sample_idx]
+                                };
+                                sample_idx += 1;
+                                if sz > 0 {
+                                    spans.push((cur_off, sz));
+                                }
+                                let Some(next_off) = cur_off.checked_add(sz as u64) else {
+                                    break;
+                                };
+                                cur_off = next_off;
+                            }
+                        } else if default_sample_size > 0 {
+                            let chunk_bytes = (n_in_chunk as u64)
+                                .saturating_mul(default_sample_size as u64)
+                                .min(u32::MAX as u64)
+                                as u32;
+                            sample_idx += n_in_chunk;
+                            if chunk_bytes > 0 {
+                                spans.push((chunk_off, chunk_bytes));
+                            }
+                        } else {
+                            let mut chunk_bytes = 0u64;
+                            for _ in 0..n_in_chunk {
+                                chunk_bytes =
+                                    chunk_bytes.saturating_add(sample_sizes[sample_idx] as u64);
+                                sample_idx += 1;
+                            }
+                            let clamped = chunk_bytes.min(u32::MAX as u64) as u32;
+                            if clamped > 0 {
+                                spans.push((chunk_off, clamped));
+                            }
+                        }
+                    }
+                }
+
+                return Some(SounSampleStats {
+                    spans,
+                    total_bytes,
+                    sample_count,
+                    is_compressed,
+                    codec_fourcc,
+                    sample_rate: if sample_rate > 0 { sample_rate } else { 16_000 },
+                    aac_asc,
+                });
             }
         }
     }
@@ -1564,6 +2262,8 @@ pub fn compute_recorder_backoff_delay(
 }
 
 /// Manages direct segment recording and retention cleanup for all configured cameras.
+pub type AudioTelemetrySink = Arc<dyn Fn(&str, i64, bool) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct RecordingEngine {
     config: Arc<RwLock<NinjaConfig>>,
@@ -1572,6 +2272,7 @@ pub struct RecordingEngine {
     ffmpeg_bin: PathBuf,
     go2rtc_relay_active: Arc<AtomicBool>,
     activity_ledger: SharedActivityLedger,
+    audio_telemetry_sink: Option<AudioTelemetrySink>,
     storage_degraded: Arc<AtomicBool>,
     storage_error: Arc<std::sync::Mutex<Option<String>>>,
     recorders: Arc<tokio::sync::Mutex<HashMap<String, SupervisedRecorderHandle>>>,
@@ -1620,6 +2321,7 @@ impl RecordingEngine {
             ffmpeg_bin: resolve_ffmpeg_bin(),
             go2rtc_relay_active: Arc::new(AtomicBool::new(false)),
             activity_ledger,
+            audio_telemetry_sink: None,
             storage_degraded,
             storage_error,
             recorders: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -1640,6 +2342,13 @@ impl RecordingEngine {
     /// credentialed camera RTSP inputs automatically route through loopback instead of CLI `argv`.
     pub fn with_go2rtc_relay(self, active: bool) -> Self {
         self.go2rtc_relay_active.store(active, Ordering::Relaxed);
+        self
+    }
+
+    /// Registers an optional real-time callback invoked with `(camera, dbfs, acoustic_active)`
+    /// whenever a recorded segment closes so MQTT/WS and `/api/stats` reflect measured audio levels.
+    pub fn with_audio_telemetry_sink(mut self, sink: AudioTelemetrySink) -> Self {
+        self.audio_telemetry_sink = Some(sink);
         self
     }
 
@@ -2277,9 +2986,20 @@ impl RecordingEngine {
             probed_dbfs: i64,
         }
 
+        let prel_ledger_dbfs =
+            if let Some(exp_start) = explicit_start_time.filter(|ts| ts.is_finite() && *ts > 0.0) {
+                let prel_end = exp_start + csv_duration.clamp(0.5, 60.0);
+                let ledger = self.activity_ledger.read().await;
+                ledger.get(camera).map_or(0, |ring| {
+                    ring.aggregate_range_with_audio(exp_start, prel_end).3
+                })
+            } else {
+                0
+            };
+
         let staged_probe_path = staged_path.to_path_buf();
         let cam_probe = camera.to_string();
-        let audio_probe_enabled = policy.audio_probe_enabled;
+        let audio_probe_enabled = policy.audio_probe_enabled && prel_ledger_dbfs == 0;
         let ffmpeg_bin_probe = self.ffmpeg_bin.clone();
         let probe_res =
             tokio::task::spawn_blocking(move || -> Result<Option<StagedSegmentProbe>> {
@@ -2349,8 +3069,10 @@ impl RecordingEngine {
         };
         let dbfs = if ledger_dbfs != 0 {
             ledger_dbfs
-        } else {
+        } else if probed_dbfs != 0 {
             probed_dbfs
+        } else {
+            prel_ledger_dbfs
         };
 
         let should_keep = if policy.keep_continuous || policy.retain_mode == "all" {
@@ -2374,6 +3096,10 @@ impl RecordingEngine {
                 },
             )
         };
+        let acoustic_trigger = check_acoustic_event_trigger(dbfs, &audio_cfg);
+        if let Some(ref sink) = self.audio_telemetry_sink {
+            sink(camera, dbfs, acoustic_trigger.is_some());
+        }
 
         let db_ref = self.db.clone();
         let media_dir_ref = self.media_dir.clone();
@@ -2434,7 +3160,7 @@ impl RecordingEngine {
             })?;
 
             // Emit dedicated acoustic event and ReviewSegment when audio exceeds threshold
-            if let Some(audio_label) = check_acoustic_event_trigger(dbfs, &audio_cfg) {
+            if let Some(audio_label) = acoustic_trigger {
                 let ev_id = format!("audio-{id}");
                 if let Err(err) = db_ref.upsert_event(&EventDto {
                     id: ev_id.clone(),
@@ -2810,11 +3536,15 @@ impl RecordingEngine {
                 let engine_ev = self.clone();
                 let cam_ev = camera.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    if let Ok(clip_paths) = engine_ev.db.cleanup_expired_events_and_reviews(
-                        &cam_ev,
-                        alerts_cutoff,
-                        detections_cutoff,
-                    ) {
+                    if let Ok((_ev_del, _rev_del, clip_paths)) = engine_ev
+                        .db
+                        .cleanup_camera_expired_events_and_reviews_in_dir(
+                            &engine_ev.media_dir,
+                            &cam_ev,
+                            alerts_cutoff,
+                            detections_cutoff,
+                        )
+                    {
                         for cp in clip_paths {
                             let _ = engine_ev.remove_contained_media_file(&cp);
                         }
@@ -5218,7 +5948,10 @@ mod tests {
         let mdia = make_box(b"mdia", &mdia_body);
         let trak = make_box(b"trak", &mdia);
         let stats = extract_soun_sample_stats(&trak).expect("soun stats");
-        assert!(stats.3, "expected mp4a stsd to be marked as compressed");
+        assert!(
+            stats.is_compressed,
+            "expected mp4a stsd to be marked as compressed"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
@@ -8155,6 +8888,398 @@ cameras:
             !probe_hits.exists() || fd_recs[0].dbfs == 0,
             "audio_probe_enabled=false must keep dbfs=0 without audio decode"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_process_symphonia_mp4_audio_decodes_g711_and_aac_without_spawning_ffmpeg() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "ninjanvr-media-symphonia-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let poison_marker = root.join("poison_ffmpeg_called.log");
+        let poison_ffmpeg = root.join("poison_ffmpeg.sh");
+        std::fs::write(
+            &poison_ffmpeg,
+            format!(
+                "#!/bin/sh\necho spawned >> \"{}\"\nexit 1\n",
+                poison_marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&poison_ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Build a valid ISO-BMFF MP4 carrying compressed G.711 A-law (`alaw`) samples in pure Rust.
+        let make_box = |btype: &[u8; 4], body: &[u8]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(8 + body.len());
+            out.extend_from_slice(&((8 + body.len()) as u32).to_be_bytes());
+            out.extend_from_slice(btype);
+            out.extend_from_slice(body);
+            out
+        };
+        let alaw_samples = vec![0x2Au8; 1600]; // Loud non-silent A-law waveform (~0.2s @ 8kHz)
+        let ftyp = make_box(b"ftyp", b"isom\x00\x00\x02\x00isomiso2mp41");
+        let mdat_offset = (ftyp.len() + 8) as u32;
+        let mdat = make_box(b"mdat", &alaw_samples);
+
+        let mut mvhd = vec![0u8; 100];
+        mvhd[12..16].copy_from_slice(&8000u32.to_be_bytes());
+        mvhd[16..20].copy_from_slice(&1600u32.to_be_bytes());
+        mvhd[96..100].copy_from_slice(&2u32.to_be_bytes());
+
+        let mut tkhd = vec![0u8; 84];
+        tkhd[3] = 0x07; // enabled | in_movie | in_preview
+        tkhd[12..16].copy_from_slice(&1u32.to_be_bytes());
+        tkhd[20..24].copy_from_slice(&1600u32.to_be_bytes());
+        tkhd[36..38].copy_from_slice(&0x0100u16.to_be_bytes());
+
+        let mut mdhd = vec![0u8; 24];
+        mdhd[12..16].copy_from_slice(&8000u32.to_be_bytes());
+        mdhd[16..20].copy_from_slice(&1600u32.to_be_bytes());
+
+        let mut hdlr = vec![0u8; 25];
+        hdlr[8..12].copy_from_slice(b"soun");
+
+        let smhd = vec![0u8; 8];
+        let mut dref_payload = vec![0u8; 8];
+        dref_payload[7] = 1;
+        dref_payload.extend_from_slice(&make_box(b"url ", &[0, 0, 0, 1]));
+        let dinf = make_box(b"dinf", &make_box(b"dref", &dref_payload));
+
+        // AudioSampleEntry `alaw`: 6 reserved + 2 data_ref_idx + 8 reserved + 2 channels(1)
+        // + 2 sample_size(8) + 4 reserved + 4 sample_rate(8000 << 16)
+        let mut alaw_entry = vec![0u8; 28];
+        alaw_entry[6..8].copy_from_slice(&1u16.to_be_bytes());
+        alaw_entry[16..18].copy_from_slice(&1u16.to_be_bytes());
+        alaw_entry[18..20].copy_from_slice(&8u16.to_be_bytes());
+        alaw_entry[24..28].copy_from_slice(&(8000u32 << 16).to_be_bytes());
+        let mut stsd_payload = vec![0u8; 8];
+        stsd_payload[7] = 1;
+        stsd_payload.extend_from_slice(&make_box(b"alaw", &alaw_entry));
+
+        let mut stts_payload = vec![0u8; 8];
+        stts_payload[7] = 1;
+        stts_payload.extend_from_slice(&1600u32.to_be_bytes());
+        stts_payload.extend_from_slice(&1u32.to_be_bytes());
+
+        let mut stsc_payload = vec![0u8; 8];
+        stsc_payload[7] = 1;
+        stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+        stsc_payload.extend_from_slice(&1600u32.to_be_bytes());
+        stsc_payload.extend_from_slice(&1u32.to_be_bytes());
+
+        let mut stsz_payload = vec![0u8; 12];
+        stsz_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
+        stsz_payload[8..12].copy_from_slice(&1600u32.to_be_bytes());
+
+        let mut stco_payload = vec![0u8; 8];
+        stco_payload[7] = 1;
+        stco_payload.extend_from_slice(&mdat_offset.to_be_bytes());
+
+        let stbl = make_box(
+            b"stbl",
+            &[
+                make_box(b"stsd", &stsd_payload),
+                make_box(b"stts", &stts_payload),
+                make_box(b"stsc", &stsc_payload),
+                make_box(b"stsz", &stsz_payload),
+                make_box(b"stco", &stco_payload),
+            ]
+            .concat(),
+        );
+        let minf = make_box(
+            b"minf",
+            &[make_box(b"smhd", &smhd), dinf.clone(), stbl].concat(),
+        );
+        let mdia = make_box(
+            b"mdia",
+            &[make_box(b"mdhd", &mdhd), make_box(b"hdlr", &hdlr), minf].concat(),
+        );
+        let trak = make_box(b"trak", &[make_box(b"tkhd", &tkhd), mdia].concat());
+        let moov = make_box(b"moov", &[make_box(b"mvhd", &mvhd), trak].concat());
+
+        let alaw_mp4_path = root.join("camera_alaw.mp4");
+        std::fs::write(&alaw_mp4_path, [ftyp, mdat, moov.clone()].concat()).unwrap();
+
+        let alaw_db = probe_mp4_audio_dbfs_with_bin(&alaw_mp4_path, true, Some(&poison_ffmpeg));
+        assert!(
+            (-40..=-1).contains(&alaw_db),
+            "in-process Symphonia decoder must measure active dBFS on G.711 alaw MP4, got {alaw_db}"
+        );
+        assert!(
+            !poison_marker.exists(),
+            "in-process MP4 audio decode must NEVER spawn ffmpeg subprocess"
+        );
+
+        // 2. Interleaved multi-track MP4 (`vide` high-entropy H.264 NALs + 50 chunks of digital-silent `alaw` 0xD5)
+        // must read strictly the 160-byte audio chunks (never bleeding into adjacent `vide` bytes) and detect peaks at chunk #42 (t = 8.4s > chunk #8).
+        let build_interleaved_alaw_mp4 = |loud_from_chunk: Option<usize>| -> Vec<u8> {
+            let num_chunks = 50usize;
+            let ftyp_b = make_box(b"ftyp", b"isom\x00\x00\x02\x00isomiso2mp41");
+            let mdat_data_start = (ftyp_b.len() + 8) as u32;
+            let mut mdat_payload = Vec::new();
+            let mut soun_chunk_offsets = Vec::with_capacity(num_chunks);
+            let mut vide_chunk_offsets = Vec::with_capacity(num_chunks);
+
+            for c in 0..num_chunks {
+                soun_chunk_offsets.push(mdat_data_start + mdat_payload.len() as u32);
+                let fill = if loud_from_chunk.is_some_and(|start_c| c >= start_c) {
+                    0x2Au8
+                } else {
+                    0xD5u8 // ITU-T G.711 A-law digital silence (linear -8 / 32768 -> -72 dBFS)
+                };
+                mdat_payload.extend(std::iter::repeat_n(fill, 160));
+
+                vide_chunk_offsets.push(mdat_data_start + mdat_payload.len() as u32);
+                // High-entropy pseudo-H.264 bitstream immediately following every 160-byte audio chunk
+                for k in 0..2048usize {
+                    mdat_payload.push(((k.wrapping_mul(73).wrapping_add(c * 19)) & 0xFF) as u8);
+                }
+            }
+            let mdat_b = make_box(b"mdat", &mdat_payload);
+
+            let mut vide_hdlr = vec![0u8; 25];
+            vide_hdlr[8..12].copy_from_slice(b"vide");
+            let mut vide_stsz = vec![0u8; 12];
+            vide_stsz[4..8].copy_from_slice(&2048u32.to_be_bytes());
+            vide_stsz[8..12].copy_from_slice(&(num_chunks as u32).to_be_bytes());
+            let mut vide_stsc = vec![0u8; 8];
+            vide_stsc[7] = 1;
+            vide_stsc.extend_from_slice(&1u32.to_be_bytes());
+            vide_stsc.extend_from_slice(&1u32.to_be_bytes());
+            vide_stsc.extend_from_slice(&1u32.to_be_bytes());
+            let mut vide_stco = vec![0u8; 8];
+            vide_stco[4..8].copy_from_slice(&(num_chunks as u32).to_be_bytes());
+            for off in &vide_chunk_offsets {
+                vide_stco.extend_from_slice(&off.to_be_bytes());
+            }
+            let vide_trak = make_box(
+                b"trak",
+                &make_box(
+                    b"mdia",
+                    &[
+                        make_box(b"hdlr", &vide_hdlr),
+                        make_box(
+                            b"minf",
+                            &make_box(
+                                b"stbl",
+                                &[
+                                    make_box(b"stsc", &vide_stsc),
+                                    make_box(b"stsz", &vide_stsz),
+                                    make_box(b"stco", &vide_stco),
+                                ]
+                                .concat(),
+                            ),
+                        ),
+                    ]
+                    .concat(),
+                ),
+            );
+
+            let mut soun_stsc = vec![0u8; 8];
+            soun_stsc[7] = 1;
+            soun_stsc.extend_from_slice(&1u32.to_be_bytes());
+            soun_stsc.extend_from_slice(&160u32.to_be_bytes());
+            soun_stsc.extend_from_slice(&1u32.to_be_bytes());
+            let mut soun_stsz = vec![0u8; 12];
+            soun_stsz[4..8].copy_from_slice(&1u32.to_be_bytes());
+            soun_stsz[8..12].copy_from_slice(&((num_chunks * 160) as u32).to_be_bytes());
+            let mut soun_stco = vec![0u8; 8];
+            soun_stco[4..8].copy_from_slice(&(num_chunks as u32).to_be_bytes());
+            for off in &soun_chunk_offsets {
+                soun_stco.extend_from_slice(&off.to_be_bytes());
+            }
+            let soun_trak = make_box(
+                b"trak",
+                &[
+                    make_box(b"tkhd", &tkhd),
+                    make_box(
+                        b"mdia",
+                        &[
+                            make_box(b"mdhd", &mdhd),
+                            make_box(b"hdlr", &hdlr),
+                            make_box(
+                                b"minf",
+                                &[
+                                    make_box(b"smhd", &smhd),
+                                    dinf.clone(),
+                                    make_box(
+                                        b"stbl",
+                                        &[
+                                            make_box(b"stsd", &stsd_payload),
+                                            make_box(b"stts", &stts_payload),
+                                            make_box(b"stsc", &soun_stsc),
+                                            make_box(b"stsz", &soun_stsz),
+                                            make_box(b"stco", &soun_stco),
+                                        ]
+                                        .concat(),
+                                    ),
+                                ]
+                                .concat(),
+                            ),
+                        ]
+                        .concat(),
+                    ),
+                ]
+                .concat(),
+            );
+            let moov_b = make_box(
+                b"moov",
+                &[make_box(b"mvhd", &mvhd), vide_trak, soun_trak].concat(),
+            );
+            [ftyp_b, mdat_b, moov_b].concat()
+        };
+
+        let silent_interleaved_path = root.join("interleaved_silent_alaw.mp4");
+        std::fs::write(&silent_interleaved_path, build_interleaved_alaw_mp4(None)).unwrap();
+        let silent_interleaved_db =
+            probe_mp4_audio_dbfs_with_bin(&silent_interleaved_path, true, Some(&poison_ffmpeg));
+        assert!(
+            silent_interleaved_db == 0 || silent_interleaved_db <= -68,
+            "silent G.711 alaw interleaved with H.264 NALs must NOT bleed into video bytes (got {silent_interleaved_db} dBFS)"
+        );
+
+        let late_peak_path = root.join("interleaved_late_peak_alaw.mp4");
+        std::fs::write(&late_peak_path, build_interleaved_alaw_mp4(Some(40))).unwrap();
+        let late_peak_db =
+            probe_mp4_audio_dbfs_with_bin(&late_peak_path, true, Some(&poison_ffmpeg));
+        assert!(
+            (-45..=-1).contains(&late_peak_db),
+            "late acoustic event after chunk #40 must be sampled and detected, got {late_peak_db} dBFS"
+        );
+
+        // 3. Malicious/corrupt fragmented MP4 (`mvex` + `moof`/`trun` with `sample_count = u32::MAX`)
+        // must be rejected by `moov_is_safe_for_in_process_demux` in < 50ms without spinning in `symphonia-format-isomp4`.
+        let mut mp4a_entry = vec![0u8; 28];
+        mp4a_entry[6..8].copy_from_slice(&1u16.to_be_bytes());
+        mp4a_entry[16..18].copy_from_slice(&1u16.to_be_bytes());
+        mp4a_entry[18..20].copy_from_slice(&16u16.to_be_bytes());
+        mp4a_entry[24..28].copy_from_slice(&(16000u32 << 16).to_be_bytes());
+        let mut mp4a_stsd = vec![0u8; 8];
+        mp4a_stsd[7] = 1;
+        mp4a_stsd.extend_from_slice(&make_box(b"mp4a", &mp4a_entry));
+        let mut frag_stsz = vec![0u8; 12];
+        frag_stsz[4..8].copy_from_slice(&16u32.to_be_bytes());
+        frag_stsz[8..12].copy_from_slice(&1u32.to_be_bytes());
+        let frag_trak = make_box(
+            b"trak",
+            &make_box(
+                b"mdia",
+                &[
+                    make_box(b"hdlr", &hdlr),
+                    make_box(
+                        b"minf",
+                        &make_box(
+                            b"stbl",
+                            &[make_box(b"stsd", &mp4a_stsd), make_box(b"stsz", &frag_stsz)]
+                                .concat(),
+                        ),
+                    ),
+                ]
+                .concat(),
+            ),
+        );
+        let mvex = make_box(b"mvex", &[0u8; 16]);
+        let frag_moov = make_box(b"moov", &[frag_trak.clone(), mvex].concat());
+        let mut trun_body = vec![0u8; 8];
+        trun_body[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
+        let moof = make_box(b"moof", &make_box(b"traf", &make_box(b"trun", &trun_body)));
+        let evil_frag_path = root.join("evil_trun_max.mp4");
+        std::fs::write(
+            &evil_frag_path,
+            [
+                make_box(b"ftyp", b"isom\x00\x00\x02\x00isomiso6"),
+                frag_moov.clone(),
+                moof.clone(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let noop_ffmpeg = root.join("noop_ffmpeg.sh");
+        std::fs::write(&noop_ffmpeg, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&noop_ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let t_frag = std::time::Instant::now();
+        let frag_db = probe_mp4_audio_dbfs_with_bin(&evil_frag_path, true, Some(&noop_ffmpeg));
+        assert_eq!(frag_db, 0);
+        assert!(
+            t_frag.elapsed() < std::time::Duration::from_millis(500),
+            "fragmented trun u32::MAX container must be rejected immediately without spinning"
+        );
+
+        assert!(
+            moov_is_safe_for_in_process_demux(&moov[8..]),
+            "valid non-fragmented moov payload must be accepted by moov_is_safe_for_in_process_demux"
+        );
+        let mut trailing_junk_moov = moov[8..].to_vec();
+        trailing_junk_moov.extend_from_slice(&[0, 0, 0, 0]);
+        assert!(
+            !moov_is_safe_for_in_process_demux(&trailing_junk_moov),
+            "truncated/trailing-junk moov payload must be rejected"
+        );
+        assert!(
+            !moov_is_safe_for_in_process_demux(&frag_moov[8..]),
+            "fragmented moov containing mvex must be rejected"
+        );
+
+        let smuggled_two_moov_path = root.join("evil_two_moov_trun_max.mp4");
+        let clean_mp4a_moov = make_box(b"moov", &frag_trak);
+        std::fs::write(
+            &smuggled_two_moov_path,
+            [
+                make_box(b"ftyp", b"isom\x00\x00\x02\x00isomiso6"),
+                clean_mp4a_moov,
+                frag_moov,
+                moof,
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let t_smug = std::time::Instant::now();
+        let smug_db =
+            probe_mp4_audio_dbfs_with_bin(&smuggled_two_moov_path, true, Some(&noop_ffmpeg));
+        assert_eq!(smug_db, 0);
+        assert!(
+            t_smug.elapsed() < std::time::Duration::from_millis(500),
+            "second-moov + top-level moof/trun smuggling must be rejected without spinning"
+        );
+
+        // If real `ffmpeg` is available in the test environment, also verify real `mp4a` AAC-LC MP4!
+        let real_ffmpeg = resolve_ffmpeg_bin();
+        let aac_mp4_path = root.join("camera_aac_real.mp4");
+        if std::process::Command::new(&real_ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=16000:duration=0.5",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "64k",
+            ])
+            .arg(&aac_mp4_path)
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            let aac_db = probe_mp4_audio_dbfs_with_bin(&aac_mp4_path, true, Some(&poison_ffmpeg));
+            assert!(
+                (-35..=-1).contains(&aac_db),
+                "in-process Symphonia decoder must measure active dBFS on AAC-LC MP4, got {aac_db}"
+            );
+            assert!(
+                !poison_marker.exists(),
+                "real AAC-LC MP4 audio decode must NEVER spawn ffmpeg subprocess"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }

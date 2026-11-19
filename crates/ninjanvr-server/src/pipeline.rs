@@ -442,6 +442,27 @@ pub struct CameraRuntimeMetrics {
 pub type SharedCameraMetrics = Arc<RwLock<HashMap<String, CameraRuntimeMetrics>>>;
 pub type SharedLatestYuvFrames = Arc<RwLock<HashMap<String, YuvFrame>>>;
 
+const MAX_HEALTH_EVENT_EPOCHS: usize = 256;
+const HEALTH_WINDOW_SEC: f64 = 3600.0;
+
+#[derive(Debug, Clone, Default)]
+pub struct CameraStreamHealth {
+    pub reconnect_epochs: std::collections::VecDeque<f64>,
+    pub stall_epochs: std::collections::VecDeque<f64>,
+    pub last_audio_dbfs: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CameraHealthSummary {
+    pub reconnects_last_hour: u32,
+    pub stalls_last_hour: u32,
+    pub audio_dbfs: i64,
+    pub audio_rms: u32,
+    pub connection_quality: &'static str,
+}
+
+pub type SharedCameraHealth = Arc<std::sync::Mutex<HashMap<String, CameraStreamHealth>>>;
+
 fn unix_now_f64() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1089,6 +1110,10 @@ impl CameraVisionSession {
         }
 
         // 5. Record activity into in-memory ring buffer for RecordingEngine
+        // Exclude long-lived motionless stationary objects so parked cars or static furniture
+        // do not mark 100% of 10s segments with `objects >= 1` and defeat continuous retention.
+        let active_non_stationary_objects =
+            active_tracks.iter().filter(|t| !t.stationary).count() as u32;
         {
             let mut ledger = pipeline.activity_ledger.write().await;
             ledger
@@ -1097,7 +1122,7 @@ impl CameraVisionSession {
                 .record_sample(
                     now,
                     motion_px,
-                    active_tracks.len() as u32,
+                    active_non_stationary_objects,
                     regions.len() as u32,
                 );
         }
@@ -1335,6 +1360,7 @@ pub struct VisionPipeline {
     pub ffmpeg_bin: PathBuf,
     pub fallback_tamper_reviews: Arc<tokio::sync::Mutex<HashMap<String, ReviewItemDto>>>,
     pub fallback_roi_reviews: Arc<tokio::sync::Mutex<HashMap<(String, String), ReviewItemDto>>>,
+    pub camera_health: SharedCameraHealth,
 }
 
 impl VisionPipeline {
@@ -1386,6 +1412,170 @@ impl VisionPipeline {
             ffmpeg_bin: resolve_ffmpeg_bin(),
             fallback_tamper_reviews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             fallback_roi_reviews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            camera_health: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn record_camera_reconnect(&self, camera: &str, now_ts: f64) {
+        if !now_ts.is_finite() {
+            return;
+        }
+        if let Ok(mut map) = self.camera_health.lock() {
+            let entry = map.entry(camera.to_string()).or_default();
+            let cutoff = now_ts - HEALTH_WINDOW_SEC;
+            while entry.reconnect_epochs.front().is_some_and(|&t| t < cutoff) {
+                entry.reconnect_epochs.pop_front();
+            }
+            if entry.reconnect_epochs.len() >= MAX_HEALTH_EVENT_EPOCHS {
+                entry.reconnect_epochs.pop_front();
+            }
+            entry.reconnect_epochs.push_back(now_ts);
+        }
+    }
+
+    pub fn record_camera_stall(&self, camera: &str, now_ts: f64) {
+        if !now_ts.is_finite() {
+            return;
+        }
+        if let Ok(mut map) = self.camera_health.lock() {
+            let entry = map.entry(camera.to_string()).or_default();
+            let cutoff = now_ts - HEALTH_WINDOW_SEC;
+            while entry.stall_epochs.front().is_some_and(|&t| t < cutoff) {
+                entry.stall_epochs.pop_front();
+            }
+            if entry.stall_epochs.len() >= MAX_HEALTH_EVENT_EPOCHS {
+                entry.stall_epochs.pop_front();
+            }
+            entry.stall_epochs.push_back(now_ts);
+        }
+    }
+
+    pub fn record_camera_audio_dbfs(&self, camera: &str, dbfs: i64) {
+        if let Ok(mut map) = self.camera_health.lock() {
+            map.entry(camera.to_string()).or_default().last_audio_dbfs = dbfs.clamp(-90, 0);
+        }
+    }
+
+    pub fn snapshot_camera_health(
+        &self,
+        camera: &str,
+        now_ts: f64,
+        camera_fps: f64,
+        expected_fps: u32,
+        enabled: bool,
+    ) -> CameraHealthSummary {
+        let (reconnects_last_hour, stalls_last_hour, audio_dbfs) =
+            if let Ok(mut map) = self.camera_health.lock() {
+                if let Some(entry) = map.get_mut(camera) {
+                    if now_ts.is_finite() {
+                        let cutoff = now_ts - HEALTH_WINDOW_SEC;
+                        while entry.reconnect_epochs.front().is_some_and(|&t| t < cutoff) {
+                            entry.reconnect_epochs.pop_front();
+                        }
+                        while entry.stall_epochs.front().is_some_and(|&t| t < cutoff) {
+                            entry.stall_epochs.pop_front();
+                        }
+                    }
+                    (
+                        entry.reconnect_epochs.len() as u32,
+                        entry.stall_epochs.len() as u32,
+                        entry.last_audio_dbfs,
+                    )
+                } else {
+                    (0, 0, 0)
+                }
+            } else {
+                (0, 0, 0)
+            };
+
+        let audio_rms = if (-89..=-1).contains(&audio_dbfs) {
+            let amp = 10.0f64.powf((audio_dbfs as f64) / 20.0);
+            ((amp * 32767.0).round().clamp(0.0, 32767.0)) as u32
+        } else {
+            0
+        };
+
+        let connection_quality = if !enabled {
+            "disabled"
+        } else if !camera_fps.is_finite() || camera_fps <= 0.0 {
+            "offline"
+        } else if stalls_last_hour >= 3
+            || reconnects_last_hour >= 6
+            || (expected_fps > 0 && camera_fps < (expected_fps as f64) * 0.5)
+        {
+            "degraded"
+        } else if stalls_last_hour > 0 || reconnects_last_hour >= 2 {
+            "good"
+        } else {
+            "excellent"
+        };
+
+        CameraHealthSummary {
+            reconnects_last_hour,
+            stalls_last_hour,
+            audio_dbfs,
+            audio_rms,
+            connection_quality,
+        }
+    }
+
+    async fn freeze_alert_review_thumbnail(
+        &self,
+        camera: &str,
+        alert_id: &str,
+        yuv_data: &[u8],
+        width: u32,
+        height: u32,
+        now: f64,
+    ) -> String {
+        let fallback = format!("/api/{camera}/latest.jpg");
+        let (even_w, even_h, needed_len) = sanitize_yuv420p_dimensions(width, height);
+        if yuv_data.len() < needed_len {
+            return fallback;
+        }
+        let raw_mask = {
+            let cfg = self.config.read().await;
+            cfg.cameras
+                .get(camera)
+                .map_or_else(|| json!({}), |c| c.privacy_mask.clone())
+        };
+        let policy = PrivacyMaskPolicy::from_value(&raw_mask, even_w.max(1), even_h.max(1));
+        if policy.is_invalid() {
+            return fallback;
+        }
+        let safe_cam = sanitize_filename_component(camera);
+        let safe_id = sanitize_filename_component(alert_id);
+        if safe_cam.is_empty() || safe_id.is_empty() {
+            return fallback;
+        }
+        let fname = format!("thumb-{safe_cam}-{safe_id}.webp");
+        let media_root = self.media_dir.clone();
+        let review_dir = self.media_dir.join("clips").join("review");
+        let frame = YuvFrame {
+            camera: Arc::<str>::from(camera),
+            timestamp: now,
+            width: even_w,
+            height: even_h,
+            data: Arc::new(yuv_data[..needed_len].to_vec()),
+        };
+        let fname_for_task = fname.clone();
+        let wrote = tokio::task::spawn_blocking(move || -> bool {
+            let mut rgb = yuv420p_to_rgb_image_scaled(&frame, None, &[], Some(360));
+            if !policy.redact_rgb(&mut rgb) {
+                return false;
+            }
+            let Ok(webp) = encode_image_webp(&rgb) else {
+                return false;
+            };
+            write_contained_media_file(&media_root, &review_dir, &fname_for_task, &webp).is_ok()
+        })
+        .await
+        .unwrap_or(false);
+
+        if wrote {
+            format!("/media/ninjanvr/clips/review/{fname}")
+        } else {
+            fallback
         }
     }
 
@@ -2034,14 +2224,17 @@ impl VisionPipeline {
                 backoff_attempt = 0;
             }
 
+            let now_disc = unix_now_f64();
             let retry_dur = if received_any_frame {
+                self.record_camera_reconnect(&camera, now_disc);
                 consecutive_stall_cycles = 0;
                 let d = compute_vision_backoff_delay(backoff_attempt);
                 backoff_attempt = backoff_attempt.saturating_add(1);
                 d
             } else {
+                self.record_camera_stall(&camera, now_disc);
                 consecutive_stall_cycles = consecutive_stall_cycles.saturating_add(1);
-                let now_ts = unix_now_f64();
+                let now_ts = now_disc;
                 if consecutive_stall_cycles >= 3 && now_ts - last_watchdog_reboot_ts >= 1800.0 {
                     last_watchdog_reboot_ts = now_ts;
                     let cfg_snap = self.config.read().await.clone();
@@ -2150,13 +2343,18 @@ impl VisionPipeline {
                         ),
                     );
                     let tamper_id = format!("{now:.6}-tamper-{}", random_suffix());
+                    let thumb_path = self
+                        .freeze_alert_review_thumbnail(
+                            camera, &tamper_id, yuv_data, width, height, now,
+                        )
+                        .await;
                     let dto = ReviewItemDto {
                         id: tamper_id,
                         camera: camera.to_string(),
                         start_time: now,
                         end_time: None,
                         severity: "alert".to_string(),
-                        thumb_path: format!("/api/{camera}/latest.jpg"),
+                        thumb_path,
                         data: json!({
                             "detections": [],
                             "objects": ["camera_tamper"],
@@ -2276,7 +2474,10 @@ impl VisionPipeline {
                     .publish_roi_state(camera, &tr.roi_name, &tr.current_state);
             }
             if tr.anomaly_triggered {
-                if let Some(dto) = self.emit_roi_anomaly_review_alert(camera, tr, now).await {
+                if let Some(dto) = self
+                    .emit_roi_anomaly_review_alert(camera, tr, now, Some((yuv_data, width, height)))
+                    .await
+                {
                     active_roi_reviews.insert(tr.roi_name.clone(), dto);
                 }
             } else if !tr.is_anomalous
@@ -2318,7 +2519,14 @@ impl VisionPipeline {
                 .publish_roi_state(camera, &tr.roi_name, &tr.current_state);
         }
         if tr.anomaly_triggered {
-            if let Some(dto) = self.emit_roi_anomaly_review_alert(camera, &tr, now).await {
+            let latest_frame_opt = self.latest_yuv_frames.read().await.get(camera).cloned();
+            let borrowed = latest_frame_opt
+                .as_ref()
+                .map(|f| (f.data.as_slice(), f.width, f.height));
+            if let Some(dto) = self
+                .emit_roi_anomaly_review_alert(camera, &tr, now, borrowed)
+                .await
+            {
                 self.fallback_roi_reviews
                     .lock()
                     .await
@@ -2351,6 +2559,7 @@ impl VisionPipeline {
         camera: &str,
         tr: &RoiStateTransition,
         now: f64,
+        frame_yuv: Option<(&[u8], u32, u32)>,
     ) -> Option<ReviewItemDto> {
         self.log_hub.push_ninjanvr(
             "WARNING",
@@ -2362,13 +2571,20 @@ impl VisionPipeline {
         );
         let safe_roi = sanitize_filename_component(&tr.roi_name);
         let alert_id = format!("{now:.6}-roi-{safe_roi}-{}", random_suffix());
+        let thumb_path = match frame_yuv {
+            Some((yuv, w, h)) => {
+                self.freeze_alert_review_thumbnail(camera, &alert_id, yuv, w, h, now)
+                    .await
+            }
+            None => format!("/api/{camera}/latest.jpg"),
+        };
         let dto = ReviewItemDto {
             id: alert_id,
             camera: camera.to_string(),
             start_time: now,
             end_time: None,
             severity: "alert".to_string(),
-            thumb_path: format!("/api/{camera}/latest.jpg"),
+            thumb_path,
             data: json!({
                 "detections": [],
                 "objects": [format!("roi:{}:{}", tr.roi_name, tr.current_state)],

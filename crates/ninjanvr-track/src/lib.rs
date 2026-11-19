@@ -76,6 +76,16 @@ struct ZonePresenceState {
 
 const MAX_ACTIVE_TRACKS: usize = 256;
 const MAX_ATTRIBUTES_PER_TRACK: usize = 32;
+const MAX_STATIONARY_ANCHORS: usize = 32;
+const STATIONARY_ANCHOR_TTL_SEC: f64 = 1800.0;
+
+#[derive(Debug, Clone)]
+struct StationaryAnchor {
+    label: String,
+    bbox: BoundingBox,
+    expires_at: f64,
+    empty_scans: u32,
+}
 
 /// Multi-Object Tracker implementing 2-stage **ByteTrack** association
 /// (high-confidence pass + low-confidence occlusion recovery pass),
@@ -97,6 +107,8 @@ pub struct ByteTracker {
     zones: BTreeMap<String, (PolygonMask, Vec<String>, Option<String>)>,
     zone_presence: BTreeMap<String, BTreeMap<String, ZonePresenceState>>,
     unscanned_stationary_frames: BTreeMap<String, u32>,
+    initial_bboxes: BTreeMap<String, BoundingBox>,
+    stationary_anchors: Vec<StationaryAnchor>,
     confirmed_tracks: BTreeSet<String>,
     tracks: BTreeMap<String, TrackedObject>,
     frame_seq: u64,
@@ -182,6 +194,8 @@ impl ByteTracker {
             zones,
             zone_presence: BTreeMap::new(),
             unscanned_stationary_frames: BTreeMap::new(),
+            initial_bboxes: BTreeMap::new(),
+            stationary_anchors: Vec::new(),
             confirmed_tracks: BTreeSet::new(),
             tracks: BTreeMap::new(),
             frame_seq: 0,
@@ -223,10 +237,15 @@ impl ByteTracker {
     }
 
     pub fn set_active_preset(&mut self, preset: Option<&str>) {
-        self.active_preset = preset
+        let next_preset = preset
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        if self.active_preset != next_preset {
+            self.stationary_anchors.clear();
+            self.initial_bboxes.clear();
+            self.active_preset = next_preset;
+        }
     }
 
     pub fn active_preset(&self) -> Option<&str> {
@@ -251,12 +270,19 @@ impl ByteTracker {
     }
 
     pub fn non_stationary_boxes(&self, motion_boxes: &[BoundingBox]) -> Vec<BoundingBox> {
+        let req_frames = self.effective_min_initialized();
         let force_scan = self
             .frame_seq
             .is_multiple_of(self.stationary_interval as u64);
         self.tracks
             .values()
             .filter(|t| {
+                let is_confirmed =
+                    self.confirmed_tracks.contains(&t.id) || t.frames_tracked >= req_frames;
+                if !is_confirmed {
+                    return t.disappeared_frames == 0
+                        && motion_boxes.iter().any(|mb| mb.intersects(&t.bbox));
+                }
                 t.disappeared_frames <= 5
                     && (force_scan
                         || !t.stationary
@@ -598,6 +624,40 @@ impl ByteTracker {
             }
         }
 
+        // 2b. Reconcile post-eviction stationary anchors against current scanned regions & detections
+        if raw_time_finite {
+            self.stationary_anchors
+                .retain(|a| a.expires_at > frame_time);
+        }
+        if !self.stationary_anchors.is_empty() {
+            self.stationary_anchors.retain_mut(|anchor| {
+                let Some(same_spot_det) = high_dets
+                    .iter()
+                    .chain(low_dets.iter())
+                    .find(|d| d.label == anchor.label && anchor.bbox.iou(&d.bbox) >= 0.72)
+                else {
+                    let displaced = high_dets.iter().any(|d| {
+                        d.label == anchor.label && (0.20..0.65).contains(&anchor.bbox.iou(&d.bbox))
+                    });
+                    if displaced {
+                        return false;
+                    }
+                    let was_scanned = scanned_regions.iter().any(|r| r.intersects(&anchor.bbox));
+                    if was_scanned {
+                        anchor.empty_scans = anchor.empty_scans.saturating_add(1);
+                        return anchor.empty_scans < 3;
+                    }
+                    return true;
+                };
+                anchor.bbox = same_spot_det.bbox;
+                anchor.empty_scans = 0;
+                if raw_time_finite {
+                    anchor.expires_at = frame_time + STATIONARY_ANCHOR_TTL_SEC;
+                }
+                true
+            });
+        }
+
         let track_ids: Vec<String> = self.tracks.keys().cloned().collect();
         let mut matched_tracks = vec![false; track_ids.len()];
         let mut matched_high = vec![false; high_dets.len()];
@@ -681,17 +741,15 @@ impl ByteTracker {
                         .get(tid)
                         .is_some_and(|t| t.frames_tracked >= req_init);
                 let mut drop_unconfirmed = false;
+                let mut expired_unscanned = false;
                 if let Some(trk) = self.tracks.get_mut(tid) {
                     if !is_confirmed {
                         drop_unconfirmed = true;
                     } else {
                         let was_scanned = scanned_regions.iter().any(|r| r.intersects(&trk.bbox));
-                        if !trk.stationary || was_scanned {
+                        if !trk.stationary || was_scanned || trk.disappeared_frames > 0 {
                             self.unscanned_stationary_frames.remove(tid);
                             trk.disappeared_frames = trk.disappeared_frames.saturating_add(1);
-                            if trk.stationary && trk.disappeared_frames >= 3 {
-                                trk.stationary = false;
-                            }
                         } else {
                             let unscanned = self
                                 .unscanned_stationary_frames
@@ -699,7 +757,7 @@ impl ByteTracker {
                                 .or_insert(0);
                             *unscanned = unscanned.saturating_add(1);
                             if *unscanned > max_stationary_unscanned {
-                                trk.stationary = false;
+                                expired_unscanned = true;
                                 trk.disappeared_frames = self.max_disappeared.saturating_add(1);
                             }
                         }
@@ -710,6 +768,7 @@ impl ByteTracker {
                     self.confirmed_tracks.remove(tid);
                     self.zone_presence.remove(tid);
                     self.unscanned_stationary_frames.remove(tid);
+                    self.initial_bboxes.remove(tid);
                 } else if self
                     .tracks
                     .get(tid)
@@ -720,7 +779,29 @@ impl ByteTracker {
                         self.confirmed_tracks.remove(tid) || removed.frames_tracked >= req_init;
                     self.zone_presence.remove(tid);
                     self.unscanned_stationary_frames.remove(tid);
+                    let birth_bbox = self.initial_bboxes.remove(tid).unwrap_or(removed.bbox);
                     if was_confirmed {
+                        let never_displaced = birth_bbox.iou(&removed.bbox) >= 0.78;
+                        if removed.stationary && (expired_unscanned || never_displaced) {
+                            let expires_at = frame_time + STATIONARY_ANCHOR_TTL_SEC;
+                            if let Some(existing) = self.stationary_anchors.iter_mut().find(|a| {
+                                a.label == removed.label && a.bbox.iou(&removed.bbox) >= 0.72
+                            }) {
+                                existing.bbox = removed.bbox;
+                                existing.expires_at = expires_at;
+                                existing.empty_scans = 0;
+                            } else {
+                                if self.stationary_anchors.len() >= MAX_STATIONARY_ANCHORS {
+                                    self.stationary_anchors.remove(0);
+                                }
+                                self.stationary_anchors.push(StationaryAnchor {
+                                    label: removed.label.clone(),
+                                    bbox: removed.bbox,
+                                    expires_at,
+                                    empty_scans: 0,
+                                });
+                            }
+                        }
                         ended_tracks.push(removed);
                     }
                 }
@@ -730,6 +811,15 @@ impl ByteTracker {
         // 4. Initialize new tracks from unmatched High-Confidence detections
         for (d_idx, det) in high_dets.into_iter().enumerate() {
             if matched_high[d_idx] {
+                continue;
+            }
+            // Suppress duplicate re-initialization of an unchanged static background object
+            // (e.g., office chair, coat, parked car) that already completed a stationary cycle.
+            if self
+                .stationary_anchors
+                .iter()
+                .any(|a| a.label == det.label && a.bbox.iou(&det.bbox) >= 0.72)
+            {
                 continue;
             }
             // Skip if it heavily overlaps or is nested inside an already-active track of the same label
@@ -834,6 +924,7 @@ impl ByteTracker {
                 stationary: false,
             };
             let _ = &self.camera_name;
+            self.initial_bboxes.insert(id.clone(), det.bbox);
             self.tracks.insert(
                 id.clone(),
                 TrackedObject {
@@ -871,6 +962,8 @@ impl ByteTracker {
         self.zone_presence
             .retain(|k, _| self.tracks.contains_key(k));
         self.unscanned_stationary_frames
+            .retain(|k, _| self.tracks.contains_key(k));
+        self.initial_bboxes
             .retain(|k, _| self.tracks.contains_key(k));
 
         let active: Vec<TrackedObject> = self.active_tracks().cloned().collect();
@@ -2822,5 +2915,168 @@ mod tests {
         let (attr_active, _) = logo_tracker.update(3.0, &attr_flood, &[reg], &logo_cfg);
         let car_trk = attr_active.iter().find(|t| t.id == car_id).unwrap();
         assert_eq!(car_trk.attributes.len(), MAX_ATTRIBUTES_PER_TRACK);
+    }
+
+    #[test]
+    fn tentative_noise_requires_motion_and_stationary_anchor_suppresses_retrigger_storm() {
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.detect.min_initialized = 2;
+        cam_cfg.detect.min_initialized_night = Some(4);
+        cam_cfg.detect.max_disappeared = 5;
+        cam_cfg.detect.stationary.threshold = 10;
+        cam_cfg.detect.stationary.interval = 10;
+
+        let mut tracker = ByteTracker::new("office", 1280, 720, &cam_cfg);
+        tracker.set_night_mode(true);
+        let reg = BoundingBox::new(0, 0, 1280, 720);
+        let chair_bbox = BoundingBox::new(770, 180, 1020, 304);
+        let chair_det = DetectionResult {
+            label: "person".to_string(),
+            score: 0.82,
+            bbox: chair_bbox,
+            region: reg,
+        };
+
+        // 1. Single-frame IR/keyframe noise creates an unconfirmed tentative track (frames_tracked == 1 < 4).
+        // On the next frame with empty motion_boxes, non_stationary_boxes must NOT self-sustain inference!
+        let (act1, _) = tracker.update(1000.0, std::slice::from_ref(&chair_det), &[reg], &cam_cfg);
+        assert!(act1.is_empty());
+        assert!(
+            tracker.non_stationary_boxes(&[]).is_empty(),
+            "unconfirmed tentative track must require motion overlap instead of self-sustaining on motionless frames"
+        );
+        assert_eq!(
+            tracker.non_stationary_boxes(&[chair_bbox]),
+            vec![chair_bbox],
+            "unconfirmed tentative track overlapping real motion must continue scanning"
+        );
+        // Motionless frame 2 drops the tentative ghost immediately without emitting an ended event.
+        let (act2, ended2) = tracker.update(1000.2, &[], &[], &cam_cfg);
+        assert!(act2.is_empty());
+        assert!(ended2.is_empty());
+
+        // 2. Suppose continuous nearby motion confirms the static chair and marks it stationary (>= 10 frames),
+        // then unscanned interval expires it: ended track MUST preserve `stationary == true` AND anchor it.
+        for i in 0..12 {
+            let _ = tracker.update(
+                2000.0 + i as f64,
+                std::slice::from_ref(&chair_det),
+                &[reg],
+                &cam_cfg,
+            );
+        }
+        let confirmed_now: Vec<_> = tracker.active_tracks().cloned().collect();
+        assert_eq!(confirmed_now.len(), 1);
+        assert!(confirmed_now[0].stationary);
+
+        let mut expired_tracks = Vec::new();
+        for i in 0..135 {
+            let (_, ended) = tracker.update(2100.0 + i as f64, &[], &[], &cam_cfg);
+            expired_tracks.extend(ended);
+        }
+        assert_eq!(expired_tracks.len(), 1);
+        assert!(
+            expired_tracks[0].stationary,
+            "stationary track expiring after unscanned window must preserve stationary=true"
+        );
+
+        // 3. Subsequent flicker on the exact same motionless chair is suppressed by StationaryAnchor!
+        for i in 0..6 {
+            let (re_act, re_end) = tracker.update(
+                2300.0 + i as f64,
+                std::slice::from_ref(&chair_det),
+                &[reg],
+                &cam_cfg,
+            );
+            assert!(
+                re_act.is_empty() && re_end.is_empty(),
+                "unchanged static background object must not spawn duplicate tracks after stationary cycle"
+            );
+        }
+
+        // 4. Three consecutive genuinely empty scans clear the anchor so a real future person tracks normally.
+        for i in 0..3 {
+            let _ = tracker.update(2400.0 + i as f64, &[], &[reg], &cam_cfg);
+        }
+        for i in 0..4 {
+            let (fresh_act, _) = tracker.update(
+                2410.0 + i as f64,
+                std::slice::from_ref(&chair_det),
+                &[reg],
+                &cam_cfg,
+            );
+            if i == 3 {
+                assert_eq!(
+                    fresh_act.len(),
+                    1,
+                    "after 3 empty scanned frames clear the anchor, a new arrival must confirm normally"
+                );
+            }
+        }
+
+        // 5. A genuinely moving person who walks across the frame, achieves a new `top_score`
+        // while paused (`stationary = true`), and then disappears via occlusion must NOT leave a StationaryAnchor!
+        let mut walk_tracker = ByteTracker::new("lobby", 1000, 1000, &cam_cfg);
+        let walk_start = DetectionResult {
+            label: "person".to_string(),
+            score: 0.80,
+            bbox: BoundingBox::new(100, 200, 200, 450),
+            region: reg,
+        };
+        let walk_dest = DetectionResult {
+            label: "person".to_string(),
+            score: 0.96, // higher score at destination overwrites `provenance.bbox`, NOT `initial_bboxes`!
+            bbox: BoundingBox::new(650, 200, 750, 450),
+            region: reg,
+        };
+        for i in 0..3 {
+            let _ = walk_tracker.update(
+                10.0 + i as f64,
+                std::slice::from_ref(&walk_start),
+                &[reg],
+                &cam_cfg,
+            );
+        }
+        // Step smoothly to x=650..750
+        for step in 1..=6 {
+            let x = 100 + step * 90;
+            let step_det = DetectionResult {
+                label: "person".to_string(),
+                score: 0.85,
+                bbox: BoundingBox::new(x, 200, x + 100, 450),
+                region: reg,
+            };
+            let _ = walk_tracker.update(20.0 + step as f64, &[step_det], &[reg], &cam_cfg);
+        }
+        // Pause at destination long enough to become `stationary = true` with new top_score 0.96
+        for i in 0..14 {
+            let _ = walk_tracker.update(
+                30.0 + i as f64,
+                std::slice::from_ref(&walk_dest),
+                &[reg],
+                &cam_cfg,
+            );
+        }
+        // Occlude for > max_disappeared WITH scanned region (so it expires via disappearance, not unscanned timeout)
+        for i in 0..8 {
+            let _ = walk_tracker.update(50.0 + i as f64, &[], &[reg], &cam_cfg);
+        }
+        // Re-appearing at `walk_dest` on the very next frame (before 3 empty scans) MUST track immediately!
+        let mut reappeared_confirmed = false;
+        for i in 0..3 {
+            let (act, _) = walk_tracker.update(
+                60.0 + i as f64,
+                std::slice::from_ref(&walk_dest),
+                &[reg],
+                &cam_cfg,
+            );
+            if !act.is_empty() {
+                reappeared_confirmed = true;
+            }
+        }
+        assert!(
+            reappeared_confirmed,
+            "displaced object whose top_score updated after pausing must NOT create a StationaryAnchor"
+        );
     }
 }
