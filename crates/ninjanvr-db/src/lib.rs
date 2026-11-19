@@ -244,6 +244,7 @@ pub struct NinjaDatabase {
     read_pool: Option<Arc<ReadConnPool>>,
     path: PathBuf,
     recordings_mutation_seq: Arc<std::sync::atomic::AtomicU64>,
+    recordings_vod_invalidation_seq: Arc<std::sync::atomic::AtomicU64>,
     storage_usage_cache: Arc<Mutex<Option<(std::time::Instant, u64, Value)>>>,
     events_mutation_seq: Arc<std::sync::atomic::AtomicU64>,
     event_counts_cache: Arc<Mutex<Option<EventCountsCacheEntry>>>,
@@ -917,12 +918,23 @@ impl NinjaDatabase {
             .with_context(|| format!("failed to open SQLite DB at {}", path.display()))?;
 
         #[cfg(unix)]
-        if !is_in_memory
-            && let Ok(meta) = std::fs::symlink_metadata(&path)
-            && meta.file_type().is_file()
-        {
+        if !is_in_memory {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            for candidate in [
+                path.clone(),
+                PathBuf::from(format!("{}-wal", path.display())),
+                PathBuf::from(format!("{}-shm", path.display())),
+                PathBuf::from(format!("{}-journal", path.display())),
+            ] {
+                if let Ok(meta) = std::fs::symlink_metadata(&candidate)
+                    && meta.file_type().is_file()
+                {
+                    let _ = std::fs::set_permissions(
+                        &candidate,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                }
+            }
         }
 
         conn.execute_batch(
@@ -942,6 +954,7 @@ impl NinjaDatabase {
             read_pool: None,
             path,
             recordings_mutation_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            recordings_vod_invalidation_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             storage_usage_cache: Arc::new(Mutex::new(None)),
             events_mutation_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             event_counts_cache: Arc::new(Mutex::new(None)),
@@ -956,6 +969,25 @@ impl NinjaDatabase {
     fn bump_recordings_mutation(&self) {
         self.recordings_mutation_seq
             .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    fn bump_recordings_vod_invalidation(&self) {
+        self.bump_recordings_mutation();
+        self.recordings_vod_invalidation_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Monotonic counter incremented whenever rows in `recordings` are inserted, compacted, or deleted.
+    pub fn recordings_mutation_seq(&self) -> u64 {
+        self.recordings_mutation_seq
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Monotonic counter incremented whenever existing recording files are compacted, tier-migrated,
+    /// or deleted (excluding routine 10s segment appends so `VodWindowCache` retains high hit rate).
+    pub fn recordings_vod_invalidation_seq(&self) -> u64 {
+        self.recordings_vod_invalidation_seq
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn bump_events_mutation(&self) {
@@ -1314,7 +1346,7 @@ impl NinjaDatabase {
         }
         tx.commit()?;
         if !paths.is_empty() {
-            self.bump_recordings_mutation();
+            self.bump_recordings_vod_invalidation();
         }
         Ok(paths)
     }
@@ -1322,8 +1354,9 @@ impl NinjaDatabase {
     pub fn delete_recording_by_id(&self, id: &str) -> Result<usize> {
         let conn = self.lock_conn();
         let rows = conn.execute("DELETE FROM recordings WHERE id = ?1", params![id])?;
+        drop(conn);
         if rows > 0 {
-            self.bump_recordings_mutation();
+            self.bump_recordings_vod_invalidation();
         }
         Ok(rows)
     }
@@ -5420,7 +5453,7 @@ impl NinjaDatabase {
         }
         tx.commit()?;
         if !ids.is_empty() {
-            self.bump_recordings_mutation();
+            self.bump_recordings_vod_invalidation();
         }
         Ok(paths)
     }
@@ -5506,7 +5539,7 @@ impl NinjaDatabase {
             "UPDATE recordings SET segment_size = ?2, stream_tier = 'compacted' WHERE id = ?1",
             params![id, safe_size],
         )?;
-        self.bump_recordings_mutation();
+        self.bump_recordings_vod_invalidation();
         Ok(())
     }
 
@@ -5551,7 +5584,7 @@ impl NinjaDatabase {
         }
         tx.commit()?;
         if !matched.is_empty() {
-            self.bump_recordings_mutation();
+            self.bump_recordings_vod_invalidation();
         }
         Ok(matched)
     }
@@ -5595,7 +5628,7 @@ impl NinjaDatabase {
         }
         tx.commit()?;
         if deleted > 0 {
-            self.bump_recordings_mutation();
+            self.bump_recordings_vod_invalidation();
         }
         Ok(deleted)
     }
@@ -5639,6 +5672,10 @@ impl NinjaDatabase {
             "UPDATE recordings SET path = ?2 WHERE id = ?1",
             params![id, new_path],
         )?;
+        drop(conn);
+        if rows > 0 {
+            self.bump_recordings_vod_invalidation();
+        }
         Ok(rows > 0)
     }
 
@@ -5714,7 +5751,7 @@ impl NinjaDatabase {
         }
         tx.commit()?;
         if !paths.is_empty() {
-            self.bump_recordings_mutation();
+            self.bump_recordings_vod_invalidation();
         }
         Ok(paths)
     }
@@ -5784,7 +5821,7 @@ impl NinjaDatabase {
         }
         tx.commit()?;
         if !paths.is_empty() {
-            self.bump_recordings_mutation();
+            self.bump_recordings_vod_invalidation();
         }
         Ok(paths)
     }

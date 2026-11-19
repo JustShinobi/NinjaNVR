@@ -374,6 +374,23 @@ pub async fn api_federation_nodes(
     Json(json!({ "nodes": nodes })).into_response()
 }
 
+pub const MAX_PROXY_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+
+fn is_disallowed_federation_upstream_content_type(ct: &str) -> bool {
+    let media_type = ct
+        .split(';')
+        .next()
+        .unwrap_or(ct)
+        .trim()
+        .to_ascii_lowercase();
+    media_type.contains("html")
+        || media_type.contains("svg")
+        || media_type.contains("javascript")
+        || media_type.contains("ecmascript")
+        || media_type == "text/xml"
+        || media_type == "application/xml"
+}
+
 pub async fn api_federation_proxy(
     State(state): State<AppState>,
     method: axum::http::Method,
@@ -381,7 +398,18 @@ pub async fn api_federation_proxy(
     headers: HeaderMap,
     AxumPath((node, subpath)): AxumPath<(String, String)>,
     uri: Uri,
+    body: axum::body::Bytes,
 ) -> Response {
+    if body.len() > MAX_PROXY_REQUEST_BODY_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "success": false,
+                "message": "Federation proxy request body exceeds maximum allowed size"
+            })),
+        )
+            .into_response();
+    }
     if method != axum::http::Method::GET
         && method != axum::http::Method::HEAD
         && !verify_cookie_csrf_origin(&headers, &uri)
@@ -518,12 +546,29 @@ pub async fn api_federation_proxy(
         target_url.push_str(q);
     }
 
-    let mut req = client.get(&target_url);
+    let req_method = match method {
+        axum::http::Method::POST => reqwest::Method::POST,
+        axum::http::Method::HEAD => reqwest::Method::HEAD,
+        _ => reqwest::Method::GET,
+    };
+    let mut req = client.request(req_method, &target_url);
     if !tok_env_trimmed.is_empty()
         && let Ok(tok) = std::env::var(tok_env_trimmed)
         && !tok.trim().is_empty()
     {
         req = req.header(header::AUTHORIZATION, format!("Bearer {}", tok.trim()));
+    }
+    if method == axum::http::Method::POST {
+        if let Some(ct) = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.chars().any(char::is_control))
+        {
+            req = req.header(header::CONTENT_TYPE, ct);
+        }
+        if !body.is_empty() {
+            req = req.body(body.to_vec());
+        }
     }
 
     match req.send().await {
@@ -536,6 +581,17 @@ pub async fn api_federation_proxy(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/json")
                 .to_string();
+            if is_disallowed_federation_upstream_content_type(&content_type) {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "success": false,
+                        "node": node,
+                        "message": "Federated peer returned disallowed executable/HTML Content-Type"
+                    })),
+                )
+                    .into_response();
+            }
             let Ok(body_bytes) = read_upstream_body_bounded(upstream, 16 * 1024 * 1024).await
             else {
                 return (
@@ -551,7 +607,16 @@ pub async fn api_federation_proxy(
             let scrubbed_bytes = scrub_federation_response_bytes(&content_type, body_bytes);
             (
                 status,
-                [(header::CONTENT_TYPE, content_type)],
+                [
+                    (header::CONTENT_TYPE, content_type),
+                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+                    (
+                        header::CONTENT_SECURITY_POLICY,
+                        "default-src 'none'; sandbox; frame-ancestors 'none'".to_string(),
+                    ),
+                    (header::X_FRAME_OPTIONS, "DENY".to_string()),
+                    (header::REFERRER_POLICY, "no-referrer".to_string()),
+                ],
                 scrubbed_bytes,
             )
                 .into_response()
@@ -578,7 +643,18 @@ pub async fn api_camera_proxy_root(
     headers: HeaderMap,
     AxumPath(camera): AxumPath<String>,
     uri: Uri,
+    body: axum::body::Bytes,
 ) -> Response {
+    if body.len() > MAX_PROXY_REQUEST_BODY_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "success": false,
+                "message": "Camera proxy request body exceeds maximum allowed size"
+            })),
+        )
+            .into_response();
+    }
     if method != axum::http::Method::GET
         && method != axum::http::Method::HEAD
         && !verify_cookie_csrf_origin(&headers, &uri)
@@ -611,7 +687,16 @@ pub async fn api_camera_proxy_root(
         )
             .into_response();
     }
-    handle_camera_webui_proxy(&state, &camera, "", uri.query()).await
+    handle_camera_webui_proxy_with_request(
+        &state,
+        &method,
+        &headers,
+        &camera,
+        "",
+        uri.query(),
+        body,
+    )
+    .await
 }
 
 pub async fn api_camera_proxy_subpath(
@@ -621,7 +706,18 @@ pub async fn api_camera_proxy_subpath(
     headers: HeaderMap,
     AxumPath((camera, subpath)): AxumPath<(String, String)>,
     uri: Uri,
+    body: axum::body::Bytes,
 ) -> Response {
+    if body.len() > MAX_PROXY_REQUEST_BODY_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "success": false,
+                "message": "Camera proxy request body exceeds maximum allowed size"
+            })),
+        )
+            .into_response();
+    }
     if method != axum::http::Method::GET
         && method != axum::http::Method::HEAD
         && !verify_cookie_csrf_origin(&headers, &uri)
@@ -654,7 +750,16 @@ pub async fn api_camera_proxy_subpath(
         )
             .into_response();
     }
-    handle_camera_webui_proxy(&state, &camera, &subpath, uri.query()).await
+    handle_camera_webui_proxy_with_request(
+        &state,
+        &method,
+        &headers,
+        &camera,
+        &subpath,
+        uri.query(),
+        body,
+    )
+    .await
 }
 
 /// Resolves DNS (or literal IP) for a camera WebUI `base_url`, verifies every resolved
@@ -733,11 +838,34 @@ async fn build_verified_camera_webui_client(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+#[cfg(test)]
 pub(crate) async fn handle_camera_webui_proxy(
     state: &AppState,
     camera: &str,
     subpath: &str,
     query: Option<&str>,
+) -> Response {
+    let empty_headers = HeaderMap::new();
+    handle_camera_webui_proxy_with_request(
+        state,
+        &axum::http::Method::GET,
+        &empty_headers,
+        camera,
+        subpath,
+        query,
+        axum::body::Bytes::new(),
+    )
+    .await
+}
+
+pub(crate) async fn handle_camera_webui_proxy_with_request(
+    state: &AppState,
+    method: &axum::http::Method,
+    req_headers: &HeaderMap,
+    camera: &str,
+    subpath: &str,
+    query: Option<&str>,
+    req_body: axum::body::Bytes,
 ) -> Response {
     let Some(decoded_sub) = percent_decode_path(subpath) else {
         return (
@@ -828,7 +956,26 @@ pub(crate) async fn handle_camera_webui_proxy(
         }
     };
 
-    match client.get(&target_url).send().await {
+    let upstream_method = match *method {
+        axum::http::Method::POST => reqwest::Method::POST,
+        axum::http::Method::HEAD => reqwest::Method::HEAD,
+        _ => reqwest::Method::GET,
+    };
+    let mut out_req = client.request(upstream_method, &target_url);
+    if *method == axum::http::Method::POST {
+        if let Some(ct) = req_headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.chars().any(char::is_control))
+        {
+            out_req = out_req.header(header::CONTENT_TYPE, ct);
+        }
+        if !req_body.is_empty() {
+            out_req = out_req.body(req_body.to_vec());
+        }
+    }
+
+    match out_req.send().await {
         Ok(upstream) => {
             let status =
                 StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -886,8 +1033,27 @@ pub(crate) async fn handle_camera_webui_proxy(
                 )
                     .into_response();
             };
-            let mut resp =
-                (status, [(header::CONTENT_TYPE, content_type)], body_bytes).into_response();
+            // Isolate proxied camera HTML/JS inside an opaque sandboxed origin (`sandbox` without
+            // `allow-same-origin` or `allow-scripts`) so untrusted camera firmware can never read
+            // NinjaNVR Same-Origin state or issue authenticated `/api/*` requests.
+            let mut resp = (
+                status,
+                [
+                    (header::CONTENT_TYPE, content_type),
+                    (
+                        header::CONTENT_SECURITY_POLICY,
+                        "sandbox; frame-ancestors 'self'".to_string(),
+                    ),
+                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+                    (header::REFERRER_POLICY, "no-referrer".to_string()),
+                    (
+                        header::HeaderName::from_static("cross-origin-resource-policy"),
+                        "same-origin".to_string(),
+                    ),
+                ],
+                body_bytes,
+            )
+                .into_response();
             if let Some(loc_str) = rewritten_loc
                 && let Ok(hv) = header::HeaderValue::from_str(&loc_str)
             {

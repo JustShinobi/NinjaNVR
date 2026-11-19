@@ -1570,6 +1570,7 @@ pub struct RecordingEngine {
     db: NinjaDatabase,
     media_dir: PathBuf,
     ffmpeg_bin: PathBuf,
+    go2rtc_relay_active: Arc<AtomicBool>,
     activity_ledger: SharedActivityLedger,
     storage_degraded: Arc<AtomicBool>,
     storage_error: Arc<std::sync::Mutex<Option<String>>>,
@@ -1617,6 +1618,7 @@ impl RecordingEngine {
             db,
             media_dir,
             ffmpeg_bin: resolve_ffmpeg_bin(),
+            go2rtc_relay_active: Arc::new(AtomicBool::new(false)),
             activity_ledger,
             storage_degraded,
             storage_error,
@@ -1634,6 +1636,13 @@ impl RecordingEngine {
         self
     }
 
+    /// Marks whether a local supervised `go2rtc` RTSP relay (`127.0.0.1:8554`) is active so
+    /// credentialed camera RTSP inputs automatically route through loopback instead of CLI `argv`.
+    pub fn with_go2rtc_relay(self, active: bool) -> Self {
+        self.go2rtc_relay_active.store(active, Ordering::Relaxed);
+        self
+    }
+
     /// Returns the sorted list of cameras with active supervised recorder loops.
     pub async fn active_recorder_cameras(&self) -> Vec<String> {
         let map = self.recorders.lock().await;
@@ -1646,19 +1655,32 @@ impl RecordingEngine {
         names
     }
 
-    fn desired_camera_specs(cfg: &NinjaConfig) -> HashMap<String, CameraRecorderSpec> {
+    fn desired_camera_specs(
+        cfg: &NinjaConfig,
+        go2rtc_relay_active: bool,
+    ) -> HashMap<String, CameraRecorderSpec> {
         cfg.cameras
             .iter()
             .filter(|(name, c)| c.enabled && c.record.enabled && is_safe_identifier(name))
             .filter_map(|(name, c)| {
                 let use_sub_default =
                     c.record.continuous_substream || cfg.record.continuous_substream;
-                let input_url = if use_sub_default && c.record.continuous.days == 0.0 {
-                    cfg.camera_input_for_role(name, "detect")
-                        .or_else(|| cfg.camera_input_for_role(name, "record"))?
-                } else {
-                    cfg.camera_input_for_role(name, "record")?
-                };
+                let (role_used, raw_input_url) =
+                    if use_sub_default && c.record.continuous.days == 0.0 {
+                        if let Some(det) = cfg.camera_input_for_role(name, "detect") {
+                            ("detect", det)
+                        } else {
+                            ("record", cfg.camera_input_for_role(name, "record")?)
+                        }
+                    } else {
+                        ("record", cfg.camera_input_for_role(name, "record")?)
+                    };
+                let input_url = cfg.prefer_local_go2rtc_relay_url(
+                    name,
+                    role_used,
+                    &raw_input_url,
+                    go2rtc_relay_active,
+                );
                 if !ninjanvr_config::is_safe_camera_input_url(&input_url) {
                     warn!("Skipping recorder for camera {name}: unsafe stream input URL");
                     return None;
@@ -1750,7 +1772,7 @@ impl RecordingEngine {
         }
         let desired = {
             let cfg = self.config.read().await;
-            Self::desired_camera_specs(&cfg)
+            Self::desired_camera_specs(&cfg, self.go2rtc_relay_active.load(Ordering::Relaxed))
         };
 
         let to_stop = {
@@ -2652,6 +2674,18 @@ impl RecordingEngine {
             };
             let configured_cold_dir = tier_cfg.cold_dir.clone();
 
+            struct DeferredCameraCompaction {
+                camera: String,
+                compact_after_hours: u32,
+                compact_crf: u8,
+                compact_idle_only: bool,
+                pre_capture_sec: f64,
+                post_capture_sec: f64,
+                compact_codec: String,
+                compact_preset: String,
+                compact_hwaccel: String,
+            }
+            let mut pending_compactions: Vec<DeferredCameraCompaction> = Vec::new();
             for CameraRetentionEntry {
                 camera,
                 continuous_days,
@@ -2792,138 +2826,17 @@ impl RecordingEngine {
                 .await;
 
                 if compact_enabled {
-                    let compact_before = now - (compact_after_hours as f64) * 3600.0;
-                    let db_cand = self.db.clone();
-                    let cam_cand = camera.clone();
-                    let candidates = tokio::task::spawn_blocking(move || {
-                        db_cand.list_cold_compaction_candidates(
-                            &cam_cand,
-                            compact_before,
-                            compact_idle_only,
-                            pre_capture_sec,
-                            post_capture_sec,
-                            12,
-                        )
-                    })
-                    .await
-                    .ok()
-                    .and_then(|r| r.ok())
-                    .unwrap_or_default();
-
-                    for (seg_id, db_path) in candidates {
-                        let engine_prep = self.clone();
-                        let cold_prep = configured_cold_dir.clone();
-                        let seg_id_prep = seg_id.clone();
-                        let prep_res =
-                            tokio::task::spawn_blocking(move || -> Option<(PathBuf, u64)> {
-                                let Some(disk_path) = engine_prep.resolve_contained_recording_file(
-                                    &db_path,
-                                    cold_prep.as_deref(),
-                                ) else {
-                                    let _ = engine_prep
-                                        .db
-                                        .update_recording_compacted(&seg_id_prep, 0.0);
-                                    return None;
-                                };
-                                let Ok(orig_meta) = std::fs::symlink_metadata(&disk_path) else {
-                                    let _ = engine_prep
-                                        .db
-                                        .update_recording_compacted(&seg_id_prep, 0.0);
-                                    return None;
-                                };
-                                if !orig_meta.file_type().is_file() {
-                                    let _ = engine_prep
-                                        .db
-                                        .update_recording_compacted(&seg_id_prep, 0.0);
-                                    return None;
-                                }
-                                let orig_len = orig_meta.len();
-                                if orig_len < 65_536 {
-                                    let mb = ((orig_len as f64) / (1024.0 * 1024.0) * 100.0)
-                                        .round()
-                                        / 100.0;
-                                    let _ =
-                                        engine_prep.db.update_recording_compacted(&seg_id_prep, mb);
-                                    return None;
-                                }
-                                Some((disk_path, orig_len))
-                            })
-                            .await
-                            .ok()
-                            .flatten();
-
-                        let Some((disk_path, orig_len)) = prep_res else {
-                            continue;
-                        };
-
-                        let compact_nonce: u64 = rand::random();
-                        let tmp_out =
-                            disk_path.with_extension(format!("{compact_nonce:016x}.compact.mp4"));
-                        let _tmp_compact_guard = TempPathGuard(tmp_out.clone());
-                        let primary_args = build_cold_compaction_ffmpeg_args(
-                            &disk_path,
-                            &tmp_out,
-                            &compact_codec,
-                            &compact_preset,
-                            &compact_hwaccel,
-                            compact_crf,
-                        );
-                        let mut cmd = Command::new(&ffmpeg_bin);
-                        cmd.args(&primary_args)
-                            .stdin(Stdio::null())
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .kill_on_drop(true);
-                        let mut status = cmd.status().await;
-                        if !status.as_ref().is_ok_and(|s| s.success()) && compact_hwaccel != "none"
-                        {
-                            let fallback_args = build_cold_compaction_ffmpeg_args(
-                                &disk_path,
-                                &tmp_out,
-                                &compact_codec,
-                                &compact_preset,
-                                "none",
-                                compact_crf,
-                            );
-                            let mut fb_cmd = Command::new(&ffmpeg_bin);
-                            fb_cmd
-                                .args(&fallback_args)
-                                .stdin(Stdio::null())
-                                .stdout(Stdio::null())
-                                .stderr(Stdio::null())
-                                .kill_on_drop(true);
-                            status = fb_cmd.status().await;
-                        }
-                        let ff_success = status.is_ok_and(|s| s.success());
-                        let db_fin = self.db.clone();
-                        let tmp_out_fin = tmp_out.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            let mut final_mb =
-                                ((orig_len as f64) / (1024.0 * 1024.0) * 100.0).round() / 100.0;
-                            if ff_success
-                                && let Ok(new_meta) = std::fs::symlink_metadata(&tmp_out_fin)
-                                && new_meta.file_type().is_file()
-                                && new_meta.len() > 4096
-                                && new_meta.len() < orig_len
-                                && probe_mp4_duration_fast(&tmp_out_fin).is_some()
-                                && std::fs::symlink_metadata(&disk_path)
-                                    .is_ok_and(|m| m.file_type().is_file())
-                            {
-                                if std::fs::rename(&tmp_out_fin, &disk_path).is_ok() {
-                                    final_mb = ((new_meta.len() as f64) / (1024.0 * 1024.0)
-                                        * 100.0)
-                                        .round()
-                                        / 100.0;
-                                } else {
-                                    let _ = std::fs::remove_file(&tmp_out_fin);
-                                }
-                            } else {
-                                let _ = std::fs::remove_file(&tmp_out_fin);
-                            }
-                            let _ = db_fin.update_recording_compacted(&seg_id, final_mb);
-                        })
-                        .await;
-                    }
+                    pending_compactions.push(DeferredCameraCompaction {
+                        camera,
+                        compact_after_hours,
+                        compact_crf,
+                        compact_idle_only,
+                        pre_capture_sec,
+                        post_capture_sec,
+                        compact_codec,
+                        compact_preset,
+                        compact_hwaccel,
+                    });
                 }
             }
 
@@ -2975,6 +2888,162 @@ impl RecordingEngine {
                     }
                 })
                 .await;
+            }
+
+            // Cold compaction pass runs after age + quota/headroom eviction and skips `.compact.mp4` staging
+            // whenever free disk space is below `min_free_gb`.
+            for DeferredCameraCompaction {
+                camera,
+                compact_after_hours,
+                compact_crf,
+                compact_idle_only,
+                pre_capture_sec,
+                post_capture_sec,
+                compact_codec,
+                compact_preset,
+                compact_hwaccel,
+            } in pending_compactions
+            {
+                if let Some(min_free_gb) = sanitize_quota_gb(global_min_free_gb) {
+                    let rec_root_chk = recordings_root.clone();
+                    let low_headroom = tokio::task::spawn_blocking(move || {
+                        nix::sys::statvfs::statvfs(&rec_root_chk).is_ok_and(|stat| {
+                            let free_gb = (stat.blocks_available() as f64
+                                * stat.fragment_size() as f64)
+                                / (1024.0 * 1024.0 * 1024.0);
+                            free_gb < min_free_gb
+                        })
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if low_headroom {
+                        continue;
+                    }
+                }
+                let compact_before = now - (compact_after_hours as f64) * 3600.0;
+                let db_cand = self.db.clone();
+                let cam_cand = camera;
+                let candidates = tokio::task::spawn_blocking(move || {
+                    db_cand.list_cold_compaction_candidates(
+                        &cam_cand,
+                        compact_before,
+                        compact_idle_only,
+                        pre_capture_sec,
+                        post_capture_sec,
+                        12,
+                    )
+                })
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+
+                for (seg_id, db_path) in candidates {
+                    let engine_prep = self.clone();
+                    let cold_prep = configured_cold_dir.clone();
+                    let seg_id_prep = seg_id.clone();
+                    let prep_res =
+                        tokio::task::spawn_blocking(move || -> Option<(PathBuf, u64)> {
+                            let Some(disk_path) = engine_prep
+                                .resolve_contained_recording_file(&db_path, cold_prep.as_deref())
+                            else {
+                                let _ =
+                                    engine_prep.db.update_recording_compacted(&seg_id_prep, 0.0);
+                                return None;
+                            };
+                            let Ok(orig_meta) = std::fs::symlink_metadata(&disk_path) else {
+                                let _ =
+                                    engine_prep.db.update_recording_compacted(&seg_id_prep, 0.0);
+                                return None;
+                            };
+                            if !orig_meta.file_type().is_file() {
+                                let _ =
+                                    engine_prep.db.update_recording_compacted(&seg_id_prep, 0.0);
+                                return None;
+                            };
+                            let orig_len = orig_meta.len();
+                            if orig_len < 65_536 {
+                                let mb =
+                                    ((orig_len as f64) / (1024.0 * 1024.0) * 100.0).round() / 100.0;
+                                let _ = engine_prep.db.update_recording_compacted(&seg_id_prep, mb);
+                                return None;
+                            }
+                            Some((disk_path, orig_len))
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+
+                    let Some((disk_path, orig_len)) = prep_res else {
+                        continue;
+                    };
+
+                    let compact_nonce: u64 = rand::random();
+                    let tmp_out =
+                        disk_path.with_extension(format!("{compact_nonce:016x}.compact.mp4"));
+                    let _tmp_compact_guard = TempPathGuard(tmp_out.clone());
+                    let primary_args = build_cold_compaction_ffmpeg_args(
+                        &disk_path,
+                        &tmp_out,
+                        &compact_codec,
+                        &compact_preset,
+                        &compact_hwaccel,
+                        compact_crf,
+                    );
+                    let mut cmd = Command::new(&ffmpeg_bin);
+                    cmd.args(&primary_args)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .kill_on_drop(true);
+                    let mut status = cmd.status().await;
+                    if !status.as_ref().is_ok_and(|s| s.success()) && compact_hwaccel != "none" {
+                        let fallback_args = build_cold_compaction_ffmpeg_args(
+                            &disk_path,
+                            &tmp_out,
+                            &compact_codec,
+                            &compact_preset,
+                            "none",
+                            compact_crf,
+                        );
+                        let mut fb_cmd = Command::new(&ffmpeg_bin);
+                        fb_cmd
+                            .args(&fallback_args)
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .kill_on_drop(true);
+                        status = fb_cmd.status().await;
+                    }
+                    let ff_success = status.is_ok_and(|s| s.success());
+                    let db_fin = self.db.clone();
+                    let tmp_out_fin = tmp_out.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let mut final_mb =
+                            ((orig_len as f64) / (1024.0 * 1024.0) * 100.0).round() / 100.0;
+                        if ff_success
+                            && let Ok(new_meta) = std::fs::symlink_metadata(&tmp_out_fin)
+                            && new_meta.file_type().is_file()
+                            && new_meta.len() > 4096
+                            && new_meta.len() < orig_len
+                            && probe_mp4_duration_fast(&tmp_out_fin).is_some()
+                            && std::fs::symlink_metadata(&disk_path)
+                                .is_ok_and(|m| m.file_type().is_file())
+                        {
+                            if std::fs::rename(&tmp_out_fin, &disk_path).is_ok() {
+                                final_mb = ((new_meta.len() as f64) / (1024.0 * 1024.0) * 100.0)
+                                    .round()
+                                    / 100.0;
+                            } else {
+                                let _ = std::fs::remove_file(&tmp_out_fin);
+                            }
+                        } else {
+                            let _ = std::fs::remove_file(&tmp_out_fin);
+                        }
+                        let _ = db_fin.update_recording_compacted(&seg_id, final_mb);
+                    })
+                    .await;
+                }
             }
 
             // Hot-to-Cold tiered storage migration pass

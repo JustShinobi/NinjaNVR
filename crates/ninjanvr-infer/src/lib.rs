@@ -934,6 +934,16 @@ impl AiDetectorEngine {
         lock_unpoisoned(&self.pool).get(n).cloned()
     }
 
+    /// Returns the bounded concurrency capacity (slot count) of this detector instance so async
+    /// callers can apply backpressure before entering `tokio::task::spawn_blocking`.
+    pub fn infer_slot_capacity(&self) -> usize {
+        let guard = lock_unpoisoned(&self.inner);
+        match guard.backend.as_ref() {
+            Some(InferenceRuntimeBackend::OpenVino(ov)) => ov.slot_count().max(1),
+            Some(InferenceRuntimeBackend::OnnxRuntime(_)) | None => DEFAULT_OV_INFER_SLOTS,
+        }
+    }
+
     /// Returns the average inference latency (ms) for a specific named detector, falling back to the primary detector.
     pub fn avg_inference_ms_for(&self, name: &str) -> f32 {
         if let Some(det) = lock_unpoisoned(&self.pool).get(name).cloned() {

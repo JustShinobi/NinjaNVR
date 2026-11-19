@@ -61,6 +61,7 @@ import {
   ArchiveMetadataCacheProvider,
   createArchiveMetadataCache,
 } from "./utils/archivePlayback";
+import { invalidateCameraHardwareCache } from "./utils/cameraCapabilities";
 import { resolveSafeMediaUrl } from "./utils/mediaUrlPolicy";
 import {
   type EventMutationPatch,
@@ -583,6 +584,9 @@ export const App: React.FC = () => {
           (r) => r.status === 401
         )
       ) {
+        archiveMetadataCache.clear();
+        invalidateCameraHardwareCache();
+        setCameraActivity({});
         setAuthNeeded(true);
         setAuthChecked(true);
         return;
@@ -1833,6 +1837,7 @@ export const App: React.FC = () => {
     setFocusSegments([]);
     setGlobalDaysSummary([]);
     archiveMetadataCache.clear();
+    invalidateCameraHardwareCache();
     setFfprobeInfo(null);
     setDraftPoints([]);
     workbenchSession.hydrateFromServer(null, "");

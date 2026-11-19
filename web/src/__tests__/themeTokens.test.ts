@@ -401,6 +401,10 @@ describe("themeTokens colorimetric utilities & cross-monitor invariants (#88)", 
     expect(cssText).toMatch(
       /\[data-high-contrast="true"\]\s*\.nvr-cfg-card[\s\S]*?border-width:\s*1\.5px/
     );
+    expect(darkHcVars["--ptt-badge-fg"]?.toLowerCase()).toBe("#ffffff");
+    expect(darkHcVars["--ptt-badge-bg"]).toBe("rgba(127, 29, 29, 0.96)");
+    expect(lightVars["--ptt-badge-fg"]?.toLowerCase()).toBe("#ffffff");
+    expect(lightVars["--ptt-badge-bg"]).toBe("rgba(153, 27, 27, 0.94)");
   });
 
   test("resolveEffectiveTheme, cycleThemeMode, applyThemeToDocument, resolveCanvasThemePalette, and useNvrStore theme actions (#89)", () => {

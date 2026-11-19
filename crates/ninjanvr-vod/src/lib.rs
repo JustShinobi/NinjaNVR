@@ -305,9 +305,19 @@ struct ParsedTrack {
     samples: Vec<ParsedSample>,
 }
 
-fn read_moov_from_file(path: &Path) -> Result<(Vec<u8>, usize)> {
+fn read_moov_from_open_file(
+    file: &mut std::fs::File,
+    file_len: u64,
+    path: &Path,
+) -> Result<(Vec<u8>, usize)> {
     use std::io::{Read, Seek, SeekFrom};
-    let (mut file, file_len) = open_validated_segment_file(path)?;
+    let file_len_usize = usize::try_from(file_len).map_err(|_| {
+        anyhow!(
+            "MP4 segment {} exceeds addressable size ({} bytes)",
+            path.display(),
+            file_len
+        )
+    })?;
     let mut pos = 0u64;
     let mut hdr = [0u8; 8];
     let mut boxes_seen = 0usize;
@@ -349,11 +359,16 @@ fn read_moov_from_file(path: &Path) -> Result<(Vec<u8>, usize)> {
             let payload_len = payload_u64 as usize;
             let mut buf = vec![0u8; payload_len];
             file.read_exact(&mut buf)?;
-            return Ok((buf, file_len as usize));
+            return Ok((buf, file_len_usize));
         }
         pos = next_pos;
     }
     bail!("no moov box found in {}", path.display())
+}
+
+fn read_moov_from_file(path: &Path) -> Result<(Vec<u8>, usize)> {
+    let (mut file, file_len) = open_validated_segment_file(path)?;
+    read_moov_from_open_file(&mut file, file_len, path)
 }
 
 fn parse_tracks_from_moov(
@@ -822,36 +837,17 @@ pub fn build_init_mp4(first_segment_path: &Path) -> Result<Vec<u8>> {
 }
 
 /// Synthesizes an HLS fMP4 media segment (`seg-N-v1-a1.m4s`: `moof` + `mdat`)
-/// from a standard MP4 recording file on disk.
+/// from a standard MP4 recording file on disk without loading the full source MP4 into heap twice.
 pub fn build_media_segment_m4s(
     segment_path: &Path,
     sequence_number: u32,
     base_time_seconds: f64,
 ) -> Result<Vec<u8>> {
-    use std::io::Read;
-    let (file, expected_len) = open_validated_segment_file(segment_path)?;
-    let cap = usize::try_from(expected_len.min(MAX_SEGMENT_FILE_BYTES)).unwrap_or(0);
-    let mut file_bytes = Vec::with_capacity(cap);
-    file.take(MAX_SEGMENT_FILE_BYTES + 1)
-        .read_to_end(&mut file_bytes)
-        .with_context(|| format!("failed to read MP4 file {}", segment_path.display()))?;
-    if file_bytes.len() as u64 > MAX_SEGMENT_FILE_BYTES {
-        bail!(
-            "MP4 segment {} exceeds maximum allowed size ({} bytes)",
-            segment_path.display(),
-            file_bytes.len()
-        );
-    }
-    let top_boxes = iter_boxes(&file_bytes);
-    let moov_payload =
-        find_box(&top_boxes, b"moov").ok_or_else(|| anyhow!("missing moov in segment"))?;
-    if moov_payload.len() as u64 > MAX_MOOV_BYTES {
-        bail!(
-            "moov box exceeds maximum allowed size in {}",
-            segment_path.display()
-        );
-    }
-    let (_mvhd, tracks) = parse_tracks_from_moov(moov_payload, file_bytes.len())?;
+    use std::io::{Read, Seek, SeekFrom};
+    let (mut file, expected_len) = open_validated_segment_file(segment_path)?;
+    let (moov_payload, file_len) = read_moov_from_open_file(&mut file, expected_len, segment_path)?;
+    let (_mvhd, tracks) = parse_tracks_from_moov(&moov_payload, file_len)?;
+    drop(moov_payload);
 
     // Two-pass moof construction so `data_offset` in each `trun` points accurately into `mdat`
     let build_moof = |data_offsets: &[i32]| -> Vec<u8> {
@@ -943,10 +939,9 @@ pub fn build_media_segment_m4s(
                 .ok_or_else(|| anyhow!("mdat payload size overflow"))?;
         }
     }
-    if total_mdat_payload > file_bytes.len() {
+    if total_mdat_payload > file_len {
         bail!(
-            "mdat sample table payload ({total_mdat_payload} bytes) exceeds source segment file size ({} bytes)",
-            file_bytes.len()
+            "mdat sample table payload ({total_mdat_payload} bytes) exceeds source segment file size ({file_len} bytes)"
         );
     }
 
@@ -967,17 +962,42 @@ pub fn build_media_segment_m4s(
     out.extend_from_slice(&mdat_box_size.to_be_bytes());
     out.extend_from_slice(b"mdat");
 
+    // Coalesce contiguous sample runs per track so sequential chunks read in one syscall directly into `out`.
     for t in &tracks {
-        for s in &t.samples {
-            let end = s
-                .offset
-                .checked_add(s.size as usize)
+        let mut idx = 0usize;
+        while idx < t.samples.len() {
+            let run_start = t.samples[idx].offset;
+            let mut run_end = run_start
+                .checked_add(t.samples[idx].size as usize)
                 .ok_or_else(|| anyhow!("sample offset overflow"))?;
-            if end <= file_bytes.len() {
-                out.extend_from_slice(&file_bytes[s.offset..end]);
-            } else {
+            if run_end > file_len {
                 bail!("sample offset out of bounds in {}", segment_path.display());
             }
+            idx += 1;
+            while idx < t.samples.len() && t.samples[idx].offset == run_end {
+                let next_end = run_end
+                    .checked_add(t.samples[idx].size as usize)
+                    .ok_or_else(|| anyhow!("sample offset overflow"))?;
+                if next_end > file_len {
+                    bail!("sample offset out of bounds in {}", segment_path.display());
+                }
+                run_end = next_end;
+                idx += 1;
+            }
+            let run_len = run_end - run_start;
+            if run_len == 0 {
+                continue;
+            }
+            let dst_offset = out.len();
+            out.resize(dst_offset + run_len, 0u8);
+            file.seek(SeekFrom::Start(run_start as u64))?;
+            file.read_exact(&mut out[dst_offset..dst_offset + run_len])
+                .with_context(|| {
+                    format!(
+                        "failed to read sample range {run_start}..{run_end} from {}",
+                        segment_path.display()
+                    )
+                })?;
         }
     }
 

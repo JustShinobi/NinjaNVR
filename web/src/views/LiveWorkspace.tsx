@@ -1525,16 +1525,26 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
       }
       prevMatchRef.current[cam] = matches;
     }
-    setNowTick(nowSec);
-  }, [cameraActivity, cameraNames, spotlightFilter]);
+    if (liveLayout === "spotlight") {
+      setNowTick((prev) => (prev === nowSec ? prev : nowSec));
+    }
+  }, [cameraActivity, cameraNames, spotlightFilter, liveLayout]);
 
   useEffect(() => {
-    if (liveLayout !== "spotlight" && simulatedFleetCount <= 0) return;
+    const hasSnapshotDockTiles =
+      liveLayout === "focus" && effectiveCameraNames.length > 7;
+    if (
+      liveLayout !== "spotlight" &&
+      simulatedFleetCount <= 0 &&
+      !hasSnapshotDockTiles
+    ) {
+      return;
+    }
     const tmr = window.setInterval(() => {
       setNowTick(Math.floor(Date.now() / 1000));
     }, 1500);
     return () => window.clearInterval(tmr);
-  }, [liveLayout, simulatedFleetCount]);
+  }, [liveLayout, simulatedFleetCount, effectiveCameraNames.length]);
 
   const groupCams = useMemo(() => {
     const resolved = resolveOrderedDashboardCameras(
@@ -2062,9 +2072,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         type="button"
                         className={`nvr-btn mono ${isCurrent ? "active" : ""} sm`}
                         onClick={() => {
-                          lastActiveRef.current[item.cam] = nowTick;
-                          lastSurgeRef.current[item.cam] = nowTick;
-                          setNowTick(nowTick);
+                          const ts = Math.floor(Date.now() / 1000);
+                          lastActiveRef.current[item.cam] = ts;
+                          lastSurgeRef.current[item.cam] = ts;
+                          setNowTick(ts);
                           setSelectedCamera(item.cam);
                           setLockedSpotlightCam(item.cam);
                         }}

@@ -28,7 +28,7 @@ FROM mwader/static-ffmpeg:8.1.2@sha256:33f770f812cbfc3de96c547157fc9faf8bd95a364
 FROM python:3.12-slim-trixie@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS openvino-assets
 
 COPY docker/requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+RUN pip install --no-cache-dir --only-binary=:all: -r /tmp/requirements.txt \
     && mkdir -p /openvino-model /out/openvino \
     && OV_LIBS="$(python3 -c 'import openvino, pathlib; print(pathlib.Path(openvino.__file__).parent / "libs")')" \
     && cp -a \
@@ -88,8 +88,8 @@ ENV OV_CPU_THREADS_NUM=1
 
 # 5000: Auth-enforced HTTP API & health probes | 8971: HTTPS/TLS operator console
 # 9091: Dedicated OpenMetrics (/metrics) & /healthz listener (set NINJANVR_METRICS_PORT=0 to disable)
-# 8554: go2rtc RTSP relay | 8555: go2rtc WebRTC media (TCP/UDP)
-EXPOSE 5000 8971 9091 8554 8555/tcp 8555/udp
+# 8555: go2rtc WebRTC media (TCP/UDP); go2rtc API (:1984) & RTSP relay (:8554) bind to 127.0.0.1 by default
+EXPOSE 5000 8971 9091 8555/tcp 8555/udp
 
 # Drops privileges to 10001:10001 (ninjanvr) by default on fresh/10001-writable mounts,
 # honors explicit Kubernetes securityContext.runAsNonRoot (--user 10001:10001), and

@@ -590,6 +590,8 @@ pub struct CameraVisionSession {
     pub prev_label_counts: BTreeMap<String, usize>,
     pub prev_total_objs: usize,
     pub prev_night_ir: bool,
+    pub prev_track_meta: Vec<(String, String, bool, Option<String>)>,
+    pub last_activity_ws_emit: Option<std::time::Instant>,
     pub consecutive_tamper_frames: u32,
     pub tamper_threshold_frames: u32,
     pub last_seen_frame_ts: f64,
@@ -647,6 +649,8 @@ impl CameraVisionSession {
             prev_label_counts,
             prev_total_objs: 0,
             prev_night_ir: false,
+            prev_track_meta: Vec::new(),
+            last_activity_ws_emit: None,
             consecutive_tamper_frames: 0,
             tamper_threshold_frames: (fps * 4).max(12),
             last_seen_frame_ts: 0.0,
@@ -953,6 +957,7 @@ impl CameraVisionSession {
         let (raw_detections, returned_tensor_buf, batch_detect_calls) = if regions.is_empty() {
             (Vec::new(), std::mem::take(&mut self.tensor_buf), 0u64)
         } else {
+            let _infer_permit = pipeline.infer_semaphore.acquire().await.ok();
             let det_engine = active_det.clone();
             let frame_for_infer = yuv_frame.clone();
             let regions_for_infer = regions.clone();
@@ -1033,10 +1038,31 @@ impl CameraVisionSession {
             activity_changed = true;
         }
 
+        let cur_track_meta: Vec<(String, String, bool, Option<String>)> = active_tracks
+            .iter()
+            .map(|t| {
+                (
+                    t.id.clone(),
+                    t.label.clone(),
+                    t.stationary,
+                    t.inferred_sub_label.clone(),
+                )
+            })
+            .collect();
+        let track_meta_changed = cur_track_meta != self.prev_track_meta;
+        if track_meta_changed {
+            self.prev_track_meta = cur_track_meta;
+        }
+        let throttle_elapsed = self
+            .last_activity_ws_emit
+            .is_none_or(|t| t.elapsed() >= Duration::from_millis(250));
+
         if activity_changed
-            || !active_tracks.is_empty()
-            || (motion_on && frame_count.is_multiple_of(5))
+            || track_meta_changed
+            || (!active_tracks.is_empty() && throttle_elapsed)
+            || (motion_on && frame_count.is_multiple_of(5) && throttle_elapsed)
         {
+            self.last_activity_ws_emit = Some(std::time::Instant::now());
             let max_area = motion_boxes.iter().map(|b| b.area()).max().unwrap_or(0);
             let objs_json: Vec<Value> = active_tracks
                 .iter()
@@ -1295,6 +1321,9 @@ pub struct VisionPipeline {
     pub camera_driver_runtime: crate::camera_protocols::CameraDriverRuntime,
     pub snapshot_http_client: Option<reqwest::Client>,
     pub siren_http_client: Option<reqwest::Client>,
+    pub go2rtc_http_base: String,
+    pub go2rtc_relay_active: Arc<std::sync::atomic::AtomicBool>,
+    pub infer_semaphore: Arc<Semaphore>,
     pub high_res_snapshot_semaphore: Arc<Semaphore>,
     pub genai_verify_semaphore: Arc<Semaphore>,
     pub alert_backup_semaphore: Arc<Semaphore>,
@@ -1325,6 +1354,7 @@ impl VisionPipeline {
         log_hub: crate::LogBufferHub,
         camera_driver_runtime: crate::camera_protocols::CameraDriverRuntime,
     ) -> Self {
+        let infer_slots = detector.infer_slot_capacity().clamp(1, 16);
         Self {
             config,
             db,
@@ -1340,6 +1370,9 @@ impl VisionPipeline {
             camera_driver_runtime,
             snapshot_http_client: build_snapshot_http_client(),
             siren_http_client: build_siren_http_client(),
+            go2rtc_http_base: "http://127.0.0.1:1984".to_string(),
+            go2rtc_relay_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            infer_semaphore: Arc::new(Semaphore::new(infer_slots)),
             high_res_snapshot_semaphore: Arc::new(Semaphore::new(
                 MAX_CONCURRENT_HIGH_RES_SNAPSHOT_TASKS,
             )),
@@ -1361,6 +1394,17 @@ impl VisionPipeline {
         self
     }
 
+    pub fn with_go2rtc_endpoint(
+        mut self,
+        http_base: impl Into<String>,
+        relay_active: bool,
+    ) -> Self {
+        self.go2rtc_http_base = http_base.into();
+        self.go2rtc_relay_active
+            .store(relay_active, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
     pub async fn active_vision_cameras(&self) -> Vec<String> {
         let map = self.workers.lock().await;
         let mut out: Vec<String> = map
@@ -1374,14 +1418,24 @@ impl VisionPipeline {
 
     fn desired_camera_specs(
         cfg: &NinjaConfig,
+        go2rtc_relay_active: bool,
     ) -> BTreeMap<String, (CameraConfig, CameraVisionSpec)> {
         cfg.cameras
             .iter()
             .filter(|(_, c)| c.enabled && c.detect.enabled)
             .filter_map(|(name, c)| {
-                let sub_url = cfg
-                    .camera_input_for_role(name, "detect")
-                    .or_else(|| cfg.camera_input_for_role(name, "record"))?;
+                let (role_used, raw_sub_url) =
+                    if let Some(det) = cfg.camera_input_for_role(name, "detect") {
+                        ("detect", det)
+                    } else {
+                        ("record", cfg.camera_input_for_role(name, "record")?)
+                    };
+                let sub_url = cfg.prefer_local_go2rtc_relay_url(
+                    name,
+                    role_used,
+                    &raw_sub_url,
+                    go2rtc_relay_active,
+                );
                 let (width, height, _) =
                     sanitize_yuv420p_dimensions(c.detect.width, c.detect.height);
                 let fps = c.detect.fps.clamp(1, 30);
@@ -1455,7 +1509,11 @@ impl VisionPipeline {
         }
         let desired = {
             let cfg = self.config.read().await;
-            Self::desired_camera_specs(&cfg)
+            Self::desired_camera_specs(
+                &cfg,
+                self.go2rtc_relay_active
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
         };
 
         let to_stop = {
@@ -2583,6 +2641,7 @@ impl VisionPipeline {
                     img
                 });
                 let face_rgb = crop_and_scale_rgb_square(full_redacted, face_crop_box, 112);
+                let _face_infer_permit = self.infer_semaphore.acquire().await.ok();
                 let det_clone = self.detector.clone();
                 let faces_dir_clone = faces_dir.clone();
                 let sim_thresh = face_cfg.similarity_threshold;
@@ -2837,10 +2896,10 @@ impl VisionPipeline {
                         let priv_policy = priv_mask_policy.clone();
                         let media_root_clone = self.media_dir.clone();
                         let clips_dir_clone = clips_dir.clone();
+                        let go2rtc_base = self.go2rtc_http_base.trim_end_matches('/').to_string();
                         tokio::spawn(async move {
                             let _permit = permit;
-                            let url =
-                                format!("http://127.0.0.1:1984/api/frame.jpeg?src={safe_src}");
+                            let url = format!("{go2rtc_base}/api/frame.jpeg?src={safe_src}");
                             if let Ok(mut resp) = client.get(&url).send().await
                                 && resp.status().is_success()
                                 && resp

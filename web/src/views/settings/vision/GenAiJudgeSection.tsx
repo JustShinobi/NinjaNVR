@@ -239,26 +239,33 @@ export const GenAiJudgeSection: React.FC<GenAiJudgeSectionProps> = ({
           }
         }
 
-        const directRes = await fetch(directUrl, { method: "GET", headers });
-        const directJson = await directRes.json().catch(() => ({}));
-        if (!isMountedRef.current || seq !== genaiValidateSeqRef.current) {
+        try {
+          const directRes = await fetch(directUrl, { method: "GET", headers });
+          const directJson = await directRes.json().catch(() => ({}));
+          if (!isMountedRef.current || seq !== genaiValidateSeqRef.current) {
+            return;
+          }
+          const directModels = normalizeDiscoveredGenAiModels(directJson, prov);
+          if (directRes.ok && directModels.length > 0) {
+            applyValidModels(directModels);
+            return;
+          }
+          const apiErr =
+            directJson?.error?.message ||
+            data?.message ||
+            (isPt
+              ? `Falha ao validar API (HTTP ${directRes.status})`
+              : `API validation failed (HTTP ${directRes.status})`);
+          setGenaiModels([]);
+          setGenaiValidationState({ status: "invalid", message: apiErr });
+          notify(apiErr);
           return;
+        } catch {
+          // Cross-origin direct fallback blocked by CSP or network; preserve server error message below
+          if (!isMountedRef.current || seq !== genaiValidateSeqRef.current) {
+            return;
+          }
         }
-        const directModels = normalizeDiscoveredGenAiModels(directJson, prov);
-        if (directRes.ok && directModels.length > 0) {
-          applyValidModels(directModels);
-          return;
-        }
-        const apiErr =
-          directJson?.error?.message ||
-          data?.message ||
-          (isPt
-            ? `Falha ao validar API (HTTP ${directRes.status})`
-            : `API validation failed (HTTP ${directRes.status})`);
-        setGenaiModels([]);
-        setGenaiValidationState({ status: "invalid", message: apiErr });
-        notify(apiErr);
-        return;
       }
 
       setGenaiModels([]);

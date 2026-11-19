@@ -54,6 +54,8 @@
   --signal-accent-tint: rgba(14, 165, 233, 0.15);
   --signal-accent-border: rgba(14, 165, 233, 0.45);
   --badge-surface: rgba(14, 16, 21, 0.88);
+  --ptt-badge-bg: rgba(127, 29, 29, 0.92);
+  --ptt-badge-fg: #fecaca;
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   --text-xs: 11px;
@@ -101,6 +103,8 @@
   --signal-accent-tint: rgba(2, 132, 199, 0.14);
   --signal-accent-border: rgba(2, 132, 199, 0.48);
   --badge-surface: var(--bg-elevated);
+  --ptt-badge-bg: rgba(153, 27, 27, 0.94);
+  --ptt-badge-fg: #ffffff;
 }
 
 [data-high-contrast="true"] {
@@ -112,6 +116,8 @@
   --text-primary: #ffffff;
   --text-secondary: #d0ddef;
   --text-muted: #b0bfd4;
+  --ptt-badge-bg: rgba(127, 29, 29, 0.96);
+  --ptt-badge-fg: #ffffff;
 }
 
 [data-theme="light"][data-high-contrast="true"] {

@@ -83,16 +83,54 @@ fn default_camera_activity_entry() -> Value {
     })
 }
 
+type MqttOutboundMsg = (String, Vec<u8>, bool);
+type MqttReceiverSlot = Arc<Mutex<Option<mpsc::Receiver<MqttOutboundMsg>>>>;
+type MqttConfigWatchTx = Arc<Mutex<Option<tokio::sync::watch::Sender<Option<MqttConfig>>>>>;
+
 #[derive(Clone)]
 pub struct CommsHub {
     ws_tx: broadcast::Sender<String>,
-    mqtt_tx: mpsc::Sender<(String, Vec<u8>, bool)>,
+    mqtt_tx: mpsc::Sender<MqttOutboundMsg>,
+    mqtt_rx_slot: MqttReceiverSlot,
+    mqtt_cfg_tx: MqttConfigWatchTx,
+    set_cmd_tx: broadcast::Sender<(String, String)>,
     camera_states: Arc<RwLock<BTreeMap<String, Value>>>,
     initialized_from_config: Arc<AtomicBool>,
     active_profile: Arc<RwLock<String>>,
     profile_persist_path: Arc<RwLock<Option<std::path::PathBuf>>>,
     profile_persisted_once: Arc<AtomicBool>,
     profile_persist_lock: Arc<Mutex<Option<String>>>,
+}
+
+#[derive(Clone)]
+struct WeakCommsHub {
+    ws_tx: broadcast::Sender<String>,
+    mqtt_tx: mpsc::WeakSender<MqttOutboundMsg>,
+    set_cmd_tx: broadcast::Sender<(String, String)>,
+    camera_states: std::sync::Weak<RwLock<BTreeMap<String, Value>>>,
+    initialized_from_config: std::sync::Weak<AtomicBool>,
+    active_profile: std::sync::Weak<RwLock<String>>,
+    profile_persist_path: std::sync::Weak<RwLock<Option<std::path::PathBuf>>>,
+    profile_persisted_once: std::sync::Weak<AtomicBool>,
+    profile_persist_lock: std::sync::Weak<Mutex<Option<String>>>,
+}
+
+impl WeakCommsHub {
+    fn upgrade(&self) -> Option<CommsHub> {
+        Some(CommsHub {
+            ws_tx: self.ws_tx.clone(),
+            mqtt_tx: self.mqtt_tx.upgrade()?,
+            mqtt_rx_slot: Arc::new(Mutex::new(None)),
+            mqtt_cfg_tx: Arc::new(Mutex::new(None)),
+            set_cmd_tx: self.set_cmd_tx.clone(),
+            camera_states: self.camera_states.upgrade()?,
+            initialized_from_config: self.initialized_from_config.upgrade()?,
+            active_profile: self.active_profile.upgrade()?,
+            profile_persist_path: self.profile_persist_path.upgrade()?,
+            profile_persisted_once: self.profile_persisted_once.upgrade()?,
+            profile_persist_lock: self.profile_persist_lock.upgrade()?,
+        })
+    }
 }
 
 impl Default for CommsHub {
@@ -163,10 +201,14 @@ fn sanitize_mqtt_client_id(raw: &str) -> String {
 impl CommsHub {
     pub fn new() -> Self {
         let (ws_tx, _) = broadcast::channel(512);
-        let (mqtt_tx, _rx) = mpsc::channel(MQTT_QUEUE_CAPACITY);
+        let (set_cmd_tx, _) = broadcast::channel(128);
+        let (mqtt_tx, mqtt_rx) = mpsc::channel(MQTT_QUEUE_CAPACITY);
         Self {
             ws_tx,
             mqtt_tx,
+            mqtt_rx_slot: Arc::new(Mutex::new(Some(mqtt_rx))),
+            mqtt_cfg_tx: Arc::new(Mutex::new(None)),
+            set_cmd_tx,
             camera_states: Arc::new(RwLock::new(BTreeMap::new())),
             initialized_from_config: Arc::new(AtomicBool::new(false)),
             active_profile: Arc::new(RwLock::new("armed".to_string())),
@@ -177,26 +219,75 @@ impl CommsHub {
     }
 
     pub fn with_mqtt(mqtt_cfg: &MqttConfig) -> Self {
-        let (ws_tx, _) = broadcast::channel(512);
-        let (mqtt_tx, mqtt_rx) = mpsc::channel(MQTT_QUEUE_CAPACITY);
-        let hub = Self {
-            ws_tx,
-            mqtt_tx,
-            camera_states: Arc::new(RwLock::new(BTreeMap::new())),
-            initialized_from_config: Arc::new(AtomicBool::new(false)),
-            active_profile: Arc::new(RwLock::new("armed".to_string())),
-            profile_persist_path: Arc::new(RwLock::new(None)),
-            profile_persisted_once: Arc::new(AtomicBool::new(false)),
-            profile_persist_lock: Arc::new(Mutex::new(None)),
-        };
+        let hub = Self::new();
         if mqtt_cfg.enabled {
-            let cfg_clone = mqtt_cfg.clone();
-            let hub_clone = hub.clone();
-            tokio::spawn(async move {
-                run_mqtt_loop(cfg_clone, mqtt_rx, hub_clone).await;
-            });
+            hub.reconfigure_mqtt(mqtt_cfg.clone());
         }
         hub
+    }
+
+    fn downgrade(&self) -> WeakCommsHub {
+        WeakCommsHub {
+            ws_tx: self.ws_tx.clone(),
+            mqtt_tx: self.mqtt_tx.downgrade(),
+            set_cmd_tx: self.set_cmd_tx.clone(),
+            camera_states: Arc::downgrade(&self.camera_states),
+            initialized_from_config: Arc::downgrade(&self.initialized_from_config),
+            active_profile: Arc::downgrade(&self.active_profile),
+            profile_persist_path: Arc::downgrade(&self.profile_persist_path),
+            profile_persisted_once: Arc::downgrade(&self.profile_persisted_once),
+            profile_persist_lock: Arc::downgrade(&self.profile_persist_lock),
+        }
+    }
+
+    /// Reconfigures (starts, reconnects, or stops) the background MQTT client loop on hot-reload.
+    pub fn reconfigure_mqtt(&self, next_cfg: MqttConfig) {
+        let desired = next_cfg.enabled.then_some(next_cfg);
+        let mut cfg_guard = self.mqtt_cfg_tx.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref tx) = *cfg_guard {
+            if *tx.borrow() != desired {
+                let _ = tx.send(desired);
+            }
+            return;
+        }
+        let Some(active_cfg) = desired else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let Some(mqtt_rx) = self
+            .mqtt_rx_slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        else {
+            return;
+        };
+        let (tx, rx_watch) = tokio::sync::watch::channel(Some(active_cfg));
+        *cfg_guard = Some(tx);
+        let weak_hub = self.downgrade();
+        tokio::spawn(async move {
+            run_mqtt_loop(rx_watch, mqtt_rx, weak_hub).await;
+        });
+    }
+
+    /// Stops any active MQTT connection loop cleanly and drops the config watch sender
+    /// so `run_mqtt_loop` and its internal forwarder task exit without cyclic `CommsHub` retention.
+    pub fn shutdown_mqtt(&self) {
+        if let Some(tx) = self
+            .mqtt_cfg_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = tx.send(None);
+        }
+    }
+
+    /// Subscribes to inbound `<camera>/<feature>/set` and `profile/set` commands received over MQTT.
+    pub fn subscribe_set_commands(&self) -> broadcast::Receiver<(String, String)> {
+        self.set_cmd_tx.subscribe()
     }
 
     pub fn subscribe_ws(&self) -> broadcast::Receiver<String> {
@@ -1123,14 +1214,18 @@ impl<T> Drop for AbortTaskOnDrop<T> {
 }
 
 async fn run_mqtt_loop(
-    cfg: MqttConfig,
+    mut cfg_rx: tokio::sync::watch::Receiver<Option<MqttConfig>>,
     mut rx: mpsc::Receiver<(String, Vec<u8>, bool)>,
-    hub: CommsHub,
+    weak_hub: WeakCommsHub,
 ) {
-    let prefix = sanitize_mqtt_prefix(&cfg.topic_prefix);
+    let initial_prefix = cfg_rx.borrow().as_ref().map_or_else(
+        || "ninjanvr".to_string(),
+        |c| sanitize_mqtt_prefix(&c.topic_prefix),
+    );
+    let active_prefix: Arc<RwLock<String>> = Arc::new(RwLock::new(initial_prefix));
     let active_client: Arc<RwLock<Option<AsyncClient>>> = Arc::new(RwLock::new(None));
     let active_client_for_tx = active_client.clone();
-    let prefix_for_tx = prefix.clone();
+    let active_prefix_for_tx = active_prefix.clone();
     let (closed_tx, mut closed_rx) = tokio::sync::watch::channel(false);
 
     // Forward outgoing internal messages from `rx` in a dedicated task so `eventloop.poll()`
@@ -1140,7 +1235,11 @@ async fn run_mqtt_loop(
         while let Some((sub_topic, payload, retain)) = rx.recv().await {
             let clean_sub = sub_topic.trim_matches('/');
             if is_valid_mqtt_publish_topic(clean_sub) {
-                let full_topic = format!("{prefix_for_tx}/{clean_sub}");
+                let prefix_snap = active_prefix_for_tx
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let full_topic = format!("{prefix_snap}/{clean_sub}");
                 if is_valid_mqtt_publish_topic(&full_topic) {
                     let maybe_client = active_client_for_tx
                         .read()
@@ -1160,6 +1259,28 @@ async fn run_mqtt_loop(
         if *closed_rx.borrow() {
             return;
         }
+        let cfg_opt = cfg_rx.borrow_and_update().clone();
+        let Some(cfg) = cfg_opt else {
+            *active_client.write().unwrap_or_else(|e| e.into_inner()) = None;
+            tokio::select! {
+                biased;
+                _ = closed_rx.changed() => {
+                    if *closed_rx.borrow() {
+                        return;
+                    }
+                }
+                res = cfg_rx.changed() => {
+                    if res.is_err() {
+                        return;
+                    }
+                    backoff_secs = 2;
+                }
+            }
+            continue;
+        };
+
+        let prefix = sanitize_mqtt_prefix(&cfg.topic_prefix);
+        *active_prefix.write().unwrap_or_else(|e| e.into_inner()) = prefix.clone();
         let cfg_for_opts = cfg.clone();
         let mqtt_opts = tokio::task::spawn_blocking(move || build_mqtt_options(&cfg_for_opts))
             .await
@@ -1167,12 +1288,30 @@ async fn run_mqtt_loop(
         let (client, mut eventloop) = AsyncClient::new(mqtt_opts, 256);
         *active_client.write().unwrap_or_else(|e| e.into_inner()) = Some(client.clone());
         let mut connected_at: Option<tokio::time::Instant> = None;
+        let mut reconfigured = false;
 
         loop {
             if *closed_rx.borrow() {
                 return;
             }
-            match eventloop.poll().await {
+            let poll_res = tokio::select! {
+                biased;
+                _ = closed_rx.changed() => {
+                    if *closed_rx.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+                chg = cfg_rx.changed() => {
+                    if chg.is_err() {
+                        return;
+                    }
+                    reconfigured = true;
+                    break;
+                }
+                ev = eventloop.poll() => ev,
+            };
+            match poll_res {
                 Ok(MqttEvent::Incoming(Packet::ConnAck(_))) => {
                     connected_at = Some(tokio::time::Instant::now());
                     info!("Connected to MQTT broker at {}:{}", cfg.host, cfg.port);
@@ -1191,7 +1330,12 @@ async fn run_mqtt_loop(
                     {
                         let payload_str = String::from_utf8_lossy(&pub_pkt.payload).to_string();
                         debug!("MQTT command on {}: {payload_str}", pub_pkt.topic);
-                        hub.apply_set_command(rel, &payload_str);
+                        if let Some(hub) = weak_hub.upgrade() {
+                            hub.apply_set_command(rel, &payload_str);
+                            let _ = hub.set_cmd_tx.send((rel.to_string(), payload_str));
+                        } else {
+                            return;
+                        }
                     }
                 }
                 Ok(_) => {}
@@ -1205,12 +1349,24 @@ async fn run_mqtt_loop(
                 }
             }
         }
+        *active_client.write().unwrap_or_else(|e| e.into_inner()) = None;
+        if reconfigured {
+            backoff_secs = 2;
+            continue;
+        }
         tokio::select! {
             biased;
             _ = closed_rx.changed() => {
                 if *closed_rx.borrow() {
                     return;
                 }
+            }
+            chg = cfg_rx.changed() => {
+                if chg.is_err() {
+                    return;
+                }
+                backoff_secs = 2;
+                continue;
             }
             _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
         }

@@ -9,10 +9,10 @@ use anyhow::{Context, Result};
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoConnBuilder;
-use ninjanvr_config::{DEFAULT_CONFIG_PATH, DEFAULT_GO2RTC_SHM_PATH};
+use ninjanvr_config::DEFAULT_CONFIG_PATH;
 use ninjanvr_server::{
     DEFAULT_METRICS_PORT, build_metrics_router, build_router_with_auth,
-    generate_self_signed_tls_config, generate_self_signed_tls_config_with_sans, new_app_state,
+    load_or_generate_tls_config, new_app_state,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
@@ -335,7 +335,7 @@ pub fn ensure_private_key_permissions(key_path: &Path) -> Result<()> {
             );
         }
         let mode = f_meta.permissions().mode() & 0o777;
-        if mode != 0o600 {
+        if (mode & 0o077) != 0 {
             let mut perms = f_meta.permissions();
             perms.set_mode(0o600);
             file.set_permissions(perms).with_context(|| {
@@ -615,10 +615,11 @@ pub fn cleanup_supervised_processes_and_shm(
     for &pid in std::iter::once(&go2rtc_pid).chain(camera_pids.iter()) {
         if pid > 1 && pid != self_pid {
             #[cfg(unix)]
-            {
-                let _ = std::process::Command::new("kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .status();
+            if let Ok(raw_pid) = i32::try_from(pid) {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(raw_pid),
+                    nix::sys::signal::Signal::SIGTERM,
+                );
             }
         }
     }
@@ -758,9 +759,9 @@ async fn main() -> Result<()> {
 
     let state = new_app_state(&config_path, web_dir, media_dir, spawn_go2rtc).await?;
     state.set_active_listener_ports(http_port, https_port, metrics_port);
-    let (raw_san_hosts, mqtt_client_key) = {
+    let (tls_cfg_snapshot, mqtt_client_key) = {
         let cfg = state.config.read().await;
-        (cfg.tls.san_hosts.clone(), cfg.mqtt.tls_client_key.clone())
+        (cfg.tls.clone(), cfg.mqtt.tls_client_key.clone())
     };
     if let Some(ref key_path) = mqtt_client_key
         && std::fs::symlink_metadata(key_path).is_ok()
@@ -768,7 +769,14 @@ async fn main() -> Result<()> {
     {
         warn!("MQTT TLS private key permission check warning: {err:#}");
     }
-    let san_hosts = sanitize_san_hosts(&raw_san_hosts);
+    if let Some(ref tls_key_path) = tls_cfg_snapshot.key_path
+        && std::fs::symlink_metadata(tls_key_path).is_ok()
+        && let Err(err) = ensure_private_key_permissions(tls_key_path)
+    {
+        warn!("HTTPS TLS private key permission check warning: {err:#}");
+    }
+    let san_hosts = sanitize_san_hosts(&tls_cfg_snapshot.san_hosts);
+    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("/config"));
     let go2rtc_supervisor = state.go2rtc_supervisor.clone();
     let camera_metrics = state.camera_metrics.clone();
     let enforce_http_auth = resolve_enforce_http_auth(
@@ -900,15 +908,7 @@ async fn main() -> Result<()> {
     // 2. Run HTTPS server on :8971 (external authenticated TLS port)
     let https_addr = SocketAddr::from(([0, 0, 0, 0], https_port));
     let https_listener = TcpListener::bind(https_addr).await?;
-    let tls_config = match generate_self_signed_tls_config_with_sans(&san_hosts) {
-        Ok(cfg) => cfg,
-        Err(err) => {
-            warn!(
-                "Failed to build TLS certificate with custom SANs ({err:#}); falling back to default SANs"
-            );
-            generate_self_signed_tls_config()?
-        }
-    };
+    let tls_config = load_or_generate_tls_config(&tls_cfg_snapshot, config_dir, &san_hosts)?;
     let tls_acceptor = TlsAcceptor::from(tls_config);
     let https_conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     info!("Listening on HTTPS https://{https_addr}");
@@ -973,8 +973,14 @@ async fn main() -> Result<()> {
         });
     }
 
-    state_for_shutdown.pipeline.shutdown().await;
-    state_for_shutdown.recorder.shutdown().await;
+    // Drain in-flight HTTPS connections (up to 3s) and stop all supervised background services
+    // before removing `/dev/shm/go2rtc.yaml` so `Go2RtcSupervisor` never rewrites credentials during exit.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(3),
+        https_conn_sem.acquire_many(MAX_CONCURRENT_CONNECTIONS as u32),
+    )
+    .await;
+    state_for_shutdown.shutdown().await;
 
     let cam_pids: Vec<u32> = camera_metrics
         .read()
@@ -985,7 +991,7 @@ async fn main() -> Result<()> {
     cleanup_supervised_processes_and_shm(
         go2rtc_supervisor.pid(),
         &cam_pids,
-        Path::new(DEFAULT_GO2RTC_SHM_PATH),
+        go2rtc_supervisor.shm_config_path(),
     );
     Ok(())
 }
@@ -993,6 +999,9 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ninjanvr_server::{
+        generate_self_signed_tls_config, generate_self_signed_tls_config_with_sans,
+    };
 
     #[test]
     fn sanitize_peer_ip_and_host_headers_overwrites_spoofed_peer_ip_and_populates_host() {

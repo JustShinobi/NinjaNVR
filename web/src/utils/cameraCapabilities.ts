@@ -928,7 +928,10 @@ export function createCameraHardwareCacheController(
     notify(clean);
   };
 
+  let cacheEpoch = 0;
+
   const invalidateCameraHardwareCache = (cam?: string): void => {
+    cacheEpoch += 1;
     const clean = (cam || "").trim();
     if (clean) {
       hardwareByCam.delete(clean);
@@ -1000,6 +1003,7 @@ export function createCameraHardwareCacheController(
       }
     }
 
+    const probeEpoch = cacheEpoch;
     const task = (async (): Promise<CameraHardwareProbeSnapshot> => {
       let hwData: CameraHardwareInfoResponse | null = force
         ? null
@@ -1018,7 +1022,9 @@ export function createCameraHardwareCacheController(
               .catch(() => null)) as CameraHardwareInfoResponse | null;
             if (parsed) {
               hwData = parsed;
-              hardwareByCam.set(cleanCam, parsed);
+              if (probeEpoch === cacheEpoch) {
+                hardwareByCam.set(cleanCam, parsed);
+              }
             }
           }
         } catch {
@@ -1046,7 +1052,9 @@ export function createCameraHardwareCacheController(
               .catch(() => null)) as CameraPtzInfoResponse | null;
             if (parsedPtz) {
               ptzData = parsedPtz;
-              ptzByCam.set(cleanCam, parsedPtz);
+              if (probeEpoch === cacheEpoch) {
+                ptzByCam.set(cleanCam, parsedPtz);
+              }
             }
           }
         } catch {
@@ -1054,7 +1062,9 @@ export function createCameraHardwareCacheController(
         }
       }
 
-      notify(cleanCam);
+      if (probeEpoch === cacheEpoch) {
+        notify(cleanCam);
+      }
       return {
         hardware: hwData ?? hardwareByCam.get(cleanCam) ?? null,
         ptz: ptzData ?? ptzByCam.get(cleanCam) ?? null,

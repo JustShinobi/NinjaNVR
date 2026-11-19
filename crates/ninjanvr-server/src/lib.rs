@@ -131,14 +131,40 @@ pub struct AppState {
     pub media_delivery_gate: MediaDeliveryGate,
     pub live_gateway: LiveStreamGateway,
     pub debug_reprocess_semaphore: Arc<tokio::sync::Semaphore>,
+    pub vod_remux_semaphore: Arc<tokio::sync::Semaphore>,
     pub metrics_scrape_semaphore: Arc<tokio::sync::Semaphore>,
     pub unscoped_metrics_cache: Arc<tokio::sync::Mutex<Option<(Instant, u64, String)>>>,
+    pub camera_logs_cooldown: Arc<std::sync::Mutex<HashMap<String, (Instant, Value)>>>,
+    pub shutdown_tx: tokio::sync::watch::Sender<bool>,
     pub active_listener_ports: Arc<std::sync::RwLock<(u16, u16, u16)>>,
     #[doc(hidden)]
     pub allow_ephemeral_loopback_federation_for_test: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
+    /// Runs a blocking SQLite closure on Tokio's `spawn_blocking` pool so async HTTP/WS worker
+    /// threads never stall on `Condvar::wait` or `PRAGMA busy_timeout`.
+    pub async fn run_db<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&NinjaDatabase) -> Result<T> + Send + 'static,
+    {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || f(&db))
+            .await
+            .context("database blocking task panicked")?
+    }
+
+    /// Coordinates graceful shutdown of background tasks, MQTT, MSE sessions, vision workers,
+    /// recorders, and the `go2rtc` supervisor (removing ephemeral `/dev/shm/go2rtc.yaml`).
+    pub async fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+        self.comms.shutdown_mqtt();
+        self.mse_hub.shutdown().await;
+        self.pipeline.shutdown().await;
+        self.recorder.shutdown().await;
+        self.go2rtc_supervisor.shutdown().await;
+    }
     #[doc(hidden)]
     pub fn enable_ephemeral_loopback_federation_for_test(&self) {
         self.allow_ephemeral_loopback_federation_for_test
@@ -288,6 +314,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
 
     let api_router = Router::new()
         .route("/healthz", get(api_healthz))
+        .route("/readyz", get(api_readyz))
         .route("/version", get(api_version))
         .route("/ui/switch", get(api_ui_switch))
         .route("/ui/version", get(api_ui_version))
@@ -322,7 +349,12 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/config/set", put(api_config_set))
         .route("/config/schema.json", get(api_config_schema))
         .route("/detectors/catalog", get(api_detectors_catalog))
-        .route("/detectors/models/upload", post(api_detector_model_upload))
+        .route(
+            "/detectors/models/upload",
+            post(api_detector_model_upload).layer(axum::extract::DefaultBodyLimit::max(
+                MAX_MODEL_UPLOAD_BYTES + 2 * 1024 * 1024,
+            )),
+        )
         .route("/dataset/summary", get(api_dataset_summary))
         .route("/dataset/samples", get(api_dataset_samples))
         .route(
@@ -556,6 +588,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .nest("/api", api_router)
         .route("/share/{token}", get(share_player_page))
         .route("/healthz", get(api_healthz))
+        .route("/readyz", get(api_readyz))
         .route("/version", get(api_version))
         .route("/metrics", get(api_prometheus_metrics))
         .route("/auth", get(api_auth_verify))
@@ -633,6 +666,8 @@ pub fn build_metrics_router(state: AppState) -> Router {
         .route("/api/metrics", get(telemetry_prometheus_metrics))
         .route("/healthz", get(api_healthz))
         .route("/api/healthz", get(api_healthz))
+        .route("/readyz", get(api_readyz))
+        .route("/api/readyz", get(api_readyz))
         .route("/version", get(api_version))
         .route("/api/version", get(api_version))
         .fallback(telemetry_not_found)
@@ -701,6 +736,8 @@ fn read_contained_web_asset_sync(base_dir: &Path, candidate: &Path) -> Option<Ve
     Some(bytes)
 }
 
+const SPA_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob: https:; media-src 'self' blob:; worker-src 'self' blob:; child-src 'self' blob:; frame-src 'self'; connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'self'; object-src 'none'";
+
 async fn serve_login_page(State(state): State<AppState>) -> Response {
     let web_dir = state.web_dir.clone();
     let index_path = web_dir.join("index.html");
@@ -712,7 +749,11 @@ async fn serve_login_page(State(state): State<AppState>) -> Response {
     .ok()
     .flatten();
     match html_opt {
-        Some(html) => Html(html).into_response(),
+        Some(html) => (
+            [(header::CONTENT_SECURITY_POLICY, SPA_CONTENT_SECURITY_POLICY)],
+            Html(html),
+        )
+            .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -750,6 +791,7 @@ async fn serve_spa_fallback(State(state): State<AppState>, uri: axum::http::Uri)
                 Some("ico") => "image/x-icon",
                 Some("webp") => "image/webp",
                 Some("json" | "webmanifest") => "application/json; charset=utf-8",
+                Some("woff2") => "font/woff2",
                 Some("txt") => "text/plain; charset=utf-8",
                 Some("html") => "text/html; charset=utf-8",
                 _ => "application/octet-stream",
@@ -760,6 +802,16 @@ async fn serve_spa_fallback(State(state): State<AppState>, uri: axum::http::Uri)
         .ok()
         .flatten();
         if let Some((mime, bytes)) = resolved_asset {
+            if mime.starts_with("text/html") {
+                return (
+                    [
+                        (header::CONTENT_TYPE, mime),
+                        (header::CONTENT_SECURITY_POLICY, SPA_CONTENT_SECURITY_POLICY),
+                    ],
+                    bytes,
+                )
+                    .into_response();
+            }
             return ([(header::CONTENT_TYPE, mime)], bytes).into_response();
         }
     }
@@ -773,7 +825,11 @@ async fn serve_spa_fallback(State(state): State<AppState>, uri: axum::http::Uri)
     .ok()
     .flatten();
     match html_opt {
-        Some(html) => Html(html).into_response(),
+        Some(html) => (
+            [(header::CONTENT_SECURITY_POLICY, SPA_CONTENT_SECURITY_POLICY)],
+            Html(html),
+        )
+            .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -785,6 +841,34 @@ async fn api_healthz() -> Response {
             (header::CACHE_CONTROL, "no-store"),
         ],
         "ok\n",
+    )
+        .into_response()
+}
+
+async fn api_readyz(State(state): State<AppState>) -> Response {
+    let db_ok = state
+        .run_db(|db| {
+            db.with_read_conn(|conn| Ok(conn.query_row("SELECT 1", [], |r| r.get::<_, i32>(0))?))
+        })
+        .await
+        .is_ok_and(|v| v == 1);
+    let storage_degraded = state
+        .storage_degraded
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let status = if db_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "ready": db_ok,
+            "database": db_ok,
+            "storage_degraded": storage_degraded,
+            "go2rtc_pid": state.go2rtc_supervisor.pid()
+        })),
     )
         .into_response()
 }
@@ -908,7 +992,7 @@ async fn api_users(State(state): State<AppState>, jar: CookieJar, headers: Heade
     if let Err(err_resp) = authorize_admin_read(&state, &jar, &headers).await {
         return err_resp.into_response();
     }
-    let users = state.db.list_users().unwrap_or_default();
+    let users = state.run_db(|db| db.list_users()).await.unwrap_or_default();
     Json(Value::Array(users)).into_response()
 }
 
@@ -1118,18 +1202,29 @@ async fn api_user_role(
         )
             .into_response();
     }
-    match state.db.update_user_role_with_cameras(
-        &username,
-        &body.role,
-        body.allowed_cameras.as_deref(),
-    ) {
+    let u_owned = username.clone();
+    let r_owned = body.role.clone();
+    let c_owned = body.allowed_cameras.clone();
+    let update_res = state
+        .run_db(move |db| db.update_user_role_with_cameras(&u_owned, &r_owned, c_owned.as_deref()))
+        .await;
+    match update_res {
         Ok(true) => {
             state.auth_gate.invalidate_user(&username);
-            if let Err(err) = state.share_engine.on_creator_permissions_changed(
-                &state,
-                &username,
-                Some(&body.role),
-            ) {
+            let st_for_share = state.clone();
+            let u_share = username.clone();
+            let r_share = body.role.clone();
+            let share_res = tokio::task::spawn_blocking(move || {
+                st_for_share.share_engine.on_creator_permissions_changed(
+                    &st_for_share,
+                    &u_share,
+                    Some(&r_share),
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+            .and_then(|r| r);
+            if let Err(err) = share_res {
                 warn!("Failed to revoke share links for demoted user '{username}': {err}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1140,10 +1235,11 @@ async fn api_user_role(
                 )
                     .into_response();
             }
+            let users = state.run_db(|db| db.list_users()).await.unwrap_or_default();
             Json(json!({
                 "success": true,
                 "message": format!("Role updated for '{username}'"),
-                "users": state.db.list_users().unwrap_or_default()
+                "users": users
             }))
             .into_response()
         }
@@ -1171,19 +1267,29 @@ async fn api_user_cameras(
     if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
         return err_resp.into_response();
     }
+    let u_owned = username.clone();
+    let cams_owned = body.allowed_cameras.clone();
     match state
-        .db
-        .update_user_allowed_cameras(&username, &body.allowed_cameras)
+        .run_db(move |db| db.update_user_allowed_cameras(&u_owned, &cams_owned))
+        .await
     {
         Ok(true) => {
             state.auth_gate.invalidate_user(&username);
-            let _ = state
-                .share_engine
-                .on_creator_permissions_changed(&state, &username, None);
+            let st_for_share = state.clone();
+            let u_share = username.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                st_for_share.share_engine.on_creator_permissions_changed(
+                    &st_for_share,
+                    &u_share,
+                    None,
+                )
+            })
+            .await;
+            let users = state.run_db(|db| db.list_users()).await.unwrap_or_default();
             Json(json!({
                 "success": true,
                 "message": format!("Allowed cameras updated for '{username}'"),
-                "users": state.db.list_users().unwrap_or_default()
+                "users": users
             }))
             .into_response()
         }
@@ -1210,13 +1316,24 @@ async fn api_user_delete(
     if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
         return err_resp.into_response();
     }
-    match state.db.delete_user(&username) {
+    let u_owned = username.clone();
+    match state.run_db(move |db| db.delete_user(&u_owned)).await {
         Ok(true) => {
-            state.auth_gate.invalidate_user(&username);
+            state.auth_gate.record_user_deleted(&username, unix_now());
             state
                 .auth_gate
                 .clear_all_login_failures_for_user(username.trim());
-            if let Err(err) = state.share_engine.on_creator_deleted(&state, &username) {
+            let st_for_share = state.clone();
+            let u_share = username.clone();
+            let share_res = tokio::task::spawn_blocking(move || {
+                st_for_share
+                    .share_engine
+                    .on_creator_deleted(&st_for_share, &u_share)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+            .and_then(|r| r);
+            if let Err(err) = share_res {
                 warn!("Failed to revoke share links for deleted user '{username}': {err}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1227,10 +1344,11 @@ async fn api_user_delete(
                 )
                     .into_response();
             }
+            let users = state.run_db(|db| db.list_users()).await.unwrap_or_default();
             Json(json!({
                 "success": true,
                 "message": format!("User '{username}' deleted"),
-                "users": state.db.list_users().unwrap_or_default()
+                "users": users
             }))
             .into_response()
         }
@@ -1268,7 +1386,10 @@ async fn api_tokens_list(
     if let Err(err_resp) = authorize_admin_read(&state, &jar, &headers).await {
         return err_resp.into_response();
     }
-    let tokens = state.db.list_api_tokens().unwrap_or_default();
+    let tokens = state
+        .run_db(|db| db.list_api_tokens())
+        .await
+        .unwrap_or_default();
     Json(Value::Array(tokens)).into_response()
 }
 
@@ -1309,17 +1430,23 @@ async fn api_token_create(
     let expires_at = body
         .expires_in_days
         .map(|d| (unix_now() as f64) + (d as f64) * 86400.0);
+    let name_owned = body.name.clone();
+    let scope_owned = body.scope.clone();
     match state
-        .db
-        .create_api_token(&body.name, &body.scope, expires_at)
+        .run_db(move |db| {
+            let (meta, plaintext) = db.create_api_token(&name_owned, &scope_owned, expires_at)?;
+            let tokens = db.list_api_tokens().unwrap_or_default();
+            Ok((meta, plaintext, tokens))
+        })
+        .await
     {
-        Ok((meta, plaintext)) => {
+        Ok((meta, plaintext, tokens)) => {
             state.auth_gate.invalidate_tokens();
             Json(json!({
                 "success": true,
                 "token": plaintext,
                 "metadata": meta,
-                "tokens": state.db.list_api_tokens().unwrap_or_default()
+                "tokens": tokens
             }))
             .into_response()
         }
@@ -1341,22 +1468,36 @@ async fn api_token_delete(
     if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
         return err_resp.into_response();
     }
-    let token_name = state.db.list_api_tokens().ok().and_then(|tokens| {
-        tokens.into_iter().find_map(|item| {
-            if item["id"].as_str() == Some(id.trim()) {
-                item["name"].as_str().map(str::to_string)
-            } else {
-                None
-            }
+    let id_for_lookup = id.clone();
+    let (token_name, del_res) = state
+        .run_db(move |db| {
+            let tname = db.list_api_tokens().ok().and_then(|tokens| {
+                tokens.into_iter().find_map(|item| {
+                    if item["id"].as_str() == Some(id_for_lookup.trim()) {
+                        item["name"].as_str().map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+            });
+            Ok((tname, db.delete_api_token(&id_for_lookup)))
         })
-    });
-    match state.db.delete_api_token(&id) {
+        .await
+        .unwrap_or_else(|e| (None, Err(e)));
+    match del_res {
         Ok(true) => {
             state.auth_gate.invalidate_tokens();
-            if let Err(err) = state
-                .share_engine
-                .on_creator_token_revoked(&state, token_name.as_deref())
-            {
+            let st_for_share = state.clone();
+            let tname_share = token_name.clone();
+            let share_res = tokio::task::spawn_blocking(move || {
+                st_for_share
+                    .share_engine
+                    .on_creator_token_revoked(&st_for_share, tname_share.as_deref())
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+            .and_then(|r| r);
+            if let Err(err) = share_res {
                 let name = token_name.as_deref().unwrap_or("");
                 warn!("Failed to revoke share links for deleted token '{name}': {err}");
                 return (
@@ -1368,9 +1509,13 @@ async fn api_token_delete(
                 )
                     .into_response();
             }
+            let tokens = state
+                .run_db(|db| db.list_api_tokens())
+                .await
+                .unwrap_or_default();
             Json(json!({
                 "success": true,
-                "tokens": state.db.list_api_tokens().unwrap_or_default()
+                "tokens": tokens
             }))
             .into_response()
         }
@@ -3682,7 +3827,10 @@ async fn api_review(
         after: q.after,
         limit: q.limit,
     };
-    let items = state.db.query_reviews(&filter).unwrap_or_default();
+    let items = state
+        .run_db(move |db| db.query_reviews(&filter))
+        .await
+        .unwrap_or_default();
     Json(serde_json::to_value(items).unwrap_or_else(|_| json!([])))
 }
 
@@ -3695,8 +3843,8 @@ async fn api_review_summary(
     let allowed = effective_caller_allowed_cameras(&state, &jar, &headers).await;
     let cams = scope_cameras_filter(split_csv_opt(&q.cameras), allowed);
     let summary = state
-        .db
-        .query_review_summary(cams.as_deref())
+        .run_db(move |db| db.query_review_summary(cams.as_deref()))
+        .await
         .unwrap_or_else(|_| json!({}));
     Json(summary)
 }
@@ -3713,8 +3861,8 @@ async fn api_review_activity_motion(
     let allowed = effective_caller_allowed_cameras(&state, &jar, &headers).await;
     let cams = scope_cameras_filter(split_csv_opt(&q.cameras), allowed);
     let activity = state
-        .db
-        .query_motion_activity(cams.as_deref(), after, before)
+        .run_db(move |db| db.query_motion_activity(cams.as_deref(), after, before))
+        .await
         .unwrap_or_default();
     Json(Value::Array(activity))
 }
@@ -3725,7 +3873,8 @@ async fn api_review_by_id(
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    match state.db.get_review_by_id(&id) {
+    let id_owned = id.clone();
+    match state.run_db(move |db| db.get_review_by_id(&id_owned)).await {
         Ok(Some(item)) => {
             if let Some(allowed) = effective_caller_allowed_cameras(&state, &jar, &headers).await
                 && !allowed.iter().any(|a| a == &item.camera)
@@ -3983,7 +4132,10 @@ async fn api_review_unview_one(
                 .into_response();
         }
     }
-    if let Err(err) = state.db.mark_reviews_viewed(&[id], false) {
+    if let Err(err) = state
+        .run_db(move |db| db.mark_reviews_viewed(&[id], false))
+        .await
+    {
         warn!("Failed to mark review unviewed: {err}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -4031,33 +4183,48 @@ async fn api_reviews_viewed(
         )
             .into_response();
     }
-    if let Some(allowed) = effective_caller_allowed_cameras(&state, &jar, &headers).await {
-        for id in &body.ids {
-            let permitted = state
-                .db
-                .get_review_by_id(id)
-                .ok()
-                .flatten()
-                .is_some_and(|r| allowed.iter().any(|a| a == &r.camera));
-            if !permitted {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({ "success": false, "message": "Camera is not permitted for this user" })),
-                )
-                    .into_response();
+    let allowed_opt = effective_caller_allowed_cameras(&state, &jar, &headers).await;
+    let ids_owned = body.ids.clone();
+    let reviewed = body.reviewed;
+    let res = state
+        .run_db(move |db| {
+            if let Some(ref allowed) = allowed_opt {
+                for id in &ids_owned {
+                    let permitted = db
+                        .get_review_by_id(id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|r| allowed.iter().any(|a| a == &r.camera));
+                    if !permitted {
+                        return Ok(false);
+                    }
+                }
             }
+            db.mark_reviews_viewed(&ids_owned, reviewed).map(|_| true)
+        })
+        .await;
+    match res {
+        Ok(false) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(
+                    json!({ "success": false, "message": "Camera is not permitted for this user" }),
+                ),
+            )
+                .into_response();
         }
-    }
-    if let Err(err) = state.db.mark_reviews_viewed(&body.ids, body.reviewed) {
-        warn!("Failed to mark reviews viewed: {err}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "success": false,
-                "message": "Failed to update review state"
-            })),
-        )
-            .into_response();
+        Err(err) => {
+            warn!("Failed to mark reviews viewed: {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "message": "Failed to update review state"
+                })),
+            )
+                .into_response();
+        }
+        Ok(true) => {}
     }
     Json(json!({ "success": true })).into_response()
 }
@@ -4225,7 +4392,10 @@ async fn api_events(
         after: q.after,
         limit: q.limit,
     };
-    let mut events = state.db.query_events(&filter).unwrap_or_default();
+    let mut events = state
+        .run_db(move |db| db.query_events(&filter))
+        .await
+        .unwrap_or_default();
     redact_event_slice_thumbnails_if_masked(&state.config, &mut events).await;
     Json(Value::Array(events))
 }
@@ -4238,7 +4408,10 @@ async fn api_event_ids(
 ) -> Json<Value> {
     let mut ids = split_csv_opt(&q.ids).unwrap_or_default();
     ids.truncate(MAX_BULK_IDS);
-    let mut events = state.db.get_events_by_ids(&ids).unwrap_or_default();
+    let mut events = state
+        .run_db(move |db| db.get_events_by_ids(&ids))
+        .await
+        .unwrap_or_default();
     if let Some(allowed) = effective_caller_allowed_cameras(&state, &jar, &headers).await {
         events.retain(|ev| {
             ev["camera"]
@@ -4263,8 +4436,8 @@ async fn api_events_explore(
         .await
         .map_or_else(|_| CameraScope::Allowed(Vec::new()), |p| p.camera_scope());
     let mut events = state
-        .db
-        .query_events_explore_scoped(limit as i64, &scope)
+        .run_db(move |db| db.query_events_explore_scoped(limit as i64, &scope))
+        .await
         .unwrap_or_default();
     redact_event_slice_thumbnails_if_masked(&state.config, &mut events).await;
     Json(Value::Array(events))
@@ -4281,8 +4454,8 @@ async fn api_events_summary(
         .await
         .map_or_else(|_| CameraScope::Allowed(Vec::new()), |p| p.camera_scope());
     let summary = state
-        .db
-        .query_events_summary_scoped(&scope)
+        .run_db(move |db| db.query_events_summary_scoped(&scope))
+        .await
         .unwrap_or_else(|_| Value::Array(Vec::new()));
     Json(summary)
 }
@@ -4293,7 +4466,8 @@ async fn api_event_by_id(
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    match state.db.get_event(&id) {
+    let id_owned = id.clone();
+    match state.run_db(move |db| db.get_event(&id_owned)).await {
         Ok(Some(mut ev)) => {
             if let Some(allowed) = effective_caller_allowed_cameras(&state, &jar, &headers).await
                 && !ev["camera"]
@@ -4794,6 +4968,8 @@ async fn api_detector_model_upload(
                 .into_response();
         };
         let mut field_count: usize = 0;
+        let mut total_multipart_bytes: usize = 0;
+        let max_total_multipart = MAX_MODEL_UPLOAD_BYTES * 2 + MAX_LABELMAP_UPLOAD_BYTES + 65_536;
         loop {
             match mp.next_field().await {
                 Ok(Some(field)) => {
@@ -4816,7 +4992,10 @@ async fn api_detector_model_upload(
                         )
                             .into_response();
                     };
-                    if raw_data.len() > MAX_MODEL_UPLOAD_BYTES {
+                    total_multipart_bytes = total_multipart_bytes.saturating_add(raw_data.len());
+                    if raw_data.len() > MAX_MODEL_UPLOAD_BYTES
+                        || total_multipart_bytes > max_total_multipart
+                    {
                         return (
                             StatusCode::PAYLOAD_TOO_LARGE,
                             Json(json!({ "success": false, "message": "Multipart field exceeds maximum upload size" })),
@@ -6036,6 +6215,117 @@ async fn api_streams_probe(
         .into_response();
     }
 
+    async fn resolve_and_pin_rtsp_probe_url(raw_url: &str, state: &AppState) -> Option<String> {
+        let (scheme, after_scheme) = raw_url.split_once("://")?;
+        let auth_end = after_scheme
+            .find(['/', '?', '#', '\\'])
+            .unwrap_or(after_scheme.len());
+        let authority = &after_scheme[..auth_end];
+        let path_and_rest = &after_scheme[auth_end..];
+        let (userinfo_prefix, host_port) = match authority.rfind('@') {
+            Some(idx) => (&authority[..=idx], &authority[idx + 1..]),
+            None => ("", authority),
+        };
+        let default_port = if scheme.eq_ignore_ascii_case("rtsps") {
+            322u16
+        } else {
+            554u16
+        };
+        let (raw_host, port, explicit_port) = if let Some(after_b) = host_port.strip_prefix('[') {
+            let (v6_str, rest) = after_b.split_once(']')?;
+            if rest.is_empty() {
+                (v6_str, default_port, false)
+            } else {
+                let p = rest.strip_prefix(':')?.parse::<u16>().ok()?;
+                (v6_str, p, true)
+            }
+        } else if let Some((h, p_str)) = host_port.rsplit_once(':') {
+            if h.contains(':') {
+                return None;
+            }
+            let p = p_str.parse::<u16>().ok()?;
+            (h, p, true)
+        } else {
+            (host_port, default_port, false)
+        };
+        if port == 0
+            || state.is_active_listener_port(port)
+            || (port != 8554 && ninjanvr_config::is_disallowed_internal_service_port(port))
+        {
+            return None;
+        }
+        let clean_host = raw_host.trim().trim_end_matches('.');
+        if let Ok(ip) = clean_host.parse::<std::net::IpAddr>() {
+            return match ip {
+                std::net::IpAddr::V4(v4) => {
+                    if dataset_catalog::is_disallowed_genai_ipv4(v4) {
+                        None
+                    } else {
+                        Some(raw_url.to_string())
+                    }
+                }
+                std::net::IpAddr::V6(v6) => {
+                    if !v6.is_loopback() && dataset_catalog::is_disallowed_ssrf_ipv6(v6, false) {
+                        None
+                    } else {
+                        Some(raw_url.to_string())
+                    }
+                }
+            };
+        }
+        let allow_loopback = clean_host.eq_ignore_ascii_case("localhost");
+        let resolved: Vec<std::net::SocketAddr> = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::net::lookup_host((clean_host, port)),
+        )
+        .await
+        .ok()?
+        .ok()?
+        .collect();
+        if resolved.is_empty() {
+            return None;
+        }
+        for addr in &resolved {
+            let p = addr.port();
+            if p == 0
+                || state.is_active_listener_port(p)
+                || (p != 8554 && ninjanvr_config::is_disallowed_internal_service_port(p))
+            {
+                return None;
+            }
+            let bad_ip = match addr.ip() {
+                std::net::IpAddr::V4(v4) => {
+                    (!allow_loopback && v4.is_loopback())
+                        || dataset_catalog::is_disallowed_genai_ipv4(v4)
+                }
+                std::net::IpAddr::V6(v6) => {
+                    (!allow_loopback && v6.is_loopback())
+                        || (!v6.is_loopback()
+                            && dataset_catalog::is_disallowed_ssrf_ipv6(v6, false))
+                }
+            };
+            if bad_ip {
+                return None;
+            }
+        }
+        if scheme.eq_ignore_ascii_case("rtsps") {
+            // Preserve original hostname on TLS RTSPS so FFmpeg/OpenSSL sends TLS SNI and validates X.509 SANs.
+            return Some(raw_url.to_string());
+        }
+        let chosen_ip = resolved[0].ip();
+        let formatted_host = match chosen_ip {
+            std::net::IpAddr::V4(v4) => v4.to_string(),
+            std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+        };
+        let rebuilt_host_port = if explicit_port {
+            format!("{formatted_host}:{port}")
+        } else {
+            formatted_host
+        };
+        Some(format!(
+            "{scheme}://{userinfo_prefix}{rebuilt_host_port}{path_and_rest}"
+        ))
+    }
     let probe_explicit_port = resolved_url.split_once("://").and_then(|(_, after)| {
         let auth_end = after.find(['/', '?', '#', '\\']).unwrap_or(after.len());
         let host_port = match after[..auth_end].rfind('@') {
@@ -6063,6 +6353,18 @@ async fn api_streams_probe(
         )
             .into_response();
     }
+    let Some(pinned_probe_url) = resolve_and_pin_rtsp_probe_url(&resolved_url, &state).await else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "latency_ms": started.elapsed().as_millis() as u64,
+                "streams": [],
+                "error": "Disallowed or unresolvable stream probe host"
+            })),
+        )
+            .into_response();
+    };
 
     let ffprobe_bin = resolve_ffprobe_bin();
     let mut cmd = tokio::process::Command::new(&ffprobe_bin);
@@ -6083,7 +6385,7 @@ async fn api_streams_probe(
         "json",
         "-show_streams",
         "--",
-        &resolved_url,
+        &pinned_probe_url,
     ]);
 
     match tokio::time::timeout(std::time::Duration::from_secs(8), cmd.output()).await {
@@ -6702,9 +7004,13 @@ async fn api_timeline(
         merged.truncate(limit);
         return Json(Value::Array(merged));
     }
+    let norm_cam_owned = normalized_cam.map(str::to_string);
+    let src_id_owned = q.source_id.clone();
     let items = state
-        .db
-        .query_timeline(normalized_cam, q.source_id.as_deref(), limit)
+        .run_db(move |db| {
+            db.query_timeline(norm_cam_owned.as_deref(), src_id_owned.as_deref(), limit)
+        })
+        .await
         .unwrap_or_default();
     Json(Value::Array(items))
 }
@@ -6714,7 +7020,10 @@ async fn api_exports(
     jar: CookieJar,
     headers: HeaderMap,
 ) -> Json<Value> {
-    let mut exports = state.db.query_exports().unwrap_or_default();
+    let mut exports = state
+        .run_db(|db| db.query_exports())
+        .await
+        .unwrap_or_default();
     let allowed = state
         .auth_gate
         .authenticate_read(&state, &jar, &headers)
@@ -7122,14 +7431,18 @@ async fn api_export_job_cancel(
             .into_response();
     }
     let existing_job = state.export_jobs.get(&id);
-    let target_cam = existing_job.as_ref().map(|j| j.camera.clone()).or_else(|| {
-        state
-            .db
-            .get_export_by_id(&id)
-            .ok()
-            .flatten()
-            .and_then(|exp| exp["camera"].as_str().map(|s| s.trim().to_string()))
-    });
+    let target_cam = match existing_job.as_ref().map(|j| j.camera.clone()) {
+        Some(c) => Some(c),
+        None => {
+            let id_owned = id.clone();
+            state
+                .run_db(move |db| db.get_export_by_id(&id_owned))
+                .await
+                .ok()
+                .flatten()
+                .and_then(|exp| exp["camera"].as_str().map(|s| s.trim().to_string()))
+        }
+    };
     let Some(cam) = target_cam else {
         return (
             StatusCode::NOT_FOUND,
@@ -10676,6 +10989,9 @@ async fn api_camera_logs_get(
     AxumPath(camera): AxumPath<String>,
     Query(q): Query<HardwareQueryParams>,
 ) -> Response {
+    if let Err(err_resp) = authorize_admin_read(&state, &jar, &headers).await {
+        return err_resp.into_response();
+    }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
         && !allowed.iter().any(|a| a == &camera || a == "*")
     {
@@ -10684,6 +11000,12 @@ async fn api_camera_logs_get(
             Json(json!({ "message": "Camera is not permitted for this user" })),
         )
             .into_response();
+    }
+    if let Ok(guard) = state.camera_logs_cooldown.lock()
+        && let Some((cached_at, cached_val)) = guard.get(&camera)
+        && cached_at.elapsed() < Duration::from_secs(5)
+    {
+        return Json(cached_val.clone()).into_response();
     }
 
     let (cam_opt, probe_target) = {
@@ -10758,8 +11080,18 @@ async fn api_camera_logs_get(
     for line in &report.lines {
         state.log_hub.push_camera(&camera, "INFO", line);
     }
+    let report_val = serde_json::to_value(&report).unwrap_or_else(|_| json!({}));
+    if let Ok(mut guard) = state.camera_logs_cooldown.lock() {
+        if guard.len() >= 128 && !guard.contains_key(&camera) {
+            guard.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(5));
+            if guard.len() >= 128 {
+                guard.clear();
+            }
+        }
+        guard.insert(camera, (Instant::now(), report_val.clone()));
+    }
 
-    Json(report).into_response()
+    Json(report_val).into_response()
 }
 
 async fn api_camera_audio_talkback(
@@ -12040,6 +12372,15 @@ async fn ws_go2rtc_proxy(
         )
             .into_response();
     }
+    let caller_can_talkback = caller_can_mutate(&state, &jar, &headers, false).await;
+    if !caller_can_talkback && auth_gate::query_targets_talkback_variant(uri.query(), Some(&known))
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "Read-only role is not permitted to use audio talkback" })),
+        )
+            .into_response();
+    }
     let ws = match ws_res {
         Ok(ws) => ws,
         Err(rej) => return rej.into_response(),
@@ -12050,7 +12391,13 @@ async fn ws_go2rtc_proxy(
         .on_upgrade(move |client_ws| async move {
             state
                 .live_gateway
-                .bridge_ws(client_ws, &state.go2rtc_ws_base, query, is_webrtc_ws)
+                .bridge_ws_with_talkback_guard(
+                    client_ws,
+                    &state.go2rtc_ws_base,
+                    query,
+                    is_webrtc_ws,
+                    caller_can_talkback,
+                )
                 .await;
         })
         .into_response()
@@ -12064,10 +12411,30 @@ pub fn generate_self_signed_tls_config() -> Result<Arc<rustls::ServerConfig>> {
     generate_self_signed_tls_config_with_sans(&[])
 }
 
-pub fn generate_self_signed_tls_config_with_sans(
-    extra_sans: &[String],
+fn build_server_config_from_pem_bytes(
+    cert_pem: &[u8],
+    key_pem: &[u8],
 ) -> Result<Arc<rustls::ServerConfig>> {
+    use rustls::pki_types::pem::PemObject;
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to parse TLS certificate PEM")?;
+    if certs.is_empty() {
+        anyhow::bail!("TLS certificate PEM contained zero certificates");
+    }
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem)
+        .context("failed to parse TLS private key PEM")?;
+    let mut server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("invalid TLS certificate/private-key pair")?;
+    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(Arc::new(server_config))
+}
+
+fn generate_self_signed_tls_pem_pair(extra_sans: &[String]) -> Result<(String, String)> {
     let mut subject_alt_names = vec![
         "localhost".to_string(),
         "ninjanvr".to_string(),
@@ -12109,16 +12476,127 @@ pub fn generate_self_signed_tls_config_with_sans(
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     let signing_key = rcgen::KeyPair::generate()?;
     let cert = params.self_signed(&signing_key)?;
-    let cert_der = rustls::pki_types::CertificateDer::from(cert);
-    let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
-        rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der()),
-    );
+    Ok((cert.pem(), signing_key.serialize_pem()))
+}
 
-    let mut server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)?;
-    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    Ok(Arc::new(server_config))
+pub fn generate_self_signed_tls_config_with_sans(
+    extra_sans: &[String],
+) -> Result<Arc<rustls::ServerConfig>> {
+    let (cert_pem, key_pem) = generate_self_signed_tls_pem_pair(extra_sans)?;
+    build_server_config_from_pem_bytes(cert_pem.as_bytes(), key_pem.as_bytes())
+}
+
+/// Loads operator-configured `tls.cert_path` + `tls.key_path` when present, or persists and reuses
+/// a self-signed certificate pair in `config_dir` (`0600` owner-only key) for stable TOFU pinning,
+/// falling back cleanly to an in-memory certificate when `config_dir` is read-only.
+pub fn load_or_generate_tls_config(
+    tls_cfg: &ninjanvr_config::TlsConfig,
+    config_dir: &Path,
+    san_hosts: &[String],
+) -> Result<Arc<rustls::ServerConfig>> {
+    if tls_cfg.cert_path.is_some() != tls_cfg.key_path.is_some() {
+        anyhow::bail!("tls.cert_path and tls.key_path must both be configured together");
+    }
+    if let (Some(cert_path), Some(key_path)) = (&tls_cfg.cert_path, &tls_cfg.key_path) {
+        if !ninjanvr_config::is_safe_tls_path(cert_path)
+            || !ninjanvr_config::is_safe_tls_path(key_path)
+        {
+            anyhow::bail!("unsafe TLS certificate or private key path");
+        }
+        let canon_cert = std::fs::canonicalize(cert_path)
+            .with_context(|| format!("failed to canonicalize TLS cert {}", cert_path.display()))?;
+        let canon_key = std::fs::canonicalize(key_path)
+            .with_context(|| format!("failed to canonicalize TLS key {}", key_path.display()))?;
+        if !ninjanvr_config::is_safe_tls_path(&canon_cert)
+            || !ninjanvr_config::is_safe_tls_path(&canon_key)
+        {
+            anyhow::bail!("canonicalized TLS certificate or private key path is unsafe");
+        }
+        let cert_bytes =
+            read_bounded_non_symlink_bytes_sync(&canon_cert, 512 * 1024).ok_or_else(|| {
+                anyhow::anyhow!("failed to read TLS certificate {}", cert_path.display())
+            })?;
+        let key_bytes =
+            read_bounded_non_symlink_bytes_sync(&canon_key, 256 * 1024).ok_or_else(|| {
+                anyhow::anyhow!("failed to read TLS private key {}", key_path.display())
+            })?;
+        return build_server_config_from_pem_bytes(&cert_bytes, &key_bytes);
+    }
+
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for s in san_hosts {
+        hasher.update(s.to_ascii_lowercase().as_bytes());
+        hasher.update(b"\n");
+    }
+    let sans_digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+
+    let persisted_cert = config_dir.join(".tls_cert.pem");
+    let persisted_key = config_dir.join(".tls_key.pem");
+    let persisted_meta = config_dir.join(".tls_sans.sha256");
+
+    if let (Some(cert_b), Some(key_b), Some(meta_b)) = (
+        read_bounded_non_symlink_bytes_sync(&persisted_cert, 512 * 1024),
+        read_bounded_non_symlink_bytes_sync(&persisted_key, 256 * 1024),
+        read_bounded_non_symlink_bytes_sync(&persisted_meta, 256),
+    ) && std::str::from_utf8(&meta_b).is_ok_and(|s| s.trim() == sans_digest)
+        && let Ok(cfg) = build_server_config_from_pem_bytes(&cert_b, &key_b)
+    {
+        return Ok(cfg);
+    }
+
+    let (cert_pem, key_pem) = match generate_self_signed_tls_pem_pair(san_hosts) {
+        Ok(pair) => pair,
+        Err(err) => {
+            warn!(
+                "Failed to build TLS certificate with custom SANs ({err:#}); falling back to default SANs"
+            );
+            generate_self_signed_tls_pem_pair(&[])?
+        }
+    };
+    let server_cfg = build_server_config_from_pem_bytes(cert_pem.as_bytes(), key_pem.as_bytes())?;
+
+    #[cfg(unix)]
+    if std::fs::symlink_metadata(config_dir).is_ok_and(|m| m.file_type().is_dir()) {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let write_secret = |target: &Path, content: &[u8], mode: u32| -> std::io::Result<()> {
+            if std::fs::symlink_metadata(target)
+                .is_ok_and(|m| m.file_type().is_dir() || m.file_type().is_symlink())
+            {
+                return Ok(());
+            }
+            let tmp = config_dir.join(format!(
+                ".tls_tmp.{}.{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode)
+                .custom_flags(ninjanvr_config::O_NOFOLLOW_FLAG)
+                .open(&tmp)?;
+            f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            f.write_all(content)?;
+            f.sync_all()?;
+            drop(f);
+            if let Err(e) = std::fs::rename(&tmp, target) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+            Ok(())
+        };
+        let _ = write_secret(&persisted_key, key_pem.as_bytes(), 0o600);
+        let _ = write_secret(&persisted_cert, cert_pem.as_bytes(), 0o644);
+        let _ = write_secret(&persisted_meta, sans_digest.as_bytes(), 0o600);
+    }
+
+    Ok(server_cfg)
 }
 
 fn restore_persistent_clips_mirrors(media_dir: &Path, config_dir: &Path) {
@@ -12235,9 +12713,11 @@ pub async fn new_app_state(
     let storage_degraded = Arc::new(std::sync::atomic::AtomicBool::new(init_degraded));
     let storage_error = Arc::new(std::sync::Mutex::new(init_err));
 
+    let mut using_degraded_fallback_db = false;
     let db = match NinjaDatabase::open(&cfg.database.path) {
         Ok(d) => d,
         Err(err) => {
+            using_degraded_fallback_db = true;
             warn!(
                 "Primary database path {} unavailable ({}); falling back to /tmp/ninjanvr-degraded.db",
                 cfg.database.path, err
@@ -12310,7 +12790,18 @@ pub async fn new_app_state(
         }
     }
 
-    let jwt_secret = load_or_create_jwt_secret(config_dir);
+    let base_jwt_secret = load_or_create_jwt_secret(config_dir);
+    let jwt_secret = if using_degraded_fallback_db {
+        // Isolate JWT signing key when running on an empty fallback DB so pre-existing tokens
+        // for revoked/deleted accounts are rejected and tokens minted in degraded mode never
+        // carry over once the primary database recovers.
+        auth_gate::normalize_jwt_secret_entropy(&format!(
+            "{base_jwt_secret}:degraded:{:032x}",
+            rand::random::<u128>()
+        ))
+    } else {
+        base_jwt_secret
+    };
 
     let detector = Arc::new(AiDetectorEngine::new(&cfg));
     let faces_dir = media_dir.join("faces");
@@ -12343,12 +12834,13 @@ pub async fn new_app_state(
         "ninjanvr.db",
         &format!("Connected to SQLite WAL database at {}", cfg.database.path),
     );
+    let det_cat = detector.runtime_catalog();
     log_hub.push_ninjanvr(
         "INFO",
         "ninjanvr.infer",
         &format!(
-            "Initialized OpenVINO C-API detector on CPU (model={})",
-            cfg.model.path
+            "Initialized {} detector on {} (model={})",
+            det_cat.active_backend, det_cat.active_device, cfg.model.path
         ),
     );
     for (cam_name, cam_cfg) in &cfg.cameras {
@@ -12357,22 +12849,24 @@ pub async fn new_app_state(
                 "INFO",
                 &format!("ninjanvr.camera.{cam_name}"),
                 &format!(
-                    "Started substream vision & direct segment recorder ({}x{} @ {} FPS)",
+                    "Configured substream vision & direct segment recorder ({}x{} @ {} FPS)",
                     cam_cfg.detect.width, cam_cfg.detect.height, cam_cfg.detect.fps
                 ),
             );
-            log_hub.push_go2rtc(
-                "INF",
-                "streams",
-                &format!("Registered RTSP restream producer for {cam_name} and {cam_name}_sub"),
-            );
+            if spawn_go2rtc {
+                log_hub.push_go2rtc(
+                    "INF",
+                    "streams",
+                    &format!("Registered RTSP restream producer for {cam_name} and {cam_name}_sub"),
+                );
+            }
         }
     }
-    log_hub.push_go2rtc("INF", "rtsp", "listen addr=:8554");
-    log_hub.push_go2rtc("INF", "api", "listen addr=:1984");
-    log_hub.push_go2rtc("INF", "webrtc", "listen tcp/udp addr=:8555");
-    log_hub.push_nginx("GET", "/api/version", 200);
-    log_hub.push_nginx("GET", "/api/stats", 200);
+    if spawn_go2rtc {
+        log_hub.push_go2rtc("INF", "rtsp", "listen addr=127.0.0.1:8554");
+        log_hub.push_go2rtc("INF", "api", "listen addr=127.0.0.1:1984");
+        log_hub.push_go2rtc("INF", "webrtc", "listen tcp/udp addr=:8555");
+    }
     {
         let rec_dir = media_dir.join("recordings");
         let rec_mount = stat_mount_mb(&rec_dir, "ext4");
@@ -12381,12 +12875,13 @@ pub async fn new_app_state(
         emit_heuristics_to_logs(&log_hub, &startup_heuristics);
     }
 
+    let (shutdown_tx, shutdown_rx_base) = tokio::sync::watch::channel(false);
     let shared_cfg = Arc::new(RwLock::new(cfg));
     let activity_ledger = new_activity_ledger();
     let latest_frames = Arc::new(RwLock::new(HashMap::new()));
     let latest_yuv_frames: SharedLatestYuvFrames = Arc::new(RwLock::new(HashMap::new()));
     // Live event-strip preview frames: index what survived a restart, drop the cache
-    // left by the earlier on-demand ffmpeg extractor, and prune on a timer.
+    // left by the earlier on-demand ffmpeg extractor, and prune on a cancel-safe timer.
     let preview_frame_store = preview_frames::PreviewFrameStore::new(&media_dir);
     {
         let store = preview_frame_store.clone();
@@ -12401,16 +12896,27 @@ pub async fn new_app_state(
         .unwrap_or(0);
         info!("Indexed {loaded} cached preview frames");
         let store = preview_frame_store.clone();
+        let mut prune_shutdown_rx = shutdown_rx_base.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(300));
+            tick.tick().await;
             loop {
-                tick.tick().await;
-                let store = store.clone();
-                let now_ms = unix_now().saturating_mul(1000);
-                let _ = tokio::task::spawn_blocking(move || {
-                    store.prune(now_ms, preview_frames::PREVIEW_FRAME_RETENTION_SECS * 1000)
-                })
-                .await;
+                tokio::select! {
+                    biased;
+                    _ = prune_shutdown_rx.changed() => {
+                        if *prune_shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = tick.tick() => {
+                        let store = store.clone();
+                        let now_ms = unix_now().saturating_mul(1000);
+                        let _ = tokio::task::spawn_blocking(move || {
+                            store.prune(now_ms, preview_frames::PREVIEW_FRAME_RETENTION_SECS * 1000)
+                        })
+                        .await;
+                    }
+                }
             }
         });
     }
@@ -12437,28 +12943,81 @@ pub async fn new_app_state(
     let camera_driver_runtime =
         CameraDriverRuntime::with_active_presets(ptz_active_presets.clone());
 
-    let recorder = Arc::new(RecordingEngine::with_storage_state(
-        shared_cfg.clone(),
-        db.clone(),
-        media_dir.clone(),
-        activity_ledger.clone(),
-        storage_degraded.clone(),
-        storage_error.clone(),
-    ));
-    let pipeline = Arc::new(VisionPipeline::new(
-        shared_cfg.clone(),
-        db.clone(),
-        comms.clone(),
-        detector.clone(),
-        activity_ledger.clone(),
-        latest_frames.clone(),
-        latest_yuv_frames.clone(),
-        preview_frame_store.clone(),
-        camera_metrics.clone(),
-        media_dir.clone(),
-        log_hub.clone(),
-        camera_driver_runtime.clone(),
-    ));
+    let go2rtc_http_base = "http://127.0.0.1:1984".to_string();
+    let go2rtc_ws_base = "ws://127.0.0.1:1984".to_string();
+    let vod_cache = VodWindowCache::new();
+    let recorder = Arc::new(
+        RecordingEngine::with_storage_state(
+            shared_cfg.clone(),
+            db.clone(),
+            media_dir.clone(),
+            activity_ledger.clone(),
+            storage_degraded.clone(),
+            storage_error.clone(),
+        )
+        .with_go2rtc_relay(spawn_go2rtc),
+    );
+    let pipeline = Arc::new(
+        VisionPipeline::new(
+            shared_cfg.clone(),
+            db.clone(),
+            comms.clone(),
+            detector.clone(),
+            activity_ledger.clone(),
+            latest_frames.clone(),
+            latest_yuv_frames.clone(),
+            preview_frame_store.clone(),
+            camera_metrics.clone(),
+            media_dir.clone(),
+            log_hub.clone(),
+            camera_driver_runtime.clone(),
+        )
+        .with_go2rtc_endpoint(&go2rtc_http_base, spawn_go2rtc),
+    );
+
+    // Synchronize inbound MQTT `<camera>/<feature>/set` state changes with `activity_ledger`
+    // identically to `/ws` commands so Home Assistant toggles take effect in recording policies.
+    {
+        let mut set_rx = comms.subscribe_set_commands();
+        let mut set_shutdown_rx = shutdown_rx_base.clone();
+        let comms_for_sync = comms.clone();
+        let ledger_for_sync = activity_ledger.clone();
+        let cfg_for_sync = shared_cfg.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = set_shutdown_rx.changed() => {
+                        if *set_shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    res = set_rx.recv() => {
+                        let (rel_topic, _) = match res {
+                            Ok(pair) => pair,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        };
+                        if let Some(base) = rel_topic.strip_suffix("/set") {
+                            let parts: Vec<&str> = base.split('/').collect();
+                            if parts.len() == 2 {
+                                let cam = parts[0];
+                                if is_safe_id(cam) && cfg_for_sync.read().await.cameras.contains_key(cam) {
+                                    let flags = comms_for_sync.get_camera_flags(cam);
+                                    ledger_for_sync
+                                        .write()
+                                        .await
+                                        .entry(cam.to_string())
+                                        .or_default()
+                                        .set_record_enabled(flags.enabled && flags.record);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     if spawn_go2rtc {
         go2rtc_supervisor.clone().spawn_supervisor_task();
@@ -12488,6 +13047,7 @@ pub async fn new_app_state(
 
     let config_coordinator = ConfigCoordinator::new(shared_cfg.clone())
         .with_mse_hub(mse_hub.clone())
+        .with_live_caches(vod_cache.clone(), &go2rtc_ws_base)
         .with_runtime_reconcilers(
             pipeline.clone(),
             recorder.clone(),
@@ -12507,8 +13067,8 @@ pub async fn new_app_state(
         db,
         comms,
         go2rtc_supervisor,
-        go2rtc_http_base: "http://127.0.0.1:1984".to_string(),
-        go2rtc_ws_base: "ws://127.0.0.1:1984".to_string(),
+        go2rtc_http_base,
+        go2rtc_ws_base,
         http_client,
         jwt_secret,
         auth_gate: AuthSessionGate::new(),
@@ -12526,7 +13086,7 @@ pub async fn new_app_state(
         detector,
         pipeline,
         recorder,
-        vod_cache: VodWindowCache::new(),
+        vod_cache,
         camera_metrics,
         log_hub,
         stats_history,
@@ -12541,8 +13101,11 @@ pub async fn new_app_state(
         media_delivery_gate,
         live_gateway,
         debug_reprocess_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+        vod_remux_semaphore: Arc::new(tokio::sync::Semaphore::new(6)),
         metrics_scrape_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         unscoped_metrics_cache: Arc::new(tokio::sync::Mutex::new(None)),
+        camera_logs_cooldown: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        shutdown_tx,
         active_listener_ports: Arc::new(std::sync::RwLock::new((5000, 8971, DEFAULT_METRICS_PORT))),
         allow_ephemeral_loopback_federation_for_test: Arc::new(std::sync::atomic::AtomicBool::new(
             false,
@@ -12595,18 +13158,28 @@ pub async fn new_app_state(
             .await;
 
         let stats_state = state.clone();
+        let mut stats_shutdown_rx = shutdown_rx_base;
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                let stats_val = compute_stats_snapshot(&stats_state).await;
-                {
-                    let mut hist = stats_state.stats_history.write().await;
-                    hist.push_back(stats_val.clone());
-                    while hist.len() > MAX_STATS_HISTORY {
-                        hist.pop_front();
+                tokio::select! {
+                    biased;
+                    _ = stats_shutdown_rx.changed() => {
+                        if *stats_shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                        let stats_val = compute_stats_snapshot(&stats_state).await;
+                        {
+                            let mut hist = stats_state.stats_history.write().await;
+                            hist.push_back(stats_val.clone());
+                            while hist.len() > MAX_STATS_HISTORY {
+                                hist.pop_front();
+                            }
+                        }
+                        stats_state.comms.publish_json("stats", &stats_val);
                     }
                 }
-                stats_state.comms.publish_json("stats", &stats_val);
             }
         });
     }

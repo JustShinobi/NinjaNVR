@@ -64,9 +64,10 @@ pub struct ResolvedVodSegment {
     pub cumulative_base_time: f64,
 }
 
-type VodCacheMap = HashMap<VodWindowCacheKey, (Instant, Arc<Vec<ResolvedVodSegment>>)>;
+type VodCacheMap = HashMap<VodWindowCacheKey, (Instant, u64, Arc<Vec<ResolvedVodSegment>>)>;
 
-/// Bounded `O(1)` TTL cache for resolved HLS VOD windows (`(camera, start, end)` -> segments).
+/// Bounded `O(1)` TTL cache for resolved HLS VOD windows (`(camera, start, end)` -> segments),
+/// automatically invalidated whenever `NinjaDatabase::recordings_mutation_seq()` advances.
 #[derive(Clone, Debug)]
 pub struct VodWindowCache {
     entries: Arc<std::sync::RwLock<VodCacheMap>>,
@@ -90,9 +91,18 @@ impl VodWindowCache {
     }
 
     pub fn get(&self, key: &VodWindowCacheKey) -> Option<Arc<Vec<ResolvedVodSegment>>> {
+        self.get_for_mutation_seq(key, None)
+    }
+
+    pub fn get_for_mutation_seq(
+        &self,
+        key: &VodWindowCacheKey,
+        expected_mutation_seq: Option<u64>,
+    ) -> Option<Arc<Vec<ResolvedVodSegment>>> {
         if let Ok(guard) = self.entries.read()
-            && let Some((cached_at, segs)) = guard.get(key)
+            && let Some((cached_at, seq, segs)) = guard.get(key)
             && cached_at.elapsed() <= VOD_CACHE_TTL
+            && expected_mutation_seq.is_none_or(|exp| *seq == exp)
         {
             self.hits.fetch_add(1, Ordering::Relaxed);
             return Some(Arc::clone(segs));
@@ -102,16 +112,25 @@ impl VodWindowCache {
     }
 
     pub fn insert(&self, key: VodWindowCacheKey, segments: Arc<Vec<ResolvedVodSegment>>) {
+        self.insert_with_mutation_seq(key, 0, segments);
+    }
+
+    pub fn insert_with_mutation_seq(
+        &self,
+        key: VodWindowCacheKey,
+        mutation_seq: u64,
+        segments: Arc<Vec<ResolvedVodSegment>>,
+    ) {
         let now = Instant::now();
         let Ok(mut guard) = self.entries.write() else {
             return;
         };
         if !guard.contains_key(&key) && guard.len() >= MAX_VOD_CACHE_ENTRIES {
-            guard.retain(|_, (at, _)| now.duration_since(*at) <= VOD_CACHE_TTL);
+            guard.retain(|_, (at, _, _)| now.duration_since(*at) <= VOD_CACHE_TTL);
             while guard.len() >= MAX_VOD_CACHE_ENTRIES {
                 if let Some(oldest_key) = guard
                     .iter()
-                    .min_by_key(|(_, (at, _))| *at)
+                    .min_by_key(|(_, (at, _, _))| *at)
                     .map(|(k, _)| k.clone())
                 {
                     guard.remove(&oldest_key);
@@ -120,7 +139,7 @@ impl VodWindowCache {
                 }
             }
         }
-        guard.insert(key, (now, segments));
+        guard.insert(key, (now, mutation_seq, segments));
     }
 
     pub fn invalidate_camera(&self, camera: &str) {
@@ -327,7 +346,8 @@ async fn get_or_resolve_vod_window(
     end: f64,
 ) -> Option<Arc<Vec<ResolvedVodSegment>>> {
     let key = VodWindowCacheKey::new(camera, start, end, cold_dir_opt.as_deref());
-    if let Some(cached) = state.vod_cache.get(&key) {
+    let cur_seq = state.db.recordings_vod_invalidation_seq();
+    if let Some(cached) = state.vod_cache.get_for_mutation_seq(&key, Some(cur_seq)) {
         return Some(cached);
     }
     let state_for_vod = state.clone();
@@ -345,7 +365,10 @@ async fn get_or_resolve_vod_window(
     .ok()?;
     let arc_segs = Arc::new(resolved);
     if !arc_segs.is_empty() {
-        state.vod_cache.insert(key, Arc::clone(&arc_segs));
+        let post_seq = state.db.recordings_vod_invalidation_seq();
+        state
+            .vod_cache
+            .insert_with_mutation_seq(key, post_seq, Arc::clone(&arc_segs));
     }
     Some(arc_segs)
 }
@@ -461,7 +484,10 @@ pub async fn vod_index_m3u8(
     if segs_arc.is_empty() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    state.vod_cache.insert(cache_key, Arc::clone(&segs_arc));
+    let inv_seq = state.db.recordings_vod_invalidation_seq();
+    state
+        .vod_cache
+        .insert_with_mutation_seq(cache_key, inv_seq, Arc::clone(&segs_arc));
     let recs: Vec<RecordingRow> = segs_arc.iter().map(|s| s.recording.clone()).collect();
     match ninjanvr_vod::build_media_playlist_with_resolutions(&recs, Some(&resolutions)) {
         Ok(m3u8) => (
@@ -521,6 +547,15 @@ pub async fn vod_init_mp4(
     if start_idx >= segs_arc.len() {
         return StatusCode::NOT_FOUND.into_response();
     }
+
+    let Ok(Ok(_vod_permit)) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        state.vod_remux_semaphore.acquire(),
+    )
+    .await
+    else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
 
     let Ok(Some(init_bytes)) = tokio::task::spawn_blocking(move || {
         for seg in segs_arc.iter().skip(start_idx).take(8) {
@@ -591,6 +626,15 @@ pub async fn vod_segment_m4s(
     };
     let Some(target_seg) = segs_arc.get(seq_num - 1).cloned() else {
         return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let Ok(Ok(_vod_permit)) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        state.vod_remux_semaphore.acquire(),
+    )
+    .await
+    else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
 
     match tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {

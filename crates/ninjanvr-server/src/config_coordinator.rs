@@ -710,7 +710,9 @@ pub struct ConfigCoordinator {
     config: Arc<RwLock<NinjaConfig>>,
     commit_lock: Arc<Mutex<()>>,
     go2rtc_config_path: PathBuf,
+    go2rtc_ws_base: String,
     mse_hub: Option<MseStreamHub>,
+    vod_cache: Option<crate::vod_routes::VodWindowCache>,
     pipeline: Option<Arc<VisionPipeline>>,
     recorder: Option<Arc<RecordingEngine>>,
     go2rtc_supervisor: Option<Arc<Go2RtcSupervisor>>,
@@ -725,7 +727,9 @@ impl ConfigCoordinator {
             config,
             commit_lock: Arc::new(Mutex::new(())),
             go2rtc_config_path: PathBuf::from(DEFAULT_GO2RTC_SHM_PATH),
+            go2rtc_ws_base: "ws://127.0.0.1:1984".to_string(),
             mse_hub: None,
+            vod_cache: None,
             pipeline: None,
             recorder: None,
             go2rtc_supervisor: None,
@@ -736,6 +740,18 @@ impl ConfigCoordinator {
     /// Attaches an [`MseStreamHub`] so camera stream/driver changes invalidate cached MSE sessions.
     pub fn with_mse_hub(mut self, mse_hub: MseStreamHub) -> Self {
         self.mse_hub = Some(mse_hub);
+        self
+    }
+
+    /// Attaches `VodWindowCache` and `go2rtc_ws_base` so hot-reloads invalidate VOD windows and
+    /// reconcile persistent MSE GOP warmers for newly enabled or updated cameras.
+    pub fn with_live_caches(
+        mut self,
+        vod_cache: crate::vod_routes::VodWindowCache,
+        go2rtc_ws_base: impl Into<String>,
+    ) -> Self {
+        self.vod_cache = Some(vod_cache);
+        self.go2rtc_ws_base = go2rtc_ws_base.into();
         self
     }
 
@@ -762,7 +778,21 @@ impl ConfigCoordinator {
     ) {
         if let Some(ref comms) = self.comms {
             comms.init_from_config(next_cfg);
+            comms.reconfigure_mqtt(next_cfg.mqtt.clone());
         }
+        if let Some(ref vod_cache) = self.vod_cache {
+            if invalidated_cameras.is_empty() {
+                vod_cache.invalidate_all();
+            } else {
+                for cam in invalidated_cameras {
+                    vod_cache.invalidate_camera(cam);
+                }
+            }
+        }
+        let go2rtc_running = self
+            .go2rtc_supervisor
+            .as_ref()
+            .is_some_and(|s| s.is_running());
         if let Some(ref sup) = self.go2rtc_supervisor {
             let custom_target = self.go2rtc_config_path != Path::new(DEFAULT_GO2RTC_SHM_PATH)
                 && !self.go2rtc_config_path.as_os_str().is_empty();
@@ -777,6 +807,29 @@ impl ConfigCoordinator {
             } else {
                 sup.request_reload();
             }
+        }
+        if go2rtc_running && let Some(ref mse_hub) = self.mse_hub {
+            let mut desired_streams = Vec::new();
+            for (cam_name, cam_cfg) in &next_cfg.cameras {
+                if !cam_cfg.enabled {
+                    continue;
+                }
+                let trimmed = cam_name.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if !desired_streams.iter().any(|s| s == trimmed) {
+                    desired_streams.push(trimmed.to_string());
+                }
+                let sub = format!("{trimmed}_sub");
+                let resolved_sub = next_cfg.resolve_mse_stream_alias(&sub);
+                if !desired_streams.iter().any(|s| s == resolved_sub) {
+                    desired_streams.push(resolved_sub.to_string());
+                }
+            }
+            mse_hub
+                .reconcile_persistent_streams(&self.go2rtc_ws_base, desired_streams)
+                .await;
         }
         if let Some(ref pipeline) = self.pipeline {
             pipeline.reconcile().await;
@@ -1075,7 +1128,9 @@ impl ConfigCoordinator {
             }
         };
         if persisted || next_cfg.config_path.as_os_str().is_empty() {
+            let cfg_snap = next_cfg.clone();
             *self.config.write().await = next_cfg;
+            self.reconcile_runtime_after_commit(&cfg_snap, &[]).await;
         }
         Ok(ModelDeployOutcome::Deployed {
             loaded: now_loaded,
@@ -1144,7 +1199,9 @@ impl ConfigCoordinator {
             }
         };
         if persisted || next_cfg.config_path.as_os_str().is_empty() {
+            let cfg_snap = next_cfg.clone();
             *self.config.write().await = next_cfg;
+            self.reconcile_runtime_after_commit(&cfg_snap, &[]).await;
         }
         Ok(ModelDeployOutcome::Deployed {
             loaded: now_loaded,

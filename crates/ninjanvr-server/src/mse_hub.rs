@@ -560,6 +560,48 @@ impl MseStreamHub {
         }
     }
 
+    /// Reconciles persistent background MSE GOP warmers after a hot-reload: cancels removed
+    /// persistent sessions that have zero active viewers and spawns warmers for newly added or
+    /// previously invalidated cameras.
+    pub async fn reconcile_persistent_streams(&self, go2rtc_ws_base: &str, desired: Vec<String>) {
+        let desired_set: std::collections::BTreeSet<String> = desired
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| is_valid_stream_name(s))
+            .collect();
+        {
+            let mut sessions = self.sessions.write().await;
+            let mut stale = Vec::new();
+            for (key, sess) in sessions.iter_mut() {
+                if sess.persistent && !desired_set.contains(key) {
+                    sess.persistent = false;
+                    if sess.active_clients.load(Ordering::Acquire) == 0 {
+                        stale.push(key.clone());
+                    }
+                }
+            }
+            for key in stale {
+                if let Some(removed) = sessions.remove(&key) {
+                    removed.cancel_notify.notify_waiters();
+                }
+            }
+        }
+        for stream in desired_set {
+            let _ = self
+                .ensure_upstream_session(go2rtc_ws_base, &stream, true)
+                .await;
+        }
+    }
+
+    /// Cancels all active upstream `go2rtc` MSE sessions and clears cached GOP bursts on shutdown.
+    pub async fn shutdown(&self) {
+        self.caches.write().await.clear();
+        let mut sessions = self.sessions.write().await;
+        for (_, sess) in sessions.drain() {
+            sess.cancel_notify.notify_waiters();
+        }
+    }
+
     /// Subscribes a client WebSocket to the shared upstream `go2rtc` session for `stream`,
     /// returning an atomic `(Option<MseGopBurst>, broadcast::Receiver<MseLivePacket>)` pair
     /// with continuous `tfdt` timestamps and zero duplicate or dropped fragments.

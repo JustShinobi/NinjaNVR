@@ -763,5 +763,33 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
         : [],
     }),
   setCameraActivity: (cameraActivity) =>
-    set({ cameraActivity: sanitizeCameraActivityMap(cameraActivity) }),
+    set((s) => {
+      const sanitized = sanitizeCameraActivityMap(cameraActivity);
+      const prev = s.cameraActivity;
+      const nextKeys = Object.keys(sanitized);
+      const prevKeys = Object.keys(prev);
+      let unchangedCount = 0;
+      const merged: Record<string, CameraLiveActivity> = {};
+      for (const key of nextKeys) {
+        const prevEntry = prev[key];
+        const nextEntry = sanitized[key];
+        if (
+          prevEntry !== undefined &&
+          stableSerializeConfigValue(prevEntry) ===
+            stableSerializeConfigValue(nextEntry)
+        ) {
+          merged[key] = prevEntry;
+          unchangedCount += 1;
+        } else {
+          merged[key] = nextEntry;
+        }
+      }
+      if (
+        unchangedCount === nextKeys.length &&
+        nextKeys.length === prevKeys.length
+      ) {
+        return s;
+      }
+      return { cameraActivity: merged };
+    }),
 }));

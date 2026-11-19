@@ -138,8 +138,8 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          provenance: false
-          sbom: false
+          provenance: mode=max
+          sbom: true
           build-args: |
             NINJANVR_RELEASE_VERSION=${{ steps.resolve.outputs.tag }}
           tags: ${{ steps.meta.outputs.tags }}
@@ -311,8 +311,10 @@ jobs:
               installs = json.loads(resp.read().decode())
           inst_id = next(
               (str(i["id"]) for i in installs if i.get("account", {}).get("login", "").lower() == owner.lower()),
-              str(installs[0]["id"]) if installs else "",
+              "",
           )
+          if not inst_id:
+              raise RuntimeError(f"No GitHub App installation found for owner '{owner}'")
           req2 = urllib.request.Request(
               f"https://api.github.com/app/installations/{inst_id}/access_tokens",
               method="POST",

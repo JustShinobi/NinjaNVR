@@ -101,18 +101,119 @@ impl ReqwestVisionAiTransport {
     }
 }
 
+/// Resolves DNS (or validates literal IP) for a Vision AI endpoint URL, verifying all resolved
+/// `SocketAddr`s against SSRF / cloud-metadata / internal-port blocklists and pinning resolution
+/// via `reqwest::ClientBuilder::resolve_to_addrs` to prevent DNS rebinding attacks.
+pub async fn build_dns_pinned_genai_client(
+    target_url: &str,
+    timeout: Duration,
+) -> Result<reqwest::Client, String> {
+    let parsed = reqwest::Url::parse(target_url)
+        .map_err(|_| "Disallowed or invalid GenAI request URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("Disallowed or invalid GenAI request URL".to_string());
+    }
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "Disallowed or invalid GenAI request port".to_string())?;
+    if parsed.port() == Some(0) || ninjanvr_config::is_disallowed_internal_service_port(port) {
+        return Err("Disallowed or invalid GenAI request port".to_string());
+    }
+    let raw_host = parsed
+        .host_str()
+        .ok_or_else(|| "Disallowed or invalid GenAI host".to_string())?;
+    let clean_host = raw_host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    let host_lc = clean_host.to_ascii_lowercase();
+    if host_lc.is_empty()
+        || host_lc.contains('%')
+        || host_lc == "metadata.google.internal"
+        || host_lc.ends_with(".metadata.google.internal")
+        || host_lc == "metadata"
+        || host_lc == "metadata.azure.com"
+        || host_lc.ends_with(".metadata.azure.com")
+        || host_lc == "instance-data"
+        || host_lc.ends_with(".nip.io")
+        || host_lc.ends_with(".sslip.io")
+        || host_lc.ends_with(".xip.io")
+        || host_lc == "localtest.me"
+        || host_lc.ends_with(".localtest.me")
+        || host_lc == "lvh.me"
+        || host_lc.ends_with(".lvh.me")
+    {
+        return Err("Disallowed or invalid GenAI host".to_string());
+    }
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none());
+
+    if let Ok(ip) = clean_host.parse::<std::net::IpAddr>() {
+        let disallowed = match ip {
+            std::net::IpAddr::V4(v4) => {
+                clean_host != v4.to_string() || is_disallowed_genai_ipv4(v4)
+            }
+            std::net::IpAddr::V6(v6) => is_disallowed_ssrf_ipv6(v6, true),
+        };
+        if disallowed {
+            return Err("Disallowed or invalid GenAI IP address".to_string());
+        }
+    } else {
+        let allow_loopback = host_lc == "localhost";
+        let resolved: Vec<std::net::SocketAddr> = tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::net::lookup_host((clean_host, port)),
+        )
+        .await
+        .map_err(|_| format!("Timed out resolving Vision AI host '{clean_host}'"))?
+        .map_err(|e| format!("Failed to resolve Vision AI host '{clean_host}': {e}"))?
+        .collect();
+        if resolved.is_empty() {
+            return Err(format!(
+                "Vision AI host '{clean_host}' resolved to no addresses"
+            ));
+        }
+        for addr in &resolved {
+            if ninjanvr_config::is_disallowed_internal_service_port(addr.port()) {
+                return Err("Vision AI host resolved to a disallowed internal port".to_string());
+            }
+            let bad_ip = match addr.ip() {
+                std::net::IpAddr::V4(v4) => {
+                    (!allow_loopback && v4.is_loopback()) || is_disallowed_genai_ipv4(v4)
+                }
+                std::net::IpAddr::V6(v6) => {
+                    (!allow_loopback && v6.is_loopback()) || is_disallowed_ssrf_ipv6(v6, false)
+                }
+            };
+            if bad_ip {
+                return Err(
+                    "Vision AI host resolved to a disallowed internal or metadata IP".to_string(),
+                );
+            }
+        }
+        builder = builder.resolve_to_addrs(raw_host, &resolved);
+    }
+
+    builder
+        .build()
+        .map_err(|e| format!("failed to build Vision AI HTTP client: {e}"))
+}
+
 impl VisionAiTransport for ReqwestVisionAiTransport {
     async fn send_json(
         &self,
         req: &VisionAiProviderRequest,
         timeout: Duration,
     ) -> Result<Value, String> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| format!("failed to build Vision AI HTTP client: {e}"))?;
+        let client = build_dns_pinned_genai_client(&req.url, timeout).await?;
 
         let mut builder = client.post(&req.url).json(&req.body);
         for (name, value) in &req.headers {
@@ -1762,11 +1863,7 @@ pub async fn discover_genai_models(genai: &GenAiConfig) -> Result<Vec<String>> {
     if let Some(b) = custom_base {
         validate_genai_base_url(b).map_err(|e| anyhow::anyhow!(e))?;
     }
-    let timeout_ms = genai.timeout_ms.clamp(2000, 30_000);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(timeout_ms))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
+    let timeout_dur = Duration::from_millis(genai.timeout_ms.clamp(2000, 30_000));
 
     let resp = match provider.as_str() {
         "openai" => {
@@ -1788,6 +1885,9 @@ pub async fn discover_genai_models(genai: &GenAiConfig) -> Result<Vec<String>> {
             } else {
                 format!("{base}/v1/models")
             };
+            let client = build_dns_pinned_genai_client(&url, timeout_dur)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
             let mut req = client.get(&url);
             if !api_key.is_empty() {
                 req = req.bearer_auth(&api_key);
@@ -1812,6 +1912,9 @@ pub async fn discover_genai_models(genai: &GenAiConfig) -> Result<Vec<String>> {
             } else {
                 format!("{base}/api/tags")
             };
+            let client = build_dns_pinned_genai_client(&url, timeout_dur)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
             let mut req = client.get(&url);
             if !api_key.is_empty() {
                 req = req.bearer_auth(&api_key);
@@ -1843,6 +1946,9 @@ pub async fn discover_genai_models(genai: &GenAiConfig) -> Result<Vec<String>> {
             } else {
                 format!("{base}/v1beta/models?pageSize=100&key={api_key}")
             };
+            let client = build_dns_pinned_genai_client(&url, timeout_dur)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
             let mut req = client.get(&url);
             if !api_key.is_empty() {
                 req = req.header("x-goog-api-key", &api_key);
@@ -2931,7 +3037,13 @@ pub async fn api_dataset_sample_get(
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    match state.db.get_dataset_sample(&id) {
+    let db = state.db.clone();
+    let id_owned = id.clone();
+    let sample_res = tokio::task::spawn_blocking(move || db.get_dataset_sample(&id_owned))
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
+        .and_then(|r| r);
+    match sample_res {
         Ok(Some(sample)) => {
             if let Some(allowed) = effective_caller_allowed_cameras(&state, &jar, &headers).await
                 && !allowed.iter().any(|a| a == "*" || a == &sample.camera)
@@ -2989,14 +3101,22 @@ pub async fn api_dataset_sample_update(
     {
         return err_resp.into_response();
     }
-    match state.db.update_dataset_sample_annotations(
-        &id,
-        body.annotations.as_deref(),
-        body.sample_kind.as_deref(),
-        body.verified,
-        body.verified_by.as_deref(),
-        body.split.as_deref(),
-    ) {
+    let db = state.db.clone();
+    let id_owned = id.clone();
+    let upd_res = tokio::task::spawn_blocking(move || {
+        db.update_dataset_sample_annotations(
+            &id_owned,
+            body.annotations.as_deref(),
+            body.sample_kind.as_deref(),
+            body.verified,
+            body.verified_by.as_deref(),
+            body.split.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!(e.to_string()))
+    .and_then(|r| r);
+    match upd_res {
         Ok(Some(updated)) => Json(sample_dto_to_response_json(&updated)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -3032,11 +3152,17 @@ pub async fn api_dataset_sample_delete(
     {
         return err_resp.into_response();
     }
-    let sample_opt = state.db.get_dataset_sample(&id).ok().flatten();
-    if let Some(sample) = sample_opt {
-        delete_sample_artifacts(&state.media_dir, &sample.id, Some(&sample.image_path));
-    }
-    let deleted = state.db.delete_dataset_sample(&id).unwrap_or(0);
+    let db = state.db.clone();
+    let media_dir = state.media_dir.clone();
+    let id_owned = id.clone();
+    let deleted = tokio::task::spawn_blocking(move || {
+        if let Ok(Some(sample)) = db.get_dataset_sample(&id_owned) {
+            delete_sample_artifacts(&media_dir, &sample.id, Some(&sample.image_path));
+        }
+        db.delete_dataset_sample(&id_owned).unwrap_or(0)
+    })
+    .await
+    .unwrap_or(0);
     if deleted == 0 {
         return (
             StatusCode::NOT_FOUND,
@@ -3221,7 +3347,11 @@ pub async fn api_dataset_sample_image_webp(
     if !is_safe_id(&id) {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let Ok(Some(sample)) = state.db.get_dataset_sample(&id) else {
+    let db = state.db.clone();
+    let id_owned = id.clone();
+    let Ok(Ok(Some(sample))) =
+        tokio::task::spawn_blocking(move || db.get_dataset_sample(&id_owned)).await
+    else {
         return StatusCode::NOT_FOUND.into_response();
     };
     if let Some(allowed) = effective_caller_allowed_cameras(&state, &jar, &headers).await
@@ -3246,7 +3376,12 @@ pub async fn auto_annotate_dataset_sample(
     if !is_safe_id(sample_id) {
         anyhow::bail!("Invalid dataset sample_id '{sample_id}'");
     }
-    let Some(sample) = state.db.get_dataset_sample(sample_id)? else {
+    let db = state.db.clone();
+    let sid_owned = sample_id.to_string();
+    let Some(sample) = tokio::task::spawn_blocking(move || db.get_dataset_sample(&sid_owned))
+        .await
+        .context("dataset sample lookup task panicked")??
+    else {
         anyhow::bail!("Dataset sample '{sample_id}' not found");
     };
     let raw_img_bytes = load_dataset_sample_image_bytes(state, &sample).await;

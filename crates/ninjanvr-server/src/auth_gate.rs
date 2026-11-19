@@ -134,6 +134,9 @@ pub struct AuthSessionGate {
     pub ip_login_attempts: Arc<std::sync::Mutex<HashMap<String, LoginAttemptEntry>>>,
     pub pbkdf2_semaphore: Arc<tokio::sync::Semaphore>,
     pub oidc_pending_states: Arc<std::sync::Mutex<HashMap<String, OidcPendingState>>>,
+    pub oidc_ip_attempts: Arc<std::sync::Mutex<HashMap<String, (u32, Instant)>>>,
+    pub oidc_discovery_cache: Arc<std::sync::RwLock<HashMap<String, (Value, Instant)>>>,
+    pub deleted_users: Arc<std::sync::RwLock<HashMap<String, u64>>>,
     pub user_cache: Arc<std::sync::RwLock<HashMap<String, CachedUserAuth>>>,
     pub token_verify_cache: Arc<std::sync::RwLock<HashMap<[u8; 32], CachedTokenVerification>>>,
     pub token_active_cache: Arc<std::sync::RwLock<HashMap<String, (bool, Instant)>>>,
@@ -157,6 +160,9 @@ impl AuthSessionGate {
             ip_login_attempts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pbkdf2_semaphore: Arc::new(tokio::sync::Semaphore::new(permits.max(1))),
             oidc_pending_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            oidc_ip_attempts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            oidc_discovery_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            deleted_users: Arc::new(std::sync::RwLock::new(HashMap::new())),
             user_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             token_verify_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             token_active_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -572,6 +578,92 @@ impl AuthSessionGate {
             .unwrap_or_else(|e| e.into_inner());
         guard.retain(|_, entry| now.duration_since(entry.created_at) < OIDC_PENDING_STATE_TTL);
         guard.remove(state_key)
+    }
+
+    pub fn check_and_record_oidc_login_rate(&self, peer_scope: &str) -> bool {
+        const OIDC_RATE_WINDOW: Duration = Duration::from_secs(60);
+        const MAX_OIDC_STARTS_PER_IP_PER_MIN: u32 = 24;
+        let now = Instant::now();
+        let mut guard = self
+            .oidc_ip_attempts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !guard.contains_key(peer_scope) && guard.len() >= 1024 {
+            guard.retain(|_, (_, at)| now.duration_since(*at) < OIDC_RATE_WINDOW);
+            if guard.len() >= 1024 {
+                return false;
+            }
+        }
+        match guard.get_mut(peer_scope) {
+            Some((cnt, started)) => {
+                if now.duration_since(*started) >= OIDC_RATE_WINDOW {
+                    *cnt = 1;
+                    *started = now;
+                    true
+                } else if *cnt >= MAX_OIDC_STARTS_PER_IP_PER_MIN {
+                    false
+                } else {
+                    *cnt = cnt.saturating_add(1);
+                    true
+                }
+            }
+            None => {
+                guard.insert(peer_scope.to_string(), (1, now));
+                true
+            }
+        }
+    }
+
+    pub fn get_cached_oidc_discovery(&self, issuer: &str) -> Option<Value> {
+        const OIDC_DISCOVERY_TTL: Duration = Duration::from_secs(300);
+        let guard = self.oidc_discovery_cache.read().ok()?;
+        let (doc, cached_at) = guard.get(issuer)?;
+        (cached_at.elapsed() < OIDC_DISCOVERY_TTL).then(|| doc.clone())
+    }
+
+    pub fn put_cached_oidc_discovery(&self, issuer: &str, doc: Value) {
+        if let Ok(mut guard) = self.oidc_discovery_cache.write() {
+            if guard.len() >= 16 && !guard.contains_key(issuer) {
+                guard.clear();
+            }
+            guard.insert(issuer.to_string(), (doc, Instant::now()));
+        }
+    }
+
+    /// Records the deletion epoch of a local user account so any JWT minted at or before
+    /// `deleted_at_epoch` is immediately rejected even if `user_cache` / SQLite returns `Ok(None)`.
+    pub fn record_user_deleted(&self, username: &str, deleted_at_epoch: u64) {
+        let key = username.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            return;
+        }
+        if let Ok(mut guard) = self.deleted_users.write() {
+            if guard.len() >= 4096
+                && !guard.contains_key(&key)
+                && let Some(oldest) = guard
+                    .iter()
+                    .min_by_key(|(_, ts)| **ts)
+                    .map(|(k, _)| k.clone())
+            {
+                guard.remove(&oldest);
+            }
+            guard.insert(key, deleted_at_epoch);
+        }
+        self.invalidate_user(username);
+    }
+
+    /// Returns `true` when `username` was deleted at `deleted_epoch` and `token_iat <= deleted_epoch`.
+    pub fn is_token_revoked_by_user_deletion(&self, username: &str, token_iat: u64) -> bool {
+        self.deleted_user_epoch(username)
+            .is_some_and(|deleted_epoch| token_iat <= deleted_epoch)
+    }
+
+    pub fn deleted_user_epoch(&self, username: &str) -> Option<u64> {
+        let key = username.trim().to_ascii_lowercase();
+        self.deleted_users
+            .read()
+            .ok()
+            .and_then(|g| g.get(&key).copied())
     }
 
     pub async fn authenticate_read(
@@ -1220,6 +1312,8 @@ pub fn is_protected_path(path: &str) -> bool {
         path,
         "/healthz"
             | "/api/healthz"
+            | "/readyz"
+            | "/api/readyz"
             | "/api/version"
             | "/api/login"
             | "/api/logout"
@@ -1323,6 +1417,36 @@ pub fn normalize_http_path_for_auth(raw: &str) -> Option<String> {
 
 pub fn is_safe_go2rtc_stream_name(name: &str) -> bool {
     ninjanvr_config::is_safe_go2rtc_stream_name(name)
+}
+
+pub fn query_targets_talkback_variant(
+    query: Option<&str>,
+    known_cameras: Option<&std::collections::BTreeSet<String>>,
+) -> bool {
+    let Some(q) = query.filter(|s| !s.trim().is_empty()) else {
+        return false;
+    };
+    for kv in q.split('&') {
+        let (raw_k, raw_v) = kv.split_once('=').unwrap_or((kv, ""));
+        let Some(k) = percent_decode_segment(raw_k) else {
+            continue;
+        };
+        let Some(v) = percent_decode_segment(raw_v) else {
+            continue;
+        };
+        if (k.eq_ignore_ascii_case("src") || k.eq_ignore_ascii_case("dst"))
+            && matches!(
+                ninjanvr_config::parse_go2rtc_stream_route(&v, known_cameras).map(|r| r.variant),
+                Some(
+                    ninjanvr_config::Go2RtcStreamVariant::Talkback
+                        | ninjanvr_config::Go2RtcStreamVariant::SubTalkback
+                )
+            )
+        {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn validate_go2rtc_query_streams(
@@ -1866,6 +1990,7 @@ pub async fn auth_gate_middleware(
             || path_matches_segment_prefix(&path, "/api/camera-proxy")
             || path_matches_segment_prefix(&path, "/api/recordings/sync")
             || path_matches_segment_prefix(&path, "/api/logs")
+            || (path.starts_with("/api/") && path.ends_with("/logs"))
             || path_matches_segment_prefix(&path, "/api/genai/models")
             || path_matches_segment_prefix(&path, "/api/genai/validate")
             || path_matches_segment_prefix(&path, "/api/detectors/models/upload")
@@ -1930,22 +2055,32 @@ pub async fn auth_gate_middleware(
         } else {
             None
         };
-        if (path.starts_with("/live/") || path == "/live" || path == "/api/go2rtc/webrtc")
-            && let Err(msg) = validate_go2rtc_query_streams_with_known(
+        if path.starts_with("/live/") || path == "/live" || path == "/api/go2rtc/webrtc" {
+            if let Err(msg) = validate_go2rtc_query_streams_with_known(
                 req.uri().query(),
                 allowed_set_opt.as_deref(),
                 Some(&known_cameras),
-            )
-        {
-            let status = if msg == "Stream camera is not permitted for this user"
-                || (msg == "Missing stream src query parameter" && allowed_set_opt.is_some())
+            ) {
+                let status = if msg == "Stream camera is not permitted for this user"
+                    || (msg == "Missing stream src query parameter" && allowed_set_opt.is_some())
+                {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                state.log_hub.push_nginx(&method, &path, status.as_u16());
+                return (status, Json(json!({ "message": msg }))).into_response();
+            }
+            if matches!(role_lc.as_str(), "viewer" | "read_only" | "metrics")
+                && query_targets_talkback_variant(req.uri().query(), Some(&known_cameras))
             {
-                StatusCode::FORBIDDEN
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            state.log_hub.push_nginx(&method, &path, status.as_u16());
-            return (status, Json(json!({ "message": msg }))).into_response();
+                state.log_hub.push_nginx(&method, &path, 403);
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "message": "Read-only role is not permitted to use audio talkback" })),
+                )
+                    .into_response();
+            }
         }
         if let Some(after_streams) = path.strip_prefix("/api/go2rtc/streams/") {
             let raw_seg = after_streams
@@ -2264,6 +2399,34 @@ pub async fn auth_gate_middleware(
         state
             .log_hub
             .push_nginx(&method, &path, resp.status().as_u16());
+    }
+    let resp_headers = resp.headers_mut();
+    if !resp_headers.contains_key(header::X_CONTENT_TYPE_OPTIONS) {
+        resp_headers.insert(
+            header::X_CONTENT_TYPE_OPTIONS,
+            axum::http::HeaderValue::from_static("nosniff"),
+        );
+    }
+    if !resp_headers.contains_key(header::X_FRAME_OPTIONS)
+        && !path_matches_segment_prefix(&path, "/api/camera-proxy")
+    {
+        resp_headers.insert(
+            header::X_FRAME_OPTIONS,
+            axum::http::HeaderValue::from_static("DENY"),
+        );
+    }
+    if !resp_headers.contains_key(header::REFERRER_POLICY) {
+        resp_headers.insert(
+            header::REFERRER_POLICY,
+            axum::http::HeaderValue::from_static("strict-origin-when-cross-origin"),
+        );
+    }
+    let corp_name = header::HeaderName::from_static("cross-origin-resource-policy");
+    if !resp_headers.contains_key(&corp_name) {
+        resp_headers.insert(
+            corp_name,
+            axum::http::HeaderValue::from_static("same-origin"),
+        );
     }
     resp
 }
@@ -2647,11 +2810,38 @@ pub fn generate_pkce_pair() -> (String, String, String) {
 }
 
 pub fn resolve_external_base_url(headers: &HeaderMap, uri: &Uri) -> String {
-    let x_forwarded_host = headers
-        .get("x-forwarded-host")
+    resolve_external_base_url_with_auth(headers, uri, None)
+}
+
+pub fn resolve_external_base_url_with_auth(
+    headers: &HeaderMap,
+    uri: &Uri,
+    auth_cfg: Option<&ninjanvr_config::AuthConfig>,
+) -> String {
+    let default_loopback = ["127.0.0.1/32".to_string(), "::1/128".to_string()];
+    let peer_is_trusted_proxy = headers
+        .get("x-peer-ip")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or(s).trim())
-        .filter(|s| !s.is_empty());
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_none_or(|peer_ip| {
+            let trusted_cidrs: &[String] = match auth_cfg {
+                Some(cfg) if !cfg.proxy.trusted_proxies.is_empty() => &cfg.proxy.trusted_proxies,
+                Some(cfg) if !cfg.trusted_proxies.is_empty() => &cfg.trusted_proxies,
+                _ => &default_loopback,
+            };
+            ip_matches_trusted_proxies(peer_ip, trusted_cidrs)
+        });
+
+    let x_forwarded_host = peer_is_trusted_proxy
+        .then(|| {
+            headers
+                .get("x-forwarded-host")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.split(',').next().unwrap_or(s).trim())
+                .filter(|s| !s.is_empty())
+        })
+        .flatten();
     let host_header = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
@@ -2695,11 +2885,16 @@ pub fn resolve_external_base_url(headers: &HeaderMap, uri: &Uri) -> String {
     } else {
         "https"
     };
-    let raw_proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or(s).trim())
-        .filter(|s| !s.is_empty())
+    let forwarded_proto = peer_is_trusted_proxy
+        .then(|| {
+            headers
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.split(',').next().unwrap_or(s).trim())
+                .filter(|s| !s.is_empty())
+        })
+        .flatten();
+    let raw_proto = forwarded_proto
         .or_else(|| uri.scheme_str())
         .unwrap_or(default_proto);
     let proto = if raw_proto.eq_ignore_ascii_case("http") {
@@ -2744,9 +2939,22 @@ pub async fn api_auth_oidc_login(
             .into_response();
     }
 
+    let peer_scope = extract_login_peer_scope(&headers);
+    if !state
+        .auth_gate
+        .check_and_record_oidc_login_rate(&peer_scope)
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "message": "Too many OIDC login requests; try again shortly" })),
+        )
+            .into_response();
+    }
+
     let (state_str, verifier, challenge) = generate_pkce_pair();
-    let base_url = resolve_external_base_url(&headers, &uri);
+    let base_url = resolve_external_base_url_with_auth(&headers, &uri, Some(&cfg.auth));
     let redirect_uri = format!("{base_url}/api/auth/oidc/callback");
+    drop(cfg);
 
     state.auth_gate.store_oidc_pending_state(
         state_str.clone(),
@@ -2754,34 +2962,49 @@ pub async fn api_auth_oidc_login(
         redirect_uri.clone(),
     );
 
-    // Discover authorization_endpoint or fall back to standard /authorize
+    // Discover authorization_endpoint (with 300s TTL cache) or fall back to standard /authorize
     let mut auth_endpoint = format!("{issuer}/authorize");
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    if let Ok(client) = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        && let Ok(resp) = client
-            .get(format!("{issuer}/.well-known/openid-configuration"))
-            .send()
-            .await
-        && resp.status().is_success()
-        && let Ok(disc_bytes) = read_upstream_body_bounded(resp, 256 * 1024).await
-        && let Ok(disc) = serde_json::from_slice::<Value>(&disc_bytes)
-        && disc
-            .get("issuer")
-            .and_then(|v| v.as_str())
-            .is_none_or(|s| s.trim().trim_end_matches('/') == issuer.as_str())
+    let cached_disc = state.auth_gate.get_cached_oidc_discovery(&issuer);
+    let disc_opt = if let Some(doc) = cached_disc {
+        Some(doc)
+    } else {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        if let Ok(client) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            && let Ok(resp) = client
+                .get(format!("{issuer}/.well-known/openid-configuration"))
+                .send()
+                .await
+            && resp.status().is_success()
+            && let Ok(disc_bytes) = read_upstream_body_bounded(resp, 256 * 1024).await
+            && let Ok(disc) = serde_json::from_slice::<Value>(&disc_bytes)
+            && disc
+                .get("issuer")
+                .and_then(|v| v.as_str())
+                .is_none_or(|s| s.trim().trim_end_matches('/') == issuer.as_str())
+        {
+            state
+                .auth_gate
+                .put_cached_oidc_discovery(&issuer, disc.clone());
+            Some(disc)
+        } else {
+            None
+        }
+    };
+    if let Some(disc) = disc_opt
         && let Some(ep) = disc.get("authorization_endpoint").and_then(|v| v.as_str())
         && is_valid_oidc_discovered_endpoint(ep, &issuer)
     {
         auth_endpoint = ep.trim().to_string();
     }
 
-    let scope_str = if oidc.scopes.is_empty() {
+    let scopes = state.config.read().await.auth.oidc.scopes.clone();
+    let scope_str = if scopes.is_empty() {
         "openid profile email groups".to_string()
     } else {
-        oidc.scopes.join(" ")
+        scopes.join(" ")
     };
 
     let redirect_target = format!(
@@ -2899,9 +3122,10 @@ pub async fn api_auth_oidc_callback(
             .into_response();
     }
 
-    let (oidc_cfg, cookie_name, cookie_secure, session_len) = {
+    let (auth_full_cfg, oidc_cfg, cookie_name, cookie_secure, session_len) = {
         let cfg = state.config.read().await;
         (
+            cfg.auth.clone(),
             cfg.auth.oidc.clone(),
             cfg.auth.cookie_name.clone(),
             should_set_secure_cookie(&headers, &uri, &cfg.auth),
@@ -2945,7 +3169,7 @@ pub async fn api_auth_oidc_callback(
     };
 
     let expected_callback_uri = {
-        let base_url = resolve_external_base_url(&headers, &uri);
+        let base_url = resolve_external_base_url_with_auth(&headers, &uri, Some(&auth_full_cfg));
         format!("{base_url}/api/auth/oidc/callback")
     };
     let redirect_uri = match saved_redirect_uri {
@@ -3189,9 +3413,45 @@ pub async fn api_auth_oidc_callback(
                         };
                         let mut sig_verified = false;
                         for jwk in &jwk_set.keys {
+                            if matches!(
+                                jwk.common.public_key_use,
+                                Some(jsonwebtoken::jwk::PublicKeyUse::Encryption)
+                            ) {
+                                continue;
+                            }
                             if let Some(ref req_kid) = jwt_hdr.kid
                                 && let Some(ref key_kid) = jwk.common.key_id
                                 && req_kid != key_kid
+                            {
+                                continue;
+                            }
+                            let kty_matches_alg = match &jwk.algorithm {
+                                jsonwebtoken::jwk::AlgorithmParameters::RSA(_) => matches!(
+                                    jwt_hdr.alg,
+                                    Algorithm::RS256
+                                        | Algorithm::RS384
+                                        | Algorithm::RS512
+                                        | Algorithm::PS256
+                                        | Algorithm::PS384
+                                        | Algorithm::PS512
+                                ),
+                                jsonwebtoken::jwk::AlgorithmParameters::EllipticCurve(_) => {
+                                    matches!(jwt_hdr.alg, Algorithm::ES256 | Algorithm::ES384)
+                                }
+                                jsonwebtoken::jwk::AlgorithmParameters::OctetKeyPair(_) => {
+                                    matches!(jwt_hdr.alg, Algorithm::EdDSA)
+                                }
+                                jsonwebtoken::jwk::AlgorithmParameters::OctetKey(_) => matches!(
+                                    jwt_hdr.alg,
+                                    Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512
+                                ),
+                                _ => false,
+                            };
+                            if !kty_matches_alg {
+                                continue;
+                            }
+                            if let Some(key_alg) = jwk.common.key_algorithm
+                                && format!("{key_alg:?}") != format!("{:?}", jwt_hdr.alg)
                             {
                                 continue;
                             }
@@ -3467,8 +3727,10 @@ pub async fn api_auth_oidc_callback(
                         iat: now,
                         exp: now.saturating_add(clamped_session_len),
                     };
+                    let mut oidc_hdr = Header::new(Algorithm::HS256);
+                    oidc_hdr.kid = Some("oidc".to_string());
                     let session_token = jsonwebtoken::encode(
-                        &Header::new(Algorithm::HS256),
+                        &oidc_hdr,
                         &jwt_claims,
                         &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
                     )
@@ -3676,17 +3938,23 @@ pub async fn api_login(
     }
 
     let now = unix_now();
+    let issued_at = match state.auth_gate.deleted_user_epoch(&db_user.username) {
+        Some(prev_deleted) => now.max(prev_deleted.saturating_add(1)),
+        None => now,
+    };
     let clamped_session_len = session_len.clamp(60, 86_400 * 365);
     let claims = JwtClaims {
         sub: db_user.username.clone(),
         role: db_user.role.clone(),
         allowed_cameras: Some(db_user.allowed_cameras.clone()),
-        iat: now,
-        exp: now.saturating_add(clamped_session_len),
+        iat: issued_at,
+        exp: issued_at.saturating_add(clamped_session_len),
     };
 
+    let mut local_hdr = Header::new(Algorithm::HS256);
+    local_hdr.kid = Some("local".to_string());
     let token = jsonwebtoken::encode(
-        &Header::new(Algorithm::HS256),
+        &local_hdr,
         &claims,
         &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
     )
@@ -3882,9 +4150,19 @@ pub fn extract_authenticated_user_with_cfg(
         &validation,
     )
     .ok()?;
-    if is_reserved_token_principal_prefix(&decoded.claims.sub) {
+    if is_reserved_token_principal_prefix(&decoded.claims.sub)
+        || state
+            .auth_gate
+            .is_token_revoked_by_user_deletion(&decoded.claims.sub, decoded.claims.iat)
+    {
         return None;
     }
+
+    let is_local_session_token = decoded
+        .header
+        .kid
+        .as_deref()
+        .is_some_and(|k| k.eq_ignore_ascii_case("local"));
 
     let (canonical_sub, role) = match state
         .auth_gate
@@ -3902,6 +4180,9 @@ pub fn extract_authenticated_user_with_cfg(
             )
         }
         Ok(None) => {
+            if is_local_session_token {
+                return None;
+            }
             if auth_cfg.enabled
                 && (decoded.claims.role.eq_ignore_ascii_case("admin")
                     || decoded.claims.sub.eq_ignore_ascii_case("admin"))
@@ -4719,6 +5000,13 @@ pub fn reverify_ws_caller_access_with_iat(
     let Some(user) = caller_user else {
         return Some((fallback_role.to_string(), fallback_allowed.clone()));
     };
+    if !user.starts_with("token:")
+        && state
+            .auth_gate
+            .is_token_revoked_by_user_deletion(user, session_iat.unwrap_or(0).max(0) as u64)
+    {
+        return None;
+    }
     if let Some(token_name) = user.strip_prefix("token:") {
         if !state.auth_gate.is_api_token_active_cached_sync(
             &state.db,
@@ -4748,6 +5036,13 @@ pub async fn reverify_ws_caller_access_async(
     let Some(user) = caller_user else {
         return Some((fallback_role.to_string(), fallback_allowed.clone()));
     };
+    if !user.starts_with("token:")
+        && state
+            .auth_gate
+            .is_token_revoked_by_user_deletion(user, session_iat.unwrap_or(0).max(0) as u64)
+    {
+        return None;
+    }
     if let Some(token_name) = user.strip_prefix("token:") {
         if !state
             .auth_gate

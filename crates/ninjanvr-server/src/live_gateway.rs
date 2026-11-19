@@ -243,6 +243,20 @@ pub fn query_has_disallowed_go2rtc_dst(query: &str) -> bool {
         })
 }
 
+fn is_audio_media_rest(media_rest: &str) -> bool {
+    media_rest
+        .trim_start()
+        .strip_prefix("audio")
+        .is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+}
+
+fn is_video_media_rest(media_rest: &str) -> bool {
+    media_rest
+        .trim_start()
+        .strip_prefix("video")
+        .is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+}
+
 /// Detects an audio-only WebRTC SDP offer carrying a send-capable microphone backchannel
 /// (`sendonly` or `sendrecv`, without a `video` media section).
 pub fn is_webrtc_audio_talkback_offer(sdp_bytes: &[u8]) -> bool {
@@ -250,25 +264,167 @@ pub fn is_webrtc_audio_talkback_offer(sdp_bytes: &[u8]) -> bool {
         return false;
     };
     let mut has_audio = false;
-    let mut audio_recv_or_inactive_only = false;
-    let mut in_audio_section = false;
-    for raw_line in sdp.lines() {
-        let line = raw_line.trim();
-        if let Some(media_rest) = line.strip_prefix("m=") {
-            if media_rest.starts_with("video ") || media_rest == "video" {
+    for raw_line in sdp.split(['\r', '\n']) {
+        let line_lc = raw_line.trim().to_ascii_lowercase();
+        if let Some(media_rest) = line_lc.strip_prefix("m=") {
+            if is_video_media_rest(media_rest) {
                 return false;
             }
-            in_audio_section = media_rest.starts_with("audio ") || media_rest == "audio";
-            if in_audio_section {
+            if is_audio_media_rest(media_rest) {
                 has_audio = true;
+            }
+        }
+    }
+    has_audio && sdp_has_send_capable_audio(sdp)
+}
+
+/// Returns `true` when an SDP string contains any `m=audio` section that could transmit audio
+/// (`pion/webrtc` defaults to `sendrecv` when omitted, splits `a=<key>:<value>` on `:` while
+/// checking `attr.Key`, and honors the first direction attribute; therefore an `m=audio` section
+/// is safe for read-only callers ONLY when it declares exactly one canonical `a=recvonly` or
+/// `a=inactive` line and zero `sendonly`/`sendrecv`/suffixed direction attributes).
+pub fn sdp_has_send_capable_audio(sdp: &str) -> bool {
+    let mut in_media = false;
+    let mut in_audio = false;
+    let mut session_has_send_dir = false;
+    let mut audio_recv_or_inactive_count = 0usize;
+    let mut audio_send_dir_count = 0usize;
+
+    let section_is_send_capable = |recv_cnt: usize, send_cnt: usize, sess_send: bool| -> bool {
+        send_cnt > 0 || recv_cnt != 1 || (recv_cnt == 0 && sess_send)
+    };
+
+    for raw_line in sdp.split(['\r', '\n']) {
+        let line = raw_line.trim().to_ascii_lowercase();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(media_rest) = line.strip_prefix("m=") {
+            if in_audio
+                && section_is_send_capable(
+                    audio_recv_or_inactive_count,
+                    audio_send_dir_count,
+                    session_has_send_dir,
+                )
+            {
+                return true;
+            }
+            in_media = true;
+            in_audio = is_audio_media_rest(media_rest);
+            audio_recv_or_inactive_count = 0;
+            audio_send_dir_count = 0;
+            continue;
+        }
+        let attr_key = line
+            .strip_prefix("a=")
+            .map(|rest| rest.split(':').next().unwrap_or(rest).trim());
+        if !in_media {
+            if matches!(attr_key, Some("sendonly" | "sendrecv")) {
+                session_has_send_dir = true;
             }
             continue;
         }
-        if in_audio_section && (line == "a=recvonly" || line == "a=inactive") {
-            audio_recv_or_inactive_only = true;
+        if in_audio {
+            if line == "a=recvonly" || line == "a=inactive" {
+                audio_recv_or_inactive_count += 1;
+            } else if matches!(
+                attr_key,
+                Some("sendonly" | "sendrecv" | "recvonly" | "inactive")
+            ) {
+                audio_send_dir_count += 1;
+            }
         }
     }
-    has_audio && !audio_recv_or_inactive_only
+    if in_audio
+        && section_is_send_capable(
+            audio_recv_or_inactive_count,
+            audio_send_dir_count,
+            session_has_send_dir,
+        )
+    {
+        return true;
+    }
+    false
+}
+
+/// Strict allowlist validator for client-to-`go2rtc` WebSocket control frames from read-only
+/// (`viewer` / `read_only`) callers, neutralizing Go `encoding/json` case-insensitive field
+/// matching (`Type`/`Value`/`SDP`) and blocking non-recvonly WebRTC audio offers.
+pub fn is_permitted_readonly_go2rtc_ws_message(raw_msg: &str) -> bool {
+    let trimmed = raw_msg.trim();
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) else {
+        return false;
+    };
+    let mut type_val: Option<&str> = None;
+    let mut value_entry: Option<&Value> = None;
+    for (k, v) in &map {
+        if k.eq_ignore_ascii_case("type") {
+            if type_val.is_some() {
+                return false;
+            }
+            let Some(s) = v.as_str() else {
+                return false;
+            };
+            type_val = Some(s);
+        } else if k.eq_ignore_ascii_case("value") {
+            if value_entry.is_some() {
+                return false;
+            }
+            value_entry = Some(v);
+        } else {
+            return false;
+        }
+    }
+    let Some(msg_ty) = type_val.map(|s| s.trim().to_ascii_lowercase()) else {
+        return false;
+    };
+    match msg_ty.as_str() {
+        "mse" | "webrtc/candidate" => true,
+        "webrtc" | "webrtc/offer" => {
+            let Some(val) = value_entry else {
+                return false;
+            };
+            match val {
+                Value::String(sdp) => !sdp_has_send_capable_audio(sdp),
+                Value::Object(inner) => {
+                    let mut sdp_str: Option<&str> = None;
+                    for (ik, iv) in inner {
+                        if ik.eq_ignore_ascii_case("sdp") {
+                            if sdp_str.is_some() {
+                                return false;
+                            }
+                            let Some(s) = iv.as_str() else {
+                                return false;
+                            };
+                            sdp_str = Some(s);
+                        } else if !ik.eq_ignore_ascii_case("type") {
+                            return false;
+                        }
+                    }
+                    sdp_str.is_some_and(|sdp| !sdp_has_send_capable_audio(sdp))
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Inspects a WebSocket client text message (such as `go2rtc` JSON `{"type":"webrtc","value":"v=0..."}`
+/// or raw SDP) and returns `true` if it attempts to negotiate a send-capable audio backchannel
+/// or uses a non-allowlisted control frame shape for read-only callers.
+pub fn ws_message_contains_webrtc_talkback(raw_msg: &str) -> bool {
+    let trimmed = raw_msg.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with('{') {
+        return !is_permitted_readonly_go2rtc_ws_message(trimmed);
+    }
+    if trimmed.to_ascii_lowercase().contains("m=") {
+        return sdp_has_send_capable_audio(trimmed);
+    }
+    true
 }
 
 /// Rewrites the first `src=...` query parameter in `query` to `new_src`.
@@ -558,6 +714,32 @@ impl LiveStreamGateway {
         query: String,
         is_webrtc_ws: bool,
     ) {
+        self.bridge_ws_with_talkback_guard(client_ws, go2rtc_ws_base, query, is_webrtc_ws, true)
+            .await;
+    }
+
+    /// Bridges an upgraded client WebSocket while enforcing talkback RBAC (`caller_can_talkback`)
+    /// so read-only `viewer` / `read_only` callers cannot transmit microphone audio over WebRTC WS.
+    pub async fn bridge_ws_with_talkback_guard(
+        &self,
+        client_ws: WebSocket,
+        go2rtc_ws_base: &str,
+        query: String,
+        is_webrtc_ws: bool,
+        caller_can_talkback: bool,
+    ) {
+        if !caller_can_talkback
+            && let Some(raw_src) = mse_hub::extract_stream_src_from_query(&query)
+            && matches!(
+                self.resolve_stream_route(&raw_src).await.map(|r| r.variant),
+                Some(
+                    ninjanvr_config::Go2RtcStreamVariant::Talkback
+                        | ninjanvr_config::Go2RtcStreamVariant::SubTalkback
+                )
+            )
+        {
+            return;
+        }
         if !is_webrtc_ws && let Some(raw_src) = mse_hub::extract_stream_src_from_query(&query) {
             let resolved_src = {
                 let cfg = self.config.read().await;
@@ -590,10 +772,13 @@ impl LiveStreamGateway {
                         if t.len() > MAX_GO2RTC_WS_MESSAGE_BYTES {
                             break;
                         }
+                        if !caller_can_talkback && ws_message_contains_webrtc_talkback(&t) {
+                            break;
+                        }
                         TungMsg::Text(t.to_string().into())
                     }
                     AxumWsMsg::Binary(b) => {
-                        if b.len() > MAX_GO2RTC_WS_MESSAGE_BYTES {
+                        if !caller_can_talkback || b.len() > MAX_GO2RTC_WS_MESSAGE_BYTES {
                             break;
                         }
                         TungMsg::Binary(b)

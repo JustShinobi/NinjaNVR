@@ -637,11 +637,11 @@ export const PushToTalkButton: React.FC<PushToTalkButtonProps> = ({
           ? "var(--signal-motion)"
           : undefined,
         color: isTalking
-          ? "var(--signal-alert-text)"
+          ? "var(--ptt-badge-fg)"
           : isError
           ? "var(--signal-motion-text)"
           : undefined,
-        background: isTalking ? "rgba(239, 68, 68, 0.24)" : undefined,
+        background: isTalking ? "var(--ptt-badge-bg)" : undefined,
       }}
       onClick={(e) => {
         e.stopPropagation();
@@ -1566,14 +1566,18 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
               display: "inline-flex",
               alignItems: "center",
               gap: 6,
-              background: "rgba(127, 29, 29, 0.92)",
+              background: "var(--ptt-badge-bg)",
               border: "1px solid var(--signal-alert)",
-              color: "#fecaca",
+              color: "var(--ptt-badge-fg)",
               padding: "3px 8px",
               borderRadius: 3,
               fontSize: "var(--text-xs)",
               fontWeight: 700,
               fontVariantNumeric: "tabular-nums",
+              maxWidth: "calc(100% - 150px)",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
               pointerEvents: "none",
             }}
           >

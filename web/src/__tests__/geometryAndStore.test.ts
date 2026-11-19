@@ -200,4 +200,50 @@ describe("useNvrStore state transitions and i18n parity", () => {
     ).window.localStorage.setItem("ninjanvr_locale", "pt");
     expect(resolveInitialLocale()).toBe("pt");
   });
+
+  test("setCameraActivity preserves per-camera reference identity and skips no-op notifications", () => {
+    let notifications = 0;
+    const unsubscribe = useNvrStore.subscribe(() => {
+      notifications += 1;
+    });
+    try {
+      useNvrStore.getState().setCameraActivity({
+        cam_a: {
+          motion: true,
+          objects: [{ id: "1", label: "person", score: 0.92, stationary: false }],
+        },
+        cam_b: { motion: false, objects: [] },
+      });
+      const firstMap = useNvrStore.getState().cameraActivity;
+      const firstCamA = firstMap.cam_a;
+      const afterFirstCount = notifications;
+
+      // Identical payload must be a complete Zustand no-op (zero subscriber notifications)
+      useNvrStore.getState().setCameraActivity({
+        cam_a: {
+          motion: true,
+          objects: [{ id: "1", label: "person", score: 0.92, stationary: false }],
+        },
+        cam_b: { motion: false, objects: [] },
+      });
+      expect(notifications).toBe(afterFirstCount);
+      expect(useNvrStore.getState().cameraActivity).toBe(firstMap);
+
+      // Updating cam_b preserves cam_a object reference identity
+      useNvrStore.getState().setCameraActivity({
+        cam_a: {
+          motion: true,
+          objects: [{ id: "1", label: "person", score: 0.92, stationary: false }],
+        },
+        cam_b: {
+          motion: true,
+          objects: [{ id: "2", label: "car", score: 0.88, stationary: false }],
+        },
+      });
+      expect(useNvrStore.getState().cameraActivity.cam_a).toBe(firstCamA);
+      expect(useNvrStore.getState().cameraActivity.cam_b?.motion).toBe(true);
+    } finally {
+      unsubscribe();
+    }
+  });
 });

@@ -660,6 +660,10 @@ pub struct TlsConfig {
     pub enabled: bool,
     #[serde(default)]
     pub san_hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_path: Option<PathBuf>,
 }
 
 impl Default for TlsConfig {
@@ -667,11 +671,13 @@ impl Default for TlsConfig {
         Self {
             enabled: true,
             san_hosts: Vec::new(),
+            cert_path: None,
+            key_path: None,
         }
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MqttConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -2635,6 +2641,112 @@ impl NinjaConfig {
         )
     }
 
+    /// When `go2rtc_active` is `true` and `raw_url` embeds RTSP credentials (`rtsp://user:pass@...`),
+    /// substitutes `rtsp://127.0.0.1:8554/<stream>` if `go2rtc.streams` already defines the matching
+    /// camera stream so FFmpeg worker `argv` (`/proc/<pid>/cmdline`) never exposes plaintext passwords.
+    pub fn prefer_local_go2rtc_relay_url(
+        &self,
+        camera: &str,
+        role: &str,
+        raw_url: &str,
+        go2rtc_active: bool,
+    ) -> String {
+        let trimmed = raw_url.trim();
+        if !go2rtc_active || trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+        let has_userinfo = trimmed
+            .split_once("://")
+            .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+            .is_some_and(|authority| authority.contains('@'));
+        if !has_userinfo {
+            return trimmed.to_string();
+        }
+        let cam_trimmed = camera.trim();
+        if !is_safe_go2rtc_stream_name(cam_trimmed) {
+            return trimmed.to_string();
+        }
+        let mut relay_port: u16 = 8554;
+        if let Some((_, rtsp_extra)) = self
+            .go2rtc
+            .extra
+            .iter()
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case("rtsp"))
+        {
+            let Some(rtsp_obj) = rtsp_extra.as_object() else {
+                return trimmed.to_string();
+            };
+            let has_rtsp_auth = rtsp_obj.iter().any(|(k, v)| {
+                (k.eq_ignore_ascii_case("username") || k.eq_ignore_ascii_case("password"))
+                    && v.as_str().is_some_and(|s| !s.trim().is_empty())
+            });
+            if has_rtsp_auth {
+                return trimmed.to_string();
+            }
+            if let Some((_, listen_val)) = rtsp_obj
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("listen"))
+            {
+                let Some(listen_str) = listen_val.as_str().map(str::trim) else {
+                    return trimmed.to_string();
+                };
+                if listen_str.is_empty() {
+                    return trimmed.to_string();
+                }
+                let port_opt = if let Some(p_str) = listen_str.strip_prefix(':') {
+                    p_str.parse::<u16>().ok()
+                } else if let Some((host, p_str)) = listen_str.rsplit_once(':') {
+                    let h = host.trim();
+                    if h == "127.0.0.1" || h == "0.0.0.0" || h.eq_ignore_ascii_case("localhost") {
+                        p_str.parse::<u16>().ok()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let Some(p) = port_opt.filter(|&p| p > 0) else {
+                    return trimmed.to_string();
+                };
+                relay_port = p;
+            }
+        }
+
+        let clean_requested = trimmed.split('#').next().unwrap_or(trimmed).trim();
+        let candidate_streams: [&str; 2] = if role.eq_ignore_ascii_case("detect") {
+            ["detect_sub", "main"]
+        } else {
+            ["main", "detect_sub"]
+        };
+        for kind in candidate_streams {
+            let key = if kind == "detect_sub" {
+                format!("{cam_trimmed}_sub")
+            } else {
+                cam_trimmed.to_string()
+            };
+            let matches_upstream = match self.go2rtc.streams.get(&key) {
+                Some(Value::String(s)) => {
+                    s.split('#').next().unwrap_or(s).trim() == clean_requested
+                }
+                Some(Value::Array(arr)) => arr
+                    .iter()
+                    .find_map(|v| {
+                        v.as_str().map(str::trim).filter(|s| {
+                            !s.is_empty() && !s.to_ascii_lowercase().starts_with("tapo://")
+                        })
+                    })
+                    .is_some_and(|primary| {
+                        primary.split('#').next().unwrap_or(primary).trim() == clean_requested
+                    }),
+                _ => false,
+            };
+            if matches_upstream {
+                return format!("rtsp://127.0.0.1:{relay_port}/{key}");
+            }
+        }
+        trimmed.to_string()
+    }
+
     /// Writes `/dev/shm/go2rtc.yaml` compatible with go2rtc.
     pub fn write_go2rtc_config(&self, target_path: impl AsRef<Path>) -> Result<()> {
         let target_path = target_path.as_ref();
@@ -2746,7 +2858,7 @@ impl NinjaConfig {
 
         let mut root = serde_json::Map::new();
         root.insert("streams".to_string(), serde_json::to_value(&streams_map)?);
-        root.insert("api".to_string(), json!({ "origin": "*" }));
+        root.insert("api".to_string(), json!({ "listen": "127.0.0.1:1984" }));
         root.insert("log".to_string(), json!({ "format": "text" }));
         root.insert("webrtc".to_string(), json!({ "candidates": ["stun:8555"] }));
         let is_blocked_extra_key = |k_norm: &str| {
@@ -2792,6 +2904,9 @@ impl NinjaConfig {
                     root.insert(k.clone(), v.clone());
                 }
             }
+        }
+        if !root.keys().any(|rk| rk.trim().eq_ignore_ascii_case("rtsp")) {
+            root.insert("rtsp".to_string(), json!({ "listen": "127.0.0.1:8554" }));
         }
 
         let yaml_str = serde_yaml::to_string(&Value::Object(root))?;
@@ -5194,6 +5309,21 @@ fn validate_config_file_paths(cfg: &NinjaConfig) -> std::result::Result<(), Conf
         ));
     }
     validate_mqtt_tls_paths(&cfg.mqtt)?;
+    if cfg.tls.cert_path.is_some() != cfg.tls.key_path.is_some() {
+        return Err(ConfigValidationError::InvalidTlsPath(
+            "tls.cert_path and tls.key_path must both be configured together",
+        ));
+    }
+    if let Some(ref p) = cfg.tls.cert_path
+        && !is_safe_tls_path(p)
+    {
+        return Err(ConfigValidationError::InvalidTlsPath("tls.cert_path"));
+    }
+    if let Some(ref p) = cfg.tls.key_path
+        && !is_safe_tls_path(p)
+    {
+        return Err(ConfigValidationError::InvalidTlsPath("tls.key_path"));
+    }
     Ok(())
 }
 
@@ -7252,6 +7382,7 @@ pub fn scrub_yaml_credentials(raw_yaml: &str) -> String {
     let mut scrubbed_lines = String::with_capacity(out.len());
     let mut in_multiline_secret_indent: Option<(usize, bool)> = None;
     let mut in_unclosed_secret_quote: Option<char> = None;
+    let mut pending_flow_secret_scalar = false;
     for chunk in out.split_inclusive('\n') {
         let (line_body, newline) = if let Some(stripped) = chunk.strip_suffix("\r\n") {
             (stripped, "\r\n")
@@ -7270,6 +7401,37 @@ pub fn scrub_yaml_credentials(raw_yaml: &str) -> String {
             continue;
         }
 
+        if pending_flow_secret_scalar {
+            if trimmed_start.is_empty() || trimmed_start.starts_with('#') {
+                scrubbed_lines.push_str(chunk);
+                continue;
+            }
+            pending_flow_secret_scalar = false;
+            let val_end_rel = find_flow_value_end(trimmed_start);
+            let raw_val = strip_yaml_inline_comment(&trimmed_start[..val_end_rel]);
+            let unquoted = raw_val.trim_matches('"').trim_matches('\'').trim();
+            let is_new_key = raw_val.contains(':')
+                && !trimmed_start.starts_with('"')
+                && !trimmed_start.starts_with('\'');
+            if !is_new_key
+                && !unquoted.is_empty()
+                && !unquoted.eq_ignore_ascii_case("null")
+                && unquoted != "~"
+                && unquoted != "***"
+                && !unquoted.starts_with('#')
+            {
+                in_unclosed_secret_quote = has_unclosed_yaml_quote(raw_val);
+                let (rest_scrubbed, trailing_pending) =
+                    scrub_inline_yaml_secret_keys_with_state(&trimmed_start[val_end_rel..]);
+                pending_flow_secret_scalar = trailing_pending;
+                scrubbed_lines.push_str(&line_body[..indent]);
+                scrubbed_lines.push_str("\"***\"");
+                scrubbed_lines.push_str(&rest_scrubbed);
+                scrubbed_lines.push_str(newline);
+                continue;
+            }
+        }
+
         if let Some((base_indent, ref mut mask_emitted)) = in_multiline_secret_indent {
             if trimmed_start.is_empty() {
                 if !*mask_emitted {
@@ -7280,12 +7442,40 @@ pub fn scrub_yaml_credentials(raw_yaml: &str) -> String {
             if indent > base_indent {
                 if !*mask_emitted {
                     let leading_ws = &line_body[..indent];
+                    let val_end_rel = find_flow_value_end(trimmed_start);
+                    let raw_val = strip_yaml_inline_comment(&trimmed_start[..val_end_rel]);
+                    in_unclosed_secret_quote = has_unclosed_yaml_quote(raw_val);
+                    let (rest_scrubbed, trailing_pending) =
+                        scrub_inline_yaml_secret_keys_with_state(&trimmed_start[val_end_rel..]);
+                    pending_flow_secret_scalar = trailing_pending;
                     scrubbed_lines.push_str(leading_ws);
                     scrubbed_lines.push_str("\"***\"");
+                    scrubbed_lines.push_str(&rest_scrubbed);
                     scrubbed_lines.push_str(newline);
                     *mask_emitted = true;
                 }
                 continue;
+            }
+            if !*mask_emitted
+                && indent == base_indent
+                && (trimmed_start.starts_with('"') || trimmed_start.starts_with('\''))
+            {
+                let val_end_rel = find_flow_value_end(trimmed_start);
+                let after_val = trimmed_start[val_end_rel..].trim_start();
+                if !after_val.starts_with(':') {
+                    let leading_ws = &line_body[..indent];
+                    let raw_val = strip_yaml_inline_comment(&trimmed_start[..val_end_rel]);
+                    in_unclosed_secret_quote = has_unclosed_yaml_quote(raw_val);
+                    let (rest_scrubbed, trailing_pending) =
+                        scrub_inline_yaml_secret_keys_with_state(&trimmed_start[val_end_rel..]);
+                    pending_flow_secret_scalar = trailing_pending;
+                    scrubbed_lines.push_str(leading_ws);
+                    scrubbed_lines.push_str("\"***\"");
+                    scrubbed_lines.push_str(&rest_scrubbed);
+                    scrubbed_lines.push_str(newline);
+                    in_multiline_secret_indent = None;
+                    continue;
+                }
             }
             if trimmed_start.starts_with('#') {
                 scrubbed_lines.push_str(chunk);
@@ -7350,7 +7540,8 @@ pub fn scrub_yaml_credentials(raw_yaml: &str) -> String {
         if replaced {
             continue;
         }
-        let flow_scrubbed = scrub_inline_yaml_secret_keys(line_body);
+        let (flow_scrubbed, trailing_pending) = scrub_inline_yaml_secret_keys_with_state(line_body);
+        pending_flow_secret_scalar = trailing_pending;
         scrubbed_lines.push_str(&flow_scrubbed);
         scrubbed_lines.push_str(newline);
     }
@@ -7454,10 +7645,11 @@ fn scrub_inline_key_equals_secrets(line: &str) -> String {
     out
 }
 
-fn scrub_inline_yaml_secret_keys(line: &str) -> String {
+fn scrub_inline_yaml_secret_keys_with_state(line: &str) -> (String, bool) {
     if !line.contains(':') && !line.contains('=') {
-        return line.to_string();
+        return (line.to_string(), false);
     }
+    let mut pending_next_line = false;
     let colon_scrubbed = if line.contains(':') {
         let bytes = line.as_bytes();
         let mut out = String::with_capacity(line.len());
@@ -7523,7 +7715,9 @@ fn scrub_inline_yaml_secret_keys(line: &str) -> String {
             let replace_end = val_start + ws_len + val_end_rel;
             let raw_val = strip_yaml_inline_comment(&val_trimmed[..val_end_rel]);
             let unquoted = raw_val.trim_matches('"').trim_matches('\'').trim();
-            if !unquoted.is_empty()
+            if unquoted.is_empty() && val_trimmed[val_end_rel..].trim().is_empty() {
+                pending_next_line = true;
+            } else if !unquoted.is_empty()
                 && !unquoted.eq_ignore_ascii_case("null")
                 && unquoted != "~"
                 && unquoted != "***"
@@ -7544,11 +7738,12 @@ fn scrub_inline_yaml_secret_keys(line: &str) -> String {
     } else {
         line.to_string()
     };
-    if colon_scrubbed.contains('=') {
+    let final_str = if colon_scrubbed.contains('=') {
         scrub_inline_key_equals_secrets(&colon_scrubbed)
     } else {
         colon_scrubbed
-    }
+    };
+    (final_str, pending_next_line)
 }
 
 fn is_sensitive_json_key(key: &str) -> bool {
@@ -7690,8 +7885,11 @@ pub struct Go2RtcSupervisor {
     homekit_config_path: PathBuf,
     pid: Arc<AtomicU32>,
     running: AtomicBool,
+    shutdown_flag: AtomicBool,
+    shutdown_notify: Arc<tokio::sync::Notify>,
     reload_notify: Arc<tokio::sync::Notify>,
     reload_generation: AtomicU64,
+    task_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Go2RtcSupervisor {
@@ -7733,9 +7931,20 @@ impl Go2RtcSupervisor {
             homekit_config_path,
             pid: Arc::new(AtomicU32::new(0)),
             running: AtomicBool::new(false),
+            shutdown_flag: AtomicBool::new(false),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             reload_notify: Arc::new(tokio::sync::Notify::new()),
             reload_generation: AtomicU64::new(0),
+            task_handle: tokio::sync::Mutex::new(None),
         }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Acquire) && !self.shutdown_flag.load(Ordering::Acquire)
+    }
+
+    pub fn shm_config_path(&self) -> &Path {
+        &self.shm_config_path
     }
 
     pub fn pid(&self) -> u32 {
@@ -7783,8 +7992,13 @@ impl Go2RtcSupervisor {
         {
             return;
         }
-        tokio::spawn(async move {
+        self.shutdown_flag.store(false, Ordering::SeqCst);
+        let sup_for_handle = Arc::clone(&self);
+        let handle = tokio::spawn(async move {
             loop {
+                if self.shutdown_flag.load(Ordering::SeqCst) {
+                    break;
+                }
                 let gen_before_prep = self.reload_generation.load(Ordering::SeqCst);
                 let cfg_snapshot = self.config.read().await.clone();
                 let shm_path = self.shm_config_path.clone();
@@ -7797,11 +8011,15 @@ impl Go2RtcSupervisor {
                     (write_res, bin_ok)
                 })
                 .await;
+                if self.shutdown_flag.load(Ordering::SeqCst) {
+                    break;
+                }
                 let (write_res, bin_ok) = match prep_res {
                     Ok(pair) => pair,
                     Err(err) => {
                         error!("go2rtc config writer task panicked: {err:#}");
                         tokio::select! {
+                            _ = self.shutdown_notify.notified() => break,
                             _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
                             _ = self.reload_notify.notified() => {}
                         }
@@ -7811,6 +8029,7 @@ impl Go2RtcSupervisor {
                 if let Err(err) = write_res {
                     error!("Failed to write go2rtc config: {err:#}");
                     tokio::select! {
+                        _ = self.shutdown_notify.notified() => break,
                         _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
                         _ = self.reload_notify.notified() => {}
                     }
@@ -7823,6 +8042,7 @@ impl Go2RtcSupervisor {
                         self.go2rtc_bin.display()
                     );
                     tokio::select! {
+                        _ = self.shutdown_notify.notified() => break,
                         _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
                         _ = self.reload_notify.notified() => {}
                     }
@@ -7831,6 +8051,9 @@ impl Go2RtcSupervisor {
 
                 if self.reload_generation.load(Ordering::SeqCst) != gen_before_prep {
                     continue;
+                }
+                if self.shutdown_flag.load(Ordering::SeqCst) {
+                    break;
                 }
 
                 let mut cmd = Command::new(&self.go2rtc_bin);
@@ -7846,8 +8069,22 @@ impl Go2RtcSupervisor {
                         self.pid.store(pid, Ordering::Relaxed);
                         info!("Started supervised go2rtc process (PID: {pid})");
                         tokio::select! {
+                            biased;
+                            _ = self.shutdown_notify.notified() => {
+                                let _ = child.start_kill();
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(3),
+                                    child.wait(),
+                                )
+                                .await;
+                                self.pid.store(0, Ordering::Relaxed);
+                                break;
+                            }
                             status = child.wait() => {
                                 self.pid.store(0, Ordering::Relaxed);
+                                if self.shutdown_flag.load(Ordering::SeqCst) {
+                                    break;
+                                }
                                 warn!("go2rtc process exited with status: {status:?}, restarting in 3s");
                             }
                             _ = self.reload_notify.notified() => {
@@ -7860,6 +8097,9 @@ impl Go2RtcSupervisor {
                                 )
                                 .await;
                                 self.pid.store(0, Ordering::Relaxed);
+                                if self.shutdown_flag.load(Ordering::SeqCst) {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -7867,14 +8107,66 @@ impl Go2RtcSupervisor {
                         error!("Failed to spawn go2rtc: {err:#}");
                     }
                 }
+                if self.shutdown_flag.load(Ordering::SeqCst) {
+                    break;
+                }
                 if !reloaded {
                     tokio::select! {
+                        biased;
+                        _ = self.shutdown_notify.notified() => break,
                         _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
                         _ = self.reload_notify.notified() => {}
                     }
                 }
             }
+            self.pid.store(0, Ordering::Relaxed);
+            self.running.store(false, Ordering::SeqCst);
         });
+        if let Ok(mut guard) = sup_for_handle.task_handle.try_lock() {
+            *guard = Some(handle);
+        } else {
+            tokio::spawn(async move {
+                *sup_for_handle.task_handle.lock().await = Some(handle);
+            });
+        }
+    }
+
+    /// Deterministically stops the supervisor loop, terminates any running `go2rtc` child process,
+    /// and scrubs/deletes `self.shm_config_path` so secrets are never rewritten during teardown.
+    pub async fn shutdown(&self) {
+        self.shutdown_flag.store(true, Ordering::SeqCst);
+        self.shutdown_notify.notify_waiters();
+        self.reload_notify.notify_waiters();
+        if let Some(mut handle) = self.task_handle.lock().await.take()
+            && tokio::time::timeout(std::time::Duration::from_secs(4), &mut handle)
+                .await
+                .is_err()
+        {
+            handle.abort();
+        }
+        self.pid.store(0, Ordering::Relaxed);
+        self.running.store(false, Ordering::SeqCst);
+        let shm_path = self.shm_config_path.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(meta) = std::fs::symlink_metadata(&shm_path)
+                && meta.file_type().is_file()
+                && !meta.file_type().is_symlink()
+            {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&shm_path)
+                        && let Ok(f_meta) = file.metadata()
+                        && f_meta.file_type().is_file()
+                        && (f_meta.dev(), f_meta.ino()) == (meta.dev(), meta.ino())
+                    {
+                        let _ = file.set_len(0);
+                    }
+                }
+                let _ = std::fs::remove_file(&shm_path);
+            }
+        })
+        .await;
     }
 }
 
@@ -8544,11 +8836,24 @@ go2rtc:
             parsed["streams"]["front_door_sub"][0],
             "rtsp://admin:secret@192.0.2.10:554/sub"
         );
-        assert_eq!(parsed["api"]["origin"], "*");
+        assert_eq!(parsed["api"]["listen"], "127.0.0.1:1984");
+        assert!(parsed["api"]["origin"].is_null());
         assert_eq!(parsed["webrtc"]["candidates"][0], "stun:8555");
         assert_eq!(parsed["log"]["format"], "text");
         assert_eq!(parsed["rtsp"]["listen"], ":8554");
         assert_eq!(parsed["ffmpeg"]["bin"], "/usr/local/bin/ffmpeg");
+
+        // When `go2rtc.rtsp` is not explicitly configured, default `rtsp.listen` binds strictly to loopback
+        let default_rtsp_cfg = NinjaConfig::from_yaml_str(
+            "go2rtc:\n  streams:\n    front_door:\n      - rtsp://admin:secret@192.0.2.10:554/main\n",
+            PathBuf::from("/tmp/config_def.yml"),
+        )
+        .unwrap();
+        let def_path = tmp_dir.join("go2rtc_default.yaml");
+        default_rtsp_cfg.write_go2rtc_config(&def_path).unwrap();
+        let def_parsed: Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&def_path).unwrap()).unwrap();
+        assert_eq!(def_parsed["rtsp"]["listen"], "127.0.0.1:8554");
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
