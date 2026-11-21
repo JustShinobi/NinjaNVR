@@ -398,8 +398,78 @@ jobs:
         if: steps.check_token.outputs.enabled == 'true'
         working-directory: gitops
         run: |
-          KUSTOMIZATION_PATH="${GITOPS_KUSTOMIZATION_PATH:-$(dirname "${GITOPS_MANIFEST_PATH}")/kustomization.yaml}"
-          sed -i -E "s|(image:[[:space:]]*ghcr\.io/justshinobi/ninjanvr:)[^[:space:]]+|\1${IMAGE_TAG}|g" "${GITOPS_MANIFEST_PATH}"
+          MANIFEST_PATH="${GITOPS_MANIFEST_PATH}"
+          if [ ! -f "${MANIFEST_PATH}" ]; then
+            FALLBACK_VALUES="$(dirname "${MANIFEST_PATH}")/values.yaml"
+            if [ -f "${FALLBACK_VALUES}" ]; then
+              MANIFEST_PATH="${FALLBACK_VALUES}"
+            else
+              echo "GitOps manifest not found at ${GITOPS_MANIFEST_PATH} or ${FALLBACK_VALUES}" >&2
+              exit 1
+            fi
+          fi
+          KUSTOMIZATION_PATH="${GITOPS_KUSTOMIZATION_PATH:-$(dirname "${MANIFEST_PATH}")/kustomization.yaml}"
+          MANIFEST_PATH="${MANIFEST_PATH}" python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          manifest = Path(os.environ["MANIFEST_PATH"])
+          image_tag = os.environ["IMAGE_TAG"].strip()
+          image_digest = os.environ.get("IMAGE_DIGEST", "").strip()
+          text = manifest.read_text(encoding="utf-8")
+
+          # 1. Legacy standalone Deployment manifest (`image: ghcr.io/justshinobi/ninjanvr:<tag>`)
+          updated = re.sub(
+              r"(image:\s*ghcr\.io/justshinobi/ninjanvr:)[^\s\"']+",
+              rf"\g<1>{image_tag}",
+              text,
+          )
+
+          # 2. Helm chart `values.yaml` (`image:\n  repository: ghcr.io/justshinobi/ninjanvr\n  tag: ...`)
+          lines = updated.splitlines(keepends=True)
+          in_image_block = False
+          image_indent = 0
+          block_start = None
+          block_end = None
+          for idx, line in enumerate(lines):
+              stripped = line.lstrip(" ")
+              if not stripped or stripped.startswith("#"):
+                  continue
+              indent = len(line) - len(stripped)
+              if not in_image_block:
+                  if re.match(r"^image:\s*(#.*)?$", stripped):
+                      in_image_block = True
+                      image_indent = indent
+                      block_start = idx + 1
+                      block_end = len(lines)
+              else:
+                  if indent <= image_indent:
+                      block_end = idx
+                      break
+
+          if block_start is not None and block_end is not None:
+              block_text = "".join(lines[block_start:block_end])
+              if re.search(
+                  r"(?m)^\s+repository:\s*['\"]?ghcr\.io/justshinobi/ninjanvr['\"]?\s*$",
+                  block_text,
+              ):
+                  new_block = re.sub(
+                      r"(?m)^(\s+tag:\s*)['\"]?[^\s#'\"]+['\"]?(\s*(?:#.*)?)$",
+                      rf"\g<1>{image_tag}\g<2>",
+                      block_text,
+                  )
+                  if re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest):
+                      new_block = re.sub(
+                          r"(?m)^(\s+digest:\s*)['\"]?sha256:[0-9a-f]{64}['\"]?(\s*(?:#.*)?)$",
+                          rf"\g<1>{image_digest}\g<2>",
+                          new_block,
+                      )
+                  lines[block_start:block_end] = [new_block]
+                  updated = "".join(lines)
+
+          manifest.write_text(updated, encoding="utf-8")
+          PY
           if [ -f "${KUSTOMIZATION_PATH}" ]; then
             sed -i -E "s|(newTag:[[:space:]]*)[^[:space:]]+|\1${IMAGE_TAG}|g" "${KUSTOMIZATION_PATH}"
             if [[ "${IMAGE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -409,9 +479,9 @@ jobs:
           git config user.name "${GITOPS_BOT_NAME}"
           git config user.email "${GITOPS_BOT_EMAIL}"
           if [ -f "${KUSTOMIZATION_PATH}" ]; then
-            DIFF_TARGETS=("${GITOPS_MANIFEST_PATH}" "${KUSTOMIZATION_PATH}")
+            DIFF_TARGETS=("${MANIFEST_PATH}" "${KUSTOMIZATION_PATH}")
           else
-            DIFF_TARGETS=("${GITOPS_MANIFEST_PATH}")
+            DIFF_TARGETS=("${MANIFEST_PATH}")
           fi
           if git diff --quiet -- "${DIFF_TARGETS[@]}"; then
             echo "GitOps manifest already at ${IMAGE_TAG} (${IMAGE_DIGEST}); nothing to commit."
