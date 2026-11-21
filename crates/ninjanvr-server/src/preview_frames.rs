@@ -294,6 +294,171 @@ impl PreviewFrameStore {
         }
         removed
     }
+
+    /// Scans `clips/preview_frames/<camera>/*.jpg` without following symlinks,
+    /// returning `camera -> (file_count, total_bytes)`.
+    pub fn disk_usage_by_camera(&self) -> HashMap<String, (u64, u64)> {
+        let mut out = HashMap::new();
+        let Ok(root_meta) = std::fs::symlink_metadata(&self.root) else {
+            return out;
+        };
+        if !root_meta.file_type().is_dir() {
+            return out;
+        }
+        let Ok(cam_entries) = std::fs::read_dir(&self.root) else {
+            return out;
+        };
+        for cam_entry in cam_entries.flatten().take(1024) {
+            let cam_path = cam_entry.path();
+            let Some(cam_name) = cam_path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !is_safe_camera_dir(cam_name) {
+                continue;
+            }
+            let Ok(cam_meta) = std::fs::symlink_metadata(&cam_path) else {
+                continue;
+            };
+            if !cam_meta.file_type().is_dir() {
+                continue;
+            }
+            let Ok(files) = std::fs::read_dir(&cam_path) else {
+                continue;
+            };
+            let mut count = 0u64;
+            let mut bytes = 0u64;
+            for f in files.flatten().take(100_000) {
+                if let Ok(meta) = std::fs::symlink_metadata(f.path())
+                    && meta.file_type().is_file()
+                {
+                    count += 1;
+                    bytes += meta.len();
+                }
+            }
+            if count > 0 || bytes > 0 {
+                out.insert(cam_name.to_string(), (count, bytes));
+            }
+        }
+        out
+    }
+
+    /// Purges stored preview frames matching `camera_filter` / `scope` and optional `before_ms`,
+    /// keeping the in-memory index and on-disk directory synchronized without racing concurrent writes.
+    /// Returns `(removed_files, freed_bytes)`.
+    pub fn purge_filtered(
+        &self,
+        scope: &ninjanvr_db::CameraScope,
+        camera_filter: Option<&str>,
+        before_ms: Option<u64>,
+    ) -> (usize, u64) {
+        if let Some(cam) = camera_filter
+            && !scope.allows(cam)
+        {
+            return (0, 0);
+        }
+        let now_dur = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let now_ms = now_dur.as_millis() as u64;
+        let effective_cutoff_ms = before_ms.unwrap_or_else(|| now_ms.saturating_add(1));
+        let tmp_stale_cutoff_sec = now_dur.as_secs().saturating_sub(60);
+
+        let stale: Vec<(String, Vec<u64>)> = match self.index.write() {
+            Ok(mut idx) => idx
+                .iter_mut()
+                .filter(|(cam, _)| {
+                    if let Some(target_cam) = camera_filter {
+                        cam.as_str() == target_cam
+                    } else {
+                        scope.allows(cam)
+                    }
+                })
+                .map(|(cam, set)| {
+                    let keep = set.split_off(&effective_cutoff_ms);
+                    let old: Vec<u64> = std::mem::replace(set, keep).into_iter().collect();
+                    (cam.clone(), old)
+                })
+                .filter(|(_, old)| !old.is_empty())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+
+        let mut removed = 0usize;
+        let mut freed_bytes = 0u64;
+        for (cam, old) in stale {
+            for ts in old {
+                if let Some(path) = self.frame_path(&cam, ts)
+                    && let Ok(meta) = std::fs::symlink_metadata(&path)
+                    && meta.file_type().is_file()
+                {
+                    let len = meta.len();
+                    if std::fs::remove_file(&path).is_ok() {
+                        removed += 1;
+                        freed_bytes += len;
+                    }
+                }
+            }
+        }
+
+        // Sweep matching on-disk camera directories for unindexed `.jpg` (< effective_cutoff_ms)
+        // or abandoned `.tmp` files (> 60s old), never touching concurrent in-flight writes.
+        if std::fs::symlink_metadata(&self.root).is_ok_and(|m| m.file_type().is_dir())
+            && let Ok(cam_entries) = std::fs::read_dir(&self.root)
+        {
+            for cam_entry in cam_entries.flatten().take(1024) {
+                let cam_path = cam_entry.path();
+                let Some(cam_name) = cam_path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !is_safe_camera_dir(cam_name) {
+                    continue;
+                }
+                if let Some(target_cam) = camera_filter {
+                    if cam_name != target_cam {
+                        continue;
+                    }
+                } else if !scope.allows(cam_name) {
+                    continue;
+                }
+                if !std::fs::symlink_metadata(&cam_path).is_ok_and(|m| m.file_type().is_dir()) {
+                    continue;
+                }
+                if let Ok(files) = std::fs::read_dir(&cam_path) {
+                    for f in files.flatten().take(100_000) {
+                        let fpath = f.path();
+                        let Some(fname) = fpath.file_name().and_then(|n| n.to_str()) else {
+                            continue;
+                        };
+                        let Ok(meta) = std::fs::symlink_metadata(&fpath) else {
+                            continue;
+                        };
+                        if !meta.file_type().is_file() {
+                            continue;
+                        }
+                        let should_remove = if let Some(ts) = parse_preview_frame_name(fname) {
+                            ts < effective_cutoff_ms
+                        } else if fname.starts_with('.') && fname.ends_with(".tmp") {
+                            meta.modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .is_some_and(|d| d.as_secs() < tmp_stale_cutoff_sec)
+                        } else {
+                            false
+                        };
+                        if should_remove {
+                            let len = meta.len();
+                            if std::fs::remove_file(&fpath).is_ok() {
+                                removed += 1;
+                                freed_bytes += len;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        (removed, freed_bytes)
+    }
 }
 
 #[cfg(test)]

@@ -822,6 +822,16 @@ export interface NinjaStatsResponse {
         usage: number;
         bandwidth: number;
         estimated_retention_days?: number;
+        segments_count?: number;
+        continuous_mb?: number;
+        motion_mb?: number;
+        event_segments_mb?: number;
+        compacted_mb?: number;
+        oldest_ts?: number | null;
+        newest_ts?: number | null;
+        events_count?: number;
+        pinned_events_count?: number;
+        reviews_count?: number;
       }
     >;
     storage: Record<string, StorageStatItem>;
@@ -829,6 +839,101 @@ export interface NinjaStatsResponse {
     last_updated: number;
   };
   processes: Record<string, ProcessStatItem>;
+}
+
+export interface StorageCategoryItem {
+  bytes: number;
+  count: number;
+}
+
+export interface StorageCategoriesBreakdown {
+  recordings_continuous: StorageCategoryItem;
+  recordings_motion: StorageCategoryItem;
+  recordings_events: StorageCategoryItem;
+  recordings_retained_excess: StorageCategoryItem;
+  recordings_compacted: StorageCategoryItem;
+  events_media: StorageCategoryItem;
+  pinned_events_count: number;
+  reviews_media: StorageCategoryItem;
+  previews_media: StorageCategoryItem;
+  exports_media: StorageCategoryItem;
+  share_artifacts_count: number;
+  dataset_and_models: StorageCategoryItem;
+  dataset_samples_count: number;
+  models_files_count: number;
+  database: StorageCategoryItem;
+  database_main_bytes: number;
+  database_wal_bytes: number;
+  timeline_rows_count: number;
+}
+
+export interface CameraGranularStorageDto {
+  camera: string;
+  configured: boolean;
+  total_bytes: number;
+  recordings_bytes: number;
+  continuous_bytes: number;
+  motion_bytes: number;
+  event_segments_bytes: number;
+  compacted_bytes: number;
+  retained_past_continuous_bytes: number;
+  retained_past_continuous_count: number;
+  segments_count: number;
+  oldest_segment_ts?: number | null;
+  newest_segment_ts?: number | null;
+  events_count: number;
+  pinned_events_count: number;
+  events_media_bytes: number;
+  reviews_count: number;
+  reviews_media_bytes: number;
+  previews_bytes: number;
+  previews_files_count: number;
+  exports_bytes: number;
+  exports_count: number;
+  bandwidth_mb_hr: number;
+  estimated_retention_days: number;
+  continuous_days: number;
+  event_retention_days: number;
+}
+
+export interface StorageBreakdownResponse {
+  generated_at: number;
+  total_tracked_bytes: number;
+  volume_total_bytes: number;
+  volume_used_bytes: number;
+  volume_free_bytes: number;
+  scoped: boolean;
+  categories: StorageCategoriesBreakdown;
+  cameras: Record<string, CameraGranularStorageDto>;
+}
+
+export type StorageCleanupTarget =
+  | "events"
+  | "reviews"
+  | "excess_recordings"
+  | "recordings"
+  | "previews"
+  | "exports"
+  | "retention_pass"
+  | "wal_checkpoint";
+
+export interface StorageCleanupRequest {
+  target: StorageCleanupTarget;
+  camera?: string | null;
+  older_than_days?: number | null;
+  include_pinned?: boolean;
+  prune_retained_segments?: boolean;
+}
+
+export interface StorageCleanupResponse {
+  success: boolean;
+  target: StorageCleanupTarget;
+  camera?: string | null;
+  deleted_items: number;
+  deleted_segments: number;
+  freed_bytes: number;
+  duration_ms: number;
+  message: string;
 }
 
 export interface TriggerProvenance {

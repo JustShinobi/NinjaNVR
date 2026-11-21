@@ -3017,6 +3017,7 @@ pub async fn api_dataset_sample_from_event(
                 } else {
                     sample
                 };
+            state.storage_breakdown_cache.invalidate();
             Json(sample_dto_to_response_json(&final_sample)).into_response()
         }
         Err(err) => {
@@ -3170,6 +3171,7 @@ pub async fn api_dataset_sample_delete(
         )
             .into_response();
     }
+    state.storage_breakdown_cache.invalidate();
     Json(json!({ "success": true, "deleted": deleted, "id": id })).into_response()
 }
 

@@ -153,6 +153,38 @@ pub type ScopedReviewDeleteResult = std::result::Result<(u64, Vec<Option<String>
 pub type ScopedEventDeleteResult =
     std::result::Result<Vec<(String, String, Option<String>)>, String>;
 
+/// Per-camera SQLite storage and catalog counters used by granular disk breakdown.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CameraStorageDbStats {
+    pub segments_count: u64,
+    pub recordings_mb: f64,
+    pub continuous_mb: f64,
+    pub motion_mb: f64,
+    pub event_segments_mb: f64,
+    pub compacted_mb: f64,
+    pub retained_past_continuous_mb: f64,
+    pub retained_past_continuous_count: u64,
+    pub bandwidth_mb_hr: f64,
+    pub oldest_segment_ts: Option<f64>,
+    pub newest_segment_ts: Option<f64>,
+    pub events_count: u64,
+    pub pinned_events_count: u64,
+    pub reviews_count: u64,
+}
+
+/// Consolidated read-only SQLite snapshot for granular storage telemetry.
+#[derive(Debug, Clone, Default)]
+pub struct StorageDbSnapshot {
+    pub cameras: BTreeMap<String, CameraStorageDbStats>,
+    pub event_cameras_by_id: HashMap<String, String>,
+    pub review_cameras_by_id: HashMap<String, String>,
+    pub export_entries: Vec<(String, String, String, String, bool)>,
+    pub previews_count: u64,
+    pub dataset_samples_count: u64,
+    pub timeline_rows_count: u64,
+    pub active_share_links_count: u64,
+}
+
 /// Typed database validation and invariant error (`thiserror::Error`).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DbValidationError {
@@ -2549,6 +2581,9 @@ impl NinjaDatabase {
             }
         }
         tx.commit()?;
+        if deleted_count > 0 {
+            self.bump_events_mutation();
+        }
         Ok(Ok((deleted_count, thumbs)))
     }
 
@@ -2581,6 +2616,8 @@ impl NinjaDatabase {
                 data_str
             ],
         )?;
+        drop(conn);
+        self.bump_events_mutation();
         Ok(())
     }
 
@@ -5085,9 +5122,13 @@ impl NinjaDatabase {
 
     pub fn query_recordings_storage_usage(&self) -> Result<Value> {
         const STORAGE_USAGE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
-        let current_seq = self
+        let rec_seq = self
             .recordings_mutation_seq
             .load(std::sync::atomic::Ordering::Acquire);
+        let ev_seq = self
+            .events_mutation_seq
+            .load(std::sync::atomic::Ordering::Acquire);
+        let current_seq = rec_seq.wrapping_mul(1_000_003).wrapping_add(ev_seq);
         if let Ok(guard) = self.storage_usage_cache.lock()
             && let Some((cached_at, cached_seq, ref cached_val)) = *guard
             && cached_seq == current_seq
@@ -5097,6 +5138,46 @@ impl NinjaDatabase {
         }
 
         let conn = self.read_conn();
+        let mut event_counts_by_cam: HashMap<String, (u64, u64)> = HashMap::new();
+        {
+            let mut ev_stmt = conn.prepare(
+                r#"
+                SELECT
+                    camera,
+                    COUNT(*),
+                    COALESCE(SUM(CASE WHEN COALESCE(retain_indefinitely, 0) != 0 THEN 1 ELSE 0 END), 0)
+                FROM event
+                GROUP BY camera
+                "#,
+            )?;
+            let ev_rows = ev_stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1).unwrap_or(0).max(0) as u64,
+                    r.get::<_, i64>(2).unwrap_or(0).max(0) as u64,
+                ))
+            })?;
+            for row in ev_rows {
+                let (cam, cnt, pinned) = row?;
+                event_counts_by_cam.insert(cam, (cnt, pinned));
+            }
+        }
+        let mut review_counts_by_cam: HashMap<String, u64> = HashMap::new();
+        {
+            let mut rev_stmt =
+                conn.prepare("SELECT camera, COUNT(*) FROM reviewsegment GROUP BY camera")?;
+            let rev_rows = rev_stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1).unwrap_or(0).max(0) as u64,
+                ))
+            })?;
+            for row in rev_rows {
+                let (cam, cnt) = row?;
+                review_counts_by_cam.insert(cam, cnt);
+            }
+        }
+
         let cutoff = (Utc::now().timestamp() - 86400) as f64;
         let mut stmt = conn.prepare(
             r#"
@@ -5105,7 +5186,14 @@ impl NinjaDatabase {
                 COALESCE(SUM(CASE WHEN typeof(segment_size) IN ('real', 'integer') AND segment_size > 0.0 AND segment_size < 1.0e12 THEN segment_size ELSE 0.0 END), 0.0),
                 COALESCE(SUM(CASE WHEN typeof(duration) IN ('real', 'integer') AND duration > 0.0 AND duration < 1.0e12 THEN duration ELSE 0.0 END), 0.0),
                 COALESCE(SUM(CASE WHEN start_time >= ?1 AND typeof(segment_size) IN ('real', 'integer') AND segment_size > 0.0 AND segment_size < 1.0e12 THEN segment_size ELSE 0.0 END), 0.0),
-                COALESCE(SUM(CASE WHEN start_time >= ?1 AND typeof(duration) IN ('real', 'integer') AND duration > 0.0 AND duration < 1.0e12 THEN duration ELSE 0.0 END), 0.0)
+                COALESCE(SUM(CASE WHEN start_time >= ?1 AND typeof(duration) IN ('real', 'integer') AND duration > 0.0 AND duration < 1.0e12 THEN duration ELSE 0.0 END), 0.0),
+                SUM(CASE WHEN typeof(segment_size) IN ('real', 'integer') AND segment_size >= 0.0 AND segment_size < 1.0e12 THEN 1 ELSE 0 END),
+                COALESCE(SUM(CASE WHEN COALESCE(objects, 0) = 0 AND COALESCE(motion, 0) = 0 AND typeof(segment_size) IN ('real', 'integer') AND segment_size > 0.0 AND segment_size < 1.0e12 THEN segment_size ELSE 0.0 END), 0.0),
+                COALESCE(SUM(CASE WHEN COALESCE(objects, 0) = 0 AND COALESCE(motion, 0) > 0 AND typeof(segment_size) IN ('real', 'integer') AND segment_size > 0.0 AND segment_size < 1.0e12 THEN segment_size ELSE 0.0 END), 0.0),
+                COALESCE(SUM(CASE WHEN COALESCE(objects, 0) > 0 AND typeof(segment_size) IN ('real', 'integer') AND segment_size > 0.0 AND segment_size < 1.0e12 THEN segment_size ELSE 0.0 END), 0.0),
+                COALESCE(SUM(CASE WHEN COALESCE(stream_tier, 'main') = 'compacted' AND typeof(segment_size) IN ('real', 'integer') AND segment_size > 0.0 AND segment_size < 1.0e12 THEN segment_size ELSE 0.0 END), 0.0),
+                MIN(CASE WHEN typeof(start_time) IN ('real', 'integer') AND start_time > 0.0 AND start_time < 1.0e12 THEN start_time ELSE NULL END),
+                MAX(CASE WHEN typeof(end_time) IN ('real', 'integer') AND end_time > 0.0 AND end_time < 1.0e12 THEN end_time ELSE NULL END)
             FROM recordings
             GROUP BY camera
             "#,
@@ -5117,12 +5205,40 @@ impl NinjaDatabase {
                 value_to_f64(&r.get_ref(2)?).unwrap_or(0.0),
                 value_to_f64(&r.get_ref(3)?).unwrap_or(0.0),
                 value_to_f64(&r.get_ref(4)?).unwrap_or(0.0),
+                r.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0) as u64,
+                value_to_f64(&r.get_ref(6)?).unwrap_or(0.0),
+                value_to_f64(&r.get_ref(7)?).unwrap_or(0.0),
+                value_to_f64(&r.get_ref(8)?).unwrap_or(0.0),
+                value_to_f64(&r.get_ref(9)?).unwrap_or(0.0),
+                value_to_f64(&r.get_ref(10)?).filter(|v| v.is_finite() && *v > 0.0),
+                value_to_f64(&r.get_ref(11)?).filter(|v| v.is_finite() && *v > 0.0),
             ))
         })?;
 
+        let round_mb = |val: f64| -> f64 {
+            if val.is_finite() && val > 0.0 {
+                (val * 100.0).round() / 100.0
+            } else {
+                0.0
+            }
+        };
+
         let mut out = serde_json::Map::new();
         for r in rows {
-            let (cam, raw_total_mb, raw_dur_s, raw_24h_mb, raw_24h_dur_s) = r?;
+            let (
+                cam,
+                raw_total_mb,
+                raw_dur_s,
+                raw_24h_mb,
+                raw_24h_dur_s,
+                seg_count,
+                raw_cont_mb,
+                raw_mot_mb,
+                raw_evt_mb,
+                raw_compacted_mb,
+                oldest_ts,
+                newest_ts,
+            ) = r?;
             let total_mb = if raw_total_mb.is_finite() && raw_total_mb > 0.0 {
                 raw_total_mb
             } else {
@@ -5155,13 +5271,58 @@ impl NinjaDatabase {
             } else {
                 0.0
             };
-            let usage_rounded = (total_mb * 100.0).round() / 100.0;
+            let usage_rounded = round_mb(total_mb);
+            let (ev_cnt, pinned_cnt) = event_counts_by_cam.get(&cam).copied().unwrap_or((0, 0));
+            let rev_cnt = review_counts_by_cam.get(&cam).copied().unwrap_or(0);
             out.insert(
                 cam,
                 json!({
-                    "usage": if usage_rounded.is_finite() { usage_rounded } else { 0.0 },
+                    "usage": usage_rounded,
                     "usage_percent": 0.0,
-                    "bandwidth": bw_mb_hr
+                    "bandwidth": bw_mb_hr,
+                    "segments_count": seg_count,
+                    "continuous_mb": round_mb(raw_cont_mb),
+                    "motion_mb": round_mb(raw_mot_mb),
+                    "event_segments_mb": round_mb(raw_evt_mb),
+                    "compacted_mb": round_mb(raw_compacted_mb),
+                    "oldest_ts": oldest_ts,
+                    "newest_ts": newest_ts,
+                    "events_count": ev_cnt,
+                    "pinned_events_count": pinned_cnt,
+                    "reviews_count": rev_cnt
+                }),
+            );
+        }
+        let mut extra_cams: std::collections::BTreeSet<String> =
+            event_counts_by_cam.keys().cloned().collect();
+        for cam in review_counts_by_cam.keys() {
+            extra_cams.insert(cam.clone());
+        }
+        for cam in extra_cams {
+            if out.contains_key(&cam) || cam.trim().is_empty() {
+                continue;
+            }
+            let (ev_cnt, pinned_cnt) = event_counts_by_cam.get(&cam).copied().unwrap_or((0, 0));
+            let rev_cnt = review_counts_by_cam.get(&cam).copied().unwrap_or(0);
+            if ev_cnt == 0 && rev_cnt == 0 {
+                continue;
+            }
+            out.insert(
+                cam,
+                json!({
+                    "usage": 0.0,
+                    "usage_percent": 0.0,
+                    "bandwidth": 0.0,
+                    "segments_count": 0,
+                    "continuous_mb": 0.0,
+                    "motion_mb": 0.0,
+                    "event_segments_mb": 0.0,
+                    "compacted_mb": 0.0,
+                    "oldest_ts": Value::Null,
+                    "newest_ts": Value::Null,
+                    "events_count": ev_cnt,
+                    "pinned_events_count": pinned_cnt,
+                    "reviews_count": rev_cnt
                 }),
             );
         }
@@ -5172,6 +5333,812 @@ impl NinjaDatabase {
             *guard = Some((std::time::Instant::now(), current_seq, result_val.clone()));
         }
         Ok(result_val)
+    }
+
+    /// Queries a consolidated read-only storage and catalog snapshot across `recordings`,
+    /// `event`, `reviewsegment`, `previews`, `export`, `dataset_sample`, `timeline`, and `share_link`.
+    pub fn query_storage_db_snapshot(
+        &self,
+        continuous_cutoffs: &HashMap<String, f64>,
+        default_continuous_cutoff: f64,
+        now_ts: f64,
+    ) -> Result<StorageDbSnapshot> {
+        let conn = self.read_conn();
+        let mut snap = StorageDbSnapshot::default();
+        let cutoff_24h = now_ts - 86_400.0;
+
+        // 1. Distinct cameras across recordings, event, reviewsegment, previews, and export
+        let mut cameras: Vec<String> = {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT DISTINCT camera FROM recordings
+                UNION
+                SELECT DISTINCT camera FROM event
+                UNION
+                SELECT DISTINCT camera FROM reviewsegment
+                UNION
+                SELECT DISTINCT camera FROM previews
+                UNION
+                SELECT DISTINCT camera FROM export
+                "#,
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut list = Vec::new();
+            for row in rows {
+                let cam = row?;
+                if !cam.trim().is_empty() {
+                    list.push(cam);
+                }
+            }
+            list
+        };
+        for cam in continuous_cutoffs.keys() {
+            if !cameras.iter().any(|c| c == cam) {
+                cameras.push(cam.clone());
+            }
+        }
+        cameras.sort();
+
+        // 2. Per-camera recordings aggregation (with exact camera-specific continuous_cutoff)
+        {
+            let mut rec_stmt = conn.prepare(
+                r#"
+                SELECT
+                    SUM(CASE WHEN typeof(segment_size) IN ('real', 'integer') AND segment_size >= 0.0 AND segment_size < 1.0e12 THEN 1 ELSE 0 END),
+                    COALESCE(SUM(CASE WHEN typeof(segment_size) IN ('real', 'integer') AND segment_size > 0.0 AND segment_size < 1.0e12 THEN segment_size ELSE 0.0 END), 0.0),
+                    COALESCE(SUM(CASE WHEN typeof(duration) IN ('real', 'integer') AND duration > 0.0 AND duration < 1.0e12 THEN duration ELSE 0.0 END), 0.0),
+                    COALESCE(SUM(CASE WHEN start_time >= ?2 AND typeof(segment_size) IN ('real', 'integer') AND segment_size > 0.0 AND segment_size < 1.0e12 THEN segment_size ELSE 0.0 END), 0.0),
+                    COALESCE(SUM(CASE WHEN start_time >= ?2 AND typeof(duration) IN ('real', 'integer') AND duration > 0.0 AND duration < 1.0e12 THEN duration ELSE 0.0 END), 0.0),
+                    COALESCE(SUM(CASE WHEN COALESCE(objects, 0) = 0 AND COALESCE(motion, 0) = 0 AND typeof(segment_size) IN ('real', 'integer') AND segment_size > 0.0 AND segment_size < 1.0e12 THEN segment_size ELSE 0.0 END), 0.0),
+                    COALESCE(SUM(CASE WHEN COALESCE(objects, 0) = 0 AND COALESCE(motion, 0) > 0 AND typeof(segment_size) IN ('real', 'integer') AND segment_size > 0.0 AND segment_size < 1.0e12 THEN segment_size ELSE 0.0 END), 0.0),
+                    COALESCE(SUM(CASE WHEN COALESCE(objects, 0) > 0 AND typeof(segment_size) IN ('real', 'integer') AND segment_size > 0.0 AND segment_size < 1.0e12 THEN segment_size ELSE 0.0 END), 0.0),
+                    COALESCE(SUM(CASE WHEN COALESCE(stream_tier, 'main') = 'compacted' AND typeof(segment_size) IN ('real', 'integer') AND segment_size > 0.0 AND segment_size < 1.0e12 THEN segment_size ELSE 0.0 END), 0.0),
+                    COALESCE(SUM(CASE WHEN typeof(end_time) IN ('real', 'integer') AND end_time > 0.0 AND end_time < ?3 AND typeof(segment_size) IN ('real', 'integer') AND segment_size > 0.0 AND segment_size < 1.0e12 THEN segment_size ELSE 0.0 END), 0.0),
+                    SUM(CASE WHEN typeof(end_time) IN ('real', 'integer') AND end_time > 0.0 AND end_time < ?3 AND typeof(segment_size) IN ('real', 'integer') AND segment_size >= 0.0 AND segment_size < 1.0e12 THEN 1 ELSE 0 END),
+                    MIN(CASE WHEN typeof(start_time) IN ('real', 'integer') AND start_time > 0.0 AND start_time < 1.0e12 THEN start_time ELSE NULL END),
+                    MAX(CASE WHEN typeof(end_time) IN ('real', 'integer') AND end_time > 0.0 AND end_time < 1.0e12 THEN end_time ELSE NULL END)
+                FROM recordings
+                WHERE camera = ?1
+                "#,
+            )?;
+            let round_mb = |val: f64| -> f64 {
+                if val.is_finite() && val > 0.0 {
+                    (val * 100.0).round() / 100.0
+                } else {
+                    0.0
+                }
+            };
+            for cam in &cameras {
+                let cont_cutoff = continuous_cutoffs
+                    .get(cam)
+                    .copied()
+                    .unwrap_or(default_continuous_cutoff);
+                let row = rec_stmt.query_row(params![cam, cutoff_24h, cont_cutoff], |r| {
+                    let seg_count = r.get::<_, Option<i64>>(0)?.unwrap_or(0).max(0) as u64;
+                    let total_mb = value_to_f64(&r.get_ref(1)?).unwrap_or(0.0);
+                    let dur_s = value_to_f64(&r.get_ref(2)?).unwrap_or(0.0);
+                    let r24_mb = value_to_f64(&r.get_ref(3)?).unwrap_or(0.0);
+                    let r24_dur = value_to_f64(&r.get_ref(4)?).unwrap_or(0.0);
+                    let cont_mb = value_to_f64(&r.get_ref(5)?).unwrap_or(0.0);
+                    let mot_mb = value_to_f64(&r.get_ref(6)?).unwrap_or(0.0);
+                    let evt_mb = value_to_f64(&r.get_ref(7)?).unwrap_or(0.0);
+                    let comp_mb = value_to_f64(&r.get_ref(8)?).unwrap_or(0.0);
+                    let past_cont_mb = value_to_f64(&r.get_ref(9)?).unwrap_or(0.0);
+                    let past_cont_cnt = r.get::<_, Option<i64>>(10)?.unwrap_or(0).max(0) as u64;
+                    let oldest_ts =
+                        value_to_f64(&r.get_ref(11)?).filter(|v| v.is_finite() && *v > 0.0);
+                    let newest_ts =
+                        value_to_f64(&r.get_ref(12)?).filter(|v| v.is_finite() && *v > 0.0);
+                    let bw = if r24_dur.is_finite()
+                        && r24_dur > 0.0
+                        && r24_mb.is_finite()
+                        && r24_mb > 0.0
+                    {
+                        (r24_mb / (r24_dur / 3600.0) * 100.0).round() / 100.0
+                    } else if dur_s.is_finite()
+                        && dur_s > 0.0
+                        && total_mb.is_finite()
+                        && total_mb > 0.0
+                    {
+                        (total_mb / (dur_s / 3600.0) * 100.0).round() / 100.0
+                    } else {
+                        0.0
+                    };
+                    Ok(CameraStorageDbStats {
+                        segments_count: seg_count,
+                        recordings_mb: round_mb(total_mb),
+                        continuous_mb: round_mb(cont_mb),
+                        motion_mb: round_mb(mot_mb),
+                        event_segments_mb: round_mb(evt_mb),
+                        compacted_mb: round_mb(comp_mb),
+                        retained_past_continuous_mb: round_mb(past_cont_mb),
+                        retained_past_continuous_count: past_cont_cnt,
+                        bandwidth_mb_hr: if bw.is_finite() && bw > 0.0 { bw } else { 0.0 },
+                        oldest_segment_ts: oldest_ts,
+                        newest_segment_ts: newest_ts,
+                        events_count: 0,
+                        pinned_events_count: 0,
+                        reviews_count: 0,
+                    })
+                })?;
+                snap.cameras.insert(cam.clone(), row);
+            }
+        }
+
+        // 3. Events counts & ID->camera map (bounded at 200k IDs for safety)
+        {
+            let mut ev_agg = conn.prepare(
+                r#"
+                SELECT
+                    camera,
+                    COUNT(*),
+                    COALESCE(SUM(CASE WHEN COALESCE(retain_indefinitely, 0) != 0 THEN 1 ELSE 0 END), 0)
+                FROM event
+                GROUP BY camera
+                "#,
+            )?;
+            let rows = ev_agg.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1).unwrap_or(0).max(0) as u64,
+                    r.get::<_, i64>(2).unwrap_or(0).max(0) as u64,
+                ))
+            })?;
+            for r in rows {
+                let (cam, cnt, pinned) = r?;
+                let entry = snap.cameras.entry(cam).or_default();
+                entry.events_count = cnt;
+                entry.pinned_events_count = pinned;
+            }
+
+            let mut ev_ids = conn.prepare("SELECT id, camera FROM event LIMIT 200000")?;
+            let id_rows =
+                ev_ids.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            for r in id_rows {
+                let (id, cam) = r?;
+                snap.event_cameras_by_id.insert(id, cam);
+            }
+        }
+
+        // 4. Review segments counts & ID->camera map
+        {
+            let mut rev_agg =
+                conn.prepare("SELECT camera, COUNT(*) FROM reviewsegment GROUP BY camera")?;
+            let rows = rev_agg.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1).unwrap_or(0).max(0) as u64,
+                ))
+            })?;
+            for r in rows {
+                let (cam, cnt) = r?;
+                snap.cameras.entry(cam).or_default().reviews_count = cnt;
+            }
+
+            let mut rev_ids = conn.prepare("SELECT id, camera FROM reviewsegment LIMIT 200000")?;
+            let id_rows =
+                rev_ids.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            for r in id_rows {
+                let (id, cam) = r?;
+                snap.review_cameras_by_id.insert(id, cam);
+            }
+        }
+
+        // 5. Exports & global table counters
+        {
+            let mut exp_stmt = conn.prepare(
+                "SELECT id, camera, video_path, thumb_path, COALESCE(in_progress, 0) FROM export LIMIT 50000",
+            )?;
+            let rows = exp_stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4).unwrap_or(0) != 0,
+                ))
+            })?;
+            for r in rows {
+                snap.export_entries.push(r?);
+            }
+        }
+
+        snap.previews_count = conn
+            .query_row("SELECT COUNT(*) FROM previews", [], |r| r.get::<_, i64>(0))
+            .unwrap_or(0)
+            .max(0) as u64;
+        snap.dataset_samples_count = conn
+            .query_row("SELECT COUNT(*) FROM dataset_sample", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap_or(0)
+            .max(0) as u64;
+        snap.timeline_rows_count = conn
+            .query_row("SELECT COUNT(*) FROM timeline", [], |r| r.get::<_, i64>(0))
+            .unwrap_or(0)
+            .max(0) as u64;
+        snap.active_share_links_count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM share_link WHERE COALESCE(revoked, 0) = 0 AND expires_at > ?1 AND (max_views IS NULL OR access_count < max_views)",
+                params![now_ts],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            .max(0) as u64;
+
+        Ok(snap)
+    }
+
+    /// Purges events matching `camera_filter` / `scope` and optional `before_ts`,
+    /// preserving `retain_indefinitely = 1` events unless `include_pinned` is `true`,
+    /// revoking guest share links, cleaning up `timeline` entries, and returning
+    /// `(event_id, camera, thumb_path)` tuples for media artifact removal.
+    pub fn purge_events_filtered(
+        &self,
+        scope: &CameraScope,
+        camera_filter: Option<&str>,
+        before_ts: Option<f64>,
+        now_ts: f64,
+        include_pinned: bool,
+    ) -> Result<Vec<(String, String, Option<String>)>> {
+        if let Some(cam) = camera_filter
+            && !scope.allows(cam)
+        {
+            return Ok(Vec::new());
+        }
+        if let Some(cutoff) = before_ts
+            && !cutoff.is_finite()
+        {
+            return Ok(Vec::new());
+        }
+        let open_grace_cutoff = now_ts - 60.0;
+        let has_cam_filter = i64::from(camera_filter.is_some());
+        let cam_param = camera_filter.unwrap_or("");
+        let has_before = i64::from(before_ts.is_some());
+        let before_val = before_ts.unwrap_or(0.0);
+        let allow_pinned = i64::from(include_pinned);
+
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+
+        let mut matched: Vec<(String, String, Option<String>)> = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                SELECT
+                    id,
+                    camera,
+                    CASE
+                        WHEN typeof(thumbnail) = 'text'
+                         AND length(thumbnail) < 512
+                         AND (thumbnail LIKE '/%' OR thumbnail LIKE 'clips/%')
+                        THEN thumbnail
+                        ELSE NULL
+                    END,
+                    CASE
+                        WHEN json_valid(data) AND json_type(data) = 'object'
+                        THEN COALESCE(json_extract(data, '$.thumb_path'), json_extract(data, '$.thumbnail_path'))
+                        ELSE NULL
+                    END
+                FROM event
+                WHERE (?1 = 0 OR camera = ?2)
+                  AND (?3 != 0 OR COALESCE(retain_indefinitely, 0) = 0)
+                  AND (
+                    (?4 != 0 AND COALESCE(end_time, start_time + 300.0) < ?5)
+                    OR (?4 = 0 AND (end_time IS NOT NULL OR start_time < ?6))
+                  )
+                "#,
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    has_cam_filter,
+                    cam_param,
+                    allow_pinned,
+                    has_before,
+                    before_val,
+                    open_grace_cutoff,
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2).ok().flatten(),
+                        r.get::<_, Option<String>>(3).ok().flatten(),
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (id, cam, thumb_col, data_thumb) = row?;
+                if !scope.allows(&cam) {
+                    continue;
+                }
+                let thumb_path = data_thumb
+                    .or(thumb_col)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| {
+                        !s.is_empty()
+                            && !s.starts_with("/9j/")
+                            && !s.starts_with("UklGR")
+                            && !s.starts_with("data:")
+                    });
+                matched.push((id, cam, thumb_path));
+            }
+        }
+
+        if matched.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        {
+            let mut del_ev = tx.prepare("DELETE FROM event WHERE id = ?1")?;
+            let mut rev_share =
+                tx.prepare("UPDATE share_link SET revoked = 1 WHERE target_id = ?1")?;
+            let mut del_tl = tx.prepare("DELETE FROM timeline WHERE source_id = ?1")?;
+            for (id, _, _) in &matched {
+                del_ev.execute(params![id])?;
+                rev_share.execute(params![id])?;
+                del_tl.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        self.bump_events_mutation();
+        Ok(matched)
+    }
+
+    /// Purges review segments matching `camera_filter` / `scope` and optional `before_ts`,
+    /// sparing review segments overlapping `retain_indefinitely = 1` events when `!include_pinned`.
+    pub fn purge_reviews_filtered(
+        &self,
+        scope: &CameraScope,
+        camera_filter: Option<&str>,
+        before_ts: Option<f64>,
+        now_ts: f64,
+        include_pinned: bool,
+    ) -> Result<Vec<(String, String, Option<String>)>> {
+        if let Some(cam) = camera_filter
+            && !scope.allows(cam)
+        {
+            return Ok(Vec::new());
+        }
+        if let Some(cutoff) = before_ts
+            && !cutoff.is_finite()
+        {
+            return Ok(Vec::new());
+        }
+        let open_grace_cutoff = now_ts - 60.0;
+        let has_cam_filter = i64::from(camera_filter.is_some());
+        let cam_param = camera_filter.unwrap_or("");
+        let has_before = i64::from(before_ts.is_some());
+        let before_val = before_ts.unwrap_or(0.0);
+        let allow_pinned = i64::from(include_pinned);
+
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+
+        let mut matched: Vec<(String, String, Option<String>)> = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                SELECT
+                    rv.id,
+                    rv.camera,
+                    rv.thumb_path
+                FROM reviewsegment rv
+                WHERE (?1 = 0 OR rv.camera = ?2)
+                  AND (
+                    (?3 != 0 AND COALESCE(rv.end_time, rv.start_time + 300.0) < ?4)
+                    OR (?3 = 0 AND (rv.end_time IS NOT NULL OR rv.start_time < ?5))
+                  )
+                  AND (
+                    ?6 != 0
+                    OR NOT EXISTS (
+                        SELECT 1 FROM event e
+                        WHERE e.camera = rv.camera
+                          AND COALESCE(e.retain_indefinitely, 0) != 0
+                          AND e.start_time <= COALESCE(rv.end_time, rv.start_time + 300.0)
+                          AND COALESCE(e.end_time, e.start_time + 30.0) >= rv.start_time
+                    )
+                  )
+                "#,
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    has_cam_filter,
+                    cam_param,
+                    has_before,
+                    before_val,
+                    open_grace_cutoff,
+                    allow_pinned,
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)
+                            .ok()
+                            .flatten()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty()),
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (id, cam, thumb_opt) = row?;
+                if !scope.allows(&cam) {
+                    continue;
+                }
+                matched.push((id, cam, thumb_opt));
+            }
+        }
+
+        if matched.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        {
+            let mut del_status =
+                tx.prepare("DELETE FROM userreviewstatus WHERE review_segment_id = ?1")?;
+            let mut del_seg = tx.prepare("DELETE FROM reviewsegment WHERE id = ?1")?;
+            let mut rev_share =
+                tx.prepare("UPDATE share_link SET revoked = 1 WHERE target_id = ?1")?;
+            for (id, _, _) in &matched {
+                del_status.execute(params![id])?;
+                del_seg.execute(params![id])?;
+                rev_share.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        self.bump_events_mutation();
+        Ok(matched)
+    }
+
+    /// Deletes recording rows for `camera` with `end_time <= before_ts`, optionally preserving
+    /// segments overlapping pinned (`retain_indefinitely = 1`) events, remaining `event` rows,
+    /// remaining `reviewsegment` rows, or motion-retained windows (`motion_before_ts`),
+    /// returning `(id, path, segment_size_mb)` for disk unlinking.
+    #[allow(clippy::too_many_arguments)]
+    pub fn delete_recordings_before_cutoff(
+        &self,
+        camera: &str,
+        before_ts: f64,
+        pre_capture_sec: f64,
+        post_capture_sec: f64,
+        protect_pinned_events: bool,
+        protect_remaining_events: bool,
+        protect_remaining_reviews: bool,
+        motion_before_ts: Option<f64>,
+    ) -> Result<Vec<(String, String, f64)>> {
+        if !before_ts.is_finite() {
+            return Ok(Vec::new());
+        }
+        let pre_sec = if pre_capture_sec.is_finite() {
+            pre_capture_sec.max(0.0)
+        } else {
+            0.0
+        };
+        let post_sec = if post_capture_sec.is_finite() {
+            post_capture_sec.max(0.0)
+        } else {
+            0.0
+        };
+        let has_motion_guard = i64::from(motion_before_ts.is_some_and(|v| v.is_finite()));
+        let motion_cutoff = motion_before_ts.filter(|v| v.is_finite()).unwrap_or(0.0);
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let mut matched: Vec<(String, String, f64)> = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                SELECT r.id, r.path, COALESCE(r.segment_size, 0.0)
+                FROM recordings r
+                WHERE r.camera = ?1
+                  AND r.end_time <= ?2
+                  AND (?8 = 0 OR COALESCE(r.motion, 0) = 0 OR r.end_time <= ?9)
+                  AND (
+                    ?5 = 0
+                    OR NOT EXISTS (
+                        SELECT 1 FROM event e
+                        WHERE e.camera = r.camera
+                          AND COALESCE(e.retain_indefinitely, 0) != 0
+                          AND e.start_time <= (r.end_time + ?3)
+                          AND COALESCE(e.end_time, e.start_time + 30.0) >= (r.start_time - ?4)
+                    )
+                  )
+                  AND (
+                    ?6 = 0
+                    OR NOT EXISTS (
+                        SELECT 1 FROM event e2
+                        WHERE e2.camera = r.camera
+                          AND e2.start_time >= (r.start_time - ?4 - 86400.0)
+                          AND e2.start_time <= (r.end_time + ?3)
+                          AND COALESCE(e2.end_time, e2.start_time + 15.0) >= (r.start_time - ?4)
+                    )
+                  )
+                  AND (
+                    ?7 = 0
+                    OR NOT EXISTS (
+                        SELECT 1 FROM reviewsegment rv
+                        WHERE rv.camera = r.camera
+                          AND rv.start_time >= (r.start_time - ?4 - 86400.0)
+                          AND rv.start_time <= (r.end_time + ?3)
+                          AND COALESCE(rv.end_time, rv.start_time + 15.0) >= (r.start_time - ?4)
+                    )
+                  )
+                "#,
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    camera,
+                    before_ts,
+                    pre_sec,
+                    post_sec,
+                    i64::from(protect_pinned_events),
+                    i64::from(protect_remaining_events),
+                    i64::from(protect_remaining_reviews),
+                    has_motion_guard,
+                    motion_cutoff,
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        value_to_f64(&r.get_ref(2)?).unwrap_or(0.0).max(0.0),
+                    ))
+                },
+            )?;
+            for row in rows {
+                matched.push(row?);
+            }
+        }
+        if !matched.is_empty() {
+            let mut del_stmt = tx.prepare("DELETE FROM recordings WHERE id = ?1")?;
+            for (id, _, _) in &matched {
+                del_stmt.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        if !matched.is_empty() {
+            self.bump_recordings_vod_invalidation();
+        }
+        Ok(matched)
+    }
+
+    /// Collects all clip filenames currently protected by surviving `export`, `event`, or
+    /// `reviewsegment` rows and filters `candidates` (`(filename, candidate_ids)`) using exact
+    /// primary-key lookups without any row-count truncation.
+    pub fn filter_unreferenced_clip_candidates(
+        &self,
+        candidates: &[(String, Vec<String>)],
+    ) -> Result<Vec<String>> {
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.read_conn();
+        let mut protected_names: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+
+        let push_basename = |set: &mut std::collections::BTreeSet<String>, raw: &str| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            if let Some(bn) = Path::new(trimmed).file_name().and_then(|n| n.to_str())
+                && !bn.is_empty()
+            {
+                set.insert(bn.to_string());
+            }
+        };
+
+        // 1. Protect all export thumbs (both recorded `thumb_path` and `{id}.webp`/`.jpg` for in-progress exports)
+        {
+            let mut exp_stmt = conn.prepare("SELECT id, thumb_path FROM export")?;
+            let rows =
+                exp_stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            for row in rows {
+                let (id, tp) = row?;
+                protected_names.insert(format!("{id}.webp"));
+                protected_names.insert(format!("{id}.jpg"));
+                push_basename(&mut protected_names, &tp);
+            }
+        }
+
+        // 2. Protect custom `thumb_path` / `thumbnail_path` / path-like `thumbnail` on surviving events
+        {
+            let mut ev_tp_stmt = conn.prepare(
+                r#"
+                SELECT
+                    CASE
+                        WHEN typeof(thumbnail) = 'text'
+                         AND length(thumbnail) < 512
+                         AND (thumbnail LIKE '/%' OR thumbnail LIKE 'clips/%')
+                        THEN thumbnail
+                        ELSE NULL
+                    END,
+                    CASE
+                        WHEN json_valid(data) AND json_type(data) = 'object'
+                        THEN json_extract(data, '$.thumb_path')
+                        ELSE NULL
+                    END,
+                    CASE
+                        WHEN json_valid(data) AND json_type(data) = 'object'
+                        THEN json_extract(data, '$.thumbnail_path')
+                        ELSE NULL
+                    END
+                FROM event
+                "#,
+            )?;
+            let rows = ev_tp_stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0).ok().flatten(),
+                    r.get::<_, Option<String>>(1).ok().flatten(),
+                    r.get::<_, Option<String>>(2).ok().flatten(),
+                ))
+            })?;
+            for row in rows {
+                let (t1, t2, t3) = row?;
+                if let Some(s) = t1 {
+                    push_basename(&mut protected_names, &s);
+                }
+                if let Some(s) = t2 {
+                    push_basename(&mut protected_names, &s);
+                }
+                if let Some(s) = t3 {
+                    push_basename(&mut protected_names, &s);
+                }
+            }
+        }
+
+        // 3. Protect `thumb_path` on surviving review segments
+        {
+            let mut rev_tp_stmt =
+                conn.prepare("SELECT thumb_path FROM reviewsegment WHERE thumb_path != ''")?;
+            let rows = rev_tp_stmt.query_map([], |r| r.get::<_, String>(0))?;
+            for row in rows {
+                let tp = row?;
+                push_basename(&mut protected_names, &tp);
+            }
+        }
+
+        // 4. Exact O(log N) PRIMARY KEY existence checks on `event` and `reviewsegment`
+        let mut ev_exists = conn.prepare("SELECT 1 FROM event WHERE id = ?1 LIMIT 1")?;
+        let mut rev_exists = conn.prepare("SELECT 1 FROM reviewsegment WHERE id = ?1 LIMIT 1")?;
+
+        let mut unreferenced = Vec::new();
+        for (fname, cand_ids) in candidates {
+            if protected_names.contains(fname) {
+                continue;
+            }
+            let mut any_alive = false;
+            for cid in cand_ids {
+                if ev_exists
+                    .query_row(params![cid], |_| Ok(()))
+                    .optional()?
+                    .is_some()
+                    || rev_exists
+                        .query_row(params![cid], |_| Ok(()))
+                        .optional()?
+                        .is_some()
+                {
+                    any_alive = true;
+                    break;
+                }
+            }
+            if !any_alive {
+                unreferenced.push(fname.clone());
+            }
+        }
+        Ok(unreferenced)
+    }
+
+    /// Purges `previews` rows matching `camera_filter` / `scope` and optional `before_ts`,
+    /// returning `(id, camera, path)` tuples for media file removal.
+    pub fn purge_previews_filtered(
+        &self,
+        scope: &CameraScope,
+        camera_filter: Option<&str>,
+        before_ts: Option<f64>,
+    ) -> Result<Vec<(String, String, String)>> {
+        if let Some(cam) = camera_filter
+            && !scope.allows(cam)
+        {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let mut matched = Vec::new();
+        {
+            let mut stmt = tx.prepare("SELECT id, camera, path, end_time FROM previews")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    value_to_f64(&r.get_ref(3)?).unwrap_or(0.0),
+                ))
+            })?;
+            for row in rows {
+                let (id, cam, path, end_ts) = row?;
+                if let Some(target_cam) = camera_filter {
+                    if cam != target_cam {
+                        continue;
+                    }
+                } else if !scope.allows(&cam) {
+                    continue;
+                }
+                if let Some(cutoff) = before_ts
+                    && (!end_ts.is_finite() || end_ts >= cutoff)
+                {
+                    continue;
+                }
+                matched.push((id, cam, path));
+            }
+        }
+        if !matched.is_empty() {
+            let mut del_stmt = tx.prepare("DELETE FROM previews WHERE id = ?1")?;
+            for (id, _, _) in &matched {
+                del_stmt.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(matched)
+    }
+
+    /// Lists completed (`in_progress = 0`) export IDs matching `camera_filter` / `scope` and optional `before_ts`.
+    pub fn list_completed_exports_filtered(
+        &self,
+        scope: &CameraScope,
+        camera_filter: Option<&str>,
+        before_ts: Option<f64>,
+    ) -> Result<Vec<String>> {
+        if let Some(cam) = camera_filter
+            && !scope.allows(cam)
+        {
+            return Ok(Vec::new());
+        }
+        let conn = self.read_conn();
+        let mut stmt =
+            conn.prepare("SELECT id, camera, date FROM export WHERE COALESCE(in_progress, 0) = 0")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                value_to_f64(&r.get_ref(2)?).unwrap_or(0.0),
+            ))
+        })?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let (id, cam, date_ts) = row?;
+            if let Some(target_cam) = camera_filter {
+                if cam != target_cam {
+                    continue;
+                }
+            } else if !scope.allows(&cam) {
+                continue;
+            }
+            if let Some(cutoff) = before_ts
+                && (!date_ts.is_finite() || date_ts >= cutoff)
+            {
+                continue;
+            }
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
+    /// Checkpoints and truncates the SQLite WAL journal (`PRAGMA wal_checkpoint(TRUNCATE)`)
+    /// and runs `PRAGMA optimize`, reclaiming `-wal` disk space without locking out readers
+    /// or requiring 2x temporary `VACUUM` disk space.
+    pub fn checkpoint_wal_truncate(&self) -> Result<(i64, i64)> {
+        let conn = self.lock_conn();
+        let (log_frames, checkpointed_frames) =
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((
+                    r.get::<_, i64>(1).unwrap_or(0),
+                    r.get::<_, i64>(2).unwrap_or(0),
+                ))
+            })?;
+        let _ = conn.execute_batch("PRAGMA optimize;");
+        Ok((log_frames, checkpointed_frames))
     }
 
     pub fn query_motion_activity(

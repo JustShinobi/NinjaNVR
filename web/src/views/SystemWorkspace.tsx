@@ -1,13 +1,17 @@
 import React from "react";
 import { formatMeasured, parseMeasured, resolvePrimaryInferenceMs, sparklineCeiling } from "../utils/detectorTelemetry";
-import { AlertTriangle, CheckCircle2, Copy, Pause, Play } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Copy, Pause, Play, RefreshCw, Trash2 } from "lucide-react";
 import { useI18n } from "../i18n";
 import { useNvrStore } from "../store/useNvrStore";
 import {
+  CameraGranularStorageDto,
   CameraRuntimeStats,
   HeuristicAlertItem,
   NinjaConfigResponse,
   NinjaStatsResponse,
+  StorageBreakdownResponse,
+  StorageCleanupResponse,
+  StorageCleanupTarget,
 } from "../types/nvr";
 import { formatUptime, resolveEffectiveTheme } from "../utils/format";
 import {
@@ -15,6 +19,7 @@ import {
   subscribePrefersLightScheme,
 } from "../utils/themeTokens";
 import { CanvasSparkline } from "../components/VideoPlayers";
+import { useTwoStepConfirm } from "./settings/vision/useTwoStepConfirm";
 
 export type HealthStatusFilter = "all" | "offline" | "active_ai";
 export type HealthSortColumn =
@@ -53,6 +58,188 @@ export function formatCameraTelemetryValue(
     return Number.isFinite(parsed) ? `${parsed.toFixed(digits)}${unit}` : "—";
   }
   return "—";
+}
+
+export function formatStorageBytes(rawBytes: unknown): string {
+  const bytes = Math.max(0, toFiniteNumber(rawBytes, 0));
+  if (bytes < 1024) {
+    return `${Math.round(bytes)} B`;
+  }
+  const kb = bytes / 1024;
+  if (kb < 1024) {
+    return `${kb >= 100 ? Math.round(kb) : kb.toFixed(1)} KB`;
+  }
+  const mb = kb / 1024;
+  if (mb < 1024) {
+    return `${mb >= 100 ? mb.toFixed(0) : mb.toFixed(1)} MB`;
+  }
+  const gb = mb / 1024;
+  if (gb < 1024) {
+    return `${gb.toFixed(2)} GB`;
+  }
+  const tb = gb / 1024;
+  return `${tb.toFixed(2)} TB`;
+}
+
+export function formatStorageShortBytes(rawBytes: unknown): string {
+  const bytes = Math.max(0, toFiniteNumber(rawBytes, 0));
+  if (bytes <= 0) return "0 B";
+  const mb = bytes / (1024 * 1024);
+  if (mb < 1) {
+    return `${Math.max(1, Math.round(bytes / 1024))}K`;
+  }
+  if (mb < 1024) {
+    return `${mb >= 10 ? Math.round(mb) : mb.toFixed(1)}M`;
+  }
+  const gb = mb / 1024;
+  return `${gb >= 10 ? gb.toFixed(1) : gb.toFixed(2)}G`;
+}
+
+export function formatRetentionSpan(
+  oldestTs: unknown,
+  nowSec: number = Date.now() / 1000
+): string | null {
+  const ts = toFiniteNumber(oldestTs, 0);
+  if (ts <= 0 || !Number.isFinite(nowSec) || nowSec <= ts) {
+    return null;
+  }
+  const ageSec = nowSec - ts;
+  const hours = ageSec / 3600;
+  if (hours < 24) {
+    return `${Math.max(0.1, hours).toFixed(1)}h`;
+  }
+  const days = hours / 24;
+  return `${days.toFixed(1)}d`;
+}
+
+export interface StorageStackSegment {
+  key: string;
+  label: string;
+  bytes: number;
+  pct: number;
+  color: string;
+}
+
+export function computeStorageStackSegments(
+  breakdown: StorageBreakdownResponse | null,
+  isPt: boolean
+): StorageStackSegment[] {
+  if (!breakdown) return [];
+  const c = breakdown.categories;
+  const contBytes = Math.max(0, toFiniteNumber(c?.recordings_continuous?.bytes, 0));
+  const motBytes = Math.max(0, toFiniteNumber(c?.recordings_motion?.bytes, 0));
+  const evtSegBytes = Math.max(0, toFiniteNumber(c?.recordings_events?.bytes, 0));
+  const evRevClipBytes =
+    Math.max(0, toFiniteNumber(c?.events_media?.bytes, 0)) +
+    Math.max(0, toFiniteNumber(c?.reviews_media?.bytes, 0));
+  const prevExpBytes =
+    Math.max(0, toFiniteNumber(c?.previews_media?.bytes, 0)) +
+    Math.max(0, toFiniteNumber(c?.exports_media?.bytes, 0));
+  const sysBytes =
+    Math.max(0, toFiniteNumber(c?.dataset_and_models?.bytes, 0)) +
+    Math.max(0, toFiniteNumber(c?.database?.bytes, 0));
+
+  const raw: Array<{ key: string; label: string; bytes: number; color: string }> = [
+    {
+      key: "continuous",
+      label: isPt ? "MP4 Contínuo" : "Continuous MP4",
+      bytes: contBytes,
+      color: "var(--signal-live)",
+    },
+    {
+      key: "motion",
+      label: isPt ? "MP4 Movimento" : "Motion MP4",
+      bytes: motBytes,
+      color: "var(--signal-motion)",
+    },
+    {
+      key: "event_mp4",
+      label: isPt ? "MP4 Eventos" : "Event MP4",
+      bytes: evtSegBytes,
+      color: "var(--signal-alert)",
+    },
+    {
+      key: "clips_media",
+      label: isPt ? "Snapshots & Revisões" : "Snapshots & Reviews",
+      bytes: evRevClipBytes,
+      color: "var(--signal-accent)",
+    },
+    {
+      key: "previews_exports",
+      label: isPt ? "Previews & Exports" : "Previews & Exports",
+      bytes: prevExpBytes,
+      color: "var(--text-secondary)",
+    },
+    {
+      key: "sys_db",
+      label: isPt ? "Dataset / Modelos / DB" : "Dataset / Models / DB",
+      bytes: sysBytes,
+      color: "var(--border-strong)",
+    },
+  ];
+
+  const sum = raw.reduce((acc, item) => acc + item.bytes, 0);
+  if (sum <= 0) return [];
+  return raw
+    .filter((item) => item.bytes > 0)
+    .map((item) => ({
+      ...item,
+      pct: Math.min(100, (item.bytes / sum) * 100),
+    }));
+}
+
+export function buildCameraGranularRows(
+  stats: NinjaStatsResponse | null,
+  breakdown: StorageBreakdownResponse | null
+): CameraGranularStorageDto[] {
+  if (breakdown && breakdown.cameras && Object.keys(breakdown.cameras).length > 0) {
+    return Object.values(breakdown.cameras).sort((a, b) =>
+      a.camera.localeCompare(b.camera, undefined, { numeric: true })
+    );
+  }
+  const camStorage = stats?.service?.camera_storage;
+  if (!camStorage) return [];
+  const fallbackRunway = toFiniteNumber(stats?.service?.estimated_retention_days, 14);
+  return Object.entries(camStorage)
+    .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
+    .map(([cam, cs]) => {
+      const recBytes = Math.max(0, toFiniteNumber(cs.usage, 0)) * 1024 * 1024;
+      const contBytes = Math.max(0, toFiniteNumber(cs.continuous_mb, 0)) * 1024 * 1024;
+      const motBytes = Math.max(0, toFiniteNumber(cs.motion_mb, 0)) * 1024 * 1024;
+      const evtBytes = Math.max(0, toFiniteNumber(cs.event_segments_mb, 0)) * 1024 * 1024;
+      const compBytes = Math.max(0, toFiniteNumber(cs.compacted_mb, 0)) * 1024 * 1024;
+      return {
+        camera: cam,
+        configured: true,
+        total_bytes: recBytes,
+        recordings_bytes: recBytes,
+        continuous_bytes: contBytes,
+        motion_bytes: motBytes,
+        event_segments_bytes: evtBytes,
+        compacted_bytes: compBytes,
+        retained_past_continuous_bytes: 0,
+        retained_past_continuous_count: 0,
+        segments_count: Math.max(0, Math.round(toFiniteNumber(cs.segments_count, 0))),
+        oldest_segment_ts: cs.oldest_ts ?? null,
+        newest_segment_ts: cs.newest_ts ?? null,
+        events_count: Math.max(0, Math.round(toFiniteNumber(cs.events_count, 0))),
+        pinned_events_count: Math.max(0, Math.round(toFiniteNumber(cs.pinned_events_count, 0))),
+        events_media_bytes: 0,
+        reviews_count: Math.max(0, Math.round(toFiniteNumber(cs.reviews_count, 0))),
+        reviews_media_bytes: 0,
+        previews_bytes: 0,
+        previews_files_count: 0,
+        exports_bytes: 0,
+        exports_count: 0,
+        bandwidth_mb_hr: Math.max(0, toFiniteNumber(cs.bandwidth, 0)),
+        estimated_retention_days: toFiniteNumber(
+          cs.estimated_retention_days ?? fallbackRunway,
+          fallbackRunway
+        ),
+        continuous_days: 7,
+        event_retention_days: 7,
+      };
+    });
 }
 
 const SENSITIVE_RTSP_QUERY_KEYS = new Set([
@@ -493,6 +680,8 @@ interface SystemWorkspaceProps {
   setLogPaused: React.Dispatch<React.SetStateAction<boolean>>;
   notify: (msg: string) => void;
   initialRightMode?: "alerts" | "logs";
+  initialBreakdown?: StorageBreakdownResponse | null;
+  onStorageMutated?: () => void;
 }
 
 export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
@@ -506,11 +695,14 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
   setLogPaused,
   notify,
   initialRightMode = "alerts",
+  initialBreakdown = null,
+  onStorageMutated,
 }) => {
   const { t, locale } = useI18n();
   const isPt = locale === "pt";
   const config = useNvrStore((s) => s.config);
   const stats = useNvrStore((s) => s.stats);
+  const setStats = useNvrStore((s) => s.setStats);
   const statsHistory = useNvrStore((s) => s.statsHistory);
   const themeMode = useNvrStore((s) => s.themeMode);
   const highContrast = useNvrStore((s) => s.highContrast);
@@ -534,14 +726,197 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
   const [aiBriefText, setAiBriefText] = React.useState<string | null>(null);
   const [aiBriefBusy, setAiBriefBusy] = React.useState(false);
   const [syncStorageBusy, setSyncStorageBusy] = React.useState(false);
+  const [storageBreakdown, setStorageBreakdown] =
+    React.useState<StorageBreakdownResponse | null>(initialBreakdown);
+  const [breakdownBusy, setBreakdownBusy] = React.useState(false);
+  const [cleanupBusyKey, setCleanupBusyKey] = React.useState<string | null>(null);
+  const [cleanupCameraScope, setCleanupCameraScope] = React.useState<string>("all");
+  const [cleanupOlderDays, setCleanupOlderDays] = React.useState<number>(0);
+  const [keepPinnedEvents, setKeepPinnedEvents] = React.useState<boolean>(true);
+  const [pruneRetainedSegments, setPruneRetainedSegments] = React.useState<boolean>(true);
+  const { armedKey, isArmed, confirmOrArm, clearArmed } = useTwoStepConfirm(3500);
   const isMountedRef = React.useRef(true);
 
   React.useEffect(() => {
+    if (!armedKey || typeof window === "undefined") return;
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") {
+        clearArmed();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [armedKey, clearArmed]);
+
+  const fetchStorageBreakdown = React.useCallback(
+    async (forceRefresh: boolean = false) => {
+      if (typeof fetch !== "function") return;
+      if (isMountedRef.current) {
+        setBreakdownBusy(true);
+      }
+      try {
+        const url = forceRefresh
+          ? "/api/storage/breakdown?refresh=1"
+          : "/api/storage/breakdown";
+        const res = await fetch(url, { credentials: "include" });
+        if (!isMountedRef.current) return;
+        if (res.ok) {
+          const data: StorageBreakdownResponse = await res.json();
+          if (isMountedRef.current && data && typeof data === "object") {
+            setStorageBreakdown(data);
+          }
+        }
+      } catch {
+        // Silent background fallback to stats.service.camera_storage
+      } finally {
+        if (isMountedRef.current) {
+          setBreakdownBusy(false);
+        }
+      }
+    },
+    []
+  );
+
+  React.useEffect(() => {
     isMountedRef.current = true;
+    void fetchStorageBreakdown(false);
     return () => {
       isMountedRef.current = false;
     };
-  }, []);
+  }, [fetchStorageBreakdown]);
+
+  const refreshStatsAndBreakdown = React.useCallback(async () => {
+    await fetchStorageBreakdown(true);
+    try {
+      const sRes = await fetch("/api/stats", { credentials: "include" });
+      if (sRes.ok && isMountedRef.current) {
+        const freshStats: NinjaStatsResponse = await sRes.json();
+        if (isMountedRef.current && freshStats && typeof freshStats === "object") {
+          setStats(freshStats);
+        }
+      }
+    } catch {
+      // Ignore transient refresh failure
+    }
+    onStorageMutated?.();
+  }, [fetchStorageBreakdown, onStorageMutated, setStats]);
+
+  const cameraGranularRows = React.useMemo(
+    () => buildCameraGranularRows(stats, storageBreakdown),
+    [stats, storageBreakdown]
+  );
+  const effectiveCameraScope = React.useMemo(() => {
+    if (cleanupCameraScope === "all") return "all";
+    return cameraGranularRows.some((r) => r.camera === cleanupCameraScope)
+      ? cleanupCameraScope
+      : "all";
+  }, [cleanupCameraScope, cameraGranularRows]);
+
+  React.useEffect(() => {
+    if (cleanupCameraScope !== "all" && effectiveCameraScope === "all") {
+      setCleanupCameraScope("all");
+    }
+  }, [cleanupCameraScope, effectiveCameraScope]);
+
+  const stackSegments = React.useMemo(
+    () => computeStorageStackSegments(storageBreakdown, isPt),
+    [storageBreakdown, isPt]
+  );
+  const scopedCamDto =
+    effectiveCameraScope !== "all"
+      ? storageBreakdown?.cameras?.[effectiveCameraScope] ??
+        cameraGranularRows.find((r) => r.camera === effectiveCameraScope) ??
+        null
+      : null;
+
+  const executeStorageCleanup = React.useCallback(
+    async (
+      busyKey: string,
+      target: StorageCleanupTarget,
+      cameraOverride?: string | null
+    ) => {
+      if (cleanupBusyKey) return;
+      clearArmed();
+      setCleanupBusyKey(busyKey);
+      const effectiveCam =
+        cameraOverride !== undefined
+          ? cameraOverride
+          : effectiveCameraScope === "all"
+          ? null
+          : effectiveCameraScope;
+      try {
+        const res = await fetch("/api/storage/cleanup", {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            target,
+            camera: effectiveCam,
+            older_than_days: cleanupOlderDays > 0 ? cleanupOlderDays : null,
+            include_pinned: !keepPinnedEvents,
+            prune_retained_segments: pruneRetainedSegments,
+          }),
+        });
+        if (!isMountedRef.current) return;
+        if (res.ok) {
+          const data: StorageCleanupResponse = await res.json();
+          if (!isMountedRef.current) return;
+          const freedText = formatStorageBytes(data.freed_bytes);
+          const scopeLabel = effectiveCam ? ` [${effectiveCam.toUpperCase()}]` : "";
+          notify(
+            isPt
+              ? `Limpeza concluída${scopeLabel}: ${data.deleted_items ?? 0} item(ns)${
+                  data.deleted_segments > 0
+                    ? ` + ${data.deleted_segments} seg(s) MP4`
+                    : ""
+                } removidos · ${freedText} liberados`
+              : `Cleanup completed${scopeLabel}: removed ${data.deleted_items ?? 0} item(s)${
+                  data.deleted_segments > 0
+                    ? ` + ${data.deleted_segments} MP4 seg(s)`
+                    : ""
+                } · freed ${freedText}`
+          );
+          await refreshStatsAndBreakdown();
+        } else {
+          const errBody = await res.json().catch(() => null);
+          const msg =
+            errBody && typeof errBody.message === "string"
+              ? errBody.message
+              : `HTTP ${res.status}`;
+          notify(
+            isPt
+              ? `Falha na limpeza de armazenamento (${msg})`
+              : `Storage cleanup failed (${msg})`
+          );
+        }
+      } catch {
+        if (isMountedRef.current) {
+          notify(
+            isPt
+              ? "Erro de rede ao executar limpeza de armazenamento"
+              : "Network error while running storage cleanup"
+          );
+        }
+      } finally {
+        if (isMountedRef.current) {
+          setCleanupBusyKey(null);
+        }
+      }
+    },
+    [
+      cleanupBusyKey,
+      clearArmed,
+      effectiveCameraScope,
+      cleanupOlderDays,
+      keepPinnedEvents,
+      pruneRetainedSegments,
+      isPt,
+      notify,
+      refreshStatsAndBreakdown,
+    ]
+  );
 
   const safeCopyText = async (text: string, successMsg: string) => {
     if (
@@ -625,10 +1000,14 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
   const optCount = heuristicAlerts.filter((a) => a.severity === "optimization").length;
 
   return (
-    <div
-      className="nvr-workbench nvr-system-workbench"
-      style={{ gridTemplateColumns: "1.1fr 1fr" }}
-    >
+    <div className="nvr-workbench nvr-system-workbench">
+      <div className="sr-only" role="status" aria-live="polite">
+        {armedKey
+          ? isPt
+            ? "Ação de limpeza armada. Pressione novamente em até 3 segundos para confirmar ou Escape para cancelar."
+            : "Cleanup action armed. Activate again within 3 seconds to confirm, or press Escape to cancel."
+          : ""}
+      </div>
       {/* Left Telemetry Column */}
       <div className="nvr-panel">
         <div className="nvr-panel-header">
@@ -865,13 +1244,7 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
           </div>
 
           {/* Per-Camera Pipeline Table */}
-          <div
-            style={{
-              background: "var(--bg-canvas)",
-              border: "1px solid var(--border-hairline)",
-              borderRadius: 3,
-            }}
-          >
+          <div className="nvr-system-card">
             <div
               className="nvr-panel-header"
               style={{
@@ -922,7 +1295,15 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                 ))}
               </div>
             </div>
-            <table className="nvr-table mono">
+            <div
+              className="nvr-table-region"
+              role="region"
+              tabIndex={0}
+              aria-label={
+                isPt ? "Telemetria de pipeline por câmera" : "Per-camera pipeline telemetry"
+              }
+            >
+              <table className="nvr-table mono">
               <thead>
                 <tr>
                   <th
@@ -1065,164 +1446,1186 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                 )}
               </tbody>
             </table>
+            </div>
           </div>
 
-          {/* Storage Volumes */}
-          <div
-            style={{
-              background: "var(--bg-canvas)",
-              border: "1px solid var(--border-hairline)",
-              borderRadius: 3,
-            }}
-          >
+          {/* Storage Volumes & Granular Cleanup */}
+          <div className="nvr-system-card">
             <div
               className="nvr-panel-header"
-              style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                flexWrap: "wrap",
+                gap: 6,
+                height: "auto",
+                minHeight: 34,
+                padding: "6px 12px",
+              }}
             >
               <span>{t.system.storageVolumes}</span>
-              <button
-                className="nvr-btn mono"
-                style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
-                title="Reconcile SQLite recordings table against on-disk MP4 files"
-                disabled={syncStorageBusy}
-                onClick={async () => {
-                  if (syncStorageBusy) return;
-                  setSyncStorageBusy(true);
-                  try {
-                    const res = await fetch("/api/recordings/sync", {
-                      method: "POST",
-                      credentials: "include",
-                    });
-                    if (!isMountedRef.current) return;
-                    if (res.ok) {
-                      const data = await res.json();
-                      if (!isMountedRef.current) return;
-                      notify(
-                        `Synced Storage DB: removed ${data.removed_orphans ?? 0} orphan segment(s) in ${data.duration_ms ?? 0}ms`
-                      );
-                    } else {
-                      notify(`Storage DB sync failed (${res.status})`);
-                    }
-                  } catch {
-                    if (isMountedRef.current) {
-                      notify("Storage DB sync request failed");
-                    }
-                  } finally {
-                    if (isMountedRef.current) {
-                      setSyncStorageBusy(false);
-                    }
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                <button
+                  type="button"
+                  className="nvr-btn xs mono"
+                  aria-busy={breakdownBusy}
+                  title={
+                    isPt
+                      ? "Recalcular uso detalhado de disco em todas as categorias"
+                      : "Refresh granular on-disk storage breakdown"
                   }
-                }}
-              >
-                {syncStorageBusy
-                  ? isPt
-                    ? "Sincronizando..."
-                    : "Syncing..."
-                  : isPt
-                  ? "Sincronizar DB"
-                  : "Sync Storage DB"}
-              </button>
+                  disabled={breakdownBusy || cleanupBusyKey !== null}
+                  onClick={() => {
+                    void refreshStatsAndBreakdown();
+                  }}
+                >
+                  <RefreshCw size={11} />
+                  <span>
+                    {breakdownBusy
+                      ? isPt
+                        ? "Lendo..."
+                        : "Scanning..."
+                      : isPt
+                      ? "Atualizar Uso"
+                      : "Refresh Usage"}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  className={`nvr-btn xs mono ${
+                    isArmed("hdr:retention_pass") ? "danger-armed" : ""
+                  }`}
+                  aria-busy={cleanupBusyKey === "hdr:retention_pass"}
+                  aria-label={
+                    isArmed("hdr:retention_pass")
+                      ? isPt
+                        ? "Confirmar execução imediata do ciclo de retenção"
+                        : "Confirm immediate retention pass execution"
+                      : isPt
+                      ? "Aplicar retenção agora"
+                      : "Run retention pass now"
+                  }
+                  title={
+                    isPt
+                      ? "Executar imediatamente o ciclo completo de retenção, cotas e checkpoint WAL"
+                      : "Execute full retention, quota eviction, and WAL checkpoint pass immediately"
+                  }
+                  disabled={cleanupBusyKey !== null || Boolean(storageBreakdown?.scoped)}
+                  onClick={() => {
+                    confirmOrArm("hdr:retention_pass", () => {
+                      void executeStorageCleanup("hdr:retention_pass", "retention_pass", null);
+                    });
+                  }}
+                >
+                  {cleanupBusyKey === "hdr:retention_pass"
+                    ? isPt
+                      ? "Aplicando..."
+                      : "Running..."
+                    : isArmed("hdr:retention_pass")
+                    ? isPt
+                      ? "Confirmar Retenção?"
+                      : "Confirm Retention?"
+                    : isPt
+                    ? "Aplicar Retenção"
+                    : "Run Retention"}
+                </button>
+                <button
+                  type="button"
+                  className="nvr-btn xs mono"
+                  aria-busy={syncStorageBusy}
+                  title={
+                    isPt
+                      ? "Reconciliar tabela SQLite de gravações contra os arquivos MP4 no disco"
+                      : "Reconcile SQLite recordings table against on-disk MP4 files"
+                  }
+                  disabled={syncStorageBusy || cleanupBusyKey !== null}
+                  onClick={async () => {
+                    if (syncStorageBusy) return;
+                    setSyncStorageBusy(true);
+                    try {
+                      const res = await fetch("/api/recordings/sync", {
+                        method: "POST",
+                        credentials: "include",
+                      });
+                      if (!isMountedRef.current) return;
+                      if (res.ok) {
+                        const data = await res.json();
+                        if (!isMountedRef.current) return;
+                        notify(
+                          isPt
+                            ? `DB sincronizado: ${data.removed_orphans ?? 0} segmento(s) órfão(s) removido(s) em ${data.duration_ms ?? 0}ms`
+                            : `Synced Storage DB: removed ${data.removed_orphans ?? 0} orphan segment(s) in ${data.duration_ms ?? 0}ms`
+                        );
+                        await refreshStatsAndBreakdown();
+                      } else {
+                        notify(
+                          isPt
+                            ? `Falha ao sincronizar DB (${res.status})`
+                            : `Storage DB sync failed (${res.status})`
+                        );
+                      }
+                    } catch {
+                      if (isMountedRef.current) {
+                        notify(
+                          isPt
+                            ? "Falha de rede ao sincronizar DB"
+                            : "Storage DB sync request failed"
+                        );
+                      }
+                    } finally {
+                      if (isMountedRef.current) {
+                        setSyncStorageBusy(false);
+                      }
+                    }
+                  }}
+                >
+                  {syncStorageBusy
+                    ? isPt
+                      ? "Sincronizando..."
+                      : "Syncing..."
+                    : isPt
+                    ? "Sincronizar DB"
+                    : "Sync Storage DB"}
+                </button>
+              </div>
             </div>
-            <table className="nvr-table mono">
-              <thead>
-                <tr>
-                  <th scope="col">{isPt ? "Ponto de Montagem" : "Mount Path"}</th>
-                  <th scope="col">FS</th>
-                  <th scope="col">{isPt ? "Usado" : "Used"}</th>
-                  <th scope="col">{isPt ? "Total" : "Total"}</th>
-                  <th scope="col">{isPt ? "Utilização" : "Utilization"}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {Object.entries(stats?.service?.storage || {}).map(([mPath, st]) => {
-                  const safeUsed = Math.max(0, toFiniteNumber(st?.used, 0));
-                  const safeTotal = Math.max(1, toFiniteNumber(st?.total, 1));
-                  const pct = Math.max(
-                    0,
-                    Math.min(100, Math.round((safeUsed / safeTotal) * 100))
-                  );
-                  const isCrit = pct >= 90;
-                  const isWarn = pct >= 80 && pct < 90;
-                  const barColor = isCrit
-                    ? "var(--signal-alert)"
-                    : isWarn
-                    ? "var(--signal-motion)"
-                    : "var(--signal-live)";
-                  const textColor = isCrit
-                    ? "var(--signal-alert-text)"
-                    : isWarn
-                    ? "var(--signal-motion-text)"
-                    : "var(--text-primary)";
-                  return (
-                    <tr key={mPath}>
-                      <td>
-                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                          <span>{mPath}</span>
-                          {st.mount_type === "cold_tier" || mPath.includes("cold") ? (
-                            <span className="nvr-badge mono">COLD ARCHIVE TIER</span>
-                          ) : mPath.includes("recordings") ? (
-                            <span className="nvr-badge live mono">HOT TIER</span>
-                          ) : null}
-                        </div>
-                      </td>
-                      <td>{st.mount_type}</td>
-                      <td>{(safeUsed / 1024).toFixed(1)} GB</td>
-                      <td>{(toFiniteNumber(st?.total, 0) / 1024).toFixed(1)} GB</td>
-                      <td>
-                        <div className="nvr-util-cell">
-                          <div className="nvr-util-bar" aria-hidden="true">
-                            <div
-                              className="nvr-util-fill"
-                              style={{
-                                width: `${pct}%`,
-                                background: barColor,
-                              }}
-                            />
+            <div
+              className="nvr-table-region"
+              role="region"
+              tabIndex={0}
+              aria-label={isPt ? "Volumes de armazenamento" : "Storage mounts"}
+            >
+              <table className="nvr-table mono">
+                <thead>
+                  <tr>
+                    <th scope="col">{isPt ? "Ponto de Montagem" : "Mount Path"}</th>
+                    <th scope="col">FS</th>
+                    <th scope="col">{isPt ? "Usado" : "Used"}</th>
+                    <th scope="col">{isPt ? "Total" : "Total"}</th>
+                    <th scope="col">{isPt ? "Utilização" : "Utilization"}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {Object.entries(stats?.service?.storage || {}).map(([mPath, st]) => {
+                    const safeUsed = Math.max(0, toFiniteNumber(st?.used, 0));
+                    const safeTotal = Math.max(1, toFiniteNumber(st?.total, 1));
+                    const pct = Math.max(
+                      0,
+                      Math.min(100, Math.round((safeUsed / safeTotal) * 100))
+                    );
+                    const isCrit = pct >= 90;
+                    const isWarn = pct >= 80 && pct < 90;
+                    const barColor = isCrit
+                      ? "var(--signal-alert)"
+                      : isWarn
+                      ? "var(--signal-motion)"
+                      : "var(--signal-live)";
+                    const textColor = isCrit
+                      ? "var(--signal-alert-text)"
+                      : isWarn
+                      ? "var(--signal-motion-text)"
+                      : "var(--text-primary)";
+                    return (
+                      <tr key={mPath}>
+                        <td>
+                          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                            <span>{mPath}</span>
+                            {st.mount_type === "cold_tier" || mPath.includes("cold") ? (
+                              <span className="nvr-badge mono">
+                                {isPt ? "ARQUIVO FRIO" : "COLD ARCHIVE TIER"}
+                              </span>
+                            ) : mPath.includes("recordings") ? (
+                              <span className="nvr-badge live mono">
+                                {isPt ? "TIER QUENTE" : "HOT TIER"}
+                              </span>
+                            ) : null}
                           </div>
-                          <span
+                        </td>
+                        <td>{st.mount_type}</td>
+                        <td>{(safeUsed / 1024).toFixed(1)} GB</td>
+                        <td>{(toFiniteNumber(st?.total, 0) / 1024).toFixed(1)} GB</td>
+                        <td>
+                          <div className="nvr-util-cell">
+                            <div className="nvr-util-bar" aria-hidden="true">
+                              <div
+                                className="nvr-util-fill"
+                                style={{
+                                  width: `${pct}%`,
+                                  background: barColor,
+                                }}
+                              />
+                            </div>
+                            <span
+                              style={{
+                                color: textColor,
+                                fontWeight: isCrit || isWarn ? 700 : 500,
+                              }}
+                            >
+                              {pct}%
+                            </span>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Granular Storage Composition & Cleanup Matrix */}
+            {storageBreakdown && (
+              <>
+                {stackSegments.length > 0 && (
+                  <div className="nvr-storage-stack-wrap">
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: 8,
+                        flexWrap: "wrap",
+                        fontSize: "var(--text-xs)",
+                      }}
+                    >
+                      <span
+                        className="mono"
+                        style={{
+                          fontWeight: 700,
+                          color: "var(--text-primary)",
+                          textTransform: "uppercase",
+                        }}
+                      >
+                        {isPt
+                          ? "Uso Granular do NVR por Categoria"
+                          : "Granular NVR Footprint by Category"}
+                      </span>
+                      <span className="mono" style={{ color: "var(--text-secondary)" }}>
+                        {isPt ? "Rastreado pelo NVR: " : "NVR Tracked: "}
+                        <strong style={{ color: "var(--text-primary)" }}>
+                          {formatStorageBytes(storageBreakdown.total_tracked_bytes)}
+                        </strong>
+                      </span>
+                    </div>
+                    <div className="nvr-storage-stack-bar" aria-hidden="true">
+                      {stackSegments.map((seg) => {
+                        const pctLabel =
+                          seg.pct < 0.1 ? "<0.1%" : `${seg.pct.toFixed(1)}%`;
+                        return (
+                          <div
+                            key={seg.key}
+                            className="nvr-storage-stack-seg"
+                            title={`${seg.label}: ${formatStorageBytes(seg.bytes)} (${pctLabel})`}
                             style={{
-                              color: textColor,
-                              fontWeight: isCrit || isWarn ? 700 : 500,
+                              width: `${seg.pct}%`,
+                              background: seg.color,
                             }}
-                          >
-                            {pct}%
-                          </span>
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-            {stats?.service?.camera_storage &&
-              Object.keys(stats.service.camera_storage).length > 0 && (
-                <table className="nvr-table mono" style={{ borderTop: "1px solid var(--border-hairline)" }}>
+                          />
+                        );
+                      })}
+                    </div>
+                    <div className="nvr-storage-legend mono">
+                      {stackSegments.map((seg) => (
+                        <span key={seg.key} className="nvr-storage-legend-item">
+                          <span
+                            className="nvr-storage-dot"
+                            style={{ background: seg.color }}
+                            aria-hidden="true"
+                          />
+                          <span>{seg.label}:</span>
+                          <strong style={{ color: "var(--text-primary)" }}>
+                            {formatStorageBytes(seg.bytes)}
+                          </strong>
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <div className="nvr-cleanup-toolbar mono">
+                  <div className="nvr-cleanup-controls">
+                    <label
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 5,
+                        fontSize: "var(--text-xs)",
+                        color: "var(--text-secondary)",
+                      }}
+                    >
+                      <span>{isPt ? "Escopo:" : "Scope:"}</span>
+                      <select
+                        className="nvr-select mono nvr-cleanup-select"
+                        aria-label={isPt ? "Escopo de câmera para limpeza" : "Cleanup camera scope"}
+                        value={effectiveCameraScope}
+                        onChange={(e) => {
+                          clearArmed();
+                          setCleanupCameraScope(e.target.value);
+                        }}
+                      >
+                        <option value="all">
+                          {isPt ? "Todas as Câmeras" : "All Cameras"}
+                        </option>
+                        {cameraGranularRows.map((row) => (
+                          <option key={row.camera} value={row.camera}>
+                            {row.camera.toUpperCase()}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 5,
+                        fontSize: "var(--text-xs)",
+                        color: "var(--text-secondary)",
+                      }}
+                    >
+                      <span>{isPt ? "Idade:" : "Age:"}</span>
+                      <select
+                        className="nvr-select mono nvr-cleanup-select"
+                        aria-label={isPt ? "Filtro de idade para limpeza" : "Cleanup age filter"}
+                        value={String(cleanupOlderDays)}
+                        onChange={(e) => {
+                          clearArmed();
+                          setCleanupOlderDays(Number(e.target.value) || 0);
+                        }}
+                      >
+                        <option value="0">
+                          {isPt ? "Tudo (Qualquer Idade)" : "All Ages (Everything)"}
+                        </option>
+                        <option value="1">
+                          {isPt ? "Mais antigos que 24h" : "Older than 24h"}
+                        </option>
+                        <option value="3">
+                          {isPt ? "Mais antigos que 3d" : "Older than 3d"}
+                        </option>
+                        <option value="7">
+                          {isPt ? "Mais antigos que 7d" : "Older than 7d"}
+                        </option>
+                        <option value="14">
+                          {isPt ? "Mais antigos que 14d" : "Older than 14d"}
+                        </option>
+                        <option value="30">
+                          {isPt ? "Mais antigos que 30d" : "Older than 30d"}
+                        </option>
+                      </select>
+                    </label>
+                  </div>
+                  <div className="nvr-cleanup-controls">
+                    <label
+                      className="nvr-cleanup-check"
+                      title={
+                        isPt
+                          ? "Preserva eventos marcados para retenção indefinida e seus vídeos"
+                          : "Preserves pinned (retain indefinitely) events and their recordings"
+                      }
+                    >
+                      <input
+                        type="checkbox"
+                        checked={keepPinnedEvents}
+                        onChange={(e) => {
+                          clearArmed();
+                          setKeepPinnedEvents(e.target.checked);
+                        }}
+                      />
+                      <span>{isPt ? "Manter fixados (★)" : "Keep pinned (★)"}</span>
+                    </label>
+                    <label
+                      className="nvr-cleanup-check"
+                      title={
+                        isPt
+                          ? "Ao limpar eventos, também remove segmentos MP4 mais antigos que a janela contínua que só estavam retidos por esses eventos (preservando revisões ativas)"
+                          : "When clearing events, also deletes MP4 segments older than continuous retention that were only held by those events (preserving active reviews)"
+                      }
+                    >
+                      <input
+                        type="checkbox"
+                        checked={pruneRetainedSegments}
+                        onChange={(e) => {
+                          clearArmed();
+                          setPruneRetainedSegments(e.target.checked);
+                        }}
+                      />
+                      <span>
+                        {isPt ? "Liberar MP4 retido (> cont.)" : "Free event-held MP4 (> cont.)"}
+                      </span>
+                    </label>
+                  </div>
+                </div>
+
+                <div
+                  className="nvr-table-region"
+                  role="region"
+                  tabIndex={0}
+                  aria-label={
+                    isPt ? "Detalhamento de categorias e limpeza" : "Category breakdown and cleanup"
+                  }
+                >
+                  <table className="nvr-table mono">
+                    <thead>
+                      <tr>
+                        <th scope="col">{isPt ? "Categoria" : "Category"}</th>
+                        <th scope="col">{isPt ? "Volume de Itens" : "Items"}</th>
+                        <th scope="col">{isPt ? "Uso em Disco" : "Disk Usage"}</th>
+                        <th scope="col" style={{ textAlign: "right" }}>
+                          {isPt ? "Ação de Limpeza" : "Cleanup Action"}
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(() => {
+                        const c = storageBreakdown.categories;
+                        const evCount = scopedCamDto
+                          ? scopedCamDto.events_count
+                          : c.events_media.count;
+                        const pinnedCount = scopedCamDto
+                          ? scopedCamDto.pinned_events_count
+                          : c.pinned_events_count;
+                        const evBytes = scopedCamDto
+                          ? scopedCamDto.events_media_bytes
+                          : c.events_media.bytes;
+                        const excessBytes = scopedCamDto
+                          ? scopedCamDto.retained_past_continuous_bytes
+                          : c.recordings_retained_excess.bytes;
+                        const excessCount = scopedCamDto
+                          ? scopedCamDto.retained_past_continuous_count
+                          : c.recordings_retained_excess.count;
+                        const revCount = scopedCamDto
+                          ? scopedCamDto.reviews_count
+                          : c.reviews_media.count;
+                        const revBytes = scopedCamDto
+                          ? scopedCamDto.reviews_media_bytes
+                          : c.reviews_media.bytes;
+                        const recBytes = scopedCamDto
+                          ? scopedCamDto.recordings_bytes
+                          : c.recordings_continuous.bytes +
+                            c.recordings_motion.bytes +
+                            c.recordings_events.bytes;
+                        const recCount = scopedCamDto
+                          ? scopedCamDto.segments_count
+                          : c.recordings_continuous.count;
+                        const contBytes = scopedCamDto
+                          ? scopedCamDto.continuous_bytes
+                          : c.recordings_continuous.bytes;
+                        const motBytes = scopedCamDto
+                          ? scopedCamDto.motion_bytes
+                          : c.recordings_motion.bytes;
+                        const evtSegBytes = scopedCamDto
+                          ? scopedCamDto.event_segments_bytes
+                          : c.recordings_events.bytes;
+                        const prevCount = scopedCamDto
+                          ? scopedCamDto.previews_files_count
+                          : c.previews_media.count;
+                        const prevBytes = scopedCamDto
+                          ? scopedCamDto.previews_bytes
+                          : c.previews_media.bytes;
+                        const expCount = scopedCamDto
+                          ? scopedCamDto.exports_count
+                          : c.exports_media.count;
+                        const expBytes = scopedCamDto
+                          ? scopedCamDto.exports_bytes
+                          : c.exports_media.bytes;
+
+                        const ageBadge =
+                          cleanupOlderDays > 0 ? ` (> ${cleanupOlderDays}d)` : "";
+                        const scopeCtxLabel =
+                          effectiveCameraScope !== "all"
+                            ? ` [${effectiveCameraScope.toUpperCase()}]`
+                            : "";
+
+                        const renderCleanupBtn = (
+                          key: string,
+                          target: StorageCleanupTarget,
+                          labelPt: string,
+                          labelEn: string
+                        ) => {
+                          const armed = isArmed(key);
+                          const busy = cleanupBusyKey === key;
+                          const baseLabel = `${isPt ? labelPt : labelEn}${ageBadge}`;
+                          const ariaText = armed
+                            ? isPt
+                              ? `Confirmar ${baseLabel}${scopeCtxLabel}`
+                              : `Confirm ${baseLabel}${scopeCtxLabel}`
+                            : `${baseLabel}${scopeCtxLabel}`;
+                          return (
+                            <button
+                              type="button"
+                              className={`nvr-btn xs mono ${
+                                armed ? "danger-armed" : "danger-subtle"
+                              }`}
+                              aria-busy={busy}
+                              aria-label={ariaText}
+                              disabled={cleanupBusyKey !== null}
+                              onClick={() => {
+                                confirmOrArm(key, () => {
+                                  void executeStorageCleanup(key, target);
+                                });
+                              }}
+                            >
+                              <Trash2 size={11} />
+                              <span>
+                                {busy
+                                  ? isPt
+                                    ? "Limpando..."
+                                    : "Cleaning..."
+                                  : armed
+                                  ? isPt
+                                    ? "Confirmar?"
+                                    : "Confirm?"
+                                  : baseLabel}
+                              </span>
+                            </button>
+                          );
+                        };
+
+                        return (
+                          <>
+                            <tr>
+                              <td>
+                                <div style={{ fontWeight: 700, color: "var(--text-primary)" }}>
+                                  {isPt ? "Eventos & Snapshots" : "Events & Snapshots"}
+                                </div>
+                                <div style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                                  {isPt
+                                    ? "Catálogo IA + miniaturas/clips em /clips"
+                                    : "AI event catalog + snapshots/clips in /clips"}
+                                </div>
+                              </td>
+                              <td>
+                                <span>
+                                  {evCount} {isPt ? "eventos" : "events"}
+                                </span>
+                                {pinnedCount > 0 && (
+                                  <span
+                                    className="nvr-badge mono"
+                                    style={{ marginLeft: 6 }}
+                                    title={
+                                      isPt
+                                        ? "Eventos fixados (reter indefinidamente)"
+                                        : "Pinned events (retain indefinitely)"
+                                    }
+                                  >
+                                    {pinnedCount} ★
+                                  </span>
+                                )}
+                              </td>
+                              <td>
+                                <div>{formatStorageBytes(evBytes)}</div>
+                                {excessBytes > 0 && pruneRetainedSegments && (
+                                  <div
+                                    style={{
+                                      fontSize: "var(--text-xs)",
+                                      color: "var(--signal-motion-text)",
+                                    }}
+                                  >
+                                    {isPt ? "até " : "up to "}
+                                    {formatStorageBytes(excessBytes)}{" "}
+                                    {isPt ? "MP4 > cont." : "MP4 > cont."}
+                                  </div>
+                                )}
+                              </td>
+                              <td style={{ textAlign: "right" }}>
+                                {renderCleanupBtn(
+                                  "cat:events",
+                                  "events",
+                                  "Limpar Eventos",
+                                  "Clear Events"
+                                )}
+                              </td>
+                            </tr>
+
+                            <tr>
+                              <td>
+                                <div style={{ fontWeight: 700, color: "var(--text-primary)" }}>
+                                  {isPt ? "Revisões / Triagem" : "Review Triage"}
+                                </div>
+                                <div style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                                  {isPt
+                                    ? "Segmentos de triagem + miniaturas em /clips/review"
+                                    : "Review segments + thumbnails in /clips/review"}
+                                </div>
+                              </td>
+                              <td>
+                                {revCount} {isPt ? "revisões" : "reviews"}
+                              </td>
+                              <td>{formatStorageBytes(revBytes)}</td>
+                              <td style={{ textAlign: "right" }}>
+                                {renderCleanupBtn(
+                                  "cat:reviews",
+                                  "reviews",
+                                  "Limpar Revisões",
+                                  "Clear Reviews"
+                                )}
+                              </td>
+                            </tr>
+
+                            <tr>
+                              <td>
+                                <div style={{ fontWeight: 700, color: "var(--text-primary)" }}>
+                                  {isPt
+                                    ? "Excedente MP4 (> Janela Contínua)"
+                                    : "Excess MP4 (> Continuous Window)"}
+                                </div>
+                                <div style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                                  {isPt
+                                    ? "Segmentos antigos mantidos apenas por eventos/movimento"
+                                    : "Older MP4 segments held past continuous days by events/motion"}
+                                </div>
+                              </td>
+                              <td>
+                                {excessCount} {isPt ? "segmentos" : "segments"}
+                              </td>
+                              <td
+                                style={{
+                                  color:
+                                    excessBytes > 0
+                                      ? "var(--signal-motion-text)"
+                                      : "var(--text-secondary)",
+                                  fontWeight: excessBytes > 0 ? 700 : 400,
+                                }}
+                              >
+                                {formatStorageBytes(excessBytes)}
+                              </td>
+                              <td style={{ textAlign: "right" }}>
+                                {renderCleanupBtn(
+                                  "cat:excess_recordings",
+                                  "excess_recordings",
+                                  "Podar Excedente",
+                                  "Prune Excess"
+                                )}
+                              </td>
+                            </tr>
+
+                            <tr>
+                              <td>
+                                <div style={{ fontWeight: 700, color: "var(--text-primary)" }}>
+                                  {isPt ? "Gravações MP4 (Total)" : "MP4 Recordings (Total)"}
+                                </div>
+                                <div style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                                  Cont {formatStorageShortBytes(contBytes)} ·{" "}
+                                  {isPt ? "Mov " : "Mot "}
+                                  {formatStorageShortBytes(motBytes)} · Evt{" "}
+                                  {formatStorageShortBytes(evtSegBytes)}
+                                </div>
+                              </td>
+                              <td>
+                                {recCount} {isPt ? "segmentos" : "segments"}
+                              </td>
+                              <td style={{ fontWeight: 700 }}>{formatStorageBytes(recBytes)}</td>
+                              <td style={{ textAlign: "right" }}>
+                                {renderCleanupBtn(
+                                  "cat:recordings",
+                                  "recordings",
+                                  cleanupOlderDays > 0
+                                    ? "Limpar Gravações"
+                                    : "Limpar Tudo MP4",
+                                  cleanupOlderDays > 0
+                                    ? "Clear Recordings"
+                                    : "Clear All MP4"
+                                )}
+                              </td>
+                            </tr>
+
+                            <tr>
+                              <td>
+                                <div style={{ fontWeight: 700, color: "var(--text-primary)" }}>
+                                  {isPt ? "Previews & Scrubbing" : "Previews & Scrubbing"}
+                                </div>
+                                <div style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                                  {isPt
+                                    ? "MP4s horários e quadros rápidos da timeline"
+                                    : "Hourly timeline MP4s & scrubbing JPEG frames"}
+                                </div>
+                              </td>
+                              <td>
+                                {prevCount} {isPt ? "arquivos" : "files"}
+                              </td>
+                              <td>{formatStorageBytes(prevBytes)}</td>
+                              <td style={{ textAlign: "right" }}>
+                                {renderCleanupBtn(
+                                  "cat:previews",
+                                  "previews",
+                                  "Limpar Previews",
+                                  "Clear Previews"
+                                )}
+                              </td>
+                            </tr>
+
+                            <tr>
+                              <td>
+                                <div style={{ fontWeight: 700, color: "var(--text-primary)" }}>
+                                  {isPt ? "Exports & Shares" : "Exports & Share Clips"}
+                                </div>
+                                <div style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                                  {isPt
+                                    ? "Clipes exportados e cache de links compartilhados"
+                                    : "Exported MP4 clips & guest share artifacts"}
+                                </div>
+                              </td>
+                              <td>
+                                {expCount} {isPt ? "exportações" : "exports"}
+                                {!scopedCamDto && c.share_artifacts_count > 0
+                                  ? ` · ${c.share_artifacts_count} ${
+                                      isPt ? "compartilhamentos" : "shares"
+                                    }`
+                                  : ""}
+                              </td>
+                              <td>{formatStorageBytes(expBytes)}</td>
+                              <td style={{ textAlign: "right" }}>
+                                {renderCleanupBtn(
+                                  "cat:exports",
+                                  "exports",
+                                  "Limpar Exports",
+                                  "Clear Exports"
+                                )}
+                              </td>
+                            </tr>
+
+                            {!storageBreakdown.scoped && (
+                              <>
+                                <tr>
+                                  <td>
+                                    <div
+                                      style={{
+                                        display: "flex",
+                                        alignItems: "center",
+                                        gap: 6,
+                                        flexWrap: "wrap",
+                                      }}
+                                    >
+                                      <span
+                                        style={{ fontWeight: 700, color: "var(--text-primary)" }}
+                                      >
+                                        {isPt
+                                          ? "Dataset IA, Faces & Modelos"
+                                          : "AI Dataset, Faces & Models"}
+                                      </span>
+                                      {effectiveCameraScope !== "all" && (
+                                        <span className="nvr-badge mono">GLOBAL</span>
+                                      )}
+                                    </div>
+                                    <div
+                                      style={{
+                                        fontSize: "var(--text-xs)",
+                                        color: "var(--text-muted)",
+                                      }}
+                                    >
+                                      {isPt
+                                        ? "Amostras anotadas, perfis faciais e pesos ONNX/OpenVINO"
+                                        : "Annotated samples, face profiles & ONNX/OpenVINO weights"}
+                                    </div>
+                                  </td>
+                                  <td>
+                                    {c.dataset_samples_count}{" "}
+                                    {isPt ? "amostras" : "samples"} · {c.models_files_count}{" "}
+                                    {isPt ? "modelos" : "models"}
+                                  </td>
+                                  <td>{formatStorageBytes(c.dataset_and_models.bytes)}</td>
+                                  <td
+                                    style={{
+                                      textAlign: "right",
+                                      color: "var(--text-muted)",
+                                      fontSize: "var(--text-xs)",
+                                    }}
+                                  >
+                                    {isPt ? "Protegido (Studio)" : "Protected (Studio)"}
+                                  </td>
+                                </tr>
+
+                                <tr>
+                                  <td>
+                                    <div
+                                      style={{
+                                        display: "flex",
+                                        alignItems: "center",
+                                        gap: 6,
+                                        flexWrap: "wrap",
+                                      }}
+                                    >
+                                      <span
+                                        style={{ fontWeight: 700, color: "var(--text-primary)" }}
+                                      >
+                                        {isPt ? "Banco de Dados SQLite" : "SQLite Database"}
+                                      </span>
+                                      {effectiveCameraScope !== "all" && (
+                                        <span className="nvr-badge mono">GLOBAL</span>
+                                      )}
+                                    </div>
+                                    <div
+                                      style={{
+                                        fontSize: "var(--text-xs)",
+                                        color: "var(--text-muted)",
+                                      }}
+                                    >
+                                      DB {formatStorageShortBytes(c.database_main_bytes)} · WAL{" "}
+                                      {formatStorageShortBytes(c.database_wal_bytes)} ·{" "}
+                                      {c.timeline_rows_count}{" "}
+                                      {isPt ? "eventos timeline" : "timeline rows"}
+                                    </div>
+                                  </td>
+                                  <td>
+                                    {c.database.count} {isPt ? "arquivos" : "files"}
+                                  </td>
+                                  <td>{formatStorageBytes(c.database.bytes)}</td>
+                                  <td style={{ textAlign: "right" }}>
+                                    <button
+                                      type="button"
+                                      className={`nvr-btn xs mono ${
+                                        isArmed("cat:wal_checkpoint") ? "danger-armed" : ""
+                                      }`}
+                                      aria-busy={cleanupBusyKey === "cat:wal_checkpoint"}
+                                      aria-label={
+                                        isArmed("cat:wal_checkpoint")
+                                          ? isPt
+                                            ? "Confirmar compactação do WAL SQLite"
+                                            : "Confirm SQLite WAL checkpoint"
+                                          : isPt
+                                          ? "Compactar WAL SQLite"
+                                          : "Checkpoint SQLite WAL"
+                                      }
+                                      disabled={cleanupBusyKey !== null}
+                                      onClick={() => {
+                                        confirmOrArm("cat:wal_checkpoint", () => {
+                                          void executeStorageCleanup(
+                                            "cat:wal_checkpoint",
+                                            "wal_checkpoint",
+                                            null
+                                          );
+                                        });
+                                      }}
+                                    >
+                                      {cleanupBusyKey === "cat:wal_checkpoint"
+                                        ? isPt
+                                          ? "Compactando..."
+                                          : "Checkpointing..."
+                                        : isArmed("cat:wal_checkpoint")
+                                        ? isPt
+                                          ? "Confirmar WAL?"
+                                          : "Confirm WAL?"
+                                        : isPt
+                                        ? "Compactar WAL"
+                                        : "Checkpoint WAL"}
+                                    </button>
+                                  </td>
+                                </tr>
+                              </>
+                            )}
+                          </>
+                        );
+                      })()}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+
+            {cameraGranularRows.length > 0 && (
+              <div
+                className="nvr-table-region"
+                role="region"
+                tabIndex={0}
+                aria-label={isPt ? "Armazenamento por canal de câmera" : "Per-camera storage"}
+                style={{ borderTop: "1px solid var(--border-hairline)" }}
+              >
+                <table className="nvr-table mono">
                   <thead>
                     <tr>
                       <th scope="col">{isPt ? "Canal" : "Camera Channel"}</th>
                       <th scope="col">{isPt ? "Uso de Disco" : "Disk Usage"}</th>
+                      <th scope="col">
+                        {isPt
+                          ? "Detalhamento (Cont / Mov / Evt / Clips)"
+                          : "Breakdown (Cont / Mot / Evt / Clips)"}
+                      </th>
                       <th scope="col">{isPt ? "Taxa de Escrita" : "Write Rate"}</th>
                       <th scope="col">{isPt ? "Retenção Est." : "Est. Runway"}</th>
+                      <th scope="col" style={{ textAlign: "right" }}>
+                        {isPt ? "Limpeza Rápida" : "Quick Cleanup"}
+                      </th>
                     </tr>
                   </thead>
                   <tbody>
-                    {Object.entries(stats.service.camera_storage).map(([cam, cs]) => (
-                      <tr key={cam}>
-                        <td style={{ fontWeight: 700, textTransform: "uppercase" }}>{cam}</td>
-                        <td>{(Math.max(0, toFiniteNumber(cs.usage, 0)) / 1024).toFixed(2)} GB</td>
-                        <td>{Math.max(0, toFiniteNumber(cs.bandwidth, 0)).toFixed(1)} MB/h</td>
-                        <td style={{ color: "var(--signal-live-text)" }}>
-                          {formatCameraTelemetryValue(
-                            cs.estimated_retention_days ?? stats.service.estimated_retention_days,
-                            1,
-                            "d"
-                          )}
-                        </td>
-                      </tr>
-                    ))}
+                    {cameraGranularRows.map((row) => {
+                      const cam = row.camera;
+                      const camUpper = cam.toUpperCase();
+                      const clipsAndPrev =
+                        row.events_media_bytes +
+                        row.reviews_media_bytes +
+                        row.previews_bytes +
+                        row.exports_bytes;
+                      const denom = Math.max(
+                        1,
+                        row.continuous_bytes +
+                          row.motion_bytes +
+                          row.event_segments_bytes +
+                          clipsAndPrev
+                      );
+                      const pCont = (row.continuous_bytes / denom) * 100;
+                      const pMot = (row.motion_bytes / denom) * 100;
+                      const pEvt = (row.event_segments_bytes / denom) * 100;
+                      const pClips = (clipsAndPrev / denom) * 100;
+                      const actualSpan = formatRetentionSpan(row.oldest_segment_ts);
+                      const rowAgeBadge =
+                        cleanupOlderDays > 0 ? ` (> ${cleanupOlderDays}d)` : "";
+                      const evBtnKey = `cam:${cam}:events`;
+                      const hasExcess = row.retained_past_continuous_bytes > 0;
+                      const mp4BtnKey = hasExcess
+                        ? `cam:${cam}:excess`
+                        : `cam:${cam}:recordings`;
+                      const mp4Target: StorageCleanupTarget = hasExcess
+                        ? "excess_recordings"
+                        : "recordings";
+                      const evArmed = isArmed(evBtnKey);
+                      const evBusy = cleanupBusyKey === evBtnKey;
+                      const mp4Armed = isArmed(mp4BtnKey);
+                      const mp4Busy = cleanupBusyKey === mp4BtnKey;
+                      const mp4IdleLabel = hasExcess
+                        ? `${isPt ? "Podar > Cont." : "Prune > Cont."}${rowAgeBadge}`
+                        : cleanupOlderDays > 0
+                        ? `${isPt ? "Limpar MP4" : "Clear MP4"}${rowAgeBadge}`
+                        : isPt
+                        ? "Limpar Tudo MP4"
+                        : "Clear All MP4";
+
+                      return (
+                        <tr key={cam}>
+                          <td>
+                            <div
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: 6,
+                                flexWrap: "wrap",
+                              }}
+                            >
+                              <span style={{ fontWeight: 700, textTransform: "uppercase" }}>
+                                {cam}
+                              </span>
+                              {!row.configured && (
+                                <span
+                                  className="nvr-badge mono"
+                                  title={
+                                    isPt
+                                      ? "Câmera ausente no config.yml atual, mas possui arquivos antigos no disco"
+                                      : "Camera no longer in config.yml, but still holds historical data on disk"
+                                  }
+                                >
+                                  {isPt ? "LEGADO" : "ORPHAN"}
+                                </span>
+                              )}
+                            </div>
+                            {row.events_count > 0 && (
+                              <div
+                                style={{
+                                  fontSize: "var(--text-xs)",
+                                  color: "var(--text-muted)",
+                                }}
+                              >
+                                {row.events_count} {isPt ? "eventos" : "events"}
+                                {row.pinned_events_count > 0
+                                  ? ` (${row.pinned_events_count} ★)`
+                                  : ""}
+                              </div>
+                            )}
+                          </td>
+                          <td>
+                            <div style={{ fontWeight: 700 }}>
+                              {formatStorageBytes(row.total_bytes)}
+                            </div>
+                            {actualSpan && (
+                              <div
+                                style={{
+                                  fontSize: "var(--text-xs)",
+                                  color: "var(--text-muted)",
+                                }}
+                              >
+                                {isPt ? `${actualSpan} no disco` : `${actualSpan} on disk`}
+                              </div>
+                            )}
+                          </td>
+                          <td>
+                            {row.total_bytes > 0 && (
+                              <div className="nvr-storage-mini-bar" aria-hidden="true">
+                                {pCont > 0 && (
+                                  <div
+                                    style={{
+                                      width: `${pCont}%`,
+                                      background: "var(--signal-live)",
+                                    }}
+                                  />
+                                )}
+                                {pMot > 0 && (
+                                  <div
+                                    style={{
+                                      width: `${pMot}%`,
+                                      background: "var(--signal-motion)",
+                                    }}
+                                  />
+                                )}
+                                {pEvt > 0 && (
+                                  <div
+                                    style={{
+                                      width: `${pEvt}%`,
+                                      background: "var(--signal-alert)",
+                                    }}
+                                  />
+                                )}
+                                {pClips > 0 && (
+                                  <div
+                                    style={{
+                                      width: `${pClips}%`,
+                                      background: "var(--signal-accent)",
+                                    }}
+                                  />
+                                )}
+                              </div>
+                            )}
+                            <div
+                              style={{
+                                fontSize: "var(--text-xs)",
+                                color: "var(--text-secondary)",
+                              }}
+                            >
+                              Cont {formatStorageShortBytes(row.continuous_bytes)} ·{" "}
+                              {isPt ? "Mov" : "Mot"} {formatStorageShortBytes(row.motion_bytes)} ·
+                              Evt {formatStorageShortBytes(row.event_segments_bytes)}
+                              {clipsAndPrev > 0
+                                ? ` · Clips ${formatStorageShortBytes(clipsAndPrev)}`
+                                : ""}
+                            </div>
+                            {hasExcess && (
+                              <div
+                                style={{
+                                  fontSize: "var(--text-xs)",
+                                  color: "var(--signal-motion-text)",
+                                }}
+                              >
+                                {formatStorageShortBytes(row.retained_past_continuous_bytes)}{" "}
+                                {isPt
+                                  ? `acima de ${row.continuous_days}d cont.`
+                                  : `past ${row.continuous_days}d cont.`}
+                              </div>
+                            )}
+                          </td>
+                          <td>
+                            {Math.max(0, toFiniteNumber(row.bandwidth_mb_hr, 0)).toFixed(1)} MB/h
+                          </td>
+                          <td style={{ color: "var(--signal-live-text)" }}>
+                            <div>
+                              {formatCameraTelemetryValue(
+                                row.estimated_retention_days ??
+                                  stats?.service?.estimated_retention_days,
+                                1,
+                                "d"
+                              )}
+                            </div>
+                            {storageBreakdown && (
+                              <div
+                                style={{
+                                  fontSize: "var(--text-xs)",
+                                  color: "var(--text-muted)",
+                                }}
+                              >
+                                {row.continuous_days}d / {row.event_retention_days}d
+                              </div>
+                            )}
+                          </td>
+                          <td style={{ textAlign: "right" }}>
+                            <div
+                              style={{
+                                display: "inline-flex",
+                                alignItems: "center",
+                                gap: 5,
+                                justifyContent: "flex-end",
+                              }}
+                            >
+                              <button
+                                type="button"
+                                className={`nvr-btn xs mono ${
+                                  evArmed ? "danger-armed" : "danger-subtle"
+                                }`}
+                                aria-busy={evBusy}
+                                aria-label={
+                                  evArmed
+                                    ? isPt
+                                      ? `Confirmar limpar eventos${rowAgeBadge} da câmera ${camUpper}`
+                                      : `Confirm clear events${rowAgeBadge} for camera ${camUpper}`
+                                    : isPt
+                                    ? `Limpar eventos${rowAgeBadge} da câmera ${camUpper}`
+                                    : `Clear events${rowAgeBadge} for camera ${camUpper}`
+                                }
+                                title={
+                                  isPt
+                                    ? `Limpar eventos da câmera ${camUpper}${rowAgeBadge}`
+                                    : `Clear events for camera ${camUpper}${rowAgeBadge}`
+                                }
+                                disabled={cleanupBusyKey !== null}
+                                onClick={() => {
+                                  confirmOrArm(evBtnKey, () => {
+                                    void executeStorageCleanup(evBtnKey, "events", cam);
+                                  });
+                                }}
+                              >
+                                {evBusy
+                                  ? isPt
+                                    ? "Limpando..."
+                                    : "Cleaning..."
+                                  : evArmed
+                                  ? isPt
+                                    ? "Confirmar?"
+                                    : "Confirm?"
+                                  : `${isPt ? "Limpar Eventos" : "Clear Events"}${rowAgeBadge}`}
+                              </button>
+                              <button
+                                type="button"
+                                className={`nvr-btn xs mono ${
+                                  mp4Armed ? "danger-armed" : "danger-subtle"
+                                }`}
+                                aria-busy={mp4Busy}
+                                aria-label={
+                                  mp4Armed
+                                    ? isPt
+                                      ? `Confirmar ${mp4IdleLabel} da câmera ${camUpper}`
+                                      : `Confirm ${mp4IdleLabel} for camera ${camUpper}`
+                                    : `${mp4IdleLabel} [${camUpper}]`
+                                }
+                                title={
+                                  hasExcess
+                                    ? isPt
+                                      ? `Podar gravações MP4 de ${camUpper} acima de ${row.continuous_days}d`
+                                      : `Prune ${camUpper} MP4 segments older than ${row.continuous_days}d`
+                                    : isPt
+                                    ? `Limpar gravações MP4 de ${camUpper}${rowAgeBadge || " (tudo)"}`
+                                    : `Clear ${camUpper} MP4 recordings${rowAgeBadge || " (all)"}`
+                                }
+                                disabled={cleanupBusyKey !== null}
+                                onClick={() => {
+                                  confirmOrArm(mp4BtnKey, () => {
+                                    void executeStorageCleanup(mp4BtnKey, mp4Target, cam);
+                                  });
+                                }}
+                              >
+                                {mp4Busy
+                                  ? isPt
+                                    ? "Limpando..."
+                                    : "Cleaning..."
+                                  : mp4Armed
+                                  ? isPt
+                                    ? "Confirmar?"
+                                    : "Confirm?"
+                                  : mp4IdleLabel}
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
-              )}
+              </div>
+            )}
           </div>
         </div>
       </div>

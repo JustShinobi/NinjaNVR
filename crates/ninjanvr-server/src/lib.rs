@@ -20,6 +20,7 @@ pub mod pipeline;
 pub mod preview_frames;
 pub mod share_engine;
 pub mod snapshot_capture;
+pub mod storage_ops;
 pub mod telemetry;
 pub mod track_lifecycle;
 pub mod vod_routes;
@@ -38,6 +39,7 @@ pub use mcp_routes::*;
 pub use media_redaction::MediaDeliveryGate;
 pub use ninjanvr_comms::{LogBufferHub, sanitize_logged_path};
 pub use share_engine::*;
+pub use storage_ops::*;
 pub use telemetry::{
     DEFAULT_METRICS_PORT, HostMetricsProbe, LinuxHostMetricsProbe, ProcCpuTracker,
     ProcessResourceSample, RawPidProcReading, escape_prom_label_value,
@@ -123,6 +125,7 @@ pub struct AppState {
     pub cpu_tracker: ProcCpuTracker,
     pub storage_degraded: Arc<std::sync::atomic::AtomicBool>,
     pub storage_error: Arc<std::sync::Mutex<Option<String>>>,
+    pub storage_breakdown_cache: storage_ops::StorageBreakdownCache,
     pub ptz_active_presets: Arc<RwLock<HashMap<String, Option<String>>>>,
     pub camera_driver_runtime: CameraDriverRuntime,
     pub dataset_catalog: DatasetCatalog,
@@ -480,6 +483,8 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/recordings/sync", post(api_recordings_sync))
         .route("/recordings/unavailable", get(api_empty_array))
         .route("/recordings/storage", get(api_recordings_storage))
+        .route("/storage/breakdown", get(api_storage_breakdown))
+        .route("/storage/cleanup", post(api_storage_cleanup))
         .route("/exports", get(api_exports))
         .route("/exports/delete", post(api_exports_bulk_delete))
         .route("/share", get(api_share_list).post(api_share_create))
@@ -3106,7 +3111,7 @@ async fn api_config_schema() -> Json<Value> {
     }))
 }
 
-fn stat_mount_mb(path: &Path, mount_type: &str) -> Value {
+pub(crate) fn stat_mount_mb(path: &Path, mount_type: &str) -> Value {
     if let Ok(stat) = nix::sys::statvfs::statvfs(path) {
         let bsize = stat.fragment_size() as f64;
         let total = (stat.blocks() as f64 * bsize) / (1024.0 * 1024.0);
@@ -7024,6 +7029,7 @@ async fn api_recordings_sync(
     if removed_orphans > 0 {
         state.vod_cache.invalidate_all();
     }
+    state.storage_breakdown_cache.invalidate();
     let duration_ms = started.elapsed().as_millis() as u64;
     Json(json!({
         "removed_orphans": removed_orphans,
@@ -8294,6 +8300,7 @@ async fn api_export_delete(
         )
     })
     .await;
+    state.storage_breakdown_cache.invalidate();
     Json(json!({ "success": true })).into_response()
 }
 
@@ -8386,6 +8393,7 @@ async fn api_exports_bulk_delete(
                 &id,
             );
         }
+        state_for_del.storage_breakdown_cache.invalidate();
         Json(json!({ "success": true })).into_response()
     })
     .await
@@ -13452,6 +13460,7 @@ pub async fn new_app_state(
         cpu_tracker: ProcCpuTracker::default(),
         storage_degraded,
         storage_error,
+        storage_breakdown_cache: storage_ops::StorageBreakdownCache::new(),
         ptz_active_presets,
         camera_driver_runtime,
         dataset_catalog: DatasetCatalog::new(),
