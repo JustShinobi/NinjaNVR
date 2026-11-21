@@ -180,27 +180,32 @@ fn has_only_normal_components(rel: &Path) -> bool {
     count > 0
 }
 
-fn remove_non_symlink_under_media_dir(media_dir: &Path, rel: &Path) {
+pub(crate) fn remove_non_symlink_under_media_dir_bytes(media_dir: &Path, rel: &Path) -> u64 {
     if !has_only_normal_components(rel) {
-        return;
+        return 0;
     }
     if std::fs::symlink_metadata(media_dir).is_ok_and(|m| m.file_type().is_symlink()) {
-        return;
+        return 0;
     }
     let mut current = media_dir.to_path_buf();
     let comps: Vec<_> = rel.components().collect();
     for (idx, comp) in comps.iter().enumerate() {
         current.push(comp.as_os_str());
         let Ok(meta) = std::fs::symlink_metadata(&current) else {
-            return;
+            return 0;
         };
         if meta.file_type().is_symlink() {
-            return;
+            return 0;
         }
         if idx + 1 == comps.len() && meta.file_type().is_file() {
-            let _ = std::fs::remove_file(&current);
+            let len = meta.len();
+            if std::fs::remove_file(&current).is_ok() {
+                return len;
+            }
+            return 0;
         }
     }
+    0
 }
 
 fn resolve_relative_artifact_paths(media_dir: &Path, raw_path: &str) -> Vec<PathBuf> {
@@ -242,11 +247,16 @@ fn resolve_relative_artifact_paths(media_dir: &Path, raw_path: &str) -> Vec<Path
     out
 }
 
-/// Removes cached share-link clip/snapshot artifacts for `target_id` inside `media_dir`.
-pub fn cleanup_share_clip_artifacts_in_dir(media_dir: &Path, target_type: &str, target_id: &str) {
+/// Removes cached share-link clip/snapshot artifacts for `target_id` inside `media_dir`, returning freed bytes.
+pub fn cleanup_share_clip_artifacts_in_dir_bytes(
+    media_dir: &Path,
+    target_type: &str,
+    target_id: &str,
+) -> u64 {
     if !is_safe_id(target_id) {
-        return;
+        return 0;
     }
+    let mut freed = 0u64;
     let exports_rel = Path::new("exports");
     let clips_rel = Path::new("clips");
 
@@ -255,13 +265,13 @@ pub fn cleanup_share_clip_artifacts_in_dir(media_dir: &Path, target_type: &str, 
         format!(".share_redacted_{target_id}.mask_hash"),
         format!("share_clip_{target_id}.mp4"),
     ] {
-        remove_non_symlink_under_media_dir(media_dir, &exports_rel.join(name));
+        freed += remove_non_symlink_under_media_dir_bytes(media_dir, &exports_rel.join(name));
     }
     for name in [
         format!("share_redacted_{target_id}.webp"),
         format!("share_clip_{target_id}.webp"),
     ] {
-        remove_non_symlink_under_media_dir(media_dir, &clips_rel.join(name));
+        freed += remove_non_symlink_under_media_dir_bytes(media_dir, &clips_rel.join(name));
     }
 
     let kind = target_type.trim();
@@ -271,24 +281,31 @@ pub fn cleanup_share_clip_artifacts_in_dir(media_dir: &Path, target_type: &str, 
             format!(".share_redacted_{kind}_{target_id}.mask_hash"),
             format!("share_clip_{kind}_{target_id}.mp4"),
         ] {
-            remove_non_symlink_under_media_dir(media_dir, &exports_rel.join(name));
+            freed += remove_non_symlink_under_media_dir_bytes(media_dir, &exports_rel.join(name));
         }
         for name in [
             format!("share_redacted_{kind}_{target_id}.webp"),
             format!("share_clip_{kind}_{target_id}.webp"),
         ] {
-            remove_non_symlink_under_media_dir(media_dir, &clips_rel.join(name));
+            freed += remove_non_symlink_under_media_dir_bytes(media_dir, &clips_rel.join(name));
         }
     }
+    freed
 }
 
-/// Removes event snapshot, clip, thumbnail, and share artifacts for `event_id` under `media_dir`.
-pub fn cleanup_event_media_artifacts(
+/// Removes cached share-link clip/snapshot artifacts for `target_id` inside `media_dir`.
+pub fn cleanup_share_clip_artifacts_in_dir(media_dir: &Path, target_type: &str, target_id: &str) {
+    let _ = cleanup_share_clip_artifacts_in_dir_bytes(media_dir, target_type, target_id);
+}
+
+/// Removes event snapshot, clip, thumbnail, and share artifacts for `event_id` under `media_dir`, returning freed bytes.
+pub fn cleanup_event_media_artifacts_bytes(
     media_dir: &Path,
     event_id: &str,
     camera: Option<&str>,
     thumb_path: Option<&str>,
-) {
+) -> u64 {
+    let mut freed = 0u64;
     if is_safe_id(event_id) {
         let clips_rel = Path::new("clips");
         let mut names = vec![
@@ -307,40 +324,67 @@ pub fn cleanup_event_media_artifacts(
             names.push(format!("{cam}-{event_id}.mp4"));
         }
         for name in names {
-            remove_non_symlink_under_media_dir(media_dir, &clips_rel.join(name));
+            freed += remove_non_symlink_under_media_dir_bytes(media_dir, &clips_rel.join(name));
         }
-        cleanup_share_clip_artifacts_in_dir(media_dir, "event", event_id);
+        freed += cleanup_share_clip_artifacts_in_dir_bytes(media_dir, "event", event_id);
     }
 
     if let Some(tp) = thumb_path {
         for rel in resolve_relative_artifact_paths(media_dir, tp) {
-            remove_non_symlink_under_media_dir(media_dir, &rel);
+            freed += remove_non_symlink_under_media_dir_bytes(media_dir, &rel);
         }
     }
+    freed
 }
 
-/// Removes review segment thumbnail and share artifacts for `review_id` under `media_dir`.
-pub fn cleanup_review_media_artifacts(media_dir: &Path, review_id: &str, thumb_path: Option<&str>) {
+/// Removes event snapshot, clip, thumbnail, and share artifacts for `event_id` under `media_dir`.
+pub fn cleanup_event_media_artifacts(
+    media_dir: &Path,
+    event_id: &str,
+    camera: Option<&str>,
+    thumb_path: Option<&str>,
+) {
+    let _ = cleanup_event_media_artifacts_bytes(media_dir, event_id, camera, thumb_path);
+}
+
+/// Removes review segment thumbnail and share artifacts for `review_id` under `media_dir`, returning freed bytes.
+pub fn cleanup_review_media_artifacts_bytes(
+    media_dir: &Path,
+    review_id: &str,
+    camera: Option<&str>,
+    thumb_path: Option<&str>,
+) -> u64 {
+    let mut freed = 0u64;
     if is_safe_id(review_id) {
         let clips_rel = Path::new("clips");
         let review_rel = clips_rel.join("review");
-        for rel in [
+        let mut rels = vec![
             review_rel.join(format!("thumb-{review_id}.webp")),
             review_rel.join(format!("{review_id}.webp")),
             clips_rel.join(format!("review-{review_id}.webp")),
             clips_rel.join(format!("{review_id}.webp")),
             clips_rel.join(format!("{review_id}.jpg")),
-        ] {
-            remove_non_symlink_under_media_dir(media_dir, &rel);
+        ];
+        if let Some(cam) = camera.map(str::trim).filter(|c| is_safe_id(c)) {
+            rels.push(review_rel.join(format!("thumb-{cam}-{review_id}.webp")));
         }
-        cleanup_share_clip_artifacts_in_dir(media_dir, "review", review_id);
+        for rel in rels {
+            freed += remove_non_symlink_under_media_dir_bytes(media_dir, &rel);
+        }
+        freed += cleanup_share_clip_artifacts_in_dir_bytes(media_dir, "review", review_id);
     }
 
     if let Some(tp) = thumb_path {
         for rel in resolve_relative_artifact_paths(media_dir, tp) {
-            remove_non_symlink_under_media_dir(media_dir, &rel);
+            freed += remove_non_symlink_under_media_dir_bytes(media_dir, &rel);
         }
     }
+    freed
+}
+
+/// Removes review segment thumbnail and share artifacts for `review_id` under `media_dir`.
+pub fn cleanup_review_media_artifacts(media_dir: &Path, review_id: &str, thumb_path: Option<&str>) {
+    let _ = cleanup_review_media_artifacts_bytes(media_dir, review_id, None, thumb_path);
 }
 
 /// Resolves a database recording path (which may carry a legacy `/media/ninjanvr/` prefix)
@@ -713,43 +757,53 @@ pub fn delete_reviews_with_artifacts(
     }
 }
 
+/// Deletes an export row from SQLite and removes its contained MP4, thumbnail, and share-link artifacts, returning `(deleted, freed_bytes)`.
+pub fn delete_export_with_artifacts_bytes(
+    db: &NinjaDatabase,
+    media_dir: &Path,
+    export_id: &str,
+) -> Result<(bool, u64)> {
+    let mut freed = cleanup_share_clip_artifacts_in_dir_bytes(media_dir, "export", export_id);
+    if let Some((vpath, tpath)) = db.delete_export(export_id)? {
+        let (safe_vpath, safe_tpath) = resolve_safe_export_unlink_paths(media_dir, &vpath, &tpath);
+        for p in [safe_vpath, safe_tpath].into_iter().flatten() {
+            if let Ok(meta) = std::fs::symlink_metadata(&p)
+                && meta.file_type().is_file()
+            {
+                let sz = meta.len();
+                if std::fs::remove_file(&p).is_ok() {
+                    freed += sz;
+                }
+            }
+        }
+        Ok((true, freed))
+    } else {
+        Ok((false, freed))
+    }
+}
+
 /// Deletes an export row from SQLite and removes its contained MP4, thumbnail, and share-link artifacts.
 pub fn delete_export_with_artifacts(
     db: &NinjaDatabase,
     media_dir: &Path,
     export_id: &str,
 ) -> Result<bool> {
-    cleanup_share_clip_artifacts_in_dir(media_dir, "export", export_id);
-    if let Some((vpath, tpath)) = db.delete_export(export_id)? {
-        let (safe_vpath, safe_tpath) = resolve_safe_export_unlink_paths(media_dir, &vpath, &tpath);
-        if let Some(vp) = safe_vpath {
-            let _ = std::fs::remove_file(vp);
-        }
-        if let Some(tp) = safe_tpath {
-            let _ = std::fs::remove_file(tp);
-        }
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    Ok(delete_export_with_artifacts_bytes(db, media_dir, export_id)?.0)
 }
 
-/// Deletes recording segments for `camera` in `[after, before]` across both hot `media_dir/recordings`
+/// Unlinks already-deleted `(id, db_path, seg_size_mb)` recording rows from hot `media_dir/recordings`
 /// and optional `cold_dir`, pruning empty parent directories and returning `(deleted_count, freed_bytes)`.
-pub fn delete_recordings_in_range_with_artifacts(
-    db: &NinjaDatabase,
+pub fn unlink_deleted_recording_rows(
     media_dir: &Path,
     cold_dir: Option<&Path>,
     camera: &str,
-    after: f64,
-    before: f64,
-) -> Result<(usize, u64)> {
-    let deleted = db.delete_recordings_in_range(camera, after, before)?;
+    deleted: &[(String, String, f64)],
+) -> (usize, u64) {
     let recordings_root = media_dir.join("recordings");
     let canon_rec_root = std::fs::canonicalize(&recordings_root).ok();
     let canon_cold_root = cold_dir.and_then(|c| std::fs::canonicalize(c).ok());
     let mut freed_bytes: u64 = 0;
-    for (_id, db_path, seg_size_mb) in &deleted {
+    for (_id, db_path, seg_size_mb) in deleted {
         if let Some(safe_disk_path) =
             resolve_contained_recording_segment(media_dir, cold_dir, Some(camera), db_path)
         {
@@ -772,7 +826,23 @@ pub fn delete_recordings_in_range_with_artifacts(
             freed_bytes += (seg_size_mb * 1024.0 * 1024.0).round() as u64;
         }
     }
-    Ok((deleted.len(), freed_bytes))
+    (deleted.len(), freed_bytes)
+}
+
+/// Deletes recording segments for `camera` in `[after, before]` across both hot `media_dir/recordings`
+/// and optional `cold_dir`, pruning empty parent directories and returning `(deleted_count, freed_bytes)`.
+pub fn delete_recordings_in_range_with_artifacts(
+    db: &NinjaDatabase,
+    media_dir: &Path,
+    cold_dir: Option<&Path>,
+    camera: &str,
+    after: f64,
+    before: f64,
+) -> Result<(usize, u64)> {
+    let deleted = db.delete_recordings_in_range(camera, after, before)?;
+    Ok(unlink_deleted_recording_rows(
+        media_dir, cold_dir, camera, &deleted,
+    ))
 }
 
 #[cfg(test)]

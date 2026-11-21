@@ -1989,6 +1989,9 @@ pub async fn auth_gate_middleware(
             || path_matches_segment_prefix(&path, "/api/users")
             || path_matches_segment_prefix(&path, "/api/camera-proxy")
             || path_matches_segment_prefix(&path, "/api/recordings/sync")
+            || (method != "GET"
+                && method != "HEAD"
+                && path_matches_segment_prefix(&path, "/api/storage"))
             || path_matches_segment_prefix(&path, "/api/logs")
             || (path.starts_with("/api/") && path.ends_with("/logs"))
             || path_matches_segment_prefix(&path, "/api/genai/models")
@@ -2246,6 +2249,7 @@ pub async fn auth_gate_middleware(
                         | "false_positives"
                         | "timeline"
                         | "recordings"
+                        | "storage"
                         | "exports"
                         | "jobs"
                         | "cases"

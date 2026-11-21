@@ -133,9 +133,12 @@
 
 [data-high-contrast="true"] .nvr-cfg-card,
 [data-high-contrast="true"] .nvr-subcard,
+[data-high-contrast="true"] .nvr-system-card,
 [data-high-contrast="true"] .nvr-input,
 [data-high-contrast="true"] .nvr-select,
-[data-high-contrast="true"] .nvr-segmented {
+[data-high-contrast="true"] .nvr-segmented,
+[data-high-contrast="true"] .nvr-btn.danger-subtle,
+[data-high-contrast="true"] .nvr-btn.danger-armed {
   border-width: 1.5px;
 }
 
@@ -1551,6 +1554,167 @@ dialog::backdrop {
   border-radius: 1px;
 }
 
+.nvr-table.mono td {
+  font-variant-numeric: tabular-nums;
+}
+
+.nvr-system-card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-card);
+  border-radius: 3px;
+}
+
+.nvr-btn.xs {
+  height: 22px;
+  padding: 0 8px;
+  font-size: var(--text-xs);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.nvr-table-region {
+  overflow-x: auto;
+  max-inline-size: 100%;
+  container-type: inline-size;
+  -webkit-overflow-scrolling: touch;
+}
+
+.nvr-table-region:focus-visible {
+  outline: 2px solid var(--signal-accent);
+  outline-offset: -2px;
+}
+
+.nvr-storage-section-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  background: var(--bg-subcard);
+  border-top: 1px solid var(--border-hairline);
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.nvr-storage-stack-wrap {
+  padding: 10px 10px 8px;
+  background: var(--bg-subcard);
+  border-bottom: 1px solid var(--border-divider);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.nvr-storage-stack-bar {
+  display: flex;
+  width: 100%;
+  height: 8px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-hairline);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.nvr-storage-stack-seg {
+  height: 100%;
+  min-width: 2px;
+}
+
+.nvr-storage-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.nvr-storage-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.nvr-storage-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 1px;
+  flex-shrink: 0;
+}
+
+.nvr-cleanup-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--bg-subcard);
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.nvr-cleanup-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+}
+
+.nvr-cleanup-select {
+  height: 24px;
+  padding: 0 6px;
+  font-size: var(--text-xs);
+}
+
+.nvr-cleanup-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-block-size: 24px;
+  padding: 2px 4px;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.nvr-cleanup-check input[type="checkbox"] {
+  accent-color: var(--signal-accent);
+  cursor: pointer;
+}
+
+.nvr-btn.danger-subtle {
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.nvr-btn.danger-subtle:hover:not(:disabled) {
+  border-color: var(--signal-alert-border);
+  background: var(--signal-alert-tint);
+  color: var(--signal-alert-text);
+}
+
+.nvr-btn.danger-armed {
+  border-color: var(--signal-alert);
+  background: var(--signal-alert-tint);
+  color: var(--signal-alert-text);
+  font-weight: 700;
+}
+
+.nvr-storage-mini-bar {
+  display: flex;
+  width: 96px;
+  height: 5px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-hairline);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-bottom: 3px;
+}
+
 .nvr-code-editor {
   width: 100%;
   height: 100%;
@@ -2089,12 +2253,17 @@ input[type="range"] {
   }
 }
 
+.nvr-system-workbench {
+  grid-template-columns: 1.1fr 1fr;
+}
+
 @media (max-width: 1024px) {
   .nvr-main {
     overflow-y: auto;
   }
   .nvr-focus-layout,
   .nvr-workbench,
+  .nvr-system-workbench,
   .nvr-settings-shell {
     grid-template-columns: 1fr;
     grid-template-rows: minmax(220px, auto) minmax(320px, 1fr);
@@ -4779,6 +4948,13 @@ input[type="range"] {
     -webkit-overflow-scrolling: touch;
   }
 
+  .nvr-table-region > .nvr-table {
+    display: table;
+    width: 100%;
+    max-width: none;
+    overflow-x: visible;
+  }
+
   .nvr-focus-stage .nvr-subbar div,
   .nvr-subbar > div {
     flex-wrap: wrap;
@@ -4817,10 +4993,21 @@ input[type="range"] {
 @media (max-width: 767px), (pointer: coarse) {
   .nvr-table-sort-btn,
   .nvr-system-filter-input,
-  .nvr-system-chip-btn {
+  .nvr-system-chip-btn,
+  .nvr-cleanup-toolbar .nvr-select,
+  .nvr-cleanup-check {
     min-block-size: 44px;
     min-inline-size: 44px;
     height: auto;
+  }
+
+  .nvr-cleanup-check {
+    padding: 0 6px;
+  }
+
+  .nvr-cleanup-check input[type="checkbox"] {
+    inline-size: 20px;
+    block-size: 20px;
   }
 }
 
@@ -4834,6 +5021,13 @@ input[type="range"] {
     min-inline-size: 44px;
     white-space: normal;
     text-align: center;
+  }
+
+  .nvr-table-region .nvr-btn,
+  .nvr-btn.xs {
+    white-space: nowrap;
+    flex-shrink: 0;
+    padding: 0 10px;
   }
 
   .nvr-trim-handle {

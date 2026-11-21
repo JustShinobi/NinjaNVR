@@ -681,12 +681,14 @@ export const App: React.FC = () => {
           setReviews(revJson.slice(0, MAX_LIVE_REVIEWS));
           if (revJson.length > 0) {
             setActiveReview((curr) => {
-              if (!curr) {
+              if (!curr || !revJson.some((r) => r.id === curr.id)) {
                 setSyncMasterTs(Math.floor(revJson[0].start_time));
                 return revJson[0];
               }
               return curr;
             });
+          } else {
+            setActiveReview(null);
           }
         }
       } else {
@@ -2709,6 +2711,20 @@ export const App: React.FC = () => {
                     logPaused={logPaused}
                     setLogPaused={setLogPaused}
                     notify={notify}
+                    onStorageMutated={() => {
+                      archiveMetadataCache.clear();
+                      void fetchCoreData();
+                      fetch(buildEventsFeedUrl(reviewDateFilter), {
+                        credentials: "include",
+                      })
+                        .then((r) => (r.ok ? r.json() : null))
+                        .then((arr: EventItem[] | null) => {
+                          if (Array.isArray(arr)) {
+                            setEvents(arr.slice(0, MAX_LIVE_EVENTS));
+                          }
+                        })
+                        .catch(() => {});
+                    }}
                   />
                 )}
               </Suspense>
