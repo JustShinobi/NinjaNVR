@@ -669,6 +669,122 @@ export function buildClientFallbackHeuristics(
   return out;
 }
 
+export interface CleanupStatusNotice {
+  kind: "running" | "success" | "error";
+  text: string;
+}
+
+export interface ArmedCleanupMeta {
+  key: string;
+  target: StorageCleanupTarget;
+  cameraOverride?: string | null;
+  summaryPt: string;
+  summaryEn: string;
+}
+
+export async function runStorageCleanupFlow(params: {
+  target: StorageCleanupTarget;
+  effectiveCam: string | null;
+  olderThanDays: number;
+  keepPinnedEvents: boolean;
+  pruneRetainedSegments: boolean;
+  isPt: boolean;
+  fetchImpl?: typeof fetch;
+  isMounted?: () => boolean;
+  onNotice: (notice: CleanupStatusNotice) => void;
+  notify: (msg: string) => void;
+  refreshStatsAndBreakdown: () => Promise<void>;
+  scheduleDelayedRefresh: () => void;
+}): Promise<void> {
+  const {
+    target,
+    effectiveCam,
+    olderThanDays,
+    keepPinnedEvents,
+    pruneRetainedSegments,
+    isPt,
+    fetchImpl = fetch,
+    isMounted = () => true,
+    onNotice,
+    notify,
+    refreshStatsAndBreakdown,
+    scheduleDelayedRefresh,
+  } = params;
+  const scopeLabel = effectiveCam ? ` [${effectiveCam.toUpperCase()}]` : "";
+  onNotice({
+    kind: "running",
+    text: isPt
+      ? `Executando limpeza${scopeLabel} no SQLite e disco — aguarde...`
+      : `Running storage cleanup${scopeLabel} across SQLite & disk — please wait...`,
+  });
+  try {
+    const res = await fetchImpl("/api/storage/cleanup", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        target,
+        camera: effectiveCam,
+        older_than_days: olderThanDays > 0 ? olderThanDays : null,
+        include_pinned: !keepPinnedEvents,
+        prune_retained_segments: pruneRetainedSegments,
+      }),
+    });
+    if (!isMounted()) return;
+    if (res.ok) {
+      const data: StorageCleanupResponse = await res.json();
+      if (!isMounted()) return;
+      const freedText = formatStorageBytes(data.freed_bytes);
+      const okMsg = isPt
+        ? `Limpeza concluída${scopeLabel}: ${data.deleted_items ?? 0} item(ns)${
+            data.deleted_segments > 0
+              ? ` + ${data.deleted_segments} seg(s) MP4`
+              : ""
+          } removidos · ${freedText} liberados`
+        : `Cleanup completed${scopeLabel}: removed ${data.deleted_items ?? 0} item(s)${
+            data.deleted_segments > 0
+              ? ` + ${data.deleted_segments} MP4 seg(s)`
+              : ""
+          } · freed ${freedText}`;
+      onNotice({ kind: "success", text: okMsg });
+      notify(okMsg);
+      await refreshStatsAndBreakdown();
+    } else {
+      const errBody = await res.json().catch(() => null);
+      if (!isMounted()) return;
+      const isGatewayTimeout =
+        res.status === 502 || res.status === 504 || res.status === 524;
+      const msg =
+        errBody && typeof errBody.message === "string"
+          ? errBody.message
+          : `HTTP ${res.status}`;
+      const errText = isGatewayTimeout
+        ? isPt
+          ? `Tempo limite do proxy (${msg}) durante limpeza extensa${scopeLabel} — a operação em segundo plano pode ainda estar concluindo; atualizando métricas...`
+          : `Proxy timeout (${msg}) during large cleanup${scopeLabel} — background cleanup may still be finishing; refreshing disk usage...`
+        : isPt
+        ? `Falha na limpeza de armazenamento${scopeLabel} (${msg})`
+        : `Storage cleanup failed${scopeLabel} (${msg})`;
+      onNotice({ kind: "error", text: errText });
+      notify(errText);
+      await refreshStatsAndBreakdown();
+      if (isGatewayTimeout) {
+        scheduleDelayedRefresh();
+      }
+    }
+  } catch {
+    if (isMounted()) {
+      const netMsg = isPt
+        ? `Conexão interrompida durante a limpeza${scopeLabel} — verificando uso atualizado de disco...`
+        : `Connection interrupted during cleanup${scopeLabel} — refreshing current disk usage...`;
+      onNotice({ kind: "error", text: netMsg });
+      notify(netMsg);
+      await refreshStatsAndBreakdown();
+      scheduleDelayedRefresh();
+    }
+  }
+}
+
 interface SystemWorkspaceProps {
   cameraNames: string[];
   logService: "ninjanvr" | "go2rtc" | "nginx" | "cameras";
@@ -681,6 +797,8 @@ interface SystemWorkspaceProps {
   notify: (msg: string) => void;
   initialRightMode?: "alerts" | "logs";
   initialBreakdown?: StorageBreakdownResponse | null;
+  initialArmedCleanup?: ArmedCleanupMeta | null;
+  initialCleanupNotice?: CleanupStatusNotice | null;
   onStorageMutated?: () => void;
 }
 
@@ -696,6 +814,8 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
   notify,
   initialRightMode = "alerts",
   initialBreakdown = null,
+  initialArmedCleanup = null,
+  initialCleanupNotice = null,
   onStorageMutated,
 }) => {
   const { t, locale } = useI18n();
@@ -729,26 +849,47 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
   const [storageBreakdown, setStorageBreakdown] =
     React.useState<StorageBreakdownResponse | null>(initialBreakdown);
   const [breakdownBusy, setBreakdownBusy] = React.useState(false);
+  const [breakdownError, setBreakdownError] = React.useState(false);
   const [cleanupBusyKey, setCleanupBusyKey] = React.useState<string | null>(null);
+  const [cleanupNotice, setCleanupNotice] =
+    React.useState<CleanupStatusNotice | null>(initialCleanupNotice);
+  const [armedMeta, setArmedMeta] = React.useState<ArmedCleanupMeta | null>(
+    initialArmedCleanup
+  );
   const [cleanupCameraScope, setCleanupCameraScope] = React.useState<string>("all");
   const [cleanupOlderDays, setCleanupOlderDays] = React.useState<number>(0);
   const [keepPinnedEvents, setKeepPinnedEvents] = React.useState<boolean>(true);
   const [pruneRetainedSegments, setPruneRetainedSegments] = React.useState<boolean>(true);
-  const { armedKey, isArmed, confirmOrArm, clearArmed } = useTwoStepConfirm(3500);
+  const { armedKey, isArmed, confirmOrArm, clearArmed } = useTwoStepConfirm(8000);
   const isMountedRef = React.useRef(true);
+  const followUpTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const isKeyArmed = React.useCallback(
+    (key: string) =>
+      isArmed(key) || (armedKey === null && initialArmedCleanup?.key === key && armedMeta?.key === key),
+    [isArmed, armedKey, initialArmedCleanup, armedMeta]
+  );
+
+  const activeArmedMeta =
+    armedMeta && isKeyArmed(armedMeta.key) ? armedMeta : null;
+
+  const cancelArmedCleanup = React.useCallback(() => {
+    clearArmed();
+    setArmedMeta(null);
+  }, [clearArmed]);
 
   React.useEffect(() => {
-    if (!armedKey || typeof window === "undefined") return;
+    if ((!armedKey && !activeArmedMeta) || typeof window === "undefined") return;
     const onKeyDown = (ev: KeyboardEvent) => {
       if (ev.key === "Escape") {
-        clearArmed();
+        cancelArmedCleanup();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [armedKey, clearArmed]);
+  }, [armedKey, activeArmedMeta, cancelArmedCleanup]);
 
   const fetchStorageBreakdown = React.useCallback(
     async (forceRefresh: boolean = false) => {
@@ -766,10 +907,15 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
           const data: StorageBreakdownResponse = await res.json();
           if (isMountedRef.current && data && typeof data === "object") {
             setStorageBreakdown(data);
+            setBreakdownError(false);
           }
+        } else if (isMountedRef.current) {
+          setBreakdownError(true);
         }
       } catch {
-        // Silent background fallback to stats.service.camera_storage
+        if (isMountedRef.current) {
+          setBreakdownError(true);
+        }
       } finally {
         if (isMountedRef.current) {
           setBreakdownBusy(false);
@@ -784,6 +930,10 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
     void fetchStorageBreakdown(false);
     return () => {
       isMountedRef.current = false;
+      if (followUpTimerRef.current !== null) {
+        clearTimeout(followUpTimerRef.current);
+        followUpTimerRef.current = null;
+      }
     };
   }, [fetchStorageBreakdown]);
 
@@ -802,6 +952,18 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
     }
     onStorageMutated?.();
   }, [fetchStorageBreakdown, onStorageMutated, setStats]);
+
+  const scheduleDelayedRefresh = React.useCallback(() => {
+    if (followUpTimerRef.current !== null) {
+      clearTimeout(followUpTimerRef.current);
+    }
+    followUpTimerRef.current = setTimeout(() => {
+      followUpTimerRef.current = null;
+      if (isMountedRef.current) {
+        void refreshStatsAndBreakdown();
+      }
+    }, 5000);
+  }, [refreshStatsAndBreakdown]);
 
   const cameraGranularRows = React.useMemo(
     () => buildCameraGranularRows(stats, storageBreakdown),
@@ -838,7 +1000,11 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
       cameraOverride?: string | null
     ) => {
       if (cleanupBusyKey) return;
-      clearArmed();
+      cancelArmedCleanup();
+      if (followUpTimerRef.current !== null) {
+        clearTimeout(followUpTimerRef.current);
+        followUpTimerRef.current = null;
+      }
       setCleanupBusyKey(busyKey);
       const effectiveCam =
         cameraOverride !== undefined
@@ -847,58 +1013,23 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
           ? null
           : effectiveCameraScope;
       try {
-        const res = await fetch("/api/storage/cleanup", {
-          method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            target,
-            camera: effectiveCam,
-            older_than_days: cleanupOlderDays > 0 ? cleanupOlderDays : null,
-            include_pinned: !keepPinnedEvents,
-            prune_retained_segments: pruneRetainedSegments,
-          }),
+        await runStorageCleanupFlow({
+          target,
+          effectiveCam,
+          olderThanDays: cleanupOlderDays,
+          keepPinnedEvents,
+          pruneRetainedSegments,
+          isPt,
+          isMounted: () => isMountedRef.current,
+          onNotice: (notice) => {
+            if (isMountedRef.current) {
+              setCleanupNotice(notice);
+            }
+          },
+          notify,
+          refreshStatsAndBreakdown,
+          scheduleDelayedRefresh,
         });
-        if (!isMountedRef.current) return;
-        if (res.ok) {
-          const data: StorageCleanupResponse = await res.json();
-          if (!isMountedRef.current) return;
-          const freedText = formatStorageBytes(data.freed_bytes);
-          const scopeLabel = effectiveCam ? ` [${effectiveCam.toUpperCase()}]` : "";
-          notify(
-            isPt
-              ? `Limpeza concluída${scopeLabel}: ${data.deleted_items ?? 0} item(ns)${
-                  data.deleted_segments > 0
-                    ? ` + ${data.deleted_segments} seg(s) MP4`
-                    : ""
-                } removidos · ${freedText} liberados`
-              : `Cleanup completed${scopeLabel}: removed ${data.deleted_items ?? 0} item(s)${
-                  data.deleted_segments > 0
-                    ? ` + ${data.deleted_segments} MP4 seg(s)`
-                    : ""
-                } · freed ${freedText}`
-          );
-          await refreshStatsAndBreakdown();
-        } else {
-          const errBody = await res.json().catch(() => null);
-          const msg =
-            errBody && typeof errBody.message === "string"
-              ? errBody.message
-              : `HTTP ${res.status}`;
-          notify(
-            isPt
-              ? `Falha na limpeza de armazenamento (${msg})`
-              : `Storage cleanup failed (${msg})`
-          );
-        }
-      } catch {
-        if (isMountedRef.current) {
-          notify(
-            isPt
-              ? "Erro de rede ao executar limpeza de armazenamento"
-              : "Network error while running storage cleanup"
-          );
-        }
       } finally {
         if (isMountedRef.current) {
           setCleanupBusyKey(null);
@@ -907,7 +1038,7 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
     },
     [
       cleanupBusyKey,
-      clearArmed,
+      cancelArmedCleanup,
       effectiveCameraScope,
       cleanupOlderDays,
       keepPinnedEvents,
@@ -915,7 +1046,34 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
       isPt,
       notify,
       refreshStatsAndBreakdown,
+      scheduleDelayedRefresh,
     ]
+  );
+
+  const triggerTwoStepCleanup = React.useCallback(
+    (
+      key: string,
+      target: StorageCleanupTarget,
+      summaryPt: string,
+      summaryEn: string,
+      cameraOverride?: string | null
+    ) => {
+      if (cleanupBusyKey) return;
+      const confirmed = confirmOrArm(key, () => {
+        setArmedMeta(null);
+        void executeStorageCleanup(key, target, cameraOverride);
+      });
+      if (!confirmed) {
+        setArmedMeta({
+          key,
+          target,
+          cameraOverride,
+          summaryPt,
+          summaryEn,
+        });
+      }
+    },
+    [cleanupBusyKey, confirmOrArm, executeStorageCleanup]
   );
 
   const safeCopyText = async (text: string, successMsg: string) => {
@@ -938,6 +1096,17 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
       notify("Clipboard access unavailable in this browser context");
     }
   };
+  const renderStableCleanupLabel = (idleText: string, liveText: string) => (
+    <span className="nvr-cleanup-label-stack">
+      {liveText !== idleText && (
+        <span className="nvr-cleanup-label-sizer" aria-hidden="true">
+          {idleText}
+        </span>
+      )}
+      <span className="nvr-cleanup-label-live">{liveText}</span>
+    </span>
+  );
+
   const [rightMode, setRightMode] = React.useState<"alerts" | "logs">(
     initialRightMode
   );
@@ -1004,8 +1173,8 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
       <div className="sr-only" role="status" aria-live="polite">
         {armedKey
           ? isPt
-            ? "Ação de limpeza armada. Pressione novamente em até 3 segundos para confirmar ou Escape para cancelar."
-            : "Cleanup action armed. Activate again within 3 seconds to confirm, or press Escape to cancel."
+            ? "Ação de limpeza armada. Pressione novamente em até 8 segundos (ou confirme na barra de armazenamento) ou Escape para cancelar."
+            : "Cleanup action armed. Activate again within 8 seconds (or confirm in the storage banner), or press Escape to cancel."
           : ""}
       </div>
       {/* Left Telemetry Column */}
@@ -1493,18 +1662,22 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                 </button>
                 <button
                   type="button"
-                  className={`nvr-btn xs mono ${
-                    isArmed("hdr:retention_pass") ? "danger-armed" : ""
+                  className={`nvr-btn xs mono nvr-cleanup-btn ${
+                    isKeyArmed("hdr:retention_pass") ? "danger-armed" : ""
                   }`}
                   aria-busy={cleanupBusyKey === "hdr:retention_pass"}
                   aria-label={
-                    isArmed("hdr:retention_pass")
+                    cleanupBusyKey === "hdr:retention_pass"
                       ? isPt
-                        ? "Confirmar execução imediata do ciclo de retenção"
-                        : "Confirm immediate retention pass execution"
+                        ? "Aplicando... — Aplicar Retenção"
+                        : "Running... — Run Retention"
+                      : isKeyArmed("hdr:retention_pass")
+                      ? isPt
+                        ? "Confirmar Retenção? — Aplicar Retenção"
+                        : "Confirm Retention? — Run Retention"
                       : isPt
-                      ? "Aplicar retenção agora"
-                      : "Run retention pass now"
+                      ? "Aplicar Retenção"
+                      : "Run Retention"
                   }
                   title={
                     isPt
@@ -1513,22 +1686,29 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                   }
                   disabled={cleanupBusyKey !== null || Boolean(storageBreakdown?.scoped)}
                   onClick={() => {
-                    confirmOrArm("hdr:retention_pass", () => {
-                      void executeStorageCleanup("hdr:retention_pass", "retention_pass", null);
-                    });
+                    triggerTwoStepCleanup(
+                      "hdr:retention_pass",
+                      "retention_pass",
+                      "Ciclo completo de retenção, cotas e checkpoint WAL",
+                      "Full retention, quota eviction & WAL checkpoint pass",
+                      null
+                    );
                   }}
                 >
-                  {cleanupBusyKey === "hdr:retention_pass"
-                    ? isPt
-                      ? "Aplicando..."
-                      : "Running..."
-                    : isArmed("hdr:retention_pass")
-                    ? isPt
-                      ? "Confirmar Retenção?"
-                      : "Confirm Retention?"
-                    : isPt
-                    ? "Aplicar Retenção"
-                    : "Run Retention"}
+                  {renderStableCleanupLabel(
+                    isPt ? "Aplicar Retenção" : "Run Retention",
+                    cleanupBusyKey === "hdr:retention_pass"
+                      ? isPt
+                        ? "Aplicando..."
+                        : "Running..."
+                      : isKeyArmed("hdr:retention_pass")
+                      ? isPt
+                        ? "Confirmar Retenção?"
+                        : "Confirm Retention?"
+                      : isPt
+                      ? "Aplicar Retenção"
+                      : "Run Retention"
+                  )}
                 </button>
                 <button
                   type="button"
@@ -1674,187 +1854,341 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
             </div>
 
             {/* Granular Storage Composition & Cleanup Matrix */}
+            {storageBreakdown && stackSegments.length > 0 && (
+              <div className="nvr-storage-stack-wrap">
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 8,
+                    flexWrap: "wrap",
+                    fontSize: "var(--text-xs)",
+                  }}
+                >
+                  <span
+                    className="mono"
+                    style={{
+                      fontWeight: 700,
+                      color: "var(--text-primary)",
+                      textTransform: "uppercase",
+                    }}
+                  >
+                    {isPt
+                      ? "Uso Granular do NVR por Categoria"
+                      : "Granular NVR Footprint by Category"}
+                  </span>
+                  <span className="mono" style={{ color: "var(--text-secondary)" }}>
+                    {isPt ? "Rastreado pelo NVR: " : "NVR Tracked: "}
+                    <strong style={{ color: "var(--text-primary)" }}>
+                      {formatStorageBytes(storageBreakdown.total_tracked_bytes)}
+                    </strong>
+                  </span>
+                </div>
+                <div className="nvr-storage-stack-bar" aria-hidden="true">
+                  {stackSegments.map((seg) => {
+                    const pctLabel =
+                      seg.pct < 0.1 ? "<0.1%" : `${seg.pct.toFixed(1)}%`;
+                    return (
+                      <div
+                        key={seg.key}
+                        className="nvr-storage-stack-seg"
+                        title={`${seg.label}: ${formatStorageBytes(seg.bytes)} (${pctLabel})`}
+                        style={{
+                          width: `${seg.pct}%`,
+                          background: seg.color,
+                        }}
+                      />
+                    );
+                  })}
+                </div>
+                <div className="nvr-storage-legend mono">
+                  {stackSegments.map((seg) => (
+                    <span key={seg.key} className="nvr-storage-legend-item">
+                      <span
+                        className="nvr-storage-dot"
+                        style={{ background: seg.color }}
+                        aria-hidden="true"
+                      />
+                      <span>{seg.label}:</span>
+                      <strong style={{ color: "var(--text-primary)" }}>
+                        {formatStorageBytes(seg.bytes)}
+                      </strong>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {(storageBreakdown ||
+              cameraGranularRows.length > 0 ||
+              breakdownBusy ||
+              breakdownError ||
+              activeArmedMeta ||
+              cleanupNotice) &&
+              (() => {
+                if (cleanupBusyKey !== null || cleanupNotice?.kind === "running") {
+                  return (
+                    <div
+                      className="nvr-cleanup-banner is-running mono"
+                      role="status"
+                      data-testid="storage-cleanup-status-banner"
+                    >
+                      <span>
+                        {cleanupNotice?.text ||
+                          (isPt
+                            ? "Executando limpeza no SQLite e disco — aguarde..."
+                            : "Running storage cleanup across SQLite & disk — please wait...")}
+                      </span>
+                      <span className="nvr-badge mono" style={{ minBlockSize: 24, display: "inline-flex", alignItems: "center" }}>
+                        {isPt ? "EM CURSO" : "ACTIVE"}
+                      </span>
+                    </div>
+                  );
+                }
+                if (activeArmedMeta) {
+                  return (
+                    <div
+                      className="nvr-cleanup-banner is-armed mono"
+                      role="region"
+                      data-testid="storage-cleanup-confirm-banner"
+                      aria-label={
+                        isPt
+                          ? "Confirmação de limpeza de armazenamento"
+                          : "Storage cleanup confirmation"
+                      }
+                    >
+                      <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                        <AlertTriangle size={13} aria-hidden="true" />
+                        <span>
+                          {isPt
+                            ? `Confirmar execução: ${activeArmedMeta.summaryPt}?`
+                            : `Confirm cleanup: ${activeArmedMeta.summaryEn}?`}
+                        </span>
+                      </div>
+                      <div className="nvr-cleanup-banner-actions">
+                        <button
+                          type="button"
+                          className="nvr-btn xs mono danger"
+                          data-testid="storage-cleanup-confirm-now"
+                          onClick={() => {
+                            const pending = activeArmedMeta;
+                            cancelArmedCleanup();
+                            void executeStorageCleanup(
+                              pending.key,
+                              pending.target,
+                              pending.cameraOverride
+                            );
+                          }}
+                        >
+                          <Trash2 size={11} aria-hidden="true" />
+                          <span>{isPt ? "Confirmar Limpeza" : "Confirm Clear"}</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="nvr-btn xs mono"
+                          data-testid="storage-cleanup-cancel"
+                          onClick={() => {
+                            cancelArmedCleanup();
+                          }}
+                        >
+                          <span>{isPt ? "Cancelar" : "Cancel"}</span>
+                        </button>
+                      </div>
+                    </div>
+                  );
+                }
+                if (cleanupNotice) {
+                  return (
+                    <div
+                      className={`nvr-cleanup-banner is-${cleanupNotice.kind} mono`}
+                      role={cleanupNotice.kind === "error" ? "alert" : "status"}
+                      data-testid="storage-cleanup-status-banner"
+                    >
+                      <span>{cleanupNotice.text}</span>
+                      <button
+                        type="button"
+                        className="nvr-btn xs mono"
+                        onClick={() => setCleanupNotice(null)}
+                      >
+                        <span>{isPt ? "Fechar" : "Dismiss"}</span>
+                      </button>
+                    </div>
+                  );
+                }
+                if (!storageBreakdown && breakdownBusy) {
+                  return (
+                    <div className="nvr-cleanup-banner is-running mono" role="status">
+                      <span>
+                        {isPt
+                          ? "Calculando detalhamento granular de categorias no disco..."
+                          : "Scanning granular on-disk storage categories..."}
+                      </span>
+                      <span className="nvr-badge mono" style={{ minBlockSize: 24, display: "inline-flex", alignItems: "center" }}>
+                        {isPt ? "LENDO" : "SCAN"}
+                      </span>
+                    </div>
+                  );
+                }
+                if (!storageBreakdown && breakdownError) {
+                  return (
+                    <div className="nvr-cleanup-banner is-error mono" role="alert">
+                      <span>
+                        {isPt
+                          ? "Não foi possível carregar o detalhamento por categoria agora."
+                          : "Could not load granular category breakdown right now."}
+                      </span>
+                      <button
+                        type="button"
+                        className="nvr-btn xs mono"
+                        onClick={() => {
+                          void fetchStorageBreakdown(true);
+                        }}
+                      >
+                        <RefreshCw size={11} aria-hidden="true" />
+                        <span>{isPt ? "Tentar Novamente" : "Retry Scan"}</span>
+                      </button>
+                    </div>
+                  );
+                }
+                return (
+                  <div className="nvr-cleanup-banner is-idle mono">
+                    <span>
+                      {isPt
+                        ? "Clique 2x em qualquer ação de limpeza (ou confirme aqui) para executar · Eventos fixados (★) protegidos por padrão"
+                        : "Click any cleanup action twice (or confirm here) to execute · Pinned (★) events protected by default"}
+                    </span>
+                    <span
+                      className="nvr-badge mono"
+                      style={{
+                        minBlockSize: 24,
+                        display: "inline-flex",
+                        alignItems: "center",
+                      }}
+                    >
+                      {isPt ? "2 ETAPAS" : "2-STEP"}
+                    </span>
+                  </div>
+                );
+              })()}
+
+            {(storageBreakdown || cameraGranularRows.length > 0) && (
+              <div className="nvr-cleanup-toolbar mono">
+                <div className="nvr-cleanup-controls">
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 5,
+                      fontSize: "var(--text-xs)",
+                      color: "var(--text-secondary)",
+                    }}
+                  >
+                    <span>{isPt ? "Escopo:" : "Scope:"}</span>
+                    <select
+                      className="nvr-select mono nvr-cleanup-select"
+                      aria-label={isPt ? "Escopo de câmera para limpeza" : "Cleanup camera scope"}
+                      value={effectiveCameraScope}
+                      onChange={(e) => {
+                        cancelArmedCleanup();
+                        setCleanupCameraScope(e.target.value);
+                      }}
+                    >
+                      <option value="all">
+                        {isPt ? "Todas as Câmeras" : "All Cameras"}
+                      </option>
+                      {cameraGranularRows.map((row) => (
+                        <option key={row.camera} value={row.camera}>
+                          {row.camera.toUpperCase()}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 5,
+                      fontSize: "var(--text-xs)",
+                      color: "var(--text-secondary)",
+                    }}
+                  >
+                    <span>{isPt ? "Idade:" : "Age:"}</span>
+                    <select
+                      className="nvr-select mono nvr-cleanup-select"
+                      aria-label={isPt ? "Filtro de idade para limpeza" : "Cleanup age filter"}
+                      value={String(cleanupOlderDays)}
+                      onChange={(e) => {
+                        cancelArmedCleanup();
+                        setCleanupOlderDays(Number(e.target.value) || 0);
+                      }}
+                    >
+                      <option value="0">
+                        {isPt ? "Tudo (Qualquer Idade)" : "All Ages (Everything)"}
+                      </option>
+                      <option value="1">
+                        {isPt ? "Mais antigos que 24h" : "Older than 24h"}
+                      </option>
+                      <option value="3">
+                        {isPt ? "Mais antigos que 3d" : "Older than 3d"}
+                      </option>
+                      <option value="7">
+                        {isPt ? "Mais antigos que 7d" : "Older than 7d"}
+                      </option>
+                      <option value="14">
+                        {isPt ? "Mais antigos que 14d" : "Older than 14d"}
+                      </option>
+                      <option value="30">
+                        {isPt ? "Mais antigos que 30d" : "Older than 30d"}
+                      </option>
+                    </select>
+                  </label>
+                </div>
+                <div className="nvr-cleanup-controls">
+                  <label
+                    className="nvr-cleanup-check"
+                    title={
+                      isPt
+                        ? "Preserva eventos marcados para retenção indefinida e seus vídeos"
+                        : "Preserves pinned (retain indefinitely) events and their recordings"
+                    }
+                  >
+                    <input
+                      type="checkbox"
+                      checked={keepPinnedEvents}
+                      onChange={(e) => {
+                        cancelArmedCleanup();
+                        setKeepPinnedEvents(e.target.checked);
+                      }}
+                    />
+                    <span>{isPt ? "Manter fixados (★)" : "Keep pinned (★)"}</span>
+                  </label>
+                  <label
+                    className="nvr-cleanup-check"
+                    title={
+                      isPt
+                        ? "Ao limpar eventos, remove também revisões correspondentes e segmentos MP4 acima da janela contínua (preservando eventos fixados ★)"
+                        : "When clearing events, also removes matching reviews and MP4 segments older than continuous retention (preserving pinned ★ events)"
+                    }
+                  >
+                    <input
+                      type="checkbox"
+                      checked={pruneRetainedSegments}
+                      onChange={(e) => {
+                        cancelArmedCleanup();
+                        setPruneRetainedSegments(e.target.checked);
+                      }}
+                    />
+                    <span>
+                      {isPt ? "Liberar MP4 retido (> cont.)" : "Free event-held MP4 (> cont.)"}
+                    </span>
+                  </label>
+                </div>
+              </div>
+            )}
+
             {storageBreakdown && (
               <>
-                {stackSegments.length > 0 && (
-                  <div className="nvr-storage-stack-wrap">
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        gap: 8,
-                        flexWrap: "wrap",
-                        fontSize: "var(--text-xs)",
-                      }}
-                    >
-                      <span
-                        className="mono"
-                        style={{
-                          fontWeight: 700,
-                          color: "var(--text-primary)",
-                          textTransform: "uppercase",
-                        }}
-                      >
-                        {isPt
-                          ? "Uso Granular do NVR por Categoria"
-                          : "Granular NVR Footprint by Category"}
-                      </span>
-                      <span className="mono" style={{ color: "var(--text-secondary)" }}>
-                        {isPt ? "Rastreado pelo NVR: " : "NVR Tracked: "}
-                        <strong style={{ color: "var(--text-primary)" }}>
-                          {formatStorageBytes(storageBreakdown.total_tracked_bytes)}
-                        </strong>
-                      </span>
-                    </div>
-                    <div className="nvr-storage-stack-bar" aria-hidden="true">
-                      {stackSegments.map((seg) => {
-                        const pctLabel =
-                          seg.pct < 0.1 ? "<0.1%" : `${seg.pct.toFixed(1)}%`;
-                        return (
-                          <div
-                            key={seg.key}
-                            className="nvr-storage-stack-seg"
-                            title={`${seg.label}: ${formatStorageBytes(seg.bytes)} (${pctLabel})`}
-                            style={{
-                              width: `${seg.pct}%`,
-                              background: seg.color,
-                            }}
-                          />
-                        );
-                      })}
-                    </div>
-                    <div className="nvr-storage-legend mono">
-                      {stackSegments.map((seg) => (
-                        <span key={seg.key} className="nvr-storage-legend-item">
-                          <span
-                            className="nvr-storage-dot"
-                            style={{ background: seg.color }}
-                            aria-hidden="true"
-                          />
-                          <span>{seg.label}:</span>
-                          <strong style={{ color: "var(--text-primary)" }}>
-                            {formatStorageBytes(seg.bytes)}
-                          </strong>
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                <div className="nvr-cleanup-toolbar mono">
-                  <div className="nvr-cleanup-controls">
-                    <label
-                      style={{
-                        display: "inline-flex",
-                        alignItems: "center",
-                        gap: 5,
-                        fontSize: "var(--text-xs)",
-                        color: "var(--text-secondary)",
-                      }}
-                    >
-                      <span>{isPt ? "Escopo:" : "Scope:"}</span>
-                      <select
-                        className="nvr-select mono nvr-cleanup-select"
-                        aria-label={isPt ? "Escopo de câmera para limpeza" : "Cleanup camera scope"}
-                        value={effectiveCameraScope}
-                        onChange={(e) => {
-                          clearArmed();
-                          setCleanupCameraScope(e.target.value);
-                        }}
-                      >
-                        <option value="all">
-                          {isPt ? "Todas as Câmeras" : "All Cameras"}
-                        </option>
-                        {cameraGranularRows.map((row) => (
-                          <option key={row.camera} value={row.camera}>
-                            {row.camera.toUpperCase()}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label
-                      style={{
-                        display: "inline-flex",
-                        alignItems: "center",
-                        gap: 5,
-                        fontSize: "var(--text-xs)",
-                        color: "var(--text-secondary)",
-                      }}
-                    >
-                      <span>{isPt ? "Idade:" : "Age:"}</span>
-                      <select
-                        className="nvr-select mono nvr-cleanup-select"
-                        aria-label={isPt ? "Filtro de idade para limpeza" : "Cleanup age filter"}
-                        value={String(cleanupOlderDays)}
-                        onChange={(e) => {
-                          clearArmed();
-                          setCleanupOlderDays(Number(e.target.value) || 0);
-                        }}
-                      >
-                        <option value="0">
-                          {isPt ? "Tudo (Qualquer Idade)" : "All Ages (Everything)"}
-                        </option>
-                        <option value="1">
-                          {isPt ? "Mais antigos que 24h" : "Older than 24h"}
-                        </option>
-                        <option value="3">
-                          {isPt ? "Mais antigos que 3d" : "Older than 3d"}
-                        </option>
-                        <option value="7">
-                          {isPt ? "Mais antigos que 7d" : "Older than 7d"}
-                        </option>
-                        <option value="14">
-                          {isPt ? "Mais antigos que 14d" : "Older than 14d"}
-                        </option>
-                        <option value="30">
-                          {isPt ? "Mais antigos que 30d" : "Older than 30d"}
-                        </option>
-                      </select>
-                    </label>
-                  </div>
-                  <div className="nvr-cleanup-controls">
-                    <label
-                      className="nvr-cleanup-check"
-                      title={
-                        isPt
-                          ? "Preserva eventos marcados para retenção indefinida e seus vídeos"
-                          : "Preserves pinned (retain indefinitely) events and their recordings"
-                      }
-                    >
-                      <input
-                        type="checkbox"
-                        checked={keepPinnedEvents}
-                        onChange={(e) => {
-                          clearArmed();
-                          setKeepPinnedEvents(e.target.checked);
-                        }}
-                      />
-                      <span>{isPt ? "Manter fixados (★)" : "Keep pinned (★)"}</span>
-                    </label>
-                    <label
-                      className="nvr-cleanup-check"
-                      title={
-                        isPt
-                          ? "Ao limpar eventos, também remove segmentos MP4 mais antigos que a janela contínua que só estavam retidos por esses eventos (preservando revisões ativas)"
-                          : "When clearing events, also deletes MP4 segments older than continuous retention that were only held by those events (preserving active reviews)"
-                      }
-                    >
-                      <input
-                        type="checkbox"
-                        checked={pruneRetainedSegments}
-                        onChange={(e) => {
-                          clearArmed();
-                          setPruneRetainedSegments(e.target.checked);
-                        }}
-                      />
-                      <span>
-                        {isPt ? "Liberar MP4 retido (> cont.)" : "Free event-held MP4 (> cont.)"}
-                      </span>
-                    </label>
-                  </div>
-                </div>
-
                 <div
                   className="nvr-table-region"
                   role="region"
@@ -1941,41 +2275,39 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                           labelPt: string,
                           labelEn: string
                         ) => {
-                          const armed = isArmed(key);
+                          const armed = isKeyArmed(key);
                           const busy = cleanupBusyKey === key;
                           const baseLabel = `${isPt ? labelPt : labelEn}${ageBadge}`;
-                          const ariaText = armed
-                            ? isPt
-                              ? `Confirmar ${baseLabel}${scopeCtxLabel}`
-                              : `Confirm ${baseLabel}${scopeCtxLabel}`
+                          const armedText = isPt ? "Confirmar?" : "Confirm Clear?";
+                          const busyText = isPt ? "Limpando..." : "Cleaning...";
+                          const ariaText = busy
+                            ? `${busyText} ${baseLabel}${scopeCtxLabel}`
+                            : armed
+                            ? `${armedText} — ${baseLabel}${scopeCtxLabel}`
                             : `${baseLabel}${scopeCtxLabel}`;
                           return (
                             <button
                               type="button"
-                              className={`nvr-btn xs mono ${
+                              className={`nvr-btn xs mono nvr-cleanup-btn ${
                                 armed ? "danger-armed" : "danger-subtle"
                               }`}
                               aria-busy={busy}
                               aria-label={ariaText}
                               disabled={cleanupBusyKey !== null}
                               onClick={() => {
-                                confirmOrArm(key, () => {
-                                  void executeStorageCleanup(key, target);
-                                });
+                                triggerTwoStepCleanup(
+                                  key,
+                                  target,
+                                  `${labelPt}${ageBadge}${scopeCtxLabel}`,
+                                  `${labelEn}${ageBadge}${scopeCtxLabel}`
+                                );
                               }}
                             >
-                              <Trash2 size={11} />
-                              <span>
-                                {busy
-                                  ? isPt
-                                    ? "Limpando..."
-                                    : "Cleaning..."
-                                  : armed
-                                  ? isPt
-                                    ? "Confirmar?"
-                                    : "Confirm?"
-                                  : baseLabel}
-                              </span>
+                              <Trash2 size={11} aria-hidden="true" />
+                              {renderStableCleanupLabel(
+                                baseLabel,
+                                busy ? busyText : armed ? armedText : baseLabel
+                              )}
                             </button>
                           );
                         };
@@ -2272,41 +2604,48 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                                   <td style={{ textAlign: "right" }}>
                                     <button
                                       type="button"
-                                      className={`nvr-btn xs mono ${
-                                        isArmed("cat:wal_checkpoint") ? "danger-armed" : ""
+                                      className={`nvr-btn xs mono nvr-cleanup-btn ${
+                                        isKeyArmed("cat:wal_checkpoint") ? "danger-armed" : ""
                                       }`}
                                       aria-busy={cleanupBusyKey === "cat:wal_checkpoint"}
                                       aria-label={
-                                        isArmed("cat:wal_checkpoint")
+                                        cleanupBusyKey === "cat:wal_checkpoint"
                                           ? isPt
-                                            ? "Confirmar compactação do WAL SQLite"
-                                            : "Confirm SQLite WAL checkpoint"
+                                            ? "Compactando... WAL SQLite"
+                                            : "Checkpointing... WAL SQLite"
+                                          : isKeyArmed("cat:wal_checkpoint")
+                                          ? isPt
+                                            ? "Confirmar WAL? — Compactar WAL SQLite"
+                                            : "Confirm WAL? — Checkpoint WAL SQLite"
                                           : isPt
                                           ? "Compactar WAL SQLite"
-                                          : "Checkpoint SQLite WAL"
+                                          : "Checkpoint WAL SQLite"
                                       }
                                       disabled={cleanupBusyKey !== null}
                                       onClick={() => {
-                                        confirmOrArm("cat:wal_checkpoint", () => {
-                                          void executeStorageCleanup(
-                                            "cat:wal_checkpoint",
-                                            "wal_checkpoint",
-                                            null
-                                          );
-                                        });
+                                        triggerTwoStepCleanup(
+                                          "cat:wal_checkpoint",
+                                          "wal_checkpoint",
+                                          "Compactar WAL SQLite",
+                                          "Checkpoint SQLite WAL",
+                                          null
+                                        );
                                       }}
                                     >
-                                      {cleanupBusyKey === "cat:wal_checkpoint"
-                                        ? isPt
-                                          ? "Compactando..."
-                                          : "Checkpointing..."
-                                        : isArmed("cat:wal_checkpoint")
-                                        ? isPt
-                                          ? "Confirmar WAL?"
-                                          : "Confirm WAL?"
-                                        : isPt
-                                        ? "Compactar WAL"
-                                        : "Checkpoint WAL"}
+                                      {renderStableCleanupLabel(
+                                        isPt ? "Compactar WAL" : "Checkpoint WAL",
+                                        cleanupBusyKey === "cat:wal_checkpoint"
+                                          ? isPt
+                                            ? "Compactando..."
+                                            : "Checkpointing..."
+                                          : isKeyArmed("cat:wal_checkpoint")
+                                          ? isPt
+                                            ? "Confirmar WAL?"
+                                            : "Confirm WAL?"
+                                          : isPt
+                                          ? "Compactar WAL"
+                                          : "Checkpoint WAL"
+                                      )}
                                     </button>
                                   </td>
                                 </tr>
@@ -2377,9 +2716,9 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                       const mp4Target: StorageCleanupTarget = hasExcess
                         ? "excess_recordings"
                         : "recordings";
-                      const evArmed = isArmed(evBtnKey);
+                      const evArmed = isKeyArmed(evBtnKey);
                       const evBusy = cleanupBusyKey === evBtnKey;
-                      const mp4Armed = isArmed(mp4BtnKey);
+                      const mp4Armed = isKeyArmed(mp4BtnKey);
                       const mp4Busy = cleanupBusyKey === mp4BtnKey;
                       const mp4IdleLabel = hasExcess
                         ? `${isPt ? "Podar > Cont." : "Prune > Cont."}${rowAgeBadge}`
@@ -2543,18 +2882,22 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                             >
                               <button
                                 type="button"
-                                className={`nvr-btn xs mono ${
+                                className={`nvr-btn xs mono nvr-cleanup-btn ${
                                   evArmed ? "danger-armed" : "danger-subtle"
                                 }`}
                                 aria-busy={evBusy}
                                 aria-label={
-                                  evArmed
-                                    ? isPt
-                                      ? `Confirmar limpar eventos${rowAgeBadge} da câmera ${camUpper}`
-                                      : `Confirm clear events${rowAgeBadge} for camera ${camUpper}`
-                                    : isPt
-                                    ? `Limpar eventos${rowAgeBadge} da câmera ${camUpper}`
-                                    : `Clear events${rowAgeBadge} for camera ${camUpper}`
+                                  evBusy
+                                    ? `${isPt ? "Limpando..." : "Cleaning..."} [${camUpper}]`
+                                    : evArmed
+                                    ? `${
+                                        isPt ? "Confirmar?" : "Confirm Clear?"
+                                      } — ${
+                                        isPt ? "Limpar Eventos" : "Clear Events"
+                                      }${rowAgeBadge} [${camUpper}]`
+                                    : `${
+                                        isPt ? "Limpar Eventos" : "Clear Events"
+                                      }${rowAgeBadge} [${camUpper}]`
                                 }
                                 title={
                                   isPt
@@ -2563,32 +2906,41 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                                 }
                                 disabled={cleanupBusyKey !== null}
                                 onClick={() => {
-                                  confirmOrArm(evBtnKey, () => {
-                                    void executeStorageCleanup(evBtnKey, "events", cam);
-                                  });
+                                  triggerTwoStepCleanup(
+                                    evBtnKey,
+                                    "events",
+                                    `Limpar Eventos${rowAgeBadge} [${camUpper}]`,
+                                    `Clear Events${rowAgeBadge} [${camUpper}]`,
+                                    cam
+                                  );
                                 }}
                               >
-                                {evBusy
-                                  ? isPt
-                                    ? "Limpando..."
-                                    : "Cleaning..."
-                                  : evArmed
-                                  ? isPt
-                                    ? "Confirmar?"
-                                    : "Confirm?"
-                                  : `${isPt ? "Limpar Eventos" : "Clear Events"}${rowAgeBadge}`}
+                                {renderStableCleanupLabel(
+                                  `${isPt ? "Limpar Eventos" : "Clear Events"}${rowAgeBadge}`,
+                                  evBusy
+                                    ? isPt
+                                      ? "Limpando..."
+                                      : "Cleaning..."
+                                    : evArmed
+                                    ? isPt
+                                      ? "Confirmar?"
+                                      : "Confirm Clear?"
+                                    : `${isPt ? "Limpar Eventos" : "Clear Events"}${rowAgeBadge}`
+                                )}
                               </button>
                               <button
                                 type="button"
-                                className={`nvr-btn xs mono ${
+                                className={`nvr-btn xs mono nvr-cleanup-btn ${
                                   mp4Armed ? "danger-armed" : "danger-subtle"
                                 }`}
                                 aria-busy={mp4Busy}
                                 aria-label={
-                                  mp4Armed
-                                    ? isPt
-                                      ? `Confirmar ${mp4IdleLabel} da câmera ${camUpper}`
-                                      : `Confirm ${mp4IdleLabel} for camera ${camUpper}`
+                                  mp4Busy
+                                    ? `${isPt ? "Limpando..." : "Cleaning..."} ${mp4IdleLabel} [${camUpper}]`
+                                    : mp4Armed
+                                    ? `${
+                                        isPt ? "Confirmar?" : "Confirm Clear?"
+                                      } — ${mp4IdleLabel} [${camUpper}]`
                                     : `${mp4IdleLabel} [${camUpper}]`
                                 }
                                 title={
@@ -2602,20 +2954,39 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                                 }
                                 disabled={cleanupBusyKey !== null}
                                 onClick={() => {
-                                  confirmOrArm(mp4BtnKey, () => {
-                                    void executeStorageCleanup(mp4BtnKey, mp4Target, cam);
-                                  });
+                                  triggerTwoStepCleanup(
+                                    mp4BtnKey,
+                                    mp4Target,
+                                    `${
+                                      hasExcess
+                                        ? `Podar > Cont.${rowAgeBadge}`
+                                        : cleanupOlderDays > 0
+                                        ? `Limpar MP4${rowAgeBadge}`
+                                        : "Limpar Tudo MP4"
+                                    } [${camUpper}]`,
+                                    `${
+                                      hasExcess
+                                        ? `Prune > Cont.${rowAgeBadge}`
+                                        : cleanupOlderDays > 0
+                                        ? `Clear MP4${rowAgeBadge}`
+                                        : "Clear All MP4"
+                                    } [${camUpper}]`,
+                                    cam
+                                  );
                                 }}
                               >
-                                {mp4Busy
-                                  ? isPt
-                                    ? "Limpando..."
-                                    : "Cleaning..."
-                                  : mp4Armed
-                                  ? isPt
-                                    ? "Confirmar?"
-                                    : "Confirm?"
-                                  : mp4IdleLabel}
+                                {renderStableCleanupLabel(
+                                  mp4IdleLabel,
+                                  mp4Busy
+                                    ? isPt
+                                      ? "Limpando..."
+                                      : "Cleaning..."
+                                    : mp4Armed
+                                    ? isPt
+                                      ? "Confirmar?"
+                                      : "Confirm Clear?"
+                                    : mp4IdleLabel
+                                )}
                               </button>
                             </div>
                           </td>

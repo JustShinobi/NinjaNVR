@@ -9,6 +9,8 @@ import {
   formatRetentionSpan,
   formatStorageBytes,
   formatStorageShortBytes,
+  runStorageCleanupFlow,
+  type CleanupStatusNotice,
 } from "../views/SystemWorkspace";
 
 describe("Granular storage breakdown & cleanup helpers and SystemWorkspace UI", () => {
@@ -252,11 +254,173 @@ describe("Granular storage breakdown & cleanup helpers and SystemWorkspace UI", 
     expect(html).toContain("1842");
     expect(html).toContain("3 ★");
     expect(html).toMatch(/ORPHAN|LEGADO/);
+    expect(html).toContain("nvr-cleanup-btn");
     expect(html).toMatch(/Clear Events|Limpar Eventos/);
     expect(html).toMatch(/Prune Excess|Podar Excedente/);
     expect(html).toMatch(/Clear Previews|Limpar Previews/);
     expect(html).toMatch(/Clear Exports|Limpar Exports/);
     expect(html).toMatch(/Checkpoint WAL|Compactar WAL/);
     expect(html).toMatch(/Protected \(Studio\)|Protegido \(Studio\)/);
+
+    // Armed state renders non-shrinking button + sizer + explicit inline Confirm/Cancel banner + Label-in-Name
+    const armedHtml = renderToStaticMarkup(
+      React.createElement(SystemWorkspace, {
+        cameraNames: ["escritorio"],
+        logService: "ninjanvr",
+        setLogService: () => {},
+        logLines: [],
+        logSearch: "",
+        setLogSearch: () => {},
+        logPaused: false,
+        setLogPaused: () => {},
+        notify: () => {},
+        initialBreakdown: sampleBreakdown,
+        initialArmedCleanup: {
+          key: "cam:escritorio:events",
+          target: "events",
+          cameraOverride: "escritorio",
+          summaryPt: "Limpar Eventos [ESCRITORIO]",
+          summaryEn: "Clear Events [ESCRITORIO]",
+        },
+      })
+    );
+    expect(armedHtml).toContain('data-testid="storage-cleanup-confirm-banner"');
+    expect(armedHtml).toContain('data-testid="storage-cleanup-confirm-now"');
+    expect(armedHtml).toContain('data-testid="storage-cleanup-cancel"');
+    expect(armedHtml).toContain("nvr-cleanup-label-sizer");
+    expect(armedHtml).toMatch(/Confirm Clear\?|Confirmar\?/);
+    expect(armedHtml).toMatch(
+      /aria-label="(Confirm Clear\?|Confirmar\?) — (Clear Events|Limpar Eventos) \[ESCRITORIO\]"/
+    );
+
+    // Status notice renders in the single constant-height banner slot without duplicating banners
+    const noticeHtml = renderToStaticMarkup(
+      React.createElement(SystemWorkspace, {
+        cameraNames: ["escritorio"],
+        logService: "ninjanvr",
+        setLogService: () => {},
+        logLines: [],
+        logSearch: "",
+        setLogSearch: () => {},
+        logPaused: false,
+        setLogPaused: () => {},
+        notify: () => {},
+        initialBreakdown: sampleBreakdown,
+        initialCleanupNotice: {
+          kind: "success",
+          text: "Cleanup completed [ESCRITORIO]: removed 12 item(s) · freed 2.50 GB",
+        },
+      })
+    );
+    expect(noticeHtml).toContain('data-testid="storage-cleanup-status-banner"');
+    expect(noticeHtml).toContain("removed 12 item(s) · freed 2.50 GB");
+  });
+
+  test("runStorageCleanupFlow handles 200 OK, 504 gateway timeout, and network drop while always refreshing breakdown", async () => {
+    const sentBodies: Array<Record<string, unknown>> = [];
+    const notices: CleanupStatusNotice[] = [];
+    const toasts: string[] = [];
+    let refreshCount = 0;
+    let delayedCount = 0;
+
+    // 1. 200 OK flow
+    await runStorageCleanupFlow({
+      target: "events",
+      effectiveCam: "sala",
+      olderThanDays: 7,
+      keepPinnedEvents: true,
+      pruneRetainedSegments: true,
+      isPt: false,
+      fetchImpl: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        sentBodies.push(JSON.parse(String(init?.body ?? "{}")));
+        return new Response(
+          JSON.stringify({
+            success: true,
+            target: "events",
+            camera: "sala",
+            deleted_items: 42,
+            deleted_segments: 120,
+            freed_bytes: 5 * 1024 * 1024 * 1024,
+            duration_ms: 850,
+            message: "ok",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }) as typeof fetch,
+      onNotice: (n) => notices.push(n),
+      notify: (m) => toasts.push(m),
+      refreshStatsAndBreakdown: async () => {
+        refreshCount += 1;
+      },
+      scheduleDelayedRefresh: () => {
+        delayedCount += 1;
+      },
+    });
+
+    expect(sentBodies.length).toBe(1);
+    expect(sentBodies[0]).toEqual({
+      target: "events",
+      camera: "sala",
+      older_than_days: 7,
+      include_pinned: false,
+      prune_retained_segments: true,
+    });
+    expect(notices[0].kind).toBe("running");
+    expect(notices[1].kind).toBe("success");
+    expect(notices[1].text).toContain("42 item(s) + 120 MP4 seg(s)");
+    expect(notices[1].text).toContain("5.00 GB");
+    expect(refreshCount).toBe(1);
+    expect(delayedCount).toBe(0);
+
+    // 2. 504 Gateway Timeout still refreshes breakdown immediately AND schedules delayed refresh
+    await runStorageCleanupFlow({
+      target: "events",
+      effectiveCam: "escritorio",
+      olderThanDays: 0,
+      keepPinnedEvents: true,
+      pruneRetainedSegments: true,
+      isPt: false,
+      fetchImpl: (async () =>
+        new Response("Gateway Timeout", { status: 504 })) as typeof fetch,
+      onNotice: (n) => notices.push(n),
+      notify: (m) => toasts.push(m),
+      refreshStatsAndBreakdown: async () => {
+        refreshCount += 1;
+      },
+      scheduleDelayedRefresh: () => {
+        delayedCount += 1;
+      },
+    });
+
+    expect(notices[notices.length - 1].kind).toBe("error");
+    expect(notices[notices.length - 1].text).toContain("HTTP 504");
+    expect(refreshCount).toBe(2);
+    expect(delayedCount).toBe(1);
+
+    // 3. Network drop also refreshes breakdown and schedules delayed refresh
+    await runStorageCleanupFlow({
+      target: "recordings",
+      effectiveCam: null,
+      olderThanDays: 0,
+      keepPinnedEvents: false,
+      pruneRetainedSegments: false,
+      isPt: true,
+      fetchImpl: (async () => {
+        throw new TypeError("Failed to fetch");
+      }) as typeof fetch,
+      onNotice: (n) => notices.push(n),
+      notify: (m) => toasts.push(m),
+      refreshStatsAndBreakdown: async () => {
+        refreshCount += 1;
+      },
+      scheduleDelayedRefresh: () => {
+        delayedCount += 1;
+      },
+    });
+
+    expect(notices[notices.length - 1].kind).toBe("error");
+    expect(refreshCount).toBe(3);
+    expect(delayedCount).toBe(2);
+    expect(toasts.length).toBe(3);
   });
 });

@@ -5335,6 +5335,34 @@ impl NinjaDatabase {
         Ok(result_val)
     }
 
+    /// Returns the distinct non-empty camera names referenced across `recordings`,
+    /// `event`, `reviewsegment`, `previews`, and `export` using indexed `DISTINCT` scans.
+    pub fn distinct_storage_cameras(&self) -> Result<std::collections::BTreeSet<String>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT DISTINCT camera FROM recordings
+            UNION
+            SELECT DISTINCT camera FROM event
+            UNION
+            SELECT DISTINCT camera FROM reviewsegment
+            UNION
+            SELECT DISTINCT camera FROM previews
+            UNION
+            SELECT DISTINCT camera FROM export
+            "#,
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut set = std::collections::BTreeSet::new();
+        for row in rows {
+            let cam = row?;
+            if !cam.trim().is_empty() {
+                set.insert(cam);
+            }
+        }
+        Ok(set)
+    }
+
     /// Queries a consolidated read-only storage and catalog snapshot across `recordings`,
     /// `event`, `reviewsegment`, `previews`, `export`, `dataset_sample`, `timeline`, and `share_link`.
     pub fn query_storage_db_snapshot(
@@ -5343,41 +5371,17 @@ impl NinjaDatabase {
         default_continuous_cutoff: f64,
         now_ts: f64,
     ) -> Result<StorageDbSnapshot> {
+        let mut cam_set = self.distinct_storage_cameras()?;
+        for cam in continuous_cutoffs.keys() {
+            if !cam.trim().is_empty() {
+                cam_set.insert(cam.clone());
+            }
+        }
+        let cameras: Vec<String> = cam_set.into_iter().collect();
+
         let conn = self.read_conn();
         let mut snap = StorageDbSnapshot::default();
         let cutoff_24h = now_ts - 86_400.0;
-
-        // 1. Distinct cameras across recordings, event, reviewsegment, previews, and export
-        let mut cameras: Vec<String> = {
-            let mut stmt = conn.prepare(
-                r#"
-                SELECT DISTINCT camera FROM recordings
-                UNION
-                SELECT DISTINCT camera FROM event
-                UNION
-                SELECT DISTINCT camera FROM reviewsegment
-                UNION
-                SELECT DISTINCT camera FROM previews
-                UNION
-                SELECT DISTINCT camera FROM export
-                "#,
-            )?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            let mut list = Vec::new();
-            for row in rows {
-                let cam = row?;
-                if !cam.trim().is_empty() {
-                    list.push(cam);
-                }
-            }
-            list
-        };
-        for cam in continuous_cutoffs.keys() {
-            if !cameras.iter().any(|c| c == cam) {
-                cameras.push(cam.clone());
-            }
-        }
-        cameras.sort();
 
         // 2. Per-camera recordings aggregation (with exact camera-specific continuous_cutoff)
         {
