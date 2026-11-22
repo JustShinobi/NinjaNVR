@@ -295,9 +295,13 @@ cameras:
             .unwrap();
     }
 
-    // 3. Populate reviewsegment, previews, preview_frames, exports (completed + in-progress), dataset & models
+    // 3. Populate reviewsegment (non-pinned + pinned-overlapping + cozinha), previews, preview_frames, exports, dataset & models
     let rev_esc_webp = media_dir.join("clips/review/thumb-escritorio-rev_esc_1.webp");
+    let rev_esc_pin_webp = media_dir.join("clips/review/thumb-escritorio-rev_esc_pin.webp");
+    let rev_coz_webp = media_dir.join("clips/review/thumb-cozinha-rev_coz_1.webp");
     std::fs::write(&rev_esc_webp, vec![0xEEu8; 1100]).unwrap();
+    std::fs::write(&rev_esc_pin_webp, vec![0xEFu8; 700]).unwrap();
+    std::fs::write(&rev_coz_webp, vec![0xF0u8; 500]).unwrap();
     state
         .db
         .insert_review_segment(&ReviewItemDto {
@@ -307,6 +311,32 @@ cameras:
             end_time: Some(five_days_ago + 12.0),
             severity: "alert".to_string(),
             thumb_path: "/clips/review/thumb-escritorio-rev_esc_1.webp".to_string(),
+            has_been_reviewed: false,
+            data: json!({ "objects": ["person"] }),
+        })
+        .unwrap();
+    state
+        .db
+        .insert_review_segment(&ReviewItemDto {
+            id: "rev_esc_pin".to_string(),
+            camera: "escritorio".to_string(),
+            start_time: six_days_ago,
+            end_time: Some(six_days_ago + 12.0),
+            severity: "alert".to_string(),
+            thumb_path: "/clips/review/thumb-escritorio-rev_esc_pin.webp".to_string(),
+            has_been_reviewed: false,
+            data: json!({ "objects": ["person"] }),
+        })
+        .unwrap();
+    state
+        .db
+        .insert_review_segment(&ReviewItemDto {
+            id: "rev_coz_1".to_string(),
+            camera: "cozinha".to_string(),
+            start_time: one_hour_ago,
+            end_time: Some(one_hour_ago + 12.0),
+            severity: "detection".to_string(),
+            thumb_path: "/clips/review/thumb-cozinha-rev_coz_1.webp".to_string(),
             has_been_reviewed: false,
             data: json!({ "objects": ["person"] }),
         })
@@ -469,7 +499,7 @@ cameras:
     assert_eq!(esc_stat["event_segments_mb"], json!(19.0));
     assert_eq!(esc_stat["events_count"], json!(2));
     assert_eq!(esc_stat["pinned_events_count"], json!(1));
-    assert_eq!(esc_stat["reviews_count"], json!(1));
+    assert_eq!(esc_stat["reviews_count"], json!(2));
 
     let bd_res = app
         .clone()
@@ -494,12 +524,77 @@ cameras:
         json!(3)
     );
     assert_eq!(bd["categories"]["events_media"]["bytes"], json!(3600));
-    assert_eq!(bd["categories"]["reviews_media"]["bytes"], json!(1100));
+    assert_eq!(bd["categories"]["reviews_media"]["bytes"], json!(2300));
     assert_eq!(bd["categories"]["previews_media"]["bytes"], json!(2004));
     assert_eq!(bd["categories"]["exports_media"]["bytes"], json!(6900));
     assert!(bd["categories"]["database"]["bytes"].as_u64().unwrap() > 0);
 
-    // E. Granular `events` cleanup on `escritorio` (keep pinned = true, prune_retained_segments = true)
+    // E1. When `prune_retained_segments: false`, `events` cleanup on `escritorio` (> 7d = none, then > 3d)
+    //     Wait — test `older_than_days: 7.0` with `prune_retained_segments: false` first as a no-op,
+    //     then add a transient event `ev_esc_noprune` and verify `prune_retained_segments: false` preserves reviews & MP4s!
+    let ev_esc_noprune_webp = media_dir.join("clips/escritorio-ev_esc_noprune.webp");
+    std::fs::write(&ev_esc_noprune_webp, vec![0xABu8; 800]).unwrap();
+    state
+        .db
+        .upsert_event(&EventDto {
+            id: "ev_esc_noprune".to_string(),
+            camera: "escritorio".to_string(),
+            label: "person".to_string(),
+            zones: json!([]),
+            start_time: five_days_ago,
+            end_time: Some(five_days_ago + 5.0),
+            has_clip: false,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.9),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({ "thumb_path": "/clips/escritorio-ev_esc_noprune.webp" }),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.9),
+            stationary: false,
+        })
+        .unwrap();
+
+    let clean_ev_no_prune = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/storage/cleanup")
+                .header(header::COOKIE, &admin_cookie)
+                .header(header::HOST, "localhost")
+                .header(header::ORIGIN, "http://localhost")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"target":"events","camera":"escritorio","older_than_days":4.5,"include_pinned":false,"prune_retained_segments":false}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(clean_ev_no_prune.status(), StatusCode::OK);
+    let clean_ev_no_prune_json: Value = serde_json::from_slice(
+        &to_bytes(clean_ev_no_prune.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(clean_ev_no_prune_json["deleted_items"], json!(1));
+    assert_eq!(clean_ev_no_prune_json["deleted_segments"], json!(0));
+    assert!(!ev_esc_noprune_webp.exists());
+    assert!(
+        rev_esc_webp.exists() && p_esc_rev_backed.exists(),
+        "prune_retained_segments=false must preserve reviews and MP4 segments"
+    );
+
+    // E2. Granular `events` cleanup on `escritorio` (`include_pinned: false`, `prune_retained_segments: true`)
+    //     Purges non-pinned events AND non-pinned reviews, freeing all excess MP4 segments (> 2d continuous)
+    //     even if they had a review, while strictly preserving pinned (`★`) events, reviews overlapping pinned events, and pinned MP4s!
     let clean_ev_res = app
         .clone()
         .oneshot(
@@ -524,9 +619,17 @@ cameras:
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(clean_ev_json["deleted_items"], json!(1)); // ev_esc_old deleted, ev_esc_pin kept
-    assert_eq!(clean_ev_json["deleted_segments"], json!(1)); // seg_esc_evt_only pruned; seg_esc_old_evt protected by rev_esc_1!
+    assert_eq!(clean_ev_json["deleted_items"], json!(2)); // ev_esc_old + rev_esc_1 deleted; ev_esc_pin + rev_esc_pin kept!
+    assert_eq!(clean_ev_json["deleted_segments"], json!(2)); // BOTH seg_esc_evt_only and seg_esc_old_evt freed!
     assert!(!ev_esc_old_webp.exists());
+    assert!(
+        !rev_esc_webp.exists(),
+        "non-pinned review thumb must be removed when prune_retained_segments=true"
+    );
+    assert!(
+        rev_esc_pin_webp.exists(),
+        "review overlapping pinned event must remain protected"
+    );
     assert!(
         ev_esc_pin_custom_webp.exists(),
         "pinned event custom thumb_path must remain"
@@ -536,8 +639,8 @@ cameras:
         "event-only excess MP4 must be pruned"
     );
     assert!(
-        p_esc_rev_backed.exists(),
-        "excess MP4 still backing an active reviewsegment must remain until review is cleaned"
+        !p_esc_rev_backed.exists(),
+        "review-backed excess MP4 must ALSO be freed when prune_retained_segments=true"
     );
     assert!(p_esc_pinned.exists(), "pinned event MP4 must remain");
     assert!(p_esc_cont.exists(), "recent continuous MP4 must remain");
@@ -546,8 +649,8 @@ cameras:
         "in-progress export thumbnail must remain"
     );
     assert!(
-        ev_coz_webp.exists(),
-        "other camera event must remain untouched"
+        ev_coz_webp.exists() && rev_coz_webp.exists(),
+        "other camera event & review must remain untouched"
     );
     assert!(
         latest_esc_jpg.exists(),
@@ -558,10 +661,10 @@ cameras:
 
     // F. Granular `reviews`, `excess_recordings`, `previews`, `exports`, and `wal_checkpoint` cleanups
     for (payload, check_gone) in [
-        (r#"{"target":"reviews"}"#, &rev_esc_webp),
+        (r#"{"target":"reviews","camera":"cozinha"}"#, &rev_coz_webp),
         (
-            r#"{"target":"excess_recordings","camera":"escritorio"}"#,
-            &p_esc_rev_backed,
+            r#"{"target":"excess_recordings","camera":"escritorio","include_pinned":true}"#,
+            &p_esc_pinned,
         ),
         (r#"{"target":"previews"}"#, &prev_mp4),
         (r#"{"target":"exports"}"#, &exp_done_mp4),
@@ -619,6 +722,457 @@ cameras:
         .await
         .unwrap();
     assert_eq!(wal_res.status(), StatusCode::OK);
+
+    state.shutdown().await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test]
+async fn batch_events_and_recordings_cleanup_uses_indexed_unlink_and_prunes_empty_dirs() {
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "ninjanvr-batch-storage-cleanup-{}",
+        rand::random::<u64>()
+    ));
+    let web_dir = tmp_dir.join("web");
+    let media_dir = tmp_dir.join("media");
+    let old_hour_dir = media_dir.join("recordings/2026-11-01/08/sala");
+    std::fs::create_dir_all(&web_dir).unwrap();
+    std::fs::create_dir_all(media_dir.join("clips/review")).unwrap();
+    std::fs::create_dir_all(media_dir.join("exports")).unwrap();
+    std::fs::create_dir_all(&old_hour_dir).unwrap();
+    std::fs::write(web_dir.join("index.html"), "<html>Console</html>").unwrap();
+
+    let db_path = tmp_dir.join("ninjanvr.db");
+    let cfg_path = tmp_dir.join("config.yml");
+    let yaml = format!(
+        r#"
+database:
+  path: {}
+auth:
+  enabled: true
+  hash_iterations: 1000
+go2rtc:
+  streams:
+    sala:
+      - "rtsp://cam:pass@192.0.2.20:554/stream1"
+cameras:
+  sala:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/sala
+          roles: [detect, record]
+    record:
+      enabled: true
+      continuous:
+        days: 3
+      alerts:
+        retain:
+          days: 14
+"#,
+        db_path.display()
+    );
+    std::fs::write(&cfg_path, yaml).unwrap();
+
+    let state = new_app_state(&cfg_path, web_dir, media_dir.clone(), false)
+        .await
+        .unwrap();
+    state
+        .db
+        .create_user_with_cameras("root_admin", "AdminPass#1234", "admin", "*", 1000)
+        .unwrap();
+
+    let now = now_sec();
+    let five_days_ago = now - 5.0 * 86_400.0;
+
+    // Seed 16 events + 14 reviews + 16 MP4 segments (> 8 threshold to exercise single-pass directory indexing)
+    for i in 0..16 {
+        let seg_name = format!("00.{i:02}.mp4");
+        let seg_disk = old_hour_dir.join(&seg_name);
+        std::fs::write(&seg_disk, vec![0x31u8; 2048]).unwrap();
+        state
+            .db
+            .insert_recording(&RecordingRow {
+                id: format!("seg_sala_{i}"),
+                camera: "sala".to_string(),
+                path: format!("/media/ninjanvr/recordings/2026-11-01/08/sala/{seg_name}"),
+                start_time: five_days_ago + (i as f64) * 10.0,
+                end_time: five_days_ago + (i as f64) * 10.0 + 10.0,
+                duration: 10.0,
+                motion: 100,
+                objects: 1,
+                dbfs: -20,
+                segment_size: 2.0,
+                regions: 1,
+                motion_heatmap: None,
+            })
+            .unwrap();
+
+        let snap_disk = media_dir.join(format!("clips/sala-ev_sala_{i}.webp"));
+        std::fs::write(&snap_disk, vec![0x41u8; 512]).unwrap();
+        state
+            .db
+            .upsert_event(&EventDto {
+                id: format!("ev_sala_{i}"),
+                camera: "sala".to_string(),
+                label: "person".to_string(),
+                zones: json!([]),
+                start_time: five_days_ago + (i as f64) * 10.0,
+                end_time: Some(five_days_ago + (i as f64) * 10.0 + 8.0),
+                has_clip: false,
+                has_snapshot: true,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: None,
+                top_score: Some(0.95),
+                false_positive: Some(false),
+                box_coords: None,
+                data: json!({ "thumb_path": format!("/clips/sala-ev_sala_{i}.webp") }),
+                thumbnail: None,
+                area: None,
+                ratio: None,
+                score: Some(0.95),
+                stationary: false,
+            })
+            .unwrap();
+    }
+
+    for i in 0..14 {
+        let rev_disk = media_dir.join(format!("clips/review/thumb-sala-rev_sala_{i}.webp"));
+        std::fs::write(&rev_disk, vec![0x51u8; 384]).unwrap();
+        state
+            .db
+            .insert_review_segment(&ReviewItemDto {
+                id: format!("rev_sala_{i}"),
+                camera: "sala".to_string(),
+                start_time: five_days_ago + (i as f64) * 10.0,
+                end_time: Some(five_days_ago + (i as f64) * 10.0 + 10.0),
+                severity: "alert".to_string(),
+                thumb_path: format!("/clips/review/thumb-sala-rev_sala_{i}.webp"),
+                has_been_reviewed: false,
+                data: json!({ "objects": ["person"] }),
+            })
+            .unwrap();
+    }
+
+    let app = build_router_with_auth(state.clone(), true);
+    let admin_cookie = mint_cookie(&state.jwt_secret, "root_admin", "admin", None);
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/storage/cleanup")
+                .header(header::COOKIE, &admin_cookie)
+                .header(header::HOST, "localhost")
+                .header(header::ORIGIN, "http://localhost")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"target":"events","camera":"sala","include_pinned":false,"prune_retained_segments":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(res.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    assert_eq!(body["deleted_items"], json!(30)); // 16 events + 14 reviews
+    assert_eq!(body["deleted_segments"], json!(16));
+    assert!(
+        !old_hour_dir.exists() && !media_dir.join("recordings/2026-11-01").exists(),
+        "empty <camera>, HH, and YYYY-MM-DD directories must be pruned bottom-up"
+    );
+    assert!(
+        media_dir.join("recordings").exists(),
+        "recordings root directory must remain intact"
+    );
+
+    state.shutdown().await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test]
+async fn surviving_pinned_review_span_review_prefixed_camera_and_cold_root_unlink_regression() {
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "ninjanvr-sec-storage-cleanup-{}",
+        rand::random::<u64>()
+    ));
+    let web_dir = tmp_dir.join("web");
+    let media_dir = tmp_dir.join("media");
+    let cold_real = tmp_dir.join("cold_real");
+    let cold_via_parent = tmp_dir.join("cold_parent_link/cold_tier");
+    std::fs::create_dir_all(&web_dir).unwrap();
+    std::fs::create_dir_all(media_dir.join("clips/review")).unwrap();
+    std::fs::create_dir_all(media_dir.join("exports")).unwrap();
+    std::fs::create_dir_all(media_dir.join("recordings/2026-11-01/10/review-room")).unwrap();
+    std::fs::create_dir_all(cold_real.join("cold_tier")).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&cold_real, tmp_dir.join("cold_parent_link")).unwrap();
+    std::fs::write(web_dir.join("index.html"), "<html>Console</html>").unwrap();
+
+    let db_path = tmp_dir.join("ninjanvr.db");
+    let cfg_path = tmp_dir.join("config.yml");
+    let yaml = format!(
+        r#"
+database:
+  path: {}
+auth:
+  enabled: true
+  hash_iterations: 1000
+go2rtc:
+  streams:
+    review-room:
+      - "rtsp://cam:pass@192.0.2.30:554/stream1"
+    room:
+      - "rtsp://cam:pass@192.0.2.31:554/stream1"
+cameras:
+  review-room:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/review-room
+          roles: [detect, record]
+    record:
+      enabled: true
+      continuous:
+        days: 2
+      alerts:
+        pre_capture: 5
+        post_capture: 5
+        retain:
+          days: 14
+  room:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/room
+          roles: [detect, record]
+    record:
+      enabled: true
+      continuous:
+        days: 2
+      alerts:
+        retain:
+          days: 14
+"#,
+        db_path.display()
+    );
+    std::fs::write(&cfg_path, yaml).unwrap();
+
+    let state = new_app_state(&cfg_path, web_dir, media_dir.clone(), false)
+        .await
+        .unwrap();
+    state
+        .db
+        .create_user_with_cameras("root_admin", "AdminPass#1234", "admin", "*", 1000)
+        .unwrap();
+
+    let now = now_sec();
+    let six_days_ago = now - 6.0 * 86_400.0;
+
+    // 1. Multi-segment pinned review span (`[t - 30s, t + 12s]`) wider than `ev_pin ± 5s` (`[t, t + 8s]`)
+    let seg_pin_lead = media_dir.join("recordings/2026-11-01/10/review-room/00.00.mp4");
+    let seg_pin_core = media_dir.join("recordings/2026-11-01/10/review-room/00.30.mp4");
+    std::fs::write(&seg_pin_lead, vec![0x61u8; 2048]).unwrap();
+    std::fs::write(&seg_pin_core, vec![0x62u8; 2048]).unwrap();
+    state
+        .db
+        .insert_recording(&RecordingRow {
+            id: "seg_rr_pin_lead".to_string(),
+            camera: "review-room".to_string(),
+            path: "/media/ninjanvr/recordings/2026-11-01/10/review-room/00.00.mp4".to_string(),
+            start_time: six_days_ago - 30.0,
+            end_time: six_days_ago - 20.0,
+            duration: 10.0,
+            motion: 80,
+            objects: 0,
+            dbfs: -20,
+            segment_size: 2.0,
+            regions: 1,
+            motion_heatmap: None,
+        })
+        .unwrap();
+    state
+        .db
+        .insert_recording(&RecordingRow {
+            id: "seg_rr_pin_core".to_string(),
+            camera: "review-room".to_string(),
+            path: "/media/ninjanvr/recordings/2026-11-01/10/review-room/00.30.mp4".to_string(),
+            start_time: six_days_ago,
+            end_time: six_days_ago + 10.0,
+            duration: 10.0,
+            motion: 100,
+            objects: 1,
+            dbfs: -18,
+            segment_size: 2.0,
+            regions: 1,
+            motion_heatmap: None,
+        })
+        .unwrap();
+
+    // Active/pinned event on `review-room` with `-clean.webp` and `.mp4` clip in `clips/`
+    // (backdated mtime > 60s so orphan sweep inspects them!)
+    let rr_clean_webp = media_dir.join("clips/review-room-ev_rr_pin-clean.webp");
+    let rr_clip_mp4 = media_dir.join("clips/review-room-ev_rr_pin.mp4");
+    let rr_orphan_webp = media_dir.join("clips/review-room-ev_rr_gone.webp");
+    std::fs::write(&rr_clean_webp, vec![0x71u8; 700]).unwrap();
+    std::fs::write(&rr_clip_mp4, vec![0x72u8; 1400]).unwrap();
+    std::fs::write(&rr_orphan_webp, vec![0x73u8; 500]).unwrap();
+    let old_ftime = std::fs::FileTimes::new()
+        .set_modified(UNIX_EPOCH + std::time::Duration::from_secs((six_days_ago as u64).max(1)));
+    for p in [&rr_clean_webp, &rr_clip_mp4, &rr_orphan_webp] {
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(p) {
+            let _ = f.set_times(old_ftime);
+        }
+    }
+
+    state
+        .db
+        .upsert_event(&EventDto {
+            id: "ev_rr_pin".to_string(),
+            camera: "review-room".to_string(),
+            label: "person".to_string(),
+            zones: json!([]),
+            start_time: six_days_ago,
+            end_time: Some(six_days_ago + 8.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: true,
+            sub_label: None,
+            top_score: Some(0.96),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.96),
+            stationary: false,
+        })
+        .unwrap();
+    state
+        .db
+        .insert_review_segment(&ReviewItemDto {
+            id: "rev_rr_pin_wide".to_string(),
+            camera: "review-room".to_string(),
+            start_time: six_days_ago - 30.0,
+            end_time: Some(six_days_ago + 12.0),
+            severity: "alert".to_string(),
+            thumb_path: "".to_string(),
+            has_been_reviewed: false,
+            data: json!({ "objects": ["person"] }),
+        })
+        .unwrap();
+
+    let app = build_router_with_auth(state.clone(), true);
+    let admin_cookie = mint_cookie(&state.jwt_secret, "root_admin", "admin", None);
+
+    // A. Scoped cleanup on `camera: "room"` MUST NOT touch `review-room`'s orphan `review-room-ev_rr_gone.webp`
+    let res_room = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/storage/cleanup")
+                .header(header::COOKIE, &admin_cookie)
+                .header(header::HOST, "localhost")
+                .header(header::ORIGIN, "http://localhost")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"target":"events","camera":"room","include_pinned":false,"prune_retained_segments":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_room.status(), StatusCode::OK);
+    assert!(
+        rr_orphan_webp.exists(),
+        "cleaning camera 'room' must never unlink 'review-room-*' orphan files"
+    );
+
+    // B. Cleanup on `camera: "review-room"` (`include_pinned: false, prune_retained_segments: true`)
+    //    must preserve BOTH `seg_rr_pin_lead` (covered by surviving `rev_rr_pin_wide`) and `ev_rr_pin`'s `-clean.webp`/`.mp4`,
+    //    and refuse to cross-delete ambiguous `review-room-*` vs `review-<room>-*` orphans until global unscoped cleanup runs!
+    let res_rr = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/storage/cleanup")
+                .header(header::COOKIE, &admin_cookie)
+                .header(header::HOST, "localhost")
+                .header(header::ORIGIN, "http://localhost")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"target":"events","camera":"review-room","include_pinned":false,"prune_retained_segments":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_rr.status(), StatusCode::OK);
+    assert!(
+        seg_pin_lead.exists() && seg_pin_core.exists(),
+        "all MP4 segments backing surviving pinned-overlapping review must remain intact"
+    );
+    assert!(
+        rr_clean_webp.exists() && rr_clip_mp4.exists(),
+        "review-room active/pinned event clips & -clean.webp must never be stripped to 'room-*' and unlinked"
+    );
+
+    // B2. Unscoped admin cleanup (`camera: null`) safely unlinks genuine orphan `rr_orphan_webp`
+    //     while still preserving `rr_clean_webp` and `rr_clip_mp4` for pinned `ev_rr_pin`!
+    let res_global = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/storage/cleanup")
+                .header(header::COOKIE, &admin_cookie)
+                .header(header::HOST, "localhost")
+                .header(header::ORIGIN, "http://localhost")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"target":"events","include_pinned":false,"prune_retained_segments":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_global.status(), StatusCode::OK);
+    assert!(
+        !rr_orphan_webp.exists(),
+        "genuine unreferenced orphan file must be cleaned on unscoped admin cleanup"
+    );
+    assert!(
+        rr_clean_webp.exists() && rr_clip_mp4.exists(),
+        "pinned 'review-room' event clips & -clean.webp must survive unscoped admin cleanup too"
+    );
+
+    // C. Flat cold-tier MP4 under a non-canonical parent symlink (`cold_parent_link/cold_tier/flat_seg.mp4`) unlinks cleanly
+    #[cfg(unix)]
+    {
+        let flat_cold_seg = cold_real.join("cold_tier/flat_seg.mp4");
+        std::fs::write(&flat_cold_seg, vec![0x81u8; 1024]).unwrap();
+        let (cnt, freed) = ninjanvr_server::media_lifecycle::unlink_deleted_recording_rows(
+            &media_dir,
+            Some(&cold_via_parent),
+            "room",
+            &[(
+                "seg_flat_cold".to_string(),
+                "/media/ninjanvr/recordings/flat_seg.mp4".to_string(),
+                1.0,
+            )],
+        );
+        assert_eq!(cnt, 1);
+        assert_eq!(freed, 1024);
+        assert!(
+            !flat_cold_seg.exists(),
+            "flat cold-tier segment under non-canonical cold_dir path must be unlinked from disk"
+        );
+    }
 
     state.shutdown().await;
     let _ = std::fs::remove_dir_all(&tmp_dir);

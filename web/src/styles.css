@@ -138,8 +138,14 @@
 [data-high-contrast="true"] .nvr-select,
 [data-high-contrast="true"] .nvr-segmented,
 [data-high-contrast="true"] .nvr-btn.danger-subtle,
-[data-high-contrast="true"] .nvr-btn.danger-armed {
+[data-high-contrast="true"] .nvr-btn.danger-armed,
+[data-high-contrast="true"] .nvr-btn.nvr-cleanup-btn,
+[data-high-contrast="true"] .nvr-cleanup-banner {
   border-width: 1.5px;
+}
+
+[data-high-contrast="true"] .nvr-btn.nvr-cleanup-btn:not(.danger-armed):not(.danger) {
+  border-color: var(--border-strong);
 }
 
 [data-high-contrast="true"] .nvr-segmented {
@@ -1565,8 +1571,9 @@ dialog::backdrop {
 }
 
 .nvr-btn.xs {
-  height: 22px;
-  padding: 0 8px;
+  min-block-size: 24px;
+  height: auto;
+  padding: 2px 8px;
   font-size: var(--text-xs);
   display: inline-flex;
   align-items: center;
@@ -1682,6 +1689,9 @@ dialog::backdrop {
 }
 
 .nvr-cleanup-check input[type="checkbox"] {
+  inline-size: 16px;
+  block-size: 16px;
+  flex-shrink: 0;
   accent-color: var(--signal-accent);
   cursor: pointer;
 }
@@ -1702,6 +1712,80 @@ dialog::backdrop {
   background: var(--signal-alert-tint);
   color: var(--signal-alert-text);
   font-weight: 700;
+}
+
+.nvr-btn.nvr-cleanup-btn {
+  min-inline-size: 132px;
+  justify-content: center;
+}
+
+.nvr-cleanup-label-stack {
+  display: inline-grid;
+  align-items: center;
+  justify-items: center;
+}
+
+.nvr-cleanup-label-sizer {
+  grid-area: 1 / 1;
+  visibility: hidden;
+  pointer-events: none;
+  user-select: none;
+  font-weight: 700;
+}
+
+.nvr-cleanup-label-live {
+  grid-area: 1 / 1;
+}
+
+.nvr-cleanup-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-block-size: 42px;
+  padding: 8px 12px;
+  font-size: var(--text-xs);
+  border-top: 1px solid var(--border-hairline);
+  border-bottom: 1px solid var(--border-hairline);
+  background: var(--bg-subcard);
+  color: var(--text-primary);
+  overflow-anchor: none;
+}
+
+.nvr-cleanup-banner.is-idle {
+  color: var(--text-secondary);
+}
+
+.nvr-cleanup-banner.is-armed {
+  background: var(--signal-alert-tint);
+  border-color: var(--signal-alert-border);
+  color: var(--signal-alert-text);
+}
+
+.nvr-cleanup-banner.is-running {
+  background: var(--signal-accent-tint);
+  border-color: var(--signal-accent-border);
+  color: var(--signal-accent-text);
+}
+
+.nvr-cleanup-banner.is-success {
+  background: var(--signal-live-tint);
+  border-color: var(--signal-live-border);
+  color: var(--signal-live-text);
+}
+
+.nvr-cleanup-banner.is-error {
+  background: var(--signal-alert-tint);
+  border-color: var(--signal-alert-border);
+  color: var(--signal-alert-text);
+}
+
+.nvr-cleanup-banner-actions {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
 .nvr-storage-mini-bar {
@@ -4251,12 +4335,19 @@ input[type="range"] {
   }
 
   .nvr-btn,
+  .nvr-btn.sm,
+  .nvr-btn.xs,
   .nvr-ptz-ctrl,
   .nvr-ptz-hud .nvr-btn,
   .nvr-ptz-hud .nvr-select,
   .nvr-ptz-hud .nvr-input {
     min-block-size: 44px;
     min-inline-size: 44px;
+  }
+
+  .nvr-btn.nvr-cleanup-btn,
+  .nvr-btn.xs.nvr-cleanup-btn {
+    min-inline-size: 132px;
   }
 
   .nvr-trim-handle {
@@ -5013,6 +5104,8 @@ input[type="range"] {
 
 @media (max-width: 767px) {
   .nvr-btn,
+  .nvr-btn.sm,
+  .nvr-btn.xs,
   .nvr-ptz-ctrl,
   .nvr-ptz-hud .nvr-btn,
   .nvr-ptz-hud .nvr-select,
@@ -5025,9 +5118,15 @@ input[type="range"] {
 
   .nvr-table-region .nvr-btn,
   .nvr-btn.xs {
+    min-block-size: 44px;
     white-space: nowrap;
     flex-shrink: 0;
     padding: 0 10px;
+  }
+
+  .nvr-btn.nvr-cleanup-btn,
+  .nvr-btn.xs.nvr-cleanup-btn {
+    min-inline-size: 132px;
   }
 
   .nvr-trim-handle {

@@ -382,6 +382,248 @@ pub fn cleanup_review_media_artifacts_bytes(
     freed
 }
 
+/// Indexes regular (non-symlink) filenames directly inside `dir` in a single `read_dir` pass
+/// so batch purge operations can skip `O(N * K)` missing-file `lstat` probes on network/HDD storage.
+fn index_regular_filenames_in_dir(dir: &Path) -> Option<std::collections::HashSet<String>> {
+    if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_dir()) {
+        return None;
+    }
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut names = std::collections::HashSet::new();
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_file()
+            && let Ok(name) = entry.file_name().into_string()
+        {
+            names.insert(name);
+        }
+    }
+    Some(names)
+}
+
+fn unlink_indexed_media_file(
+    media_dir: &Path,
+    index_opt: &mut Option<std::collections::HashSet<String>>,
+    subdir_rel: &Path,
+    filename: &str,
+) -> u64 {
+    if let Some(set) = index_opt {
+        if !set.remove(filename) {
+            return 0;
+        }
+        remove_non_symlink_under_media_dir_bytes(media_dir, &subdir_rel.join(filename))
+    } else {
+        0
+    }
+}
+
+/// Batch-removes event snapshots, clips, custom `thumb_path` files, and share artifacts for
+/// `(event_id, camera, thumb_path)` tuples using single-pass directory filename indexes.
+pub fn cleanup_events_batch_media_artifacts_bytes(
+    media_dir: &Path,
+    purged: &[(String, String, Option<String>)],
+) -> u64 {
+    if purged.len() <= 8 {
+        return purged
+            .iter()
+            .map(|(ev_id, cam, thumb_opt)| {
+                cleanup_event_media_artifacts_bytes(
+                    media_dir,
+                    ev_id,
+                    Some(cam.as_str()),
+                    thumb_opt.as_deref(),
+                )
+            })
+            .sum();
+    }
+    if !std::fs::symlink_metadata(media_dir).is_ok_and(|m| m.file_type().is_dir()) {
+        return 0;
+    }
+    let clips_rel = Path::new("clips");
+    let exports_rel = Path::new("exports");
+    let mut clips_idx = index_regular_filenames_in_dir(&media_dir.join(clips_rel));
+    let mut exports_idx = index_regular_filenames_in_dir(&media_dir.join(exports_rel));
+    let mut freed = 0u64;
+
+    for (event_id, cam_raw, thumb_opt) in purged {
+        if is_safe_id(event_id) {
+            for suffix in [
+                ".jpg",
+                "-clean.jpg",
+                ".webp",
+                "-clean.webp",
+                ".mp4",
+                "-clean.mp4",
+            ] {
+                let name = format!("{event_id}{suffix}");
+                freed += unlink_indexed_media_file(media_dir, &mut clips_idx, clips_rel, &name);
+            }
+            let cam = cam_raw.trim();
+            if is_safe_id(cam) {
+                for suffix in [".webp", "-clean.webp", ".jpg", "-clean.jpg", ".mp4"] {
+                    let name = format!("{cam}-{event_id}{suffix}");
+                    freed += unlink_indexed_media_file(media_dir, &mut clips_idx, clips_rel, &name);
+                }
+            }
+            for name in [
+                format!("share_redacted_{event_id}.mp4"),
+                format!(".share_redacted_{event_id}.mask_hash"),
+                format!("share_clip_{event_id}.mp4"),
+                format!("share_redacted_event_{event_id}.mp4"),
+                format!(".share_redacted_event_{event_id}.mask_hash"),
+                format!("share_clip_event_{event_id}.mp4"),
+            ] {
+                freed += unlink_indexed_media_file(media_dir, &mut exports_idx, exports_rel, &name);
+            }
+            for name in [
+                format!("share_redacted_{event_id}.webp"),
+                format!("share_clip_{event_id}.webp"),
+                format!("share_redacted_event_{event_id}.webp"),
+                format!("share_clip_event_{event_id}.webp"),
+            ] {
+                freed += unlink_indexed_media_file(media_dir, &mut clips_idx, clips_rel, &name);
+            }
+        }
+
+        if let Some(tp) = thumb_opt.as_deref() {
+            for rel in resolve_relative_artifact_paths(media_dir, tp) {
+                let mut comps = rel.components();
+                let first = comps.next();
+                let second = comps.next();
+                let third = comps.next();
+                if let (Some(Component::Normal(dir_os)), Some(Component::Normal(file_os)), None) =
+                    (first, second, third)
+                    && let Some(fname) = file_os.to_str()
+                {
+                    if dir_os == "clips" {
+                        freed +=
+                            unlink_indexed_media_file(media_dir, &mut clips_idx, clips_rel, fname);
+                        continue;
+                    } else if dir_os == "exports" {
+                        freed += unlink_indexed_media_file(
+                            media_dir,
+                            &mut exports_idx,
+                            exports_rel,
+                            fname,
+                        );
+                        continue;
+                    }
+                }
+                freed += remove_non_symlink_under_media_dir_bytes(media_dir, &rel);
+            }
+        }
+    }
+    freed
+}
+
+/// Batch-removes review thumbnails, custom `thumb_path` files, and share artifacts for
+/// `(review_id, camera, thumb_path)` tuples using single-pass directory filename indexes.
+pub fn cleanup_reviews_batch_media_artifacts_bytes(
+    media_dir: &Path,
+    purged: &[(String, String, Option<String>)],
+) -> u64 {
+    if purged.len() <= 8 {
+        return purged
+            .iter()
+            .map(|(rev_id, cam, thumb_opt)| {
+                cleanup_review_media_artifacts_bytes(
+                    media_dir,
+                    rev_id,
+                    Some(cam.as_str()),
+                    thumb_opt.as_deref(),
+                )
+            })
+            .sum();
+    }
+    if !std::fs::symlink_metadata(media_dir).is_ok_and(|m| m.file_type().is_dir()) {
+        return 0;
+    }
+    let clips_rel = Path::new("clips");
+    let review_rel = clips_rel.join("review");
+    let exports_rel = Path::new("exports");
+    let mut review_idx = index_regular_filenames_in_dir(&media_dir.join(&review_rel));
+    let mut clips_idx = index_regular_filenames_in_dir(&media_dir.join(clips_rel));
+    let mut exports_idx = index_regular_filenames_in_dir(&media_dir.join(exports_rel));
+    let mut freed = 0u64;
+
+    for (review_id, cam_raw, thumb_opt) in purged {
+        if is_safe_id(review_id) {
+            for name in [
+                format!("thumb-{review_id}.webp"),
+                format!("{review_id}.webp"),
+            ] {
+                freed += unlink_indexed_media_file(media_dir, &mut review_idx, &review_rel, &name);
+            }
+            let cam = cam_raw.trim();
+            if is_safe_id(cam) {
+                let cam_thumb = format!("thumb-{cam}-{review_id}.webp");
+                freed +=
+                    unlink_indexed_media_file(media_dir, &mut review_idx, &review_rel, &cam_thumb);
+            }
+            for name in [
+                format!("review-{review_id}.webp"),
+                format!("{review_id}.webp"),
+                format!("{review_id}.jpg"),
+                format!("share_redacted_{review_id}.webp"),
+                format!("share_clip_{review_id}.webp"),
+                format!("share_redacted_review_{review_id}.webp"),
+                format!("share_clip_review_{review_id}.webp"),
+            ] {
+                freed += unlink_indexed_media_file(media_dir, &mut clips_idx, clips_rel, &name);
+            }
+            for name in [
+                format!("share_redacted_{review_id}.mp4"),
+                format!(".share_redacted_{review_id}.mask_hash"),
+                format!("share_clip_{review_id}.mp4"),
+                format!("share_redacted_review_{review_id}.mp4"),
+                format!(".share_redacted_review_{review_id}.mask_hash"),
+                format!("share_clip_review_{review_id}.mp4"),
+            ] {
+                freed += unlink_indexed_media_file(media_dir, &mut exports_idx, exports_rel, &name);
+            }
+        }
+
+        if let Some(tp) = thumb_opt.as_deref() {
+            for rel in resolve_relative_artifact_paths(media_dir, tp) {
+                let comps: Vec<_> = rel.components().collect();
+                if comps.len() == 3
+                    && let (Component::Normal(c0), Component::Normal(c1), Component::Normal(c2)) =
+                        (comps[0], comps[1], comps[2])
+                    && c0 == "clips"
+                    && c1 == "review"
+                    && let Some(fname) = c2.to_str()
+                {
+                    freed +=
+                        unlink_indexed_media_file(media_dir, &mut review_idx, &review_rel, fname);
+                    continue;
+                }
+                if comps.len() == 2
+                    && let (Component::Normal(c0), Component::Normal(c1)) = (comps[0], comps[1])
+                    && let Some(fname) = c1.to_str()
+                {
+                    if c0 == "clips" {
+                        freed +=
+                            unlink_indexed_media_file(media_dir, &mut clips_idx, clips_rel, fname);
+                        continue;
+                    } else if c0 == "exports" {
+                        freed += unlink_indexed_media_file(
+                            media_dir,
+                            &mut exports_idx,
+                            exports_rel,
+                            fname,
+                        );
+                        continue;
+                    }
+                }
+                freed += remove_non_symlink_under_media_dir_bytes(media_dir, &rel);
+            }
+        }
+    }
+    freed
+}
+
 /// Removes review segment thumbnail and share artifacts for `review_id` under `media_dir`.
 pub fn cleanup_review_media_artifacts(media_dir: &Path, review_id: &str, thumb_path: Option<&str>) {
     let _ = cleanup_review_media_artifacts_bytes(media_dir, review_id, None, thumb_path);
@@ -799,33 +1041,161 @@ pub fn unlink_deleted_recording_rows(
     camera: &str,
     deleted: &[(String, String, f64)],
 ) -> (usize, u64) {
+    if deleted.is_empty() {
+        return (0, 0);
+    }
     let recordings_root = media_dir.join("recordings");
-    let canon_rec_root = std::fs::canonicalize(&recordings_root).ok();
-    let canon_cold_root = cold_dir.and_then(|c| std::fs::canonicalize(c).ok());
+    let canon_rec_root = ensure_path_within_media_dir(media_dir, &recordings_root);
+    let canon_cold_root = cold_dir
+        .filter(|c| std::fs::symlink_metadata(c).is_ok_and(|m| !m.file_type().is_symlink()))
+        .and_then(|c| std::fs::canonicalize(c).ok());
+
+    let mut hot_parent_cache: std::collections::HashMap<PathBuf, Option<PathBuf>> =
+        std::collections::HashMap::new();
+    let mut cold_parent_cache: std::collections::HashMap<PathBuf, Option<PathBuf>> =
+        std::collections::HashMap::new();
+    let mut hot_touched_parents: std::collections::BTreeSet<PathBuf> =
+        std::collections::BTreeSet::new();
+    let mut cold_touched_parents: std::collections::BTreeSet<PathBuf> =
+        std::collections::BTreeSet::new();
+
+    let verify_parent_in_root =
+        |cache: &mut std::collections::HashMap<PathBuf, Option<PathBuf>>,
+         raw_root: &Path,
+         canon_root: &Path,
+         raw_parent: &Path|
+         -> Option<PathBuf> {
+            if let Some(cached) = cache.get(raw_parent) {
+                return cached.clone();
+            }
+            let resolved = if raw_parent == canon_root
+                || (raw_parent == raw_root
+                    && std::fs::symlink_metadata(raw_parent).is_ok_and(|m| m.file_type().is_dir())
+                    && std::fs::canonicalize(raw_parent).ok().as_deref() == Some(canon_root))
+            {
+                std::fs::symlink_metadata(canon_root)
+                    .ok()
+                    .filter(|m| m.file_type().is_dir())
+                    .map(|_| canon_root.to_path_buf())
+            } else {
+                ensure_path_within_canon_media_dir(canon_root, raw_parent).filter(|safe_parent| {
+                    if let Ok(rel) = safe_parent.strip_prefix(canon_root)
+                        && !rel.as_os_str().is_empty()
+                        && !rel.components().any(|c| c.as_os_str() == camera)
+                    {
+                        false
+                    } else {
+                        std::fs::symlink_metadata(safe_parent).is_ok_and(|m| m.file_type().is_dir())
+                    }
+                })
+            };
+            cache.insert(raw_parent.to_path_buf(), resolved.clone());
+            resolved
+        };
+
+    let try_safe_leaf_in_root =
+        |cache: &mut std::collections::HashMap<PathBuf, Option<PathBuf>>,
+         raw_root: &Path,
+         canon_root: &Path,
+         cand: &Path|
+         -> Option<(PathBuf, PathBuf, u64)> {
+            let fname = cand.file_name()?.to_str()?;
+            if fname.is_empty()
+                || fname.starts_with('.')
+                || fname.contains('/')
+                || fname.contains('\\')
+                || !Path::new(fname)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
+            {
+                return None;
+            }
+            let raw_parent = cand.parent()?;
+            let canon_parent = verify_parent_in_root(cache, raw_root, canon_root, raw_parent)?;
+            let safe_leaf = canon_parent.join(fname);
+            let lmeta = std::fs::symlink_metadata(&safe_leaf).ok()?;
+            if !lmeta.file_type().is_file() {
+                return None;
+            }
+            Some((safe_leaf, canon_parent, lmeta.len()))
+        };
+
     let mut freed_bytes: u64 = 0;
     for (_id, db_path, seg_size_mb) in deleted {
-        if let Some(safe_disk_path) =
-            resolve_contained_recording_segment(media_dir, cold_dir, Some(camera), db_path)
-        {
-            if let Ok(meta) = std::fs::metadata(&safe_disk_path) {
-                freed_bytes += meta.len();
-            } else {
-                freed_bytes += (seg_size_mb * 1024.0 * 1024.0).round() as u64;
-            }
-            let _ = std::fs::remove_file(&safe_disk_path);
-            if let Some(ref canon_root) = canon_rec_root
-                && safe_disk_path.starts_with(canon_root)
-            {
-                ninjanvr_media::prune_empty_parent_dirs(&safe_disk_path, canon_root);
-            } else if let Some(ref canon_cold) = canon_cold_root
-                && safe_disk_path.starts_with(canon_cold)
-            {
-                ninjanvr_media::prune_empty_parent_dirs(&safe_disk_path, canon_cold);
-            }
+        let fallback_bytes = if seg_size_mb.is_finite() && *seg_size_mb > 0.0 {
+            (seg_size_mb * 1024.0 * 1024.0).round() as u64
         } else {
-            freed_bytes += (seg_size_mb * 1024.0 * 1024.0).round() as u64;
+            0
+        };
+        if db_path.is_empty()
+            || Path::new(db_path)
+                .components()
+                .any(|c| matches!(c, Component::ParentDir))
+        {
+            freed_bytes = freed_bytes.saturating_add(fallback_bytes);
+            continue;
+        }
+        let disk_path = resolve_recording_disk_path(media_dir, db_path);
+
+        if let Some(ref canon_root) = canon_rec_root
+            && let Some((safe_leaf, canon_parent, file_len)) = try_safe_leaf_in_root(
+                &mut hot_parent_cache,
+                &recordings_root,
+                canon_root,
+                &disk_path,
+            )
+        {
+            freed_bytes = freed_bytes.saturating_add(file_len);
+            let _ = std::fs::remove_file(&safe_leaf);
+            if canon_parent != *canon_root {
+                hot_touched_parents.insert(canon_parent);
+            }
+            continue;
+        }
+
+        let mut unlinked_cold = false;
+        if let (Some(cold_root), Some(canon_cold)) = (cold_dir, canon_cold_root.as_ref()) {
+            let mut cold_candidates = vec![disk_path];
+            if let Some(rel) = ninjanvr_db::strip_media_root(db_path) {
+                let rel_stripped = rel.strip_prefix("recordings/").unwrap_or(rel);
+                cold_candidates.push(cold_root.join(rel_stripped));
+                cold_candidates.push(cold_root.join(rel));
+            }
+            for cand in cold_candidates {
+                if let Some((safe_leaf, canon_parent, file_len)) =
+                    try_safe_leaf_in_root(&mut cold_parent_cache, cold_root, canon_cold, &cand)
+                {
+                    freed_bytes = freed_bytes.saturating_add(file_len);
+                    let _ = std::fs::remove_file(&safe_leaf);
+                    if canon_parent != *canon_cold {
+                        cold_touched_parents.insert(canon_parent);
+                    }
+                    unlinked_cold = true;
+                    break;
+                }
+            }
+        }
+        if !unlinked_cold {
+            freed_bytes = freed_bytes.saturating_add(fallback_bytes);
         }
     }
+
+    if let Some(ref canon_root) = canon_rec_root {
+        let mut dirs_desc: Vec<PathBuf> = hot_touched_parents.into_iter().collect();
+        dirs_desc.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+        for dir in dirs_desc {
+            ninjanvr_media::prune_empty_parent_dirs(&dir.join("_sentinel.mp4"), canon_root);
+        }
+    }
+    if let Some(ref canon_cold) = canon_cold_root {
+        let mut dirs_desc: Vec<PathBuf> = cold_touched_parents.into_iter().collect();
+        dirs_desc.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+        for dir in dirs_desc {
+            ninjanvr_media::prune_empty_parent_dirs(&dir.join("_sentinel.mp4"), canon_cold);
+        }
+    }
+
     (deleted.len(), freed_bytes)
 }
 

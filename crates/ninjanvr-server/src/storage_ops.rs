@@ -392,6 +392,59 @@ fn all_camera_prefix_decompositions<'a>(
     out
 }
 
+/// Evaluates an orphan clip/thumbnail stem against `all_cams_desc` across both `base_stem` and
+/// an optional prefix-stripped variant (e.g. `"review-"` or `"thumb-"`), enforcing that EVERY
+/// matched camera prefix in the union is permitted by `camera_for_work` / `scope` so cameras named
+/// `review-*` or `thumb-*` can never leak across RBAC boundaries or lose active/pinned event clips.
+fn evaluate_orphan_stem_candidate<'a>(
+    base_stem: &'a str,
+    optional_prefix: &str,
+    all_cams_desc: &'a [String],
+    camera_for_work: Option<&str>,
+    scope: &CameraScope,
+) -> Option<Vec<String>> {
+    if base_stem.is_empty() {
+        return None;
+    }
+    let decomps_base = all_camera_prefix_decompositions(base_stem, all_cams_desc);
+    let after_pfx = if !optional_prefix.is_empty() {
+        base_stem
+            .strip_prefix(optional_prefix)
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+    let decomps_stripped = after_pfx
+        .map(|s| all_camera_prefix_decompositions(s, all_cams_desc))
+        .unwrap_or_default();
+
+    let mut matched_cams: BTreeSet<&str> = BTreeSet::new();
+    for (cp, _) in decomps_base.iter().chain(decomps_stripped.iter()) {
+        matched_cams.insert(*cp);
+    }
+
+    let permitted = if matched_cams.is_empty() {
+        camera_for_work.is_none() && !scope.is_restricted()
+    } else if let Some(only_cam) = camera_for_work {
+        matched_cams.len() == 1 && matched_cams.contains(only_cam)
+    } else {
+        matched_cams.iter().all(|cp| scope.allows(cp))
+    };
+    if !permitted {
+        return None;
+    }
+
+    let mut cand_ids_set: BTreeSet<String> = BTreeSet::new();
+    cand_ids_set.insert(base_stem.to_string());
+    if let Some(stripped) = after_pfx {
+        cand_ids_set.insert(stripped.to_string());
+    }
+    for (_cp, id_part) in decomps_base.into_iter().chain(decomps_stripped) {
+        cand_ids_set.insert(id_part.to_string());
+    }
+    Some(cand_ids_set.into_iter().collect())
+}
+
 fn ensure_orphan_camera_dto<'a>(
     cam_dtos: &'a mut BTreeMap<String, CameraGranularStorageDto>,
     cam_name: &str,
@@ -1293,62 +1346,79 @@ pub async fn api_storage_cleanup(
                         now,
                         include_pinned,
                     )?;
-                    deleted_items = purged.len() as u64;
+                    let purged_reviews = if prune_retained_segments {
+                        state_work.db.purge_reviews_filtered(
+                            &scope,
+                            camera_for_work.as_deref(),
+                            before_ts,
+                            now,
+                            include_pinned,
+                        )?
+                    } else {
+                        Vec::new()
+                    };
+                    deleted_items = (purged.len() + purged_reviews.len()) as u64;
                     let mut affected_cams: BTreeSet<String> = BTreeSet::new();
-                    for (ev_id, cam, thumb_opt) in &purged {
+                    for (_ev_id, cam, _thumb_opt) in &purged {
                         affected_cams.insert(cam.clone());
-                        freed_bytes += media_lifecycle::cleanup_event_media_artifacts_bytes(
+                    }
+                    for (_rev_id, cam, _thumb_opt) in &purged_reviews {
+                        affected_cams.insert(cam.clone());
+                    }
+                    freed_bytes += media_lifecycle::cleanup_events_batch_media_artifacts_bytes(
+                        &state_work.media_dir,
+                        &purged,
+                    );
+                    if !purged_reviews.is_empty() {
+                        freed_bytes += media_lifecycle::cleanup_reviews_batch_media_artifacts_bytes(
                             &state_work.media_dir,
-                            ev_id,
-                            Some(cam.as_str()),
-                            thumb_opt.as_deref(),
+                            &purged_reviews,
                         );
                     }
                     purge_revoked_share_credits(&state_work);
 
-                    // Sweep genuinely orphaned event files in top-level `clips/` using exact DB primary-key
-                    // and `thumb_path` verification (zero truncation, multi-prefix camera disambiguation).
+                    // Sweep genuinely orphaned event files in top-level `clips/` (and `clips/review/`
+                    // when `prune_retained_segments` is enabled) using exact DB primary-key and
+                    // `thumb_path` verification (zero truncation, multi-prefix camera disambiguation).
+                    let db_cams: BTreeSet<String> = state_work
+                        .db
+                        .distinct_storage_cameras()
+                        .unwrap_or_default();
+                    let mut all_cams_desc: Vec<String> = policies
+                        .keys()
+                        .chain(db_cams.iter())
+                        .cloned()
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect();
+                    all_cams_desc.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+
                     let clips_dir = state_work.media_dir.join("clips");
                     let grace_cutoff = before_ts.unwrap_or(now - 60.0).min(now - 60.0);
                     if std::fs::symlink_metadata(&clips_dir).is_ok_and(|m| m.file_type().is_dir())
                         && let Ok(entries) = std::fs::read_dir(&clips_dir)
                     {
-                        let db_cams: BTreeSet<String> = state_work
-                            .db
-                            .query_storage_db_snapshot(&HashMap::new(), now, now)
-                            .map(|s| s.cameras.keys().cloned().collect())
-                            .unwrap_or_default();
-                        let mut all_cams_desc: Vec<String> = policies
-                            .keys()
-                            .chain(db_cams.iter())
-                            .cloned()
-                            .collect::<BTreeSet<_>>()
-                            .into_iter()
-                            .collect();
-                        all_cams_desc.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-
                         let mut candidates: Vec<(String, Vec<String>)> = Vec::new();
                         for entry in entries.flatten().take(MAX_SCAN_ENTRIES_PER_DIR) {
-                            let p = entry.path();
-                            let Ok(meta) = std::fs::symlink_metadata(&p) else {
+                            let Ok(ft) = entry.file_type() else {
                                 continue;
                             };
-                            if !meta.file_type().is_file() {
+                            if !ft.is_file() {
                                 continue;
                             }
-                            let Some(fname) = p.file_name().and_then(|n| n.to_str()) else {
+                            let Ok(fname) = entry.file_name().into_string() else {
                                 continue;
                             };
                             if fname.starts_with('.')
                                 || fname.starts_with("latest_")
                                 || fname.starts_with("share_clip_")
                                 || fname.starts_with("share_redacted_")
-                                || fname.starts_with("review-")
-                                || !is_safe_id(fname)
+                                || (!prune_retained_segments && fname.starts_with("review-"))
+                                || !is_safe_id(&fname)
                             {
                                 continue;
                             }
-                            let ext_ok = Path::new(fname)
+                            let ext_ok = Path::new(&fname)
                                 .extension()
                                 .and_then(|e| e.to_str())
                                 .is_some_and(|e| {
@@ -1360,41 +1430,38 @@ pub async fn api_storage_cleanup(
                             if !ext_ok {
                                 continue;
                             }
-                            let mtime_ok = meta
-                                .modified()
+
+                            let stem_raw = Path::new(&fname)
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("");
+                            let stem_base = stem_raw.strip_suffix("-clean").unwrap_or(stem_raw);
+                            let opt_pfx = if prune_retained_segments {
+                                "review-"
+                            } else {
+                                ""
+                            };
+                            let Some(cand_ids) = evaluate_orphan_stem_candidate(
+                                stem_base,
+                                opt_pfx,
+                                &all_cams_desc,
+                                camera_for_work.as_deref(),
+                                &scope,
+                            ) else {
+                                continue;
+                            };
+
+                            let mtime_ok = entry
+                                .metadata()
                                 .ok()
+                                .and_then(|m| m.modified().ok())
                                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                                 .is_some_and(|d| d.as_secs_f64() < grace_cutoff);
                             if !mtime_ok {
                                 continue;
                             }
 
-                            let stem_raw = Path::new(fname)
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("");
-                            let stem_clean = stem_raw.strip_suffix("-clean").unwrap_or(stem_raw);
-                            let decomps =
-                                all_camera_prefix_decompositions(stem_clean, &all_cams_desc);
-
-                            // Require every matching camera prefix to be permitted by `camera_for_work` / `scope`
-                            // so `cam` vs `cam-north` ambiguity can never delete across camera boundaries.
-                            let permitted = if decomps.is_empty() {
-                                camera_for_work.is_none() && !scope.is_restricted()
-                            } else if let Some(ref only_cam) = camera_for_work {
-                                decomps.len() == 1 && decomps[0].0 == only_cam.as_str()
-                            } else {
-                                decomps.iter().all(|(cp, _)| scope.allows(cp))
-                            };
-                            if !permitted {
-                                continue;
-                            }
-
-                            let mut cand_ids = vec![stem_clean.to_string()];
-                            for (_cp, id_part) in decomps {
-                                cand_ids.push(id_part.to_string());
-                            }
-                            candidates.push((fname.to_string(), cand_ids));
+                            candidates.push((fname, cand_ids));
                         }
 
                         if !candidates.is_empty()
@@ -1413,10 +1480,85 @@ pub async fn api_storage_cleanup(
                     }
 
                     if prune_retained_segments {
+                        let review_dir = clips_dir.join("review");
+                        if std::fs::symlink_metadata(&clips_dir)
+                            .is_ok_and(|m| m.file_type().is_dir())
+                            && std::fs::symlink_metadata(&review_dir)
+                                .is_ok_and(|m| m.file_type().is_dir())
+                            && let Ok(entries) = std::fs::read_dir(&review_dir)
+                        {
+                            let mut rev_candidates: Vec<(String, Vec<String>)> = Vec::new();
+                            for entry in entries.flatten().take(MAX_SCAN_ENTRIES_PER_DIR) {
+                                let Ok(ft) = entry.file_type() else {
+                                    continue;
+                                };
+                                if !ft.is_file() {
+                                    continue;
+                                }
+                                let Ok(fname) = entry.file_name().into_string() else {
+                                    continue;
+                                };
+                                if fname.starts_with('.') || !is_safe_id(&fname) {
+                                    continue;
+                                }
+                                let ext_ok = Path::new(&fname)
+                                    .extension()
+                                    .and_then(|e| e.to_str())
+                                    .is_some_and(|e| {
+                                        matches!(
+                                            e.to_ascii_lowercase().as_str(),
+                                            "jpg" | "jpeg" | "webp"
+                                        )
+                                    });
+                                if !ext_ok {
+                                    continue;
+                                }
+                                let stem = Path::new(&fname)
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("");
+                                let Some(cand_ids) = evaluate_orphan_stem_candidate(
+                                    stem,
+                                    "thumb-",
+                                    &all_cams_desc,
+                                    camera_for_work.as_deref(),
+                                    &scope,
+                                ) else {
+                                    continue;
+                                };
+                                let mtime_ok = entry
+                                    .metadata()
+                                    .ok()
+                                    .and_then(|m| m.modified().ok())
+                                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                                    .is_some_and(|d| d.as_secs_f64() < grace_cutoff);
+                                if !mtime_ok {
+                                    continue;
+                                }
+                                rev_candidates.push((fname, cand_ids));
+                            }
+                            if !rev_candidates.is_empty()
+                                && let Ok(unreferenced_fnames) = state_work
+                                    .db
+                                    .filter_unreferenced_clip_candidates(&rev_candidates)
+                            {
+                                for fname in unreferenced_fnames {
+                                    let rel = Path::new("clips").join("review").join(&fname);
+                                    freed_bytes +=
+                                        media_lifecycle::remove_non_symlink_under_media_dir_bytes(
+                                            &state_work.media_dir,
+                                            &rel,
+                                        );
+                                }
+                            }
+                        }
+
                         let cams_to_check: Vec<String> = if let Some(ref c) = camera_for_work {
                             vec![c.clone()]
                         } else {
-                            affected_cams.into_iter().collect()
+                            let mut all_db = db_cams;
+                            all_db.extend(affected_cams);
+                            target_cameras(all_db)
                         };
                         for cam in cams_to_check {
                             if !scope.allows(&cam) {
@@ -1478,25 +1620,21 @@ pub async fn api_storage_cleanup(
                         include_pinned,
                     )?;
                     deleted_items = purged.len() as u64;
-                    for (rev_id, cam, thumb_opt) in &purged {
-                        freed_bytes += media_lifecycle::cleanup_review_media_artifacts_bytes(
-                            &state_work.media_dir,
-                            rev_id,
-                            Some(cam.as_str()),
-                            thumb_opt.as_deref(),
-                        );
-                    }
+                    freed_bytes += media_lifecycle::cleanup_reviews_batch_media_artifacts_bytes(
+                        &state_work.media_dir,
+                        &purged,
+                    );
                     purge_revoked_share_credits(&state_work);
                     let _ = state_work.db.checkpoint_wal_truncate();
                     let wal_after = measure_wal_bytes(state_work.db.path());
                     freed_bytes += wal_before.saturating_sub(wal_after);
                 }
                 CleanupTarget::ExcessRecordings | CleanupTarget::Recordings => {
-                    let db_snap = state_work
+                    let db_cams = state_work
                         .db
-                        .query_storage_db_snapshot(&HashMap::new(), now, now)
+                        .distinct_storage_cameras()
                         .unwrap_or_default();
-                    let cams = target_cameras(db_snap.cameras.keys().cloned().collect());
+                    let cams = target_cameras(db_cams);
                     for cam in cams {
                         let pol = policies.get(&cam);
                         let cont_days = pol.map_or(default_cont_days, |p| p.continuous_days);
