@@ -68,7 +68,7 @@ rand = "0.10"
 bytes = "1.12"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"] }
-nix = { version = "0.31", features = ["fs", "process", "signal"] }
+nix = { version = "0.32", features = ["fs", "process", "signal"] }
 symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4", "pcm"] }
 
 [profile.release]
