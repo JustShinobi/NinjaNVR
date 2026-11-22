@@ -140,7 +140,9 @@
 [data-high-contrast="true"] .nvr-btn.danger-subtle,
 [data-high-contrast="true"] .nvr-btn.danger-armed,
 [data-high-contrast="true"] .nvr-btn.nvr-cleanup-btn,
-[data-high-contrast="true"] .nvr-cleanup-banner {
+[data-high-contrast="true"] .nvr-cleanup-pill,
+[data-high-contrast="true"] .nvr-cleanup-banner,
+[data-high-contrast="true"] .nvr-cleanup-progress-track {
   border-width: 1.5px;
 }
 
@@ -1737,6 +1739,22 @@ dialog::backdrop {
   grid-area: 1 / 1;
 }
 
+.nvr-cleanup-banner-slot {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.nvr-cleanup-banner-slot > .nvr-cleanup-banner {
+  grid-area: 1 / 1;
+  align-content: center;
+}
+
+.nvr-cleanup-banner-sizer {
+  visibility: hidden;
+  pointer-events: none;
+  user-select: none;
+}
+
 .nvr-cleanup-banner {
   display: flex;
   align-items: center;
@@ -1779,6 +1797,184 @@ dialog::backdrop {
   background: var(--signal-alert-tint);
   border-color: var(--signal-alert-border);
   color: var(--signal-alert-text);
+}
+
+.nvr-cleanup-banner.is-cancelled {
+  background: var(--signal-motion-tint);
+  border-color: var(--signal-motion-border);
+  color: var(--signal-motion-text);
+}
+
+.nvr-cleanup-banner.is-progress {
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 12px;
+}
+
+.nvr-cleanup-progress-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.nvr-cleanup-progress-title {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  color: var(--text-primary);
+}
+
+.nvr-cleanup-progress-phase {
+  color: var(--signal-accent-text);
+}
+
+.nvr-cleanup-progress-track {
+  position: relative;
+  inline-size: 100%;
+  block-size: 8px;
+  background: var(--bg-canvas);
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.nvr-cleanup-progress-fill {
+  inline-size: 100%;
+  block-size: 100%;
+  background: var(--signal-accent);
+  border-radius: 2px;
+  transform-origin: left center;
+  transform: scaleX(0);
+  transition: transform 180ms ease-out;
+  will-change: transform;
+}
+
+.nvr-cleanup-progress-track.is-indeterminate .nvr-cleanup-progress-fill {
+  inline-size: 35%;
+  transform: none;
+  animation: nvr-cleanup-indeterminate 1.4s ease-in-out infinite;
+}
+
+.nvr-cleanup-progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.nvr-cleanup-progress-stats {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+}
+
+.nvr-cleanup-progress-stats strong {
+  color: var(--text-primary);
+}
+
+.nvr-cleanup-progress-navhint {
+  color: var(--text-muted);
+}
+
+.nvr-btn.nvr-cleanup-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px;
+  border-color: var(--signal-accent-border);
+  background: var(--signal-accent-tint);
+  color: var(--signal-accent-text);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.nvr-btn.nvr-cleanup-pill:hover:not(:disabled) {
+  border-color: var(--signal-accent);
+  background: var(--bg-subcard);
+}
+
+.nvr-cleanup-pill-ext {
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+@keyframes nvr-spin-360 {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes nvr-cleanup-indeterminate {
+  0% {
+    transform: translateX(-85%);
+  }
+  50% {
+    transform: translateX(185%);
+  }
+  100% {
+    transform: translateX(-85%);
+  }
+}
+
+.nvr-spin {
+  animation: nvr-spin-360 1.1s linear infinite;
+  flex-shrink: 0;
+}
+
+.nvr-toast {
+  position: fixed;
+  bottom: 14px;
+  right: 16px;
+  max-inline-size: min(460px, calc(100vw - 32px));
+  z-index: 9999;
+  background: var(--bg-elevated);
+  border: 1px solid var(--signal-accent);
+  color: var(--text-primary);
+  padding: 8px 14px;
+  border-radius: 3px;
+  font-size: var(--text-sm);
+  box-shadow: var(--shadow-card);
+}
+
+@media (max-width: 1680px) {
+  .nvr-header .nvr-cleanup-pill-ext,
+  .nvr-header:has([data-testid="topbar-cleanup-pill"]) .nvr-telemetry-perf {
+    display: none;
+  }
+}
+
+@media (max-width: 1480px) {
+  .nvr-header:has([data-testid="topbar-cleanup-pill"]) .nvr-telemetry-ext {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nvr-spin {
+    animation: none;
+  }
+  .nvr-cleanup-progress-track.is-indeterminate .nvr-cleanup-progress-fill {
+    inline-size: 100%;
+    animation: none;
+    transform: none;
+    opacity: 0.38;
+  }
+  .nvr-cleanup-progress-fill {
+    transition: none;
+  }
 }
 
 .nvr-cleanup-banner-actions {
@@ -4327,6 +4523,11 @@ input[type="range"] {
 
 /* Touch devices: >= 44x44px coarse-pointer targets across buttons, PTZ HUD, and timeline handles */
 @media (pointer: coarse) {
+  .nvr-header {
+    height: auto;
+    min-height: 48px;
+  }
+
   .nvr-tile-icon {
     width: 44px;
     height: 44px;
@@ -4390,10 +4591,19 @@ input[type="range"] {
   .nvr-header .nvr-nav,
   .nvr-header .nvr-brand-version,
   .nvr-header .nvr-telemetry-pill,
+  .nvr-header .nvr-cleanup-pill-ext,
+  .nvr-header:has([data-testid="topbar-cleanup-pill"]) .nvr-badge.alert,
   .nvr-header .nvr-header-aux,
   .nvr-header [data-testid="topbar-logout"],
   .nvr-persistent-stage .nvr-timeline-reticle {
     display: none !important;
+  }
+
+  .nvr-toast {
+    left: 12px;
+    right: 12px;
+    bottom: calc(72px + env(safe-area-inset-bottom, 0px));
+    max-inline-size: none;
   }
 
   .nvr-compact-cols {
@@ -4488,9 +4698,11 @@ input[type="range"] {
   display: none;
   align-items: center;
   gap: 8px;
-  height: 36px;
+  min-block-size: 44px;
+  min-inline-size: 44px;
+  height: auto;
   padding: 0 12px;
-  border-radius: 18px;
+  border-radius: 22px;
   border: 1px solid var(--border-strong);
   background: var(--bg-subcard);
   color: var(--text-primary);

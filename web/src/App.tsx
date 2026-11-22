@@ -30,11 +30,23 @@ import {
   RecordingDaySummary,
   RecordingSegment,
   ReviewItem,
+  StorageCleanupJobSnapshot,
 } from "./types/nvr";
 import {
   parseExportJobPayload,
   reconcileExportJobList,
 } from "./utils/exportClipFlow";
+import {
+  formatCleanupEta,
+  formatCleanupTargetLabel,
+  formatCleanupTerminalSummary,
+  formatStorageBytes,
+  formatStorageShortBytes,
+  isActiveCleanupJobStatus,
+  isTerminalCleanupJobStatus,
+  parseCleanupJobPayload,
+  reconcileCleanupJobsResponse,
+} from "./utils/storageCleanupFlow";
 import {
   WorkspaceTab,
   applyThemeToDocument,
@@ -313,6 +325,8 @@ export const App: React.FC = () => {
   const setCameraActivity = useNvrStore((s) => s.setCameraActivity);
   const simulatedFleetCount = useNvrStore((s) => s.simulatedFleetCount);
   const setSimulatedFleetCount = useNvrStore((s) => s.setSimulatedFleetCount);
+  const cleanupJob = useNvrStore((s) => s.cleanupJob);
+  const setCleanupJob = useNvrStore((s) => s.setCleanupJob);
   const lastDeletedFaceProfile = useNvrStore((s) => s.lastDeletedFaceProfile);
   const subLabelsRefreshTick = useNvrStore((s) => s.subLabelsRefreshTick);
 
@@ -446,6 +460,9 @@ export const App: React.FC = () => {
   const [logPaused, setLogPaused] = useState(false);
 
   const toastTimerRef = useRef<number | null>(null);
+  const notifiedCleanupTerminalRef = useRef<Map<string, string>>(new Map());
+  const localeRef = useRef(locale);
+  localeRef.current = locale;
 
   const notify = useCallback((msg: string) => {
     setToastMsg(msg);
@@ -734,6 +751,56 @@ export const App: React.FC = () => {
           if (nextRole !== "admin" && (curTab === "zones" || curTab === "system")) {
             switchTab("live", { replace: true });
           }
+          if (nextRole === "admin") {
+            fetch("/api/jobs/cleanup", { credentials: "include" })
+              .then((r) => (r.ok ? r.json() : null))
+              .then((jobsRaw: unknown) => {
+                if (
+                  mySeq === coreFetchSeqRef.current &&
+                  !manualLogoutRef.current &&
+                  Array.isArray(jobsRaw)
+                ) {
+                  const parsed = jobsRaw
+                    .map(parseCleanupJobPayload)
+                    .filter((j): j is StorageCleanupJobSnapshot => j !== null);
+                  const curJob = useNvrStore.getState().cleanupJob;
+                  const nextJob = reconcileCleanupJobsResponse(curJob, parsed);
+                  if (nextJob !== curJob) {
+                    setCleanupJob(nextJob);
+                    if (
+                      nextJob &&
+                      isTerminalCleanupJobStatus(nextJob.status) &&
+                      notifiedCleanupTerminalRef.current.get(nextJob.id) !==
+                        nextJob.status
+                    ) {
+                      notifiedCleanupTerminalRef.current.set(
+                        nextJob.id,
+                        nextJob.status
+                      );
+                      notify(
+                        formatCleanupTerminalSummary(
+                          nextJob,
+                          formatStorageBytes(nextJob.freed_bytes),
+                          localeRef.current === "pt"
+                        )
+                      );
+                      archiveMetadataCache.clear();
+                      fetch(buildEventsFeedUrl(reviewDateFilter), {
+                        credentials: "include",
+                      })
+                        .then((r) => (r.ok ? r.json() : null))
+                        .then((arr: EventItem[] | null) => {
+                          if (Array.isArray(arr)) {
+                            setEvents(arr.slice(0, MAX_LIVE_EVENTS));
+                          }
+                        })
+                        .catch(() => {});
+                    }
+                  }
+                }
+              })
+              .catch(() => {});
+          }
         }
         if (profJson && typeof profJson.active_profile === "string") {
           const p = profJson.active_profile.trim().toLowerCase();
@@ -758,6 +825,8 @@ export const App: React.FC = () => {
     return run;
   }, [
     reviewDateFilter,
+    notify,
+    setCleanupJob,
     setConfig,
     setCoreDataError,
     setSelectedCamera,
@@ -770,6 +839,23 @@ export const App: React.FC = () => {
 
   const fetchCoreDataRef = useRef(fetchCoreData);
   fetchCoreDataRef.current = fetchCoreData;
+  const reconcileAfterStorageMutated = useCallback(() => {
+    archiveMetadataCache.clear();
+    void fetchCoreData();
+    fetch(buildEventsFeedUrl(reviewDateFilter), {
+      credentials: "include",
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((arr: EventItem[] | null) => {
+        if (Array.isArray(arr)) {
+          setEvents(arr.slice(0, MAX_LIVE_EVENTS));
+        }
+      })
+      .catch(() => {});
+  }, [archiveMetadataCache, fetchCoreData, reviewDateFilter]);
+
+  const reconcileAfterStorageMutatedRef = useRef(reconcileAfterStorageMutated);
+  reconcileAfterStorageMutatedRef.current = reconcileAfterStorageMutated;
 
   // Zero-401 session preflight via public GET /api/auth/providers before hydrating protected endpoints
   useEffect(() => {
@@ -1067,6 +1153,38 @@ export const App: React.FC = () => {
                 );
               }
             }
+          } else if (topic === "storage_cleanup" && msg.payload) {
+            const parsed =
+              typeof msg.payload === "string"
+                ? JSON.parse(msg.payload)
+                : msg.payload;
+            const job = parseCleanupJobPayload(parsed);
+            if (job) {
+              setCleanupJob(job);
+              const prevSeen = notifiedCleanupTerminalRef.current.get(job.id);
+              if (
+                isTerminalCleanupJobStatus(job.status) &&
+                prevSeen !== job.status
+              ) {
+                notifiedCleanupTerminalRef.current.set(job.id, job.status);
+                if (notifiedCleanupTerminalRef.current.size > 128) {
+                  const firstKey = notifiedCleanupTerminalRef.current
+                    .keys()
+                    .next().value;
+                  if (firstKey) {
+                    notifiedCleanupTerminalRef.current.delete(firstKey);
+                  }
+                }
+                notify(
+                  formatCleanupTerminalSummary(
+                    job,
+                    formatStorageBytes(job.freed_bytes),
+                    localeRef.current === "pt"
+                  )
+                );
+                reconcileAfterStorageMutatedRef.current();
+              }
+            }
           }
         } catch {
           // ignore malformed ws frame
@@ -1108,6 +1226,7 @@ export const App: React.FC = () => {
     appendStatsSample,
     notify,
     setCameraActivity,
+    setCleanupJob,
     setConfig,
     setSecurityProfile,
     setWsOnline,
@@ -1116,6 +1235,57 @@ export const App: React.FC = () => {
     t.common.exportReadyNamedToast,
     workbenchSession,
   ]);
+
+  // Fallback poll for active cleanup job ONLY when `/ws` is disconnected so completion is never missed
+  const isCleanupJobRunning = Boolean(
+    cleanupJob && isActiveCleanupJobStatus(cleanupJob.status)
+  );
+  useEffect(() => {
+    if (
+      authNeeded ||
+      userRole !== "admin" ||
+      !isCleanupJobRunning ||
+      wsOnline
+    ) {
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      fetch("/api/jobs/cleanup", { credentials: "include" })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((jobsRaw: unknown) => {
+          if (cancelled || !Array.isArray(jobsRaw)) return;
+          const parsed = jobsRaw
+            .map(parseCleanupJobPayload)
+            .filter((j): j is StorageCleanupJobSnapshot => j !== null);
+          const cur = useNvrStore.getState().cleanupJob;
+          const next = reconcileCleanupJobsResponse(cur, parsed);
+          if (next !== cur) {
+            setCleanupJob(next);
+            if (
+              next &&
+              isTerminalCleanupJobStatus(next.status) &&
+              notifiedCleanupTerminalRef.current.get(next.id) !== next.status
+            ) {
+              notifiedCleanupTerminalRef.current.set(next.id, next.status);
+              notify(
+                formatCleanupTerminalSummary(
+                  next,
+                  formatStorageBytes(next.freed_bytes),
+                  localeRef.current === "pt"
+                )
+              );
+              reconcileAfterStorageMutatedRef.current();
+            }
+          }
+        })
+        .catch(() => {});
+    }, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [authNeeded, isCleanupJobRunning, notify, setCleanupJob, userRole, wsOnline]);
 
   // Fetch multi-camera timezone-bucketed calendar days summary so Review/Explore All-Cameras calendar is never starved
   useEffect(() => {
@@ -2059,6 +2229,7 @@ export const App: React.FC = () => {
     setStats(null);
     setStatsHistory([]);
     setCameraActivity({});
+    setCleanupJob(null);
     setCoreDataError(null);
     setFocusSegments([]);
     setGlobalDaysSummary([]);
@@ -2279,6 +2450,71 @@ export const App: React.FC = () => {
               );
             })}
           </div>
+          {userRole === "admin" &&
+            cleanupJob &&
+            isActiveCleanupJobStatus(cleanupJob.status) && (() => {
+              const pctRounded = Math.min(
+                99,
+                Math.max(1, Math.round(cleanupJob.progress_pct))
+              );
+              const etaText = formatCleanupEta(cleanupJob.eta_secs);
+              const freedShort =
+                cleanupJob.freed_bytes > 0
+                  ? formatStorageShortBytes(cleanupJob.freed_bytes)
+                  : null;
+              const targetTitle = formatCleanupTargetLabel(
+                cleanupJob.target,
+                cleanupJob.camera,
+                locale === "pt"
+              );
+              const pillPrimaryText =
+                cleanupJob.status === "cancelling"
+                  ? locale === "pt"
+                    ? "PARANDO"
+                    : "STOPPING"
+                  : locale === "pt"
+                  ? `LIMPANDO ${pctRounded}%`
+                  : `CLEANING ${pctRounded}%`;
+              const pillExtText =
+                freedShort || etaText
+                  ? `${freedShort ? `· ${freedShort}` : ""}${
+                      etaText ? ` · ${etaText}` : ""
+                    }`.trim()
+                  : "";
+              const pillAriaLabel = `${pillPrimaryText}${
+                pillExtText ? ` ${pillExtText}` : ""
+              } — ${targetTitle} (${
+                locale === "pt" ? "abrir Sistema" : "open System"
+              })`;
+              return (
+                <button
+                  type="button"
+                  data-testid="topbar-cleanup-pill"
+                  className="nvr-btn sm mono nvr-cleanup-pill"
+                  aria-label={pillAriaLabel}
+                  title={
+                    locale === "pt"
+                      ? `${targetTitle} em andamento (${pctRounded}%${
+                          etaText ? ` · ETA ${etaText}` : ""
+                        }) — clique para abrir Sistema`
+                      : `${targetTitle} in progress (${pctRounded}%${
+                          etaText ? ` · ETA ${etaText}` : ""
+                        }) — click to open System`
+                  }
+                  onClick={() => switchTab("system")}
+                >
+                  <RefreshCw
+                    size={11}
+                    className="nvr-spin"
+                    aria-hidden="true"
+                  />
+                  <span>{pillPrimaryText}</span>
+                  {pillExtText && (
+                    <span className="nvr-cleanup-pill-ext">{pillExtText}</span>
+                  )}
+                </button>
+              );
+            })()}
           {stats?.service?.storage_degraded && (
             <button
               type="button"
@@ -2458,22 +2694,9 @@ export const App: React.FC = () => {
 
       {toastMsg && (
         <div
-          className="mono"
+          className="nvr-toast mono"
           role="status"
           aria-live="polite"
-          style={{
-            position: "fixed",
-            bottom: 14,
-            right: 16,
-            zIndex: 9999,
-            background: "var(--bg-elevated)",
-            border: "1px solid var(--signal-accent)",
-            color: "var(--text-primary)",
-            padding: "8px 14px",
-            borderRadius: 3,
-            fontSize: "var(--text-sm)",
-            boxShadow: "0 8px 24px rgba(0,0,0,0.65)",
-          }}
         >
           {toastMsg}
         </div>
@@ -2711,20 +2934,7 @@ export const App: React.FC = () => {
                     logPaused={logPaused}
                     setLogPaused={setLogPaused}
                     notify={notify}
-                    onStorageMutated={() => {
-                      archiveMetadataCache.clear();
-                      void fetchCoreData();
-                      fetch(buildEventsFeedUrl(reviewDateFilter), {
-                        credentials: "include",
-                      })
-                        .then((r) => (r.ok ? r.json() : null))
-                        .then((arr: EventItem[] | null) => {
-                          if (Array.isArray(arr)) {
-                            setEvents(arr.slice(0, MAX_LIVE_EVENTS));
-                          }
-                        })
-                        .catch(() => {});
-                    }}
+                    onStorageMutated={reconcileAfterStorageMutated}
                   />
                 )}
               </Suspense>

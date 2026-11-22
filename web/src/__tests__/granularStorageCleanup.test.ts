@@ -1,15 +1,31 @@
 import { describe, expect, test } from "bun:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { NinjaStatsResponse, StorageBreakdownResponse } from "../types/nvr";
+import type {
+  NinjaStatsResponse,
+  StorageBreakdownResponse,
+  StorageCleanupJobSnapshot,
+} from "../types/nvr";
+import { useNvrStore } from "../store/useNvrStore";
+import {
+  formatCleanupEta,
+  formatCleanupPhaseLabel,
+  formatCleanupTargetLabel,
+  formatCleanupTerminalSummary,
+  parseCleanupJobPayload,
+  reconcileCleanupJobsResponse,
+  resolveCleanupSrMilestone,
+} from "../utils/storageCleanupFlow";
 import {
   SystemWorkspace,
   buildCameraGranularRows,
+  cancelStorageCleanupJobFlow,
   computeStorageStackSegments,
   formatRetentionSpan,
   formatStorageBytes,
   formatStorageShortBytes,
   runStorageCleanupFlow,
+  startStorageCleanupJobFlow,
   type CleanupStatusNotice,
 } from "../views/SystemWorkspace";
 
@@ -422,5 +438,275 @@ describe("Granular storage breakdown & cleanup helpers and SystemWorkspace UI", 
     expect(refreshCount).toBe(3);
     expect(delayedCount).toBe(2);
     expect(toasts.length).toBe(3);
+  });
+
+  test("async storage cleanup job parsing, store reconciliation, progress/ETA/Cancel UI, and cancellation flow work end-to-end", async () => {
+    // 1. Payload parser & ETA / milestone helpers
+    expect(parseCleanupJobPayload(null)).toBeNull();
+    expect(parseCleanupJobPayload({ id: "", target: "events", status: "running" })).toBeNull();
+    expect(parseCleanupJobPayload({ id: "cln_1", target: "bogus", status: "running" })).toBeNull();
+
+    const runningJob = parseCleanupJobPayload({
+      id: "cln_1700000_1",
+      target: "events",
+      camera: "escritorio",
+      status: "running",
+      phase: "pruning_segments",
+      progress_pct: 62.4,
+      processed_units: 1850,
+      total_units: 3000,
+      deleted_items: 940,
+      deleted_segments: 910,
+      freed_bytes: 24.5 * 1024 * 1024 * 1024,
+      elapsed_ms: 14_200,
+      eta_secs: 75,
+      rate_per_sec: 130.2,
+      cancellable: true,
+      created_at: 1_750_000_000,
+      updated_at: 1_750_000_014,
+      message: "Unlinking MP4 segments [ESCRITORIO]...",
+      error: null,
+    });
+    expect(runningJob).not.toBeNull();
+    expect(runningJob?.cancellable).toBe(true);
+    expect(formatCleanupEta(75)).toBe("~1m 15s");
+    expect(formatCleanupEta(18)).toBe("~18s");
+    expect(formatCleanupEta(null)).toBeNull();
+    expect(formatCleanupTargetLabel("events", "escritorio", false)).toBe(
+      "Clear Events [ESCRITORIO]"
+    );
+    expect(formatCleanupPhaseLabel("pruning_segments", "running", false)).toContain(
+      "MP4"
+    );
+    expect(resolveCleanupSrMilestone(runningJob, false)).toContain("50%");
+
+    // 2. reconcileCleanupJobsResponse adopts active jobs on reload, updates tracked active->terminal, and ignores stale completed jobs on fresh load
+    const oldCompleted: StorageCleanupJobSnapshot = {
+      ...runningJob!,
+      id: "cln_old",
+      status: "completed",
+      phase: "done",
+      progress_pct: 100,
+      cancellable: false,
+      eta_secs: null,
+    };
+    expect(reconcileCleanupJobsResponse(null, [oldCompleted])).toBeNull();
+    expect(reconcileCleanupJobsResponse(null, [runningJob!, oldCompleted])?.id).toBe(
+      "cln_1700000_1"
+    );
+    const finishedSameId: StorageCleanupJobSnapshot = {
+      ...runningJob!,
+      status: "completed",
+      phase: "done",
+      progress_pct: 100,
+      cancellable: false,
+      eta_secs: null,
+    };
+    expect(
+      reconcileCleanupJobsResponse(runningJob!, [finishedSameId])?.status
+    ).toBe("completed");
+    // Server restart / 10-min retention prune: authoritative empty list clears stale running job
+    expect(reconcileCleanupJobsResponse(runningJob!, [])).toBeNull();
+
+    // 3. Store monotonic progress + terminal `cleanupDoneSeq` + guarded `dismissCleanupJob`
+    useNvrStore.getState().setCleanupJob(null);
+    const seqBefore = useNvrStore.getState().cleanupDoneSeq;
+    useNvrStore.getState().setCleanupJob(runningJob!);
+    // Out-of-order lower progress frame keeps monotonic max
+    useNvrStore.getState().setCleanupJob({ ...runningJob!, progress_pct: 40 });
+    expect(useNvrStore.getState().cleanupJob?.progress_pct).toBe(62.4);
+    // Active job cannot be dismissed prematurely
+    useNvrStore.getState().dismissCleanupJob();
+    expect(useNvrStore.getState().cleanupJob?.id).toBe("cln_1700000_1");
+    // Transition to terminal increments `cleanupDoneSeq`
+    useNvrStore.getState().setCleanupJob(finishedSameId);
+    expect(useNvrStore.getState().cleanupDoneSeq).toBe(seqBefore + 1);
+    // Late out-of-order running WS frame after terminal is ignored
+    useNvrStore.getState().setCleanupJob({ ...runningJob!, progress_pct: 90 });
+    expect(useNvrStore.getState().cleanupJob?.status).toBe("completed");
+    // Terminal job can be dismissed cleanly
+    useNvrStore.getState().dismissCleanupJob();
+    expect(useNvrStore.getState().cleanupJob).toBeNull();
+
+    // 4. `startStorageCleanupJobFlow` (202 Accepted + 409 Conflict adoption) & `cancelStorageCleanupJobFlow`
+    const snapshots: Array<StorageCleanupJobSnapshot | null> = [];
+    const toasts: string[] = [];
+    await startStorageCleanupJobFlow({
+      target: "events",
+      effectiveCam: "escritorio",
+      olderThanDays: 0,
+      keepPinnedEvents: true,
+      pruneRetainedSegments: true,
+      isPt: false,
+      fetchImpl: (async () =>
+        new Response(JSON.stringify(runningJob), {
+          status: 202,
+          headers: { "Content-Type": "application/json" },
+        })) as typeof fetch,
+      onJobSnapshot: (j) => snapshots.push(j),
+      onNotice: () => {},
+      notify: (m) => toasts.push(m),
+      refreshStatsAndBreakdown: async () => {},
+      scheduleDelayedRefresh: () => {},
+    });
+    expect(snapshots.length).toBe(1);
+    expect(snapshots[0]?.id).toBe("cln_1700000_1");
+
+    // 409 Conflict attaches UI to the already-running job
+    await startStorageCleanupJobFlow({
+      target: "reviews",
+      effectiveCam: "escritorio",
+      olderThanDays: 0,
+      keepPinnedEvents: true,
+      pruneRetainedSegments: true,
+      isPt: false,
+      fetchImpl: (async () =>
+        new Response(
+          JSON.stringify({
+            success: false,
+            message: "A storage cleanup job is already in progress",
+            job: runningJob,
+          }),
+          { status: 409, headers: { "Content-Type": "application/json" } }
+        )) as typeof fetch,
+      onJobSnapshot: (j) => snapshots.push(j),
+      onNotice: () => {},
+      notify: (m) => toasts.push(m),
+      refreshStatsAndBreakdown: async () => {},
+      scheduleDelayedRefresh: () => {},
+    });
+    expect(snapshots.length).toBe(2);
+    expect(toasts[toasts.length - 1]).toContain("already in progress");
+
+    const cancellingJob: StorageCleanupJobSnapshot = {
+      ...runningJob!,
+      status: "cancelling",
+      cancellable: false,
+      eta_secs: null,
+    };
+    const cancelOk = await cancelStorageCleanupJobFlow({
+      jobId: "cln_1700000_1",
+      isPt: false,
+      fetchImpl: (async (url: RequestInfo | URL) => {
+        expect(String(url)).toBe("/api/jobs/cleanup/cln_1700000_1/cancel");
+        return new Response(JSON.stringify(cancellingJob), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }) as typeof fetch,
+      onJobSnapshot: (j) => snapshots.push(j),
+      notify: (m) => toasts.push(m),
+    });
+    expect(cancelOk).toBe(true);
+    expect(snapshots[2]?.status).toBe("cancelling");
+
+    // 404 on cancel (job already pruned/server restarted) clears stale active job (`null`)
+    const cancelGone = await cancelStorageCleanupJobFlow({
+      jobId: "cln_missing",
+      isPt: false,
+      fetchImpl: (async () =>
+        new Response(JSON.stringify({ success: false, message: "Not found" }), {
+          status: 404,
+          headers: { "Content-Type": "application/json" },
+        })) as typeof fetch,
+      onJobSnapshot: (j) => snapshots.push(j),
+      notify: (m) => toasts.push(m),
+    });
+    expect(cancelGone).toBe(false);
+    expect(snapshots[3]).toBeNull();
+
+    // 5. Render `SystemWorkspace` with `initialCleanupJob` (running, cancelling, and cancelled states)
+    const sampleBd: StorageBreakdownResponse = {
+      generated_at: 1_750_000_000,
+      total_tracked_bytes: 80 * 1024 * 1024 * 1024,
+      volume_total_bytes: 500 * 1024 * 1024 * 1024,
+      volume_used_bytes: 180 * 1024 * 1024 * 1024,
+      volume_free_bytes: 320 * 1024 * 1024 * 1024,
+      scoped: false,
+      categories: {
+        recordings_continuous: { bytes: 20 * 1024 * 1024 * 1024, count: 2000 },
+        recordings_motion: { bytes: 10 * 1024 * 1024 * 1024, count: 0 },
+        recordings_events: { bytes: 50 * 1024 * 1024 * 1024, count: 0 },
+        recordings_retained_excess: { bytes: 50 * 1024 * 1024 * 1024, count: 2500 },
+        recordings_compacted: { bytes: 0, count: 0 },
+        events_media: { bytes: 200 * 1024 * 1024, count: 1000 },
+        pinned_events_count: 1,
+        reviews_media: { bytes: 50 * 1024 * 1024, count: 300 },
+        previews_media: { bytes: 0, count: 0 },
+        exports_media: { bytes: 0, count: 0 },
+        share_artifacts_count: 0,
+        dataset_and_models: { bytes: 0, count: 0 },
+        dataset_samples_count: 0,
+        models_files_count: 0,
+        database: { bytes: 16 * 1024 * 1024, count: 2 },
+        database_main_bytes: 12 * 1024 * 1024,
+        database_wal_bytes: 4 * 1024 * 1024,
+        timeline_rows_count: 1000,
+      },
+      cameras: {},
+    };
+
+    const progressHtml = renderToStaticMarkup(
+      React.createElement(SystemWorkspace, {
+        cameraNames: ["escritorio"],
+        logService: "ninjanvr",
+        setLogService: () => {},
+        logLines: [],
+        logSearch: "",
+        setLogSearch: () => {},
+        logPaused: false,
+        setLogPaused: () => {},
+        notify: () => {},
+        initialBreakdown: sampleBd,
+        initialCleanupJob: runningJob,
+      })
+    );
+    expect(progressHtml).toContain("nvr-cleanup-banner-slot");
+    expect(progressHtml).toContain('data-testid="storage-cleanup-progress-banner"');
+    expect(progressHtml).toContain('role="progressbar"');
+    expect(progressHtml).toContain('aria-valuenow="62"');
+    expect(progressHtml).toContain("scaleX(0.624)");
+    expect(progressHtml).toContain("62.4%");
+    expect(progressHtml).toContain("ETA ~1m 15s");
+    expect(progressHtml).toContain("24.50 GB");
+    expect(progressHtml).toContain('data-testid="storage-cleanup-abort-job"');
+    expect(progressHtml).toMatch(/safe to switch tabs|livre para navegar/);
+    // WCAG 2.5.3 Label-in-Name on Cancel button
+    expect(progressHtml).toMatch(
+      /aria-label="(Cancel Cleanup in progress|Cancelar Limpeza em andamento)"/
+    );
+
+    const cancelledJob: StorageCleanupJobSnapshot = {
+      ...runningJob!,
+      status: "cancelled",
+      phase: "done",
+      cancellable: false,
+      eta_secs: null,
+    };
+    const cancelledSummary = formatCleanupTerminalSummary(
+      cancelledJob,
+      formatStorageBytes(cancelledJob.freed_bytes),
+      false
+    );
+    expect(cancelledSummary).toContain("Cleanup cancelled [ESCRITORIO]");
+    expect(cancelledSummary).toContain("24.50 GB freed");
+
+    const cancelledHtml = renderToStaticMarkup(
+      React.createElement(SystemWorkspace, {
+        cameraNames: ["escritorio"],
+        logService: "ninjanvr",
+        setLogService: () => {},
+        logLines: [],
+        logSearch: "",
+        setLogSearch: () => {},
+        logPaused: false,
+        setLogPaused: () => {},
+        notify: () => {},
+        initialBreakdown: sampleBd,
+        initialCleanupJob: cancelledJob,
+      })
+    );
+    expect(cancelledHtml).toContain("is-cancelled");
+    expect(cancelledHtml).toContain("24.50 GB");
   });
 });

@@ -936,6 +936,45 @@ export interface StorageCleanupResponse {
   message: string;
 }
 
+export type StorageCleanupJobStatus =
+  | "queued"
+  | "running"
+  | "cancelling"
+  | "completed"
+  | "cancelled"
+  | "failed";
+
+export type StorageCleanupJobPhase =
+  | "scanning"
+  | "purging_catalog"
+  | "unlinking_media"
+  | "pruning_segments"
+  | "checkpointing_wal"
+  | "refreshing_breakdown"
+  | "done";
+
+export interface StorageCleanupJobSnapshot {
+  id: string;
+  target: StorageCleanupTarget;
+  camera: string | null;
+  status: StorageCleanupJobStatus;
+  phase: StorageCleanupJobPhase;
+  progress_pct: number;
+  processed_units: number;
+  total_units: number;
+  deleted_items: number;
+  deleted_segments: number;
+  freed_bytes: number;
+  elapsed_ms: number;
+  eta_secs: number | null;
+  rate_per_sec: number | null;
+  cancellable: boolean;
+  created_at: number;
+  updated_at: number;
+  message: string;
+  error: string | null;
+}
+
 export interface TriggerProvenance {
   trigger_ts: number;
   bbox: [number, number, number, number];

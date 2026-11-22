@@ -1182,6 +1182,7 @@ impl NinjaDatabase {
             CREATE INDEX IF NOT EXISTS "event_start_time_end_time" ON "event" ("start_time" DESC, "end_time" DESC);
             CREATE INDEX IF NOT EXISTS "event_camera_start_time_end_time" ON "event" ("camera", "start_time" ASC, "end_time" ASC);
             CREATE UNIQUE INDEX IF NOT EXISTS "userreviewstatus_user_segment" ON "userreviewstatus" ("user_id", "review_segment_id");
+            CREATE INDEX IF NOT EXISTS "idx_userreviewstatus_segment" ON "userreviewstatus" ("review_segment_id");
             CREATE TABLE IF NOT EXISTS "api_token" (
                 "id" TEXT NOT NULL PRIMARY KEY,
                 "name" TEXT NOT NULL,
@@ -5573,6 +5574,463 @@ impl NinjaDatabase {
         Ok(snap)
     }
 
+    /// Selects candidate `(event_id, camera, thumb_path)` tuples matching `camera_filter` / `scope`
+    /// and optional `before_ts` using the non-blocking read pool (`read_conn()`).
+    pub fn select_purgeable_events_filtered(
+        &self,
+        scope: &CameraScope,
+        camera_filter: Option<&str>,
+        before_ts: Option<f64>,
+        now_ts: f64,
+        include_pinned: bool,
+    ) -> Result<Vec<(String, String, Option<String>)>> {
+        if let Some(cam) = camera_filter
+            && !scope.allows(cam)
+        {
+            return Ok(Vec::new());
+        }
+        if let Some(cutoff) = before_ts
+            && !cutoff.is_finite()
+        {
+            return Ok(Vec::new());
+        }
+        let open_grace_cutoff = now_ts - 60.0;
+        let has_cam_filter = i64::from(camera_filter.is_some());
+        let cam_param = camera_filter.unwrap_or("");
+        let has_before = i64::from(before_ts.is_some());
+        let before_val = before_ts.unwrap_or(0.0);
+        let allow_pinned = i64::from(include_pinned);
+
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                id,
+                camera,
+                CASE
+                    WHEN typeof(thumbnail) = 'text'
+                     AND length(thumbnail) < 512
+                     AND (thumbnail LIKE '/%' OR thumbnail LIKE 'clips/%')
+                    THEN thumbnail
+                    ELSE NULL
+                END,
+                CASE
+                    WHEN json_valid(data) AND json_type(data) = 'object'
+                    THEN COALESCE(json_extract(data, '$.thumb_path'), json_extract(data, '$.thumbnail_path'))
+                    ELSE NULL
+                END
+            FROM event
+            WHERE (?1 = 0 OR camera = ?2)
+              AND (?3 != 0 OR COALESCE(retain_indefinitely, 0) = 0)
+              AND (
+                (?4 != 0 AND COALESCE(end_time, start_time + 300.0) < ?5)
+                OR (?4 = 0 AND (end_time IS NOT NULL OR start_time < ?6))
+              )
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![
+                has_cam_filter,
+                cam_param,
+                allow_pinned,
+                has_before,
+                before_val,
+                open_grace_cutoff,
+            ],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2).ok().flatten(),
+                    r.get::<_, Option<String>>(3).ok().flatten(),
+                ))
+            },
+        )?;
+        let mut matched = Vec::new();
+        for row in rows {
+            let (id, cam, thumb_col, data_thumb) = row?;
+            if !scope.allows(&cam) {
+                continue;
+            }
+            let thumb_path = data_thumb
+                .or(thumb_col)
+                .map(|s| s.trim().to_string())
+                .filter(|s| {
+                    !s.is_empty()
+                        && !s.starts_with("/9j/")
+                        && !s.starts_with("UklGR")
+                        && !s.starts_with("data:")
+                });
+            matched.push((id, cam, thumb_path));
+        }
+        Ok(matched)
+    }
+
+    /// Deletes a bounded micro-batch of `(event_id, camera, thumb_path)` tuples inside a short
+    /// write transaction, re-verifying `retain_indefinitely` on each row to prevent TOCTOU deletion
+    /// if an operator pinned an event while a background cleanup job was running.
+    pub fn delete_events_batch_guarded(
+        &self,
+        batch: &[(String, String, Option<String>)],
+        include_pinned: bool,
+    ) -> Result<Vec<(String, String, Option<String>)>> {
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+        let allow_pinned = i64::from(include_pinned);
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let mut deleted = Vec::with_capacity(batch.len());
+        {
+            let mut del_ev = tx.prepare(
+                "DELETE FROM event WHERE id = ?1 AND (?2 != 0 OR COALESCE(retain_indefinitely, 0) = 0)",
+            )?;
+            let mut rev_share =
+                tx.prepare("UPDATE share_link SET revoked = 1 WHERE target_id = ?1")?;
+            let mut del_tl = tx.prepare("DELETE FROM timeline WHERE source_id = ?1")?;
+            for item in batch {
+                if del_ev.execute(params![&item.0, allow_pinned])? > 0 {
+                    rev_share.execute(params![&item.0])?;
+                    del_tl.execute(params![&item.0])?;
+                    deleted.push(item.clone());
+                }
+            }
+        }
+        tx.commit()?;
+        if !deleted.is_empty() {
+            self.bump_events_mutation();
+        }
+        Ok(deleted)
+    }
+
+    /// Selects candidate `(review_id, camera, thumb_path)` tuples matching `camera_filter` / `scope`
+    /// and optional `before_ts` using the non-blocking read pool (`read_conn()`).
+    pub fn select_purgeable_reviews_filtered(
+        &self,
+        scope: &CameraScope,
+        camera_filter: Option<&str>,
+        before_ts: Option<f64>,
+        now_ts: f64,
+        include_pinned: bool,
+    ) -> Result<Vec<(String, String, Option<String>)>> {
+        if let Some(cam) = camera_filter
+            && !scope.allows(cam)
+        {
+            return Ok(Vec::new());
+        }
+        if let Some(cutoff) = before_ts
+            && !cutoff.is_finite()
+        {
+            return Ok(Vec::new());
+        }
+        let open_grace_cutoff = now_ts - 60.0;
+        let has_cam_filter = i64::from(camera_filter.is_some());
+        let cam_param = camera_filter.unwrap_or("");
+        let has_before = i64::from(before_ts.is_some());
+        let before_val = before_ts.unwrap_or(0.0);
+        let allow_pinned = i64::from(include_pinned);
+
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                rv.id,
+                rv.camera,
+                rv.thumb_path
+            FROM reviewsegment rv
+            WHERE (?1 = 0 OR rv.camera = ?2)
+              AND (
+                (?3 != 0 AND COALESCE(rv.end_time, rv.start_time + 300.0) < ?4)
+                OR (?3 = 0 AND (rv.end_time IS NOT NULL OR rv.start_time < ?5))
+              )
+              AND (
+                ?6 != 0
+                OR NOT EXISTS (
+                    SELECT 1 FROM event e
+                    WHERE e.camera = rv.camera
+                      AND COALESCE(e.retain_indefinitely, 0) != 0
+                      AND e.start_time <= COALESCE(rv.end_time, rv.start_time + 300.0)
+                      AND COALESCE(e.end_time, e.start_time + 30.0) >= rv.start_time
+                )
+              )
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![
+                has_cam_filter,
+                cam_param,
+                has_before,
+                before_val,
+                open_grace_cutoff,
+                allow_pinned,
+            ],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)
+                        .ok()
+                        .flatten()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                ))
+            },
+        )?;
+        let mut matched = Vec::new();
+        for row in rows {
+            let (id, cam, thumb_opt) = row?;
+            if !scope.allows(&cam) {
+                continue;
+            }
+            matched.push((id, cam, thumb_opt));
+        }
+        Ok(matched)
+    }
+
+    /// Deletes a bounded micro-batch of `(review_id, camera, thumb_path)` tuples inside a short
+    /// write transaction, re-verifying pinned-event overlap on each row against concurrent pins.
+    pub fn delete_reviews_batch_guarded(
+        &self,
+        batch: &[(String, String, Option<String>)],
+        include_pinned: bool,
+    ) -> Result<Vec<(String, String, Option<String>)>> {
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+        let allow_pinned = i64::from(include_pinned);
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let mut deleted = Vec::with_capacity(batch.len());
+        {
+            let mut del_seg = tx.prepare(
+                r#"
+                DELETE FROM reviewsegment
+                WHERE id = ?1
+                  AND (
+                    ?2 != 0
+                    OR NOT EXISTS (
+                        SELECT 1 FROM event e
+                        WHERE e.camera = reviewsegment.camera
+                          AND COALESCE(e.retain_indefinitely, 0) != 0
+                          AND e.start_time <= COALESCE(reviewsegment.end_time, reviewsegment.start_time + 300.0)
+                          AND COALESCE(e.end_time, e.start_time + 30.0) >= reviewsegment.start_time
+                    )
+                  )
+                "#,
+            )?;
+            let mut del_status =
+                tx.prepare("DELETE FROM userreviewstatus WHERE review_segment_id = ?1")?;
+            let mut rev_share =
+                tx.prepare("UPDATE share_link SET revoked = 1 WHERE target_id = ?1")?;
+            for item in batch {
+                if del_seg.execute(params![&item.0, allow_pinned])? > 0 {
+                    del_status.execute(params![&item.0])?;
+                    rev_share.execute(params![&item.0])?;
+                    deleted.push(item.clone());
+                }
+            }
+        }
+        tx.commit()?;
+        if !deleted.is_empty() {
+            self.bump_events_mutation();
+        }
+        Ok(deleted)
+    }
+
+    /// Selects candidate `(id, path, segment_size_mb)` recording rows for `camera` with
+    /// `end_time <= before_ts` using the non-blocking read pool (`read_conn()`).
+    #[expect(clippy::too_many_arguments)]
+    pub fn select_recordings_before_cutoff(
+        &self,
+        camera: &str,
+        before_ts: f64,
+        pre_capture_sec: f64,
+        post_capture_sec: f64,
+        protect_pinned_events: bool,
+        protect_remaining_events: bool,
+        protect_remaining_reviews: bool,
+        motion_before_ts: Option<f64>,
+    ) -> Result<Vec<(String, String, f64)>> {
+        if !before_ts.is_finite() {
+            return Ok(Vec::new());
+        }
+        let pre_sec = if pre_capture_sec.is_finite() {
+            pre_capture_sec.max(0.0)
+        } else {
+            0.0
+        };
+        let post_sec = if post_capture_sec.is_finite() {
+            post_capture_sec.max(0.0)
+        } else {
+            0.0
+        };
+        let has_motion_guard = i64::from(motion_before_ts.is_some_and(|v| v.is_finite()));
+        let motion_cutoff = motion_before_ts.filter(|v| v.is_finite()).unwrap_or(0.0);
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT r.id, r.path, COALESCE(r.segment_size, 0.0)
+            FROM recordings r
+            WHERE r.camera = ?1
+              AND r.end_time <= ?2
+              AND (?8 = 0 OR COALESCE(r.motion, 0) = 0 OR r.end_time <= ?9)
+              AND (
+                ?5 = 0
+                OR NOT EXISTS (
+                    SELECT 1 FROM event e
+                    WHERE e.camera = r.camera
+                      AND COALESCE(e.retain_indefinitely, 0) != 0
+                      AND e.start_time <= (r.end_time + ?3)
+                      AND COALESCE(e.end_time, e.start_time + 30.0) >= (r.start_time - ?4)
+                )
+              )
+              AND (
+                ?6 = 0
+                OR NOT EXISTS (
+                    SELECT 1 FROM event e2
+                    WHERE e2.camera = r.camera
+                      AND e2.start_time >= (r.start_time - ?4 - 86400.0)
+                      AND e2.start_time <= (r.end_time + ?3)
+                      AND COALESCE(e2.end_time, e2.start_time + 15.0) >= (r.start_time - ?4)
+                )
+              )
+              AND (
+                ?7 = 0
+                OR NOT EXISTS (
+                    SELECT 1 FROM reviewsegment rv
+                    WHERE rv.camera = r.camera
+                      AND rv.start_time >= (r.start_time - ?4 - 86400.0)
+                      AND rv.start_time <= (r.end_time + ?3)
+                      AND COALESCE(rv.end_time, rv.start_time + 15.0) >= (r.start_time - ?4)
+                )
+              )
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![
+                camera,
+                before_ts,
+                pre_sec,
+                post_sec,
+                i64::from(protect_pinned_events),
+                i64::from(protect_remaining_events),
+                i64::from(protect_remaining_reviews),
+                has_motion_guard,
+                motion_cutoff,
+            ],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    value_to_f64(&r.get_ref(2)?).unwrap_or(0.0).max(0.0),
+                ))
+            },
+        )?;
+        let mut matched = Vec::new();
+        for row in rows {
+            matched.push(row?);
+        }
+        Ok(matched)
+    }
+
+    /// Deletes a bounded micro-batch of `(id, path, segment_size_mb)` recording rows inside a
+    /// short write transaction while re-enforcing pinned/event/review/motion retention guards.
+    #[expect(clippy::too_many_arguments)]
+    pub fn delete_recordings_batch_guarded(
+        &self,
+        camera: &str,
+        batch: &[(String, String, f64)],
+        before_ts: f64,
+        pre_capture_sec: f64,
+        post_capture_sec: f64,
+        protect_pinned_events: bool,
+        protect_remaining_events: bool,
+        protect_remaining_reviews: bool,
+        motion_before_ts: Option<f64>,
+    ) -> Result<Vec<(String, String, f64)>> {
+        if batch.is_empty() || !before_ts.is_finite() {
+            return Ok(Vec::new());
+        }
+        let pre_sec = if pre_capture_sec.is_finite() {
+            pre_capture_sec.max(0.0)
+        } else {
+            0.0
+        };
+        let post_sec = if post_capture_sec.is_finite() {
+            post_capture_sec.max(0.0)
+        } else {
+            0.0
+        };
+        let has_motion_guard = i64::from(motion_before_ts.is_some_and(|v| v.is_finite()));
+        let motion_cutoff = motion_before_ts.filter(|v| v.is_finite()).unwrap_or(0.0);
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let mut deleted = Vec::with_capacity(batch.len());
+        {
+            let mut del_stmt = tx.prepare(
+                r#"
+                DELETE FROM recordings
+                WHERE id = ?1
+                  AND camera = ?2
+                  AND end_time <= ?3
+                  AND (?9 = 0 OR COALESCE(motion, 0) = 0 OR end_time <= ?10)
+                  AND (
+                    ?6 = 0
+                    OR NOT EXISTS (
+                        SELECT 1 FROM event e
+                        WHERE e.camera = recordings.camera
+                          AND COALESCE(e.retain_indefinitely, 0) != 0
+                          AND e.start_time <= (recordings.end_time + ?4)
+                          AND COALESCE(e.end_time, e.start_time + 30.0) >= (recordings.start_time - ?5)
+                    )
+                  )
+                  AND (
+                    ?7 = 0
+                    OR NOT EXISTS (
+                        SELECT 1 FROM event e2
+                        WHERE e2.camera = recordings.camera
+                          AND e2.start_time >= (recordings.start_time - ?5 - 86400.0)
+                          AND e2.start_time <= (recordings.end_time + ?4)
+                          AND COALESCE(e2.end_time, e2.start_time + 15.0) >= (recordings.start_time - ?5)
+                    )
+                  )
+                  AND (
+                    ?8 = 0
+                    OR NOT EXISTS (
+                        SELECT 1 FROM reviewsegment rv
+                        WHERE rv.camera = recordings.camera
+                          AND rv.start_time >= (recordings.start_time - ?5 - 86400.0)
+                          AND rv.start_time <= (recordings.end_time + ?4)
+                          AND COALESCE(rv.end_time, rv.start_time + 15.0) >= (recordings.start_time - ?5)
+                    )
+                  )
+                "#,
+            )?;
+            for item in batch {
+                let rows = del_stmt.execute(params![
+                    &item.0,
+                    camera,
+                    before_ts,
+                    pre_sec,
+                    post_sec,
+                    i64::from(protect_pinned_events),
+                    i64::from(protect_remaining_events),
+                    i64::from(protect_remaining_reviews),
+                    has_motion_guard,
+                    motion_cutoff,
+                ])?;
+                if rows > 0 {
+                    deleted.push(item.clone());
+                }
+            }
+        }
+        tx.commit()?;
+        if !deleted.is_empty() {
+            self.bump_recordings_vod_invalidation();
+        }
+        Ok(deleted)
+    }
+
     /// Purges events matching `camera_filter` / `scope` and optional `before_ts`,
     /// preserving `retain_indefinitely = 1` events unless `include_pinned` is `true`,
     /// revoking guest share links, cleaning up `timeline` entries, and returning
@@ -6136,6 +6594,21 @@ impl NinjaDatabase {
         let conn = self.lock_conn();
         let (log_frames, checkpointed_frames) =
             conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((
+                    r.get::<_, i64>(1).unwrap_or(0),
+                    r.get::<_, i64>(2).unwrap_or(0),
+                ))
+            })?;
+        let _ = conn.execute_batch("PRAGMA optimize;");
+        Ok((log_frames, checkpointed_frames))
+    }
+
+    /// Runs a non-blocking `PRAGMA wal_checkpoint(PASSIVE)` and `PRAGMA optimize` so background
+    /// storage cleanup jobs checkpoint unreferenced WAL frames without stalling active readers.
+    pub fn checkpoint_wal_passive(&self) -> Result<(i64, i64)> {
+        let conn = self.lock_conn();
+        let (log_frames, checkpointed_frames) =
+            conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
                 Ok((
                     r.get::<_, i64>(1).unwrap_or(0),
                     r.get::<_, i64>(2).unwrap_or(0),

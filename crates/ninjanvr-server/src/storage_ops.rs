@@ -3,11 +3,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Query, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Json, Response};
 use axum_extra::extract::cookie::CookieJar;
@@ -205,6 +205,515 @@ pub struct StorageCleanupResponse {
     pub freed_bytes: u64,
     pub duration_ms: u64,
     pub message: String,
+}
+
+const MAX_TERMINAL_CLEANUP_JOBS: usize = 64;
+const TERMINAL_CLEANUP_JOB_RETENTION_SECS: f64 = 600.0;
+const CLEANUP_WS_MIN_INTERVAL: Duration = Duration::from_millis(250);
+const CLEANUP_WS_MIN_STEP_PCT: f64 = 1.5;
+const CATALOG_MICRO_BATCH_SIZE: usize = 250;
+const SEGMENT_MICRO_BATCH_SIZE: usize = 200;
+const SEGMENT_UNLINK_SUBSLICE_SIZE: usize = 50;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupJobStatus {
+    Queued,
+    Running,
+    Cancelling,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+impl CleanupJobStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Cancelled | Self::Failed)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupJobPhase {
+    Scanning,
+    PurgingCatalog,
+    UnlinkingMedia,
+    PruningSegments,
+    CheckpointingWal,
+    RefreshingBreakdown,
+    Done,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageCleanupJobSnapshot {
+    pub id: String,
+    pub target: CleanupTarget,
+    pub camera: Option<String>,
+    pub status: CleanupJobStatus,
+    pub phase: CleanupJobPhase,
+    pub progress_pct: f64,
+    pub processed_units: u64,
+    pub total_units: u64,
+    pub deleted_items: u64,
+    pub deleted_segments: u64,
+    pub freed_bytes: u64,
+    pub elapsed_ms: u64,
+    pub eta_secs: Option<u64>,
+    pub rate_per_sec: Option<f64>,
+    pub cancellable: bool,
+    pub created_at: f64,
+    pub updated_at: f64,
+    pub message: String,
+    pub error: Option<String>,
+}
+
+struct CleanupJobEntry {
+    snapshot: StorageCleanupJobSnapshot,
+    cancel_flag: Arc<AtomicBool>,
+    ephemeral_sync: bool,
+    work_started_at: Option<Instant>,
+    last_ws_emit: Option<Instant>,
+    last_ws_pct: f64,
+    last_phase: CleanupJobPhase,
+}
+
+#[derive(Debug)]
+pub enum CancelCleanupJobOutcome {
+    Updated(Box<StorageCleanupJobSnapshot>),
+    NotFound,
+    Forbidden,
+}
+
+/// Isolated `AppState`-owned manager for asynchronous storage cleanup jobs with real-time `/ws`
+/// progress telemetry, ETA estimation, and cooperative micro-batch cancellation.
+#[derive(Clone)]
+pub struct StorageCleanupJobManager {
+    seq: Arc<AtomicU64>,
+    jobs: Arc<RwLock<BTreeMap<String, CleanupJobEntry>>>,
+}
+
+impl Default for StorageCleanupJobManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StorageCleanupJobManager {
+    pub fn new() -> Self {
+        Self {
+            seq: Arc::new(AtomicU64::new(1)),
+            jobs: Arc::new(RwLock::new(BTreeMap::new())),
+        }
+    }
+
+    pub fn next_job_id(&self, now_sec: f64) -> String {
+        let n = self.seq.fetch_add(1, Ordering::Relaxed);
+        let ms = (now_sec.max(0.0) * 1000.0) as u64;
+        format!("cln_{ms}_{n}")
+    }
+
+    fn prune_locked(map: &mut BTreeMap<String, CleanupJobEntry>, now_sec: f64) {
+        map.retain(|_, entry| {
+            !entry.snapshot.status.is_terminal()
+                || (now_sec - entry.snapshot.updated_at) <= TERMINAL_CLEANUP_JOB_RETENTION_SECS
+        });
+        while map
+            .values()
+            .filter(|e| e.snapshot.status.is_terminal())
+            .count()
+            > MAX_TERMINAL_CLEANUP_JOBS
+        {
+            let oldest_id = map
+                .iter()
+                .filter(|(_, e)| e.snapshot.status.is_terminal())
+                .min_by(|a, b| {
+                    a.1.snapshot
+                        .updated_at
+                        .partial_cmp(&b.1.snapshot.updated_at)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest_id {
+                map.remove(&k);
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn scope_allows_job(scope: &CameraScope, snap: &StorageCleanupJobSnapshot) -> bool {
+        if !scope.is_restricted() {
+            return true;
+        }
+        snap.camera.as_deref().is_some_and(|cam| scope.allows(cam))
+    }
+
+    pub fn try_register_running(
+        &self,
+        id: String,
+        target: CleanupTarget,
+        camera: Option<String>,
+        cancellable: bool,
+        now_sec: f64,
+    ) -> std::result::Result<
+        (StorageCleanupJobSnapshot, Arc<AtomicBool>),
+        Option<Box<StorageCleanupJobSnapshot>>,
+    > {
+        self.try_register_running_inner(id, target, camera, cancellable, false, now_sec)
+    }
+
+    fn try_register_running_inner(
+        &self,
+        id: String,
+        target: CleanupTarget,
+        camera: Option<String>,
+        cancellable: bool,
+        ephemeral_sync: bool,
+        now_sec: f64,
+    ) -> std::result::Result<
+        (StorageCleanupJobSnapshot, Arc<AtomicBool>),
+        Option<Box<StorageCleanupJobSnapshot>>,
+    > {
+        let mut guard = self.jobs.write().map_err(|_| None)?;
+        Self::prune_locked(&mut guard, now_sec);
+        if let Some(active) = guard.values().find(|e| !e.snapshot.status.is_terminal()) {
+            let exposed = (!active.ephemeral_sync).then(|| Box::new(active.snapshot.clone()));
+            return Err(exposed);
+        }
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let snap = StorageCleanupJobSnapshot {
+            id: id.clone(),
+            target,
+            camera,
+            status: CleanupJobStatus::Running,
+            phase: CleanupJobPhase::Scanning,
+            progress_pct: 1.0,
+            processed_units: 0,
+            total_units: 0,
+            deleted_items: 0,
+            deleted_segments: 0,
+            freed_bytes: 0,
+            elapsed_ms: 0,
+            eta_secs: None,
+            rate_per_sec: None,
+            cancellable,
+            created_at: now_sec,
+            updated_at: now_sec,
+            message: "Scanning catalog and disk footprint...".to_string(),
+            error: None,
+        };
+        guard.insert(
+            id,
+            CleanupJobEntry {
+                snapshot: snap.clone(),
+                cancel_flag: cancel_flag.clone(),
+                ephemeral_sync,
+                work_started_at: None,
+                last_ws_emit: Some(Instant::now()),
+                last_ws_pct: 1.0,
+                last_phase: CleanupJobPhase::Scanning,
+            },
+        );
+        Ok((snap, cancel_flag))
+    }
+
+    fn remove_ephemeral(&self, id: &str) {
+        if let Ok(mut guard) = self.jobs.write()
+            && guard.get(id).is_some_and(|e| e.ephemeral_sync)
+        {
+            guard.remove(id);
+        }
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub fn update_progress(
+        &self,
+        id: &str,
+        phase: CleanupJobPhase,
+        processed_units: u64,
+        total_units: u64,
+        stage_processed: u64,
+        stage_total: u64,
+        pct_band: (f64, f64),
+        deleted_items: u64,
+        deleted_segments: u64,
+        freed_bytes: u64,
+        elapsed_ms: u64,
+        message: &str,
+        now_sec: f64,
+    ) -> Option<(StorageCleanupJobSnapshot, bool)> {
+        let mut guard = self.jobs.write().ok()?;
+        let entry = guard.get_mut(id)?;
+        if entry.snapshot.status.is_terminal() {
+            return None;
+        }
+        let now_inst = Instant::now();
+        let phase_changed = entry.last_phase != phase;
+        if phase_changed && phase == CleanupJobPhase::PruningSegments {
+            entry.work_started_at = None;
+        }
+        if stage_total > 0 && stage_processed > 0 && entry.work_started_at.is_none() {
+            entry.work_started_at = Some(now_inst);
+        }
+        if matches!(
+            phase,
+            CleanupJobPhase::CheckpointingWal
+                | CleanupJobPhase::RefreshingBreakdown
+                | CleanupJobPhase::Done
+        ) {
+            entry.snapshot.cancellable = false;
+        }
+        let (band_lo, band_hi) = (
+            pct_band.0.clamp(1.0, 95.0),
+            pct_band.1.clamp(pct_band.0.clamp(1.0, 95.0), 95.0),
+        );
+        let raw_pct = if phase == CleanupJobPhase::RefreshingBreakdown {
+            98.0
+        } else if phase == CleanupJobPhase::CheckpointingWal {
+            96.5
+        } else if stage_total > 0 {
+            let frac = (stage_processed.min(stage_total) as f64) / (stage_total as f64);
+            (band_lo + frac * (band_hi - band_lo)).clamp(band_lo, band_hi)
+        } else {
+            match phase {
+                CleanupJobPhase::Scanning => 2.0,
+                CleanupJobPhase::PurgingCatalog => band_lo.max(8.0),
+                CleanupJobPhase::UnlinkingMedia => ((band_lo + band_hi) * 0.5).max(15.0),
+                CleanupJobPhase::PruningSegments => band_lo.max(45.0),
+                CleanupJobPhase::CheckpointingWal => 96.5,
+                CleanupJobPhase::RefreshingBreakdown => 98.0,
+                CleanupJobPhase::Done => 100.0,
+            }
+        };
+        let pct = ((raw_pct * 10.0).round() / 10.0).max(entry.snapshot.progress_pct.min(98.5));
+
+        let (rate_per_sec, eta_secs) = if entry.snapshot.cancellable
+            && stage_total > stage_processed
+            && stage_processed >= 5
+        {
+            let work_secs = entry
+                .work_started_at
+                .map_or((elapsed_ms as f64) / 1000.0, |t| {
+                    now_inst.duration_since(t).as_secs_f64()
+                });
+            if work_secs >= 0.35 {
+                let rate = (stage_processed as f64) / work_secs;
+                if rate.is_finite() && rate > 0.05 {
+                    let rem = (stage_total - stage_processed) as f64;
+                    let eta = (rem / rate).ceil().clamp(1.0, 86_400.0) as u64;
+                    (Some((rate * 10.0).round() / 10.0), Some(eta))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+        entry.snapshot.phase = phase;
+        entry.snapshot.progress_pct = pct;
+        entry.snapshot.processed_units = processed_units;
+        entry.snapshot.total_units = total_units;
+        entry.snapshot.deleted_items = deleted_items;
+        entry.snapshot.deleted_segments = deleted_segments;
+        entry.snapshot.freed_bytes = freed_bytes;
+        entry.snapshot.elapsed_ms = elapsed_ms;
+        entry.snapshot.rate_per_sec = rate_per_sec;
+        entry.snapshot.eta_secs = eta_secs;
+        entry.snapshot.updated_at = now_sec;
+        entry.snapshot.message = message.to_string();
+
+        let time_due = entry
+            .last_ws_emit
+            .is_none_or(|t| now_inst.duration_since(t) >= CLEANUP_WS_MIN_INTERVAL);
+        let step_due = (pct - entry.last_ws_pct).abs() >= CLEANUP_WS_MIN_STEP_PCT;
+        let should_emit = !entry.ephemeral_sync
+            && (phase_changed || (time_due && (step_due || processed_units > 0)));
+        if should_emit {
+            entry.last_ws_emit = Some(now_inst);
+            entry.last_ws_pct = pct;
+            entry.last_phase = phase;
+        }
+        Some((entry.snapshot.clone(), should_emit))
+    }
+
+    fn mark_finished(
+        &self,
+        id: &str,
+        outcome: &CleanupRunOutcome,
+        now_sec: f64,
+    ) -> Option<StorageCleanupJobSnapshot> {
+        let mut guard = self.jobs.write().ok()?;
+        let entry = guard.get_mut(id)?;
+        let was_cancelled = outcome.cancelled;
+        entry.snapshot.status = if was_cancelled {
+            CleanupJobStatus::Cancelled
+        } else {
+            CleanupJobStatus::Completed
+        };
+        entry.snapshot.phase = CleanupJobPhase::Done;
+        if !was_cancelled {
+            entry.snapshot.progress_pct = 100.0;
+            entry.snapshot.processed_units = entry
+                .snapshot
+                .processed_units
+                .max(entry.snapshot.total_units);
+        }
+        entry.snapshot.deleted_items = outcome.deleted_items;
+        entry.snapshot.deleted_segments = outcome.deleted_segments;
+        entry.snapshot.freed_bytes = outcome.freed_bytes;
+        entry.snapshot.elapsed_ms = outcome.duration_ms;
+        entry.snapshot.eta_secs = None;
+        entry.snapshot.cancellable = false;
+        entry.snapshot.updated_at = now_sec;
+        entry.snapshot.message = outcome.message.clone();
+        Some(entry.snapshot.clone())
+    }
+
+    pub fn mark_failed(
+        &self,
+        id: &str,
+        elapsed_ms: u64,
+        error_msg: String,
+        now_sec: f64,
+    ) -> Option<StorageCleanupJobSnapshot> {
+        let mut guard = self.jobs.write().ok()?;
+        let entry = guard.get_mut(id)?;
+        if entry.snapshot.status == CleanupJobStatus::Cancelled {
+            return None;
+        }
+        entry.snapshot.status = CleanupJobStatus::Failed;
+        entry.snapshot.phase = CleanupJobPhase::Done;
+        entry.snapshot.elapsed_ms = elapsed_ms;
+        entry.snapshot.eta_secs = None;
+        entry.snapshot.cancellable = false;
+        entry.snapshot.updated_at = now_sec;
+        entry.snapshot.message = error_msg.clone();
+        entry.snapshot.error = Some(error_msg);
+        Some(entry.snapshot.clone())
+    }
+
+    pub fn request_cancel(
+        &self,
+        id: &str,
+        scope: &CameraScope,
+        now_sec: f64,
+    ) -> CancelCleanupJobOutcome {
+        let Ok(mut guard) = self.jobs.write() else {
+            return CancelCleanupJobOutcome::NotFound;
+        };
+        let Some(entry) = guard.get_mut(id) else {
+            return CancelCleanupJobOutcome::NotFound;
+        };
+        if !Self::scope_allows_job(scope, &entry.snapshot) {
+            return CancelCleanupJobOutcome::Forbidden;
+        }
+        if entry.snapshot.status.is_terminal() || !entry.snapshot.cancellable {
+            return CancelCleanupJobOutcome::Updated(Box::new(entry.snapshot.clone()));
+        }
+        entry.cancel_flag.store(true, Ordering::SeqCst);
+        entry.snapshot.cancellable = false;
+        entry.snapshot.eta_secs = None;
+        entry.snapshot.updated_at = now_sec;
+        if entry.snapshot.status == CleanupJobStatus::Queued {
+            entry.snapshot.status = CleanupJobStatus::Cancelled;
+            entry.snapshot.phase = CleanupJobPhase::Done;
+            entry.snapshot.message = "Cleanup cancelled before start".to_string();
+        } else {
+            entry.snapshot.status = CleanupJobStatus::Cancelling;
+            entry.snapshot.message =
+                "Stopping after current micro-batch (preserving already freed space)..."
+                    .to_string();
+        }
+        CancelCleanupJobOutcome::Updated(Box::new(entry.snapshot.clone()))
+    }
+
+    pub fn list_for_scope(
+        &self,
+        scope: &CameraScope,
+        now_sec: f64,
+    ) -> Vec<StorageCleanupJobSnapshot> {
+        let Ok(mut guard) = self.jobs.write() else {
+            return Vec::new();
+        };
+        Self::prune_locked(&mut guard, now_sec);
+        let mut list: Vec<StorageCleanupJobSnapshot> = guard
+            .values()
+            .filter(|e| !e.ephemeral_sync)
+            .map(|e| e.snapshot.clone())
+            .filter(|s| Self::scope_allows_job(scope, s))
+            .collect();
+        list.sort_by(|a, b| {
+            b.created_at
+                .partial_cmp(&a.created_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        list
+    }
+
+    pub fn active_snapshots(&self) -> Vec<StorageCleanupJobSnapshot> {
+        let Ok(guard) = self.jobs.read() else {
+            return Vec::new();
+        };
+        guard
+            .values()
+            .filter(|e| !e.ephemeral_sync && !e.snapshot.status.is_terminal())
+            .map(|e| e.snapshot.clone())
+            .collect()
+    }
+}
+
+struct ActiveCleanupJobGuard {
+    state: AppState,
+    job_id: String,
+    started: Instant,
+    ephemeral_sync: bool,
+    disarmed: bool,
+}
+
+impl ActiveCleanupJobGuard {
+    fn new(state: AppState, job_id: String, started: Instant, ephemeral_sync: bool) -> Self {
+        Self {
+            state,
+            job_id,
+            started,
+            ephemeral_sync,
+            disarmed: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+        if self.ephemeral_sync {
+            self.state.cleanup_jobs.remove_ephemeral(&self.job_id);
+        }
+    }
+}
+
+impl Drop for ActiveCleanupJobGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        if self.ephemeral_sync {
+            self.state.cleanup_jobs.remove_ephemeral(&self.job_id);
+        } else if let Some(failed_snap) = self.state.cleanup_jobs.mark_failed(
+            &self.job_id,
+            self.started.elapsed().as_millis() as u64,
+            "Storage cleanup aborted unexpectedly".to_string(),
+            now_f64(),
+        ) {
+            emit_cleanup_job_ws(&self.state, &failed_snap);
+        }
+    }
+}
+
+pub(crate) fn emit_cleanup_job_ws(state: &AppState, snap: &StorageCleanupJobSnapshot) {
+    if let Ok(payload) = serde_json::to_string(snap) {
+        state.comms.publish_ws_only("storage_cleanup", payload);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1076,33 +1585,40 @@ pub async fn api_storage_breakdown(
     }
 
     // Singleflight lock so concurrent callers share one filesystem/DB scan
+    match compute_and_store_unscoped_breakdown(&state, Some(effective_ttl)).await {
+        Ok(unscoped) => Json(filter_breakdown_for_scope(unscoped, &scope)).into_response(),
+        Err(err) => {
+            warn!("Storage breakdown task failed: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn compute_and_store_unscoped_breakdown(
+    state: &AppState,
+    reuse_ttl: Option<Duration>,
+) -> std::result::Result<StorageBreakdownResponse, tokio::task::JoinError> {
     let _singleflight = state.storage_breakdown_cache.compute_lock.lock().await;
-    let seq = state.storage_breakdown_cache.composite_seq(
+    let pre_seq = state.storage_breakdown_cache.composite_seq(
         state.db.recordings_mutation_seq(),
         state.db.events_mutation_seq(),
     );
-    if let Some(cached) = state
-        .storage_breakdown_cache
-        .get_if_within_ttl(seq, effective_ttl)
+    if let Some(ttl) = reuse_ttl
+        && let Some(cached) = state
+            .storage_breakdown_cache
+            .get_if_within_ttl(pre_seq, ttl)
     {
-        return Json(filter_breakdown_for_scope(cached, &scope)).into_response();
+        return Ok(cached);
     }
-
     let cfg = state.config.read().await.clone();
     let state_for_scan = state.clone();
-    let unscoped = match tokio::task::spawn_blocking(move || {
-        compute_unscoped_breakdown_sync(&state_for_scan, &cfg)
-    })
-    .await
-    {
-        Ok(val) => val,
-        Err(err) => {
-            warn!("Storage breakdown task failed: {err}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    state.storage_breakdown_cache.store(seq, unscoped.clone());
-    Json(filter_breakdown_for_scope(unscoped, &scope)).into_response()
+    let unscoped =
+        tokio::task::spawn_blocking(move || compute_unscoped_breakdown_sync(&state_for_scan, &cfg))
+            .await?;
+    state
+        .storage_breakdown_cache
+        .store(pre_seq, unscoped.clone());
+    Ok(unscoped)
 }
 
 fn measure_wal_bytes(db_path: &Path) -> u64 {
@@ -1134,13 +1650,22 @@ fn resolve_safe_preview_rel_path(raw_db_path: &str, expected_cam: &str) -> Optio
     }
 }
 
-pub async fn api_storage_cleanup(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    uri: Uri,
-    headers: HeaderMap,
-    Json(req): Json<StorageCleanupRequest>,
-) -> Response {
+struct ValidatedCleanupParams {
+    camera_clean: Option<String>,
+    scope: CameraScope,
+    target: CleanupTarget,
+    older_than_days: Option<f64>,
+    include_pinned: bool,
+    prune_retained_segments: bool,
+}
+
+async fn validate_and_authorize_cleanup_request(
+    state: &AppState,
+    jar: &CookieJar,
+    uri: &Uri,
+    headers: &HeaderMap,
+    req: &StorageCleanupRequest,
+) -> std::result::Result<ValidatedCleanupParams, Box<Response>> {
     let camera_clean: Option<String> = req
         .camera
         .as_deref()
@@ -1151,27 +1676,31 @@ pub async fn api_storage_cleanup(
     if let Some(ref cam) = camera_clean
         && !is_safe_id(cam)
     {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "success": false,
-                "message": "Invalid camera identifier"
-            })),
-        )
-            .into_response();
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "success": false,
+                    "message": "Invalid camera identifier"
+                })),
+            )
+                .into_response(),
+        ));
     }
 
     if let Some(days) = req.older_than_days
         && (!days.is_finite() || days < 0.0 || days > 36500.0)
     {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "success": false,
-                "message": "older_than_days must be a non-negative finite number"
-            })),
-        )
-            .into_response();
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "success": false,
+                    "message": "older_than_days must be a non-negative finite number"
+                })),
+            )
+                .into_response(),
+        ));
     }
 
     let access_target = match camera_clean.as_deref() {
@@ -1180,11 +1709,11 @@ pub async fn api_storage_cleanup(
     };
     let principal = match state
         .auth_gate
-        .authorize_mutation(&state, &jar, &uri, &headers, true, access_target)
+        .authorize_mutation(state, jar, uri, headers, true, access_target)
         .await
     {
         Ok(p) => p,
-        Err(rej) => return rej.into_response(),
+        Err(rej) => return Err(Box::new(rej.into_response())),
     };
     let scope = principal.camera_scope();
 
@@ -1194,80 +1723,229 @@ pub async fn api_storage_cleanup(
             CleanupTarget::RetentionPass | CleanupTarget::WalCheckpoint
         )
     {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "success": false,
-                "message": "Camera-restricted users cannot run global maintenance tasks"
-            })),
-        )
-            .into_response();
+        return Err(Box::new(
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "success": false,
+                    "message": "Camera-restricted users cannot run global maintenance tasks"
+                })),
+            )
+                .into_response(),
+        ));
     }
 
+    Ok(ValidatedCleanupParams {
+        camera_clean,
+        scope,
+        target: req.target,
+        older_than_days: req.older_than_days,
+        include_pinned: req.include_pinned,
+        prune_retained_segments: req.prune_retained_segments,
+    })
+}
+
+#[derive(Clone)]
+struct CleanupProgressTracker {
+    state: AppState,
+    job_id: Option<String>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+    started: Instant,
+}
+
+impl CleanupProgressTracker {
+    fn is_cancelled(&self) -> bool {
+        self.cancel_flag
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Acquire))
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn report(
+        &self,
+        phase: CleanupJobPhase,
+        processed_units: u64,
+        total_units: u64,
+        deleted_items: u64,
+        deleted_segments: u64,
+        freed_bytes: u64,
+        msg: &str,
+    ) {
+        self.report_banded(
+            phase,
+            processed_units,
+            total_units,
+            processed_units,
+            total_units,
+            (1.0, 95.0),
+            deleted_items,
+            deleted_segments,
+            freed_bytes,
+            msg,
+        );
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn report_banded(
+        &self,
+        phase: CleanupJobPhase,
+        processed_units: u64,
+        total_units: u64,
+        stage_processed: u64,
+        stage_total: u64,
+        pct_band: (f64, f64),
+        deleted_items: u64,
+        deleted_segments: u64,
+        freed_bytes: u64,
+        msg: &str,
+    ) {
+        let Some(ref jid) = self.job_id else {
+            return;
+        };
+        if let Some((snap, should_emit)) = self.state.cleanup_jobs.update_progress(
+            jid,
+            phase,
+            processed_units,
+            total_units,
+            stage_processed,
+            stage_total,
+            pct_band,
+            deleted_items,
+            deleted_segments,
+            freed_bytes,
+            self.started.elapsed().as_millis() as u64,
+            msg,
+            now_f64(),
+        ) && should_emit
+        {
+            emit_cleanup_job_ws(&self.state, &snap);
+        }
+    }
+}
+
+struct CleanupRunOutcome {
+    deleted_items: u64,
+    deleted_segments: u64,
+    freed_bytes: u64,
+    duration_ms: u64,
+    cancelled: bool,
+    message: String,
+}
+
+async fn execute_storage_cleanup_core(
+    state: AppState,
+    params: ValidatedCleanupParams,
+    job_ctx: Option<(String, Arc<AtomicBool>)>,
+) -> anyhow::Result<CleanupRunOutcome> {
     let started = Instant::now();
     let now = now_f64();
-    let before_ts: Option<f64> = req
+    let before_ts: Option<f64> = params
         .older_than_days
         .filter(|d| *d > 0.0)
         .map(|d| now - d * 86_400.0);
+
+    let is_async_job = job_ctx.is_some();
+    let tracker = CleanupProgressTracker {
+        state: state.clone(),
+        job_id: job_ctx.as_ref().map(|(id, _)| id.clone()),
+        cancel_flag: job_ctx.map(|(_, f)| f),
+        started,
+    };
 
     let cfg = state.config.read().await.clone();
     let policies = extract_camera_policies(&cfg);
     let cold_dir_opt = resolve_configured_cold_dir(&cfg);
     let default_cont_days = sanitize_retention_days(cfg.record.continuous.days, 7.0, 0.002);
 
-    if req.target == CleanupTarget::RetentionPass {
-        let before_snap = {
-            let st = state.clone();
-            let c = cfg.clone();
-            tokio::task::spawn_blocking(move || compute_unscoped_breakdown_sync(&st, &c))
-                .await
-                .unwrap_or_default()
-        };
+    if params.target == CleanupTarget::RetentionPass {
+        tracker.report(
+            CleanupJobPhase::Scanning,
+            0,
+            4,
+            0,
+            0,
+            0,
+            "Scanning current storage footprint...",
+        );
+        let before_snap = compute_and_store_unscoped_breakdown(&state, None)
+            .await
+            .unwrap_or_default();
+        if tracker.is_cancelled() {
+            let duration_ms = started.elapsed().as_millis() as u64;
+            return Ok(CleanupRunOutcome {
+                deleted_items: 0,
+                deleted_segments: 0,
+                freed_bytes: 0,
+                duration_ms,
+                cancelled: true,
+                message: "Retention pass cancelled before pruning".to_string(),
+            });
+        }
+        tracker.report(
+            CleanupJobPhase::PruningSegments,
+            1,
+            4,
+            0,
+            0,
+            0,
+            "Running retention & disk-quota eviction pass...",
+        );
         let _ = state.recorder.run_retention_pass_once(now).await;
-        let state_bg = state.clone();
-        let cold_bg = cold_dir_opt.clone();
-        let removed_orphans = tokio::task::spawn_blocking(move || {
-            let orphans = state_bg
-                .db
-                .prune_missing_recording_files(|db_path| {
-                    media_lifecycle::resolve_contained_recording_segment(
-                        &state_bg.media_dir,
-                        cold_bg.as_deref(),
-                        None,
-                        db_path,
-                    )
-                    .is_some()
-                })
-                .unwrap_or(0);
-            let now_ms = (now * 1000.0) as u64;
-            let _ = state_bg.preview_frames.prune(
-                now_ms,
-                crate::preview_frames::PREVIEW_FRAME_RETENTION_SECS * 1000,
+        let cancelled_after_retention = tracker.is_cancelled();
+        let removed_orphans = if cancelled_after_retention {
+            0
+        } else {
+            tracker.report(
+                CleanupJobPhase::UnlinkingMedia,
+                2,
+                4,
+                0,
+                0,
+                0,
+                "Reconciling recording index & pruning stale preview frames...",
             );
-            purge_revoked_share_credits(&state_bg);
-            let _ = state_bg.db.checkpoint_wal_truncate();
-            orphans
-        })
-        .await
-        .unwrap_or(0);
+            let state_bg = state.clone();
+            let cold_bg = cold_dir_opt.clone();
+            tokio::task::spawn_blocking(move || {
+                let orphans = state_bg
+                    .db
+                    .prune_missing_recording_files(|db_path| {
+                        media_lifecycle::resolve_contained_recording_segment(
+                            &state_bg.media_dir,
+                            cold_bg.as_deref(),
+                            None,
+                            db_path,
+                        )
+                        .is_some()
+                    })
+                    .unwrap_or(0);
+                let now_ms = (now * 1000.0) as u64;
+                let _ = state_bg.preview_frames.prune(
+                    now_ms,
+                    crate::preview_frames::PREVIEW_FRAME_RETENTION_SECS * 1000,
+                );
+                purge_revoked_share_credits(&state_bg);
+                let _ = state_bg.db.checkpoint_wal_passive();
+                orphans
+            })
+            .await
+            .unwrap_or(0)
+        };
 
         state.vod_cache.invalidate_all();
         state.storage_breakdown_cache.invalidate();
-        let after_snap = {
-            let st = state.clone();
-            let c = cfg.clone();
-            tokio::task::spawn_blocking(move || compute_unscoped_breakdown_sync(&st, &c))
-                .await
-                .unwrap_or_default()
-        };
-        let post_seq = state.storage_breakdown_cache.composite_seq(
-            state.db.recordings_mutation_seq(),
-            state.db.events_mutation_seq(),
+        tracker.report(
+            CleanupJobPhase::RefreshingBreakdown,
+            3,
+            4,
+            removed_orphans as u64,
+            0,
+            0,
+            "Refreshing storage breakdown snapshot...",
         );
-        state
-            .storage_breakdown_cache
-            .store(post_seq, after_snap.clone());
+        let after_snap = compute_and_store_unscoped_breakdown(&state, None)
+            .await
+            .unwrap_or_default();
 
         let deleted_segments = before_snap
             .categories
@@ -1294,201 +1972,219 @@ pub async fn api_storage_cleanup(
             .total_tracked_bytes
             .saturating_sub(after_snap.total_tracked_bytes);
         let duration_ms = started.elapsed().as_millis() as u64;
-        return Json(StorageCleanupResponse {
-            success: true,
-            target: req.target,
-            camera: None,
+        let msg = if cancelled_after_retention {
+            format!("Retention pass stopped after {duration_ms}ms")
+        } else {
+            format!("Retention pass completed in {duration_ms}ms")
+        };
+        return Ok(CleanupRunOutcome {
             deleted_items,
             deleted_segments,
             freed_bytes,
             duration_ms,
-            message: format!("Retention pass completed in {duration_ms}ms"),
-        })
-        .into_response();
+            cancelled: cancelled_after_retention,
+            message: msg,
+        });
     }
 
     let state_work = state.clone();
-    let camera_for_work = camera_clean.clone();
-    let target = req.target;
-    let include_pinned = req.include_pinned;
-    let prune_retained_segments = req.prune_retained_segments;
+    let tracker_work = tracker.clone();
+    let camera_for_work = params.camera_clean.clone();
+    let scope = params.scope.clone();
+    let target = params.target;
+    let include_pinned = params.include_pinned;
+    let prune_retained_segments = params.prune_retained_segments;
 
-    let work_res =
-        tokio::task::spawn_blocking(move || -> anyhow::Result<(u64, u64, u64, Vec<String>)> {
-            let mut deleted_items = 0u64;
-            let mut deleted_segments = 0u64;
-            let mut freed_bytes = 0u64;
-            let mut invalidated_cameras: Vec<String> = Vec::new();
+    let (deleted_items, deleted_segments, freed_bytes, invalidated_cameras, cancelled) =
+        tokio::task::spawn_blocking(
+            move || -> anyhow::Result<(u64, u64, u64, Vec<String>, bool)> {
+                let mut deleted_items = 0u64;
+                let mut deleted_segments = 0u64;
+                let mut freed_bytes = 0u64;
+                let mut invalidated_cameras: Vec<String> = Vec::new();
+                let mut processed_units = 0u64;
+                let mut total_units = 0u64;
 
-            let target_cameras = |db_cams: BTreeSet<String>| -> Vec<String> {
-                let mut set: BTreeSet<String> = policies.keys().cloned().collect();
-                for c in db_cams {
-                    set.insert(c);
-                }
-                set.into_iter()
-                    .filter(|c| {
-                        if let Some(ref only_cam) = camera_for_work {
-                            c == only_cam
-                        } else {
-                            scope.allows(c)
-                        }
-                    })
-                    .collect()
-            };
+                let target_cameras = |db_cams: BTreeSet<String>| -> Vec<String> {
+                    let mut set: BTreeSet<String> = policies.keys().cloned().collect();
+                    for c in db_cams {
+                        set.insert(c);
+                    }
+                    set.into_iter()
+                        .filter(|c| {
+                            if let Some(ref only_cam) = camera_for_work {
+                                c == only_cam
+                            } else {
+                                scope.allows(c)
+                            }
+                        })
+                        .collect()
+                };
 
-            match target {
-                CleanupTarget::Events => {
-                    let wal_before = measure_wal_bytes(state_work.db.path());
-                    let purged = state_work.db.purge_events_filtered(
-                        &scope,
-                        camera_for_work.as_deref(),
-                        before_ts,
-                        now,
-                        include_pinned,
-                    )?;
-                    let purged_reviews = if prune_retained_segments {
-                        state_work.db.purge_reviews_filtered(
+                match target {
+                    CleanupTarget::Events => {
+                        tracker_work.report(
+                            CleanupJobPhase::Scanning,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            "Scanning events & review catalog...",
+                        );
+                        let wal_before = measure_wal_bytes(state_work.db.path());
+                        let ev_candidates = state_work.db.select_purgeable_events_filtered(
                             &scope,
                             camera_for_work.as_deref(),
                             before_ts,
                             now,
                             include_pinned,
-                        )?
-                    } else {
-                        Vec::new()
-                    };
-                    deleted_items = (purged.len() + purged_reviews.len()) as u64;
-                    let mut affected_cams: BTreeSet<String> = BTreeSet::new();
-                    for (_ev_id, cam, _thumb_opt) in &purged {
-                        affected_cams.insert(cam.clone());
-                    }
-                    for (_rev_id, cam, _thumb_opt) in &purged_reviews {
-                        affected_cams.insert(cam.clone());
-                    }
-                    freed_bytes += media_lifecycle::cleanup_events_batch_media_artifacts_bytes(
-                        &state_work.media_dir,
-                        &purged,
-                    );
-                    if !purged_reviews.is_empty() {
-                        freed_bytes += media_lifecycle::cleanup_reviews_batch_media_artifacts_bytes(
-                            &state_work.media_dir,
-                            &purged_reviews,
-                        );
-                    }
-                    purge_revoked_share_credits(&state_work);
-
-                    // Sweep genuinely orphaned event files in top-level `clips/` (and `clips/review/`
-                    // when `prune_retained_segments` is enabled) using exact DB primary-key and
-                    // `thumb_path` verification (zero truncation, multi-prefix camera disambiguation).
-                    let db_cams: BTreeSet<String> = state_work
-                        .db
-                        .distinct_storage_cameras()
-                        .unwrap_or_default();
-                    let mut all_cams_desc: Vec<String> = policies
-                        .keys()
-                        .chain(db_cams.iter())
-                        .cloned()
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .collect();
-                    all_cams_desc.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-
-                    let clips_dir = state_work.media_dir.join("clips");
-                    let grace_cutoff = before_ts.unwrap_or(now - 60.0).min(now - 60.0);
-                    if std::fs::symlink_metadata(&clips_dir).is_ok_and(|m| m.file_type().is_dir())
-                        && let Ok(entries) = std::fs::read_dir(&clips_dir)
-                    {
-                        let mut candidates: Vec<(String, Vec<String>)> = Vec::new();
-                        for entry in entries.flatten().take(MAX_SCAN_ENTRIES_PER_DIR) {
-                            let Ok(ft) = entry.file_type() else {
-                                continue;
-                            };
-                            if !ft.is_file() {
-                                continue;
-                            }
-                            let Ok(fname) = entry.file_name().into_string() else {
-                                continue;
-                            };
-                            if fname.starts_with('.')
-                                || fname.starts_with("latest_")
-                                || fname.starts_with("share_clip_")
-                                || fname.starts_with("share_redacted_")
-                                || (!prune_retained_segments && fname.starts_with("review-"))
-                                || !is_safe_id(&fname)
-                            {
-                                continue;
-                            }
-                            let ext_ok = Path::new(&fname)
-                                .extension()
-                                .and_then(|e| e.to_str())
-                                .is_some_and(|e| {
-                                    matches!(
-                                        e.to_ascii_lowercase().as_str(),
-                                        "jpg" | "jpeg" | "webp" | "mp4"
-                                    )
-                                });
-                            if !ext_ok {
-                                continue;
-                            }
-
-                            let stem_raw = Path::new(&fname)
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("");
-                            let stem_base = stem_raw.strip_suffix("-clean").unwrap_or(stem_raw);
-                            let opt_pfx = if prune_retained_segments {
-                                "review-"
-                            } else {
-                                ""
-                            };
-                            let Some(cand_ids) = evaluate_orphan_stem_candidate(
-                                stem_base,
-                                opt_pfx,
-                                &all_cams_desc,
-                                camera_for_work.as_deref(),
+                        )?;
+                        let rev_candidates = if prune_retained_segments {
+                            state_work.db.select_purgeable_reviews_filtered(
                                 &scope,
-                            ) else {
-                                continue;
+                                camera_for_work.as_deref(),
+                                before_ts,
+                                now,
+                                include_pinned,
+                            )?
+                        } else {
+                            Vec::new()
+                        };
+                        total_units = (ev_candidates.len() + rev_candidates.len()) as u64;
+                        let catalog_band = if prune_retained_segments {
+                            (2.0, 45.0)
+                        } else {
+                            (2.0, 95.0)
+                        };
+                        tracker_work.report_banded(
+                            CleanupJobPhase::PurgingCatalog,
+                            0,
+                            total_units,
+                            0,
+                            total_units,
+                            catalog_band,
+                            0,
+                            0,
+                            0,
+                            "Purging AI event catalog & snapshots...",
+                        );
+
+                        let mut shared_dir_idx = (total_units > 8).then(|| {
+                            media_lifecycle::MediaArtifactDirIndex::build(
+                                &state_work.media_dir,
+                                prune_retained_segments,
+                            )
+                        }).flatten();
+
+                        let mut affected_cams: BTreeSet<String> = BTreeSet::new();
+                        for ev_chunk in ev_candidates.chunks(CATALOG_MICRO_BATCH_SIZE) {
+                            if tracker_work.is_cancelled() {
+                                break;
+                            }
+                            let deleted_chunk = state_work
+                                .db
+                                .delete_events_batch_guarded(ev_chunk, include_pinned)?;
+                            for (_ev_id, cam, _thumb_opt) in &deleted_chunk {
+                                affected_cams.insert(cam.clone());
+                            }
+                            deleted_items += deleted_chunk.len() as u64;
+                            let chunk_freed = if let Some(ref mut idx) = shared_dir_idx {
+                                idx.cleanup_events_chunk_bytes(&state_work.media_dir, &deleted_chunk)
+                            } else {
+                                media_lifecycle::cleanup_events_batch_media_artifacts_bytes(
+                                    &state_work.media_dir,
+                                    &deleted_chunk,
+                                )
                             };
-
-                            let mtime_ok = entry
-                                .metadata()
-                                .ok()
-                                .and_then(|m| m.modified().ok())
-                                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                                .is_some_and(|d| d.as_secs_f64() < grace_cutoff);
-                            if !mtime_ok {
-                                continue;
+                            freed_bytes = freed_bytes.saturating_add(chunk_freed);
+                            processed_units += ev_chunk.len() as u64;
+                            tracker_work.report_banded(
+                                CleanupJobPhase::PurgingCatalog,
+                                processed_units,
+                                total_units,
+                                processed_units,
+                                total_units,
+                                catalog_band,
+                                deleted_items,
+                                deleted_segments,
+                                freed_bytes,
+                                "Purging AI events & unlinking event snapshots...",
+                            );
+                            if is_async_job && ev_candidates.len() > CATALOG_MICRO_BATCH_SIZE {
+                                std::thread::sleep(Duration::from_millis(1));
                             }
-
-                            candidates.push((fname, cand_ids));
                         }
 
-                        if !candidates.is_empty()
-                            && let Ok(unreferenced_fnames) =
-                                state_work.db.filter_unreferenced_clip_candidates(&candidates)
-                        {
-                            for fname in unreferenced_fnames {
-                                let rel = Path::new("clips").join(&fname);
-                                freed_bytes +=
-                                    media_lifecycle::remove_non_symlink_under_media_dir_bytes(
+                        if !tracker_work.is_cancelled() && !rev_candidates.is_empty() {
+                            for rev_chunk in rev_candidates.chunks(CATALOG_MICRO_BATCH_SIZE) {
+                                if tracker_work.is_cancelled() {
+                                    break;
+                                }
+                                let deleted_chunk = state_work
+                                    .db
+                                    .delete_reviews_batch_guarded(rev_chunk, include_pinned)?;
+                                for (_rev_id, cam, _thumb_opt) in &deleted_chunk {
+                                    affected_cams.insert(cam.clone());
+                                }
+                                deleted_items += deleted_chunk.len() as u64;
+                                let chunk_freed = if let Some(ref mut idx) = shared_dir_idx {
+                                    idx.cleanup_reviews_chunk_bytes(
                                         &state_work.media_dir,
-                                        &rel,
-                                    );
+                                        &deleted_chunk,
+                                    )
+                                } else {
+                                    media_lifecycle::cleanup_reviews_batch_media_artifacts_bytes(
+                                        &state_work.media_dir,
+                                        &deleted_chunk,
+                                    )
+                                };
+                                freed_bytes = freed_bytes.saturating_add(chunk_freed);
+                                processed_units += rev_chunk.len() as u64;
+                                tracker_work.report_banded(
+                                    CleanupJobPhase::PurgingCatalog,
+                                    processed_units,
+                                    total_units,
+                                    processed_units,
+                                    total_units,
+                                    catalog_band,
+                                    deleted_items,
+                                    deleted_segments,
+                                    freed_bytes,
+                                    "Purging matching review segments & thumbnails...",
+                                );
+                                if is_async_job && rev_candidates.len() > CATALOG_MICRO_BATCH_SIZE {
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
                             }
                         }
-                    }
+                        purge_revoked_share_credits(&state_work);
 
-                    if prune_retained_segments {
-                        let review_dir = clips_dir.join("review");
-                        if std::fs::symlink_metadata(&clips_dir)
-                            .is_ok_and(|m| m.file_type().is_dir())
-                            && std::fs::symlink_metadata(&review_dir)
+                        let db_cams: BTreeSet<String> = state_work
+                            .db
+                            .distinct_storage_cameras()
+                            .unwrap_or_default();
+                        let mut all_cams_desc: Vec<String> = policies
+                            .keys()
+                            .chain(db_cams.iter())
+                            .cloned()
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect();
+                        all_cams_desc.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+
+                        let clips_dir = state_work.media_dir.join("clips");
+                        let grace_cutoff = before_ts.unwrap_or(now - 60.0).min(now - 60.0);
+                        if !tracker_work.is_cancelled()
+                            && std::fs::symlink_metadata(&clips_dir)
                                 .is_ok_and(|m| m.file_type().is_dir())
-                            && let Ok(entries) = std::fs::read_dir(&review_dir)
+                            && let Ok(entries) = std::fs::read_dir(&clips_dir)
                         {
-                            let mut rev_candidates: Vec<(String, Vec<String>)> = Vec::new();
+                            let mut candidates: Vec<(String, Vec<String>)> = Vec::new();
                             for entry in entries.flatten().take(MAX_SCAN_ENTRIES_PER_DIR) {
+                                if tracker_work.is_cancelled() {
+                                    break;
+                                }
                                 let Ok(ft) = entry.file_type() else {
                                     continue;
                                 };
@@ -1498,7 +2194,13 @@ pub async fn api_storage_cleanup(
                                 let Ok(fname) = entry.file_name().into_string() else {
                                     continue;
                                 };
-                                if fname.starts_with('.') || !is_safe_id(&fname) {
+                                if fname.starts_with('.')
+                                    || fname.starts_with("latest_")
+                                    || fname.starts_with("share_clip_")
+                                    || fname.starts_with("share_redacted_")
+                                    || (!prune_retained_segments && fname.starts_with("review-"))
+                                    || !is_safe_id(&fname)
+                                {
                                     continue;
                                 }
                                 let ext_ok = Path::new(&fname)
@@ -1507,25 +2209,33 @@ pub async fn api_storage_cleanup(
                                     .is_some_and(|e| {
                                         matches!(
                                             e.to_ascii_lowercase().as_str(),
-                                            "jpg" | "jpeg" | "webp"
+                                            "jpg" | "jpeg" | "webp" | "mp4"
                                         )
                                     });
                                 if !ext_ok {
                                     continue;
                                 }
-                                let stem = Path::new(&fname)
+
+                                let stem_raw = Path::new(&fname)
                                     .file_stem()
                                     .and_then(|s| s.to_str())
                                     .unwrap_or("");
+                                let stem_base = stem_raw.strip_suffix("-clean").unwrap_or(stem_raw);
+                                let opt_pfx = if prune_retained_segments {
+                                    "review-"
+                                } else {
+                                    ""
+                                };
                                 let Some(cand_ids) = evaluate_orphan_stem_candidate(
-                                    stem,
-                                    "thumb-",
+                                    stem_base,
+                                    opt_pfx,
                                     &all_cams_desc,
                                     camera_for_work.as_deref(),
                                     &scope,
                                 ) else {
                                     continue;
                                 };
+
                                 let mtime_ok = entry
                                     .metadata()
                                     .ok()
@@ -1535,351 +2245,1059 @@ pub async fn api_storage_cleanup(
                                 if !mtime_ok {
                                     continue;
                                 }
-                                rev_candidates.push((fname, cand_ids));
+
+                                candidates.push((fname, cand_ids));
                             }
-                            if !rev_candidates.is_empty()
+
+                            if !tracker_work.is_cancelled()
+                                && !candidates.is_empty()
                                 && let Ok(unreferenced_fnames) = state_work
                                     .db
-                                    .filter_unreferenced_clip_candidates(&rev_candidates)
+                                    .filter_unreferenced_clip_candidates(&candidates)
                             {
-                                for fname in unreferenced_fnames {
-                                    let rel = Path::new("clips").join("review").join(&fname);
-                                    freed_bytes +=
-                                        media_lifecycle::remove_non_symlink_under_media_dir_bytes(
-                                            &state_work.media_dir,
-                                            &rel,
+                                total_units += unreferenced_fnames.len() as u64;
+                                for fchunk in unreferenced_fnames.chunks(100) {
+                                    if tracker_work.is_cancelled() {
+                                        break;
+                                    }
+                                    for fname in fchunk {
+                                        let rel = Path::new("clips").join(fname);
+                                        freed_bytes = freed_bytes.saturating_add(
+                                            media_lifecycle::remove_non_symlink_under_media_dir_bytes(
+                                                &state_work.media_dir,
+                                                &rel,
+                                            ),
                                         );
+                                        processed_units += 1;
+                                    }
+                                    tracker_work.report_banded(
+                                        CleanupJobPhase::UnlinkingMedia,
+                                        processed_units,
+                                        total_units,
+                                        processed_units,
+                                        total_units,
+                                        catalog_band,
+                                        deleted_items,
+                                        deleted_segments,
+                                        freed_bytes,
+                                        "Sweeping orphaned clip artifacts...",
+                                    );
                                 }
                             }
                         }
 
-                        let cams_to_check: Vec<String> = if let Some(ref c) = camera_for_work {
-                            vec![c.clone()]
-                        } else {
-                            let mut all_db = db_cams;
-                            all_db.extend(affected_cams);
-                            target_cameras(all_db)
-                        };
-                        for cam in cams_to_check {
-                            if !scope.allows(&cam) {
-                                continue;
-                            }
-                            let pol = policies.get(&cam);
-                            let cont_days = pol.map_or(default_cont_days, |p| p.continuous_days);
-                            let motion_days = pol.map_or(cont_days, |p| p.motion_days);
-                            let pre_sec = pol.map_or(5.0, |p| p.pre_capture_sec);
-                            let post_sec = pol.map_or(5.0, |p| p.post_capture_sec);
-                            let cont_cutoff = now - cont_days * 86_400.0;
-                            let motion_cutoff_opt =
-                                (motion_days > cont_days).then_some(now - motion_days * 86_400.0);
-                            let effective_cutoff = match before_ts {
-                                Some(bt) => cont_cutoff.min(bt),
-                                None => cont_cutoff,
-                            };
-                            let deleted_rows = state_work.db.delete_recordings_before_cutoff(
-                                &cam,
-                                effective_cutoff,
-                                pre_sec,
-                                post_sec,
-                                !include_pinned,
-                                true,
-                                true,
-                                motion_cutoff_opt,
-                            )?;
-                            if !deleted_rows.is_empty() {
-                                let (seg_cnt, seg_bytes) =
-                                    media_lifecycle::unlink_deleted_recording_rows(
-                                        &state_work.media_dir,
-                                        cold_dir_opt.as_deref(),
-                                        &cam,
-                                        &deleted_rows,
-                                    );
-                                deleted_segments += seg_cnt as u64;
-                                freed_bytes += seg_bytes;
-                                state_work.share_engine.on_camera_recordings_purged(
-                                    &state_work,
-                                    &cam,
-                                    0.0,
-                                    effective_cutoff,
-                                );
-                                invalidated_cameras.push(cam);
-                            }
-                        }
-                    }
-                    let _ = state_work.db.checkpoint_wal_truncate();
-                    let wal_after = measure_wal_bytes(state_work.db.path());
-                    freed_bytes += wal_before.saturating_sub(wal_after);
-                }
-                CleanupTarget::Reviews => {
-                    let wal_before = measure_wal_bytes(state_work.db.path());
-                    let purged = state_work.db.purge_reviews_filtered(
-                        &scope,
-                        camera_for_work.as_deref(),
-                        before_ts,
-                        now,
-                        include_pinned,
-                    )?;
-                    deleted_items = purged.len() as u64;
-                    freed_bytes += media_lifecycle::cleanup_reviews_batch_media_artifacts_bytes(
-                        &state_work.media_dir,
-                        &purged,
-                    );
-                    purge_revoked_share_credits(&state_work);
-                    let _ = state_work.db.checkpoint_wal_truncate();
-                    let wal_after = measure_wal_bytes(state_work.db.path());
-                    freed_bytes += wal_before.saturating_sub(wal_after);
-                }
-                CleanupTarget::ExcessRecordings | CleanupTarget::Recordings => {
-                    let db_cams = state_work
-                        .db
-                        .distinct_storage_cameras()
-                        .unwrap_or_default();
-                    let cams = target_cameras(db_cams);
-                    for cam in cams {
-                        let pol = policies.get(&cam);
-                        let cont_days = pol.map_or(default_cont_days, |p| p.continuous_days);
-                        let pre_sec = pol.map_or(5.0, |p| p.pre_capture_sec);
-                        let post_sec = pol.map_or(5.0, |p| p.post_capture_sec);
-                        let cutoff = if target == CleanupTarget::ExcessRecordings {
-                            let cont_cutoff = now - cont_days * 86_400.0;
-                            match before_ts {
-                                Some(bt) => cont_cutoff.min(bt),
-                                None => cont_cutoff,
-                            }
-                        } else {
-                            before_ts.unwrap_or(now)
-                        };
-                        let deleted_rows = state_work.db.delete_recordings_before_cutoff(
-                            &cam,
-                            cutoff,
-                            pre_sec,
-                            post_sec,
-                            !include_pinned,
-                            false,
-                            false,
-                            None,
-                        )?;
-                        if !deleted_rows.is_empty() {
-                            let (seg_cnt, seg_bytes) =
-                                media_lifecycle::unlink_deleted_recording_rows(
-                                    &state_work.media_dir,
-                                    cold_dir_opt.as_deref(),
-                                    &cam,
-                                    &deleted_rows,
-                                );
-                            deleted_items += seg_cnt as u64;
-                            deleted_segments += seg_cnt as u64;
-                            freed_bytes += seg_bytes;
-                            state_work
-                                .share_engine
-                                .on_camera_recordings_purged(&state_work, &cam, 0.0, cutoff);
-                            invalidated_cameras.push(cam);
-                        }
-                    }
-                    let _ = state_work.db.checkpoint_wal_truncate();
-                }
-                CleanupTarget::Previews => {
-                    let purged_previews = state_work.db.purge_previews_filtered(
-                        &scope,
-                        camera_for_work.as_deref(),
-                        before_ts,
-                    )?;
-                    for (_id, cam, db_path) in &purged_previews {
-                        deleted_items += 1;
-                        if let Some(safe_rel) = resolve_safe_preview_rel_path(db_path, cam) {
-                            freed_bytes += media_lifecycle::remove_non_symlink_under_media_dir_bytes(
-                                &state_work.media_dir,
-                                &safe_rel,
-                            );
-                        }
-                        if is_safe_id(cam)
-                            && let Some(fname) = Path::new(db_path).file_name().and_then(|n| n.to_str())
-                            && is_safe_id(fname)
-                        {
-                            let fallback_rel =
-                                Path::new("clips").join("previews").join(cam).join(fname);
-                            freed_bytes += media_lifecycle::remove_non_symlink_under_media_dir_bytes(
-                                &state_work.media_dir,
-                                &fallback_rel,
-                            );
-                        }
-                    }
-                    // Also sweep unindexed hourly preview MP4s in `clips/previews/<cam>/` when no age filter is set
-                    if before_ts.is_none() {
-                        let previews_root = state_work.media_dir.join("clips").join("previews");
-                        if std::fs::symlink_metadata(&previews_root).is_ok_and(|m| m.file_type().is_dir())
-                            && let Ok(cam_dirs) = std::fs::read_dir(&previews_root)
-                        {
-                            for cam_entry in cam_dirs.flatten().take(1024) {
-                                let cp = cam_entry.path();
-                                let Some(cam_name) = cp.file_name().and_then(|n| n.to_str()) else {
-                                    continue;
-                                };
-                                if !is_safe_id(cam_name) {
-                                    continue;
-                                }
-                                if let Some(ref only_cam) = camera_for_work {
-                                    if cam_name != only_cam {
+                        if prune_retained_segments && !tracker_work.is_cancelled() {
+                            let review_dir = clips_dir.join("review");
+                            if std::fs::symlink_metadata(&clips_dir)
+                                .is_ok_and(|m| m.file_type().is_dir())
+                                && std::fs::symlink_metadata(&review_dir)
+                                    .is_ok_and(|m| m.file_type().is_dir())
+                                && let Ok(entries) = std::fs::read_dir(&review_dir)
+                            {
+                                let mut rev_candidates: Vec<(String, Vec<String>)> = Vec::new();
+                                for entry in entries.flatten().take(MAX_SCAN_ENTRIES_PER_DIR) {
+                                    if tracker_work.is_cancelled() {
+                                        break;
+                                    }
+                                    let Ok(ft) = entry.file_type() else {
+                                        continue;
+                                    };
+                                    if !ft.is_file() {
                                         continue;
                                     }
-                                } else if !scope.allows(cam_name) {
-                                    continue;
+                                    let Ok(fname) = entry.file_name().into_string() else {
+                                        continue;
+                                    };
+                                    if fname.starts_with('.') || !is_safe_id(&fname) {
+                                        continue;
+                                    }
+                                    let ext_ok = Path::new(&fname)
+                                        .extension()
+                                        .and_then(|e| e.to_str())
+                                        .is_some_and(|e| {
+                                            matches!(
+                                                e.to_ascii_lowercase().as_str(),
+                                                "jpg" | "jpeg" | "webp"
+                                            )
+                                        });
+                                    if !ext_ok {
+                                        continue;
+                                    }
+                                    let stem = Path::new(&fname)
+                                        .file_stem()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("");
+                                    let Some(cand_ids) = evaluate_orphan_stem_candidate(
+                                        stem,
+                                        "thumb-",
+                                        &all_cams_desc,
+                                        camera_for_work.as_deref(),
+                                        &scope,
+                                    ) else {
+                                        continue;
+                                    };
+                                    let mtime_ok = entry
+                                        .metadata()
+                                        .ok()
+                                        .and_then(|m| m.modified().ok())
+                                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                                        .is_some_and(|d| d.as_secs_f64() < grace_cutoff);
+                                    if !mtime_ok {
+                                        continue;
+                                    }
+                                    rev_candidates.push((fname, cand_ids));
                                 }
-                                if std::fs::symlink_metadata(&cp).is_ok_and(|m| m.file_type().is_dir())
-                                    && let Ok(files) = std::fs::read_dir(&cp)
+                                if !tracker_work.is_cancelled()
+                                    && !rev_candidates.is_empty()
+                                    && let Ok(unreferenced_fnames) = state_work
+                                        .db
+                                        .filter_unreferenced_clip_candidates(&rev_candidates)
                                 {
-                                    for f in files.flatten().take(MAX_SCAN_ENTRIES_PER_DIR) {
-                                        if let Some(fname) = f.file_name().to_str()
-                                            && is_safe_id(fname)
-                                        {
-                                            let rel = Path::new("clips")
-                                                .join("previews")
-                                                .join(cam_name)
-                                                .join(fname);
-                                            let b =
+                                    total_units += unreferenced_fnames.len() as u64;
+                                    for fchunk in unreferenced_fnames.chunks(100) {
+                                        if tracker_work.is_cancelled() {
+                                            break;
+                                        }
+                                        for fname in fchunk {
+                                            let rel = Path::new("clips").join("review").join(fname);
+                                            freed_bytes = freed_bytes.saturating_add(
                                                 media_lifecycle::remove_non_symlink_under_media_dir_bytes(
                                                     &state_work.media_dir,
                                                     &rel,
+                                                ),
+                                            );
+                                            processed_units += 1;
+                                        }
+                                        tracker_work.report_banded(
+                                            CleanupJobPhase::UnlinkingMedia,
+                                            processed_units,
+                                            total_units,
+                                            processed_units,
+                                            total_units,
+                                            catalog_band,
+                                            deleted_items,
+                                            deleted_segments,
+                                            freed_bytes,
+                                            "Sweeping orphaned review thumbnails...",
+                                        );
+                                    }
+                                }
+                            }
+
+                            let cams_to_check: Vec<String> = if let Some(ref c) = camera_for_work {
+                                vec![c.clone()]
+                            } else {
+                                let mut all_db = db_cams;
+                                all_db.extend(affected_cams);
+                                target_cameras(all_db)
+                            };
+                            let mut cam_plans = Vec::new();
+                            for cam in cams_to_check {
+                                if tracker_work.is_cancelled() {
+                                    break;
+                                }
+                                if !scope.allows(&cam) {
+                                    continue;
+                                }
+                                let pol = policies.get(&cam);
+                                let cont_days = pol.map_or(default_cont_days, |p| p.continuous_days);
+                                let motion_days = pol.map_or(cont_days, |p| p.motion_days);
+                                let pre_sec = pol.map_or(5.0, |p| p.pre_capture_sec);
+                                let post_sec = pol.map_or(5.0, |p| p.post_capture_sec);
+                                let cont_cutoff = now - cont_days * 86_400.0;
+                                let motion_cutoff_opt =
+                                    (motion_days > cont_days).then_some(now - motion_days * 86_400.0);
+                                let effective_cutoff = match before_ts {
+                                    Some(bt) => cont_cutoff.min(bt),
+                                    None => cont_cutoff,
+                                };
+                                let rows = state_work.db.select_recordings_before_cutoff(
+                                    &cam,
+                                    effective_cutoff,
+                                    pre_sec,
+                                    post_sec,
+                                    !include_pinned,
+                                    true,
+                                    true,
+                                    motion_cutoff_opt,
+                                )?;
+                                if !rows.is_empty() {
+                                    total_units += rows.len() as u64;
+                                    cam_plans.push((
+                                        cam,
+                                        effective_cutoff,
+                                        pre_sec,
+                                        post_sec,
+                                        motion_cutoff_opt,
+                                        rows,
+                                    ));
+                                }
+                            }
+
+                            if !cam_plans.is_empty() && !tracker_work.is_cancelled() {
+                                let seg_stage_total: u64 =
+                                    cam_plans.iter().map(|p| p.5.len() as u64).sum();
+                                let mut seg_stage_processed = 0u64;
+                                let seg_band = (45.0, 95.0);
+                                tracker_work.report_banded(
+                                    CleanupJobPhase::PruningSegments,
+                                    processed_units,
+                                    total_units,
+                                    0,
+                                    seg_stage_total,
+                                    seg_band,
+                                    deleted_items,
+                                    deleted_segments,
+                                    freed_bytes,
+                                    "Pruning retained MP4 segments past continuous window...",
+                                );
+                                for (
+                                    cam,
+                                    effective_cutoff,
+                                    pre_sec,
+                                    post_sec,
+                                    motion_cutoff_opt,
+                                    rows,
+                                ) in cam_plans
+                                {
+                                    let mut cam_deleted_any = false;
+                                    let cam_upper = cam.to_ascii_uppercase();
+                                    for seg_chunk in rows.chunks(SEGMENT_MICRO_BATCH_SIZE) {
+                                        if tracker_work.is_cancelled() {
+                                            break;
+                                        }
+                                        let deleted_rows =
+                                            state_work.db.delete_recordings_batch_guarded(
+                                                &cam,
+                                                seg_chunk,
+                                                effective_cutoff,
+                                                pre_sec,
+                                                post_sec,
+                                                !include_pinned,
+                                                true,
+                                                true,
+                                                motion_cutoff_opt,
+                                            )?;
+                                        let skipped =
+                                            seg_chunk.len().saturating_sub(deleted_rows.len())
+                                                as u64;
+                                        processed_units += skipped;
+                                        seg_stage_processed += skipped;
+                                        if !deleted_rows.is_empty() {
+                                            cam_deleted_any = true;
+                                            for sub in
+                                                deleted_rows.chunks(SEGMENT_UNLINK_SUBSLICE_SIZE)
+                                            {
+                                                let (seg_cnt, seg_bytes) =
+                                                    media_lifecycle::unlink_deleted_recording_rows(
+                                                        &state_work.media_dir,
+                                                        cold_dir_opt.as_deref(),
+                                                        &cam,
+                                                        sub,
+                                                    );
+                                                deleted_segments += seg_cnt as u64;
+                                                freed_bytes =
+                                                    freed_bytes.saturating_add(seg_bytes);
+                                                processed_units += sub.len() as u64;
+                                                seg_stage_processed += sub.len() as u64;
+                                                tracker_work.report_banded(
+                                                    CleanupJobPhase::PruningSegments,
+                                                    processed_units,
+                                                    total_units,
+                                                    seg_stage_processed,
+                                                    seg_stage_total,
+                                                    seg_band,
+                                                    deleted_items,
+                                                    deleted_segments,
+                                                    freed_bytes,
+                                                    &format!(
+                                                        "Unlinking MP4 segments [{cam_upper}]..."
+                                                    ),
                                                 );
-                                            if b > 0 {
-                                                deleted_items += 1;
-                                                freed_bytes += b;
+                                            }
+                                        }
+                                        if is_async_job && rows.len() > SEGMENT_MICRO_BATCH_SIZE {
+                                            std::thread::sleep(Duration::from_millis(2));
+                                        }
+                                    }
+                                    if cam_deleted_any {
+                                        state_work.share_engine.on_camera_recordings_purged(
+                                            &state_work,
+                                            &cam,
+                                            0.0,
+                                            effective_cutoff,
+                                        );
+                                        invalidated_cameras.push(cam);
+                                    }
+                                    if tracker_work.is_cancelled() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        tracker_work.report(
+                            CleanupJobPhase::CheckpointingWal,
+                            processed_units,
+                            total_units,
+                            deleted_items,
+                            deleted_segments,
+                            freed_bytes,
+                            "Checkpointing SQLite WAL...",
+                        );
+                        if is_async_job {
+                            let _ = state_work.db.checkpoint_wal_passive();
+                        } else {
+                            let _ = state_work.db.checkpoint_wal_truncate();
+                        }
+                        let wal_after = measure_wal_bytes(state_work.db.path());
+                        freed_bytes = freed_bytes.saturating_add(wal_before.saturating_sub(wal_after));
+                    }
+                    CleanupTarget::Reviews => {
+                        tracker_work.report(
+                            CleanupJobPhase::Scanning,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            "Scanning review triage catalog...",
+                        );
+                        let wal_before = measure_wal_bytes(state_work.db.path());
+                        let candidates = state_work.db.select_purgeable_reviews_filtered(
+                            &scope,
+                            camera_for_work.as_deref(),
+                            before_ts,
+                            now,
+                            include_pinned,
+                        )?;
+                        total_units = candidates.len() as u64;
+                        let mut shared_rev_idx = (total_units > 8)
+                            .then(|| {
+                                media_lifecycle::MediaArtifactDirIndex::build(
+                                    &state_work.media_dir,
+                                    true,
+                                )
+                            })
+                            .flatten();
+                        for rev_chunk in candidates.chunks(CATALOG_MICRO_BATCH_SIZE) {
+                            if tracker_work.is_cancelled() {
+                                break;
+                            }
+                            let deleted_chunk = state_work
+                                .db
+                                .delete_reviews_batch_guarded(rev_chunk, include_pinned)?;
+                            deleted_items += deleted_chunk.len() as u64;
+                            let chunk_freed = if let Some(ref mut idx) = shared_rev_idx {
+                                idx.cleanup_reviews_chunk_bytes(
+                                    &state_work.media_dir,
+                                    &deleted_chunk,
+                                )
+                            } else {
+                                media_lifecycle::cleanup_reviews_batch_media_artifacts_bytes(
+                                    &state_work.media_dir,
+                                    &deleted_chunk,
+                                )
+                            };
+                            freed_bytes = freed_bytes.saturating_add(chunk_freed);
+                            processed_units += rev_chunk.len() as u64;
+                            tracker_work.report(
+                                CleanupJobPhase::PurgingCatalog,
+                                processed_units,
+                                total_units,
+                                deleted_items,
+                                deleted_segments,
+                                freed_bytes,
+                                "Purging review segments & thumbnails...",
+                            );
+                            if is_async_job && candidates.len() > CATALOG_MICRO_BATCH_SIZE {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                        }
+                        purge_revoked_share_credits(&state_work);
+                        tracker_work.report(
+                            CleanupJobPhase::CheckpointingWal,
+                            processed_units,
+                            total_units,
+                            deleted_items,
+                            deleted_segments,
+                            freed_bytes,
+                            "Checkpointing SQLite WAL...",
+                        );
+                        if is_async_job {
+                            let _ = state_work.db.checkpoint_wal_passive();
+                        } else {
+                            let _ = state_work.db.checkpoint_wal_truncate();
+                        }
+                        let wal_after = measure_wal_bytes(state_work.db.path());
+                        freed_bytes = freed_bytes.saturating_add(wal_before.saturating_sub(wal_after));
+                    }
+                    CleanupTarget::ExcessRecordings | CleanupTarget::Recordings => {
+                        tracker_work.report(
+                            CleanupJobPhase::Scanning,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            "Scanning recording segments...",
+                        );
+                        let db_cams = state_work
+                            .db
+                            .distinct_storage_cameras()
+                            .unwrap_or_default();
+                        let cams = target_cameras(db_cams);
+                        let mut cam_plans = Vec::new();
+                        for cam in cams {
+                            if tracker_work.is_cancelled() {
+                                break;
+                            }
+                            let pol = policies.get(&cam);
+                            let cont_days = pol.map_or(default_cont_days, |p| p.continuous_days);
+                            let pre_sec = pol.map_or(5.0, |p| p.pre_capture_sec);
+                            let post_sec = pol.map_or(5.0, |p| p.post_capture_sec);
+                            let cutoff = if target == CleanupTarget::ExcessRecordings {
+                                let cont_cutoff = now - cont_days * 86_400.0;
+                                match before_ts {
+                                    Some(bt) => cont_cutoff.min(bt),
+                                    None => cont_cutoff,
+                                }
+                            } else {
+                                before_ts.unwrap_or(now)
+                            };
+                            let rows = state_work.db.select_recordings_before_cutoff(
+                                &cam,
+                                cutoff,
+                                pre_sec,
+                                post_sec,
+                                !include_pinned,
+                                false,
+                                false,
+                                None,
+                            )?;
+                            if !rows.is_empty() {
+                                total_units += rows.len() as u64;
+                                cam_plans.push((cam, cutoff, pre_sec, post_sec, rows));
+                            }
+                        }
+
+                        if !cam_plans.is_empty() && !tracker_work.is_cancelled() {
+                            tracker_work.report(
+                                CleanupJobPhase::PruningSegments,
+                                0,
+                                total_units,
+                                0,
+                                0,
+                                0,
+                                "Unlinking MP4 recording segments...",
+                            );
+                            for (cam, cutoff, pre_sec, post_sec, rows) in cam_plans {
+                                let mut cam_deleted_any = false;
+                                let cam_upper = cam.to_ascii_uppercase();
+                                for seg_chunk in rows.chunks(SEGMENT_MICRO_BATCH_SIZE) {
+                                    if tracker_work.is_cancelled() {
+                                        break;
+                                    }
+                                    let deleted_rows = state_work.db.delete_recordings_batch_guarded(
+                                        &cam,
+                                        seg_chunk,
+                                        cutoff,
+                                        pre_sec,
+                                        post_sec,
+                                        !include_pinned,
+                                        false,
+                                        false,
+                                        None,
+                                    )?;
+                                    let skipped =
+                                        seg_chunk.len().saturating_sub(deleted_rows.len()) as u64;
+                                    processed_units += skipped;
+                                    if !deleted_rows.is_empty() {
+                                        cam_deleted_any = true;
+                                        for sub in deleted_rows.chunks(SEGMENT_UNLINK_SUBSLICE_SIZE)
+                                        {
+                                            let (seg_cnt, seg_bytes) =
+                                                media_lifecycle::unlink_deleted_recording_rows(
+                                                    &state_work.media_dir,
+                                                    cold_dir_opt.as_deref(),
+                                                    &cam,
+                                                    sub,
+                                                );
+                                            deleted_items += seg_cnt as u64;
+                                            deleted_segments += seg_cnt as u64;
+                                            freed_bytes = freed_bytes.saturating_add(seg_bytes);
+                                            processed_units += sub.len() as u64;
+                                            tracker_work.report(
+                                                CleanupJobPhase::PruningSegments,
+                                                processed_units,
+                                                total_units,
+                                                deleted_items,
+                                                deleted_segments,
+                                                freed_bytes,
+                                                &format!("Unlinking MP4 segments [{cam_upper}]..."),
+                                            );
+                                        }
+                                    }
+                                    if is_async_job && rows.len() > SEGMENT_MICRO_BATCH_SIZE {
+                                        std::thread::sleep(Duration::from_millis(2));
+                                    }
+                                }
+                                if cam_deleted_any {
+                                    state_work.share_engine.on_camera_recordings_purged(
+                                        &state_work,
+                                        &cam,
+                                        0.0,
+                                        cutoff,
+                                    );
+                                    invalidated_cameras.push(cam);
+                                }
+                                if tracker_work.is_cancelled() {
+                                    break;
+                                }
+                            }
+                        }
+
+                        tracker_work.report(
+                            CleanupJobPhase::CheckpointingWal,
+                            processed_units,
+                            total_units,
+                            deleted_items,
+                            deleted_segments,
+                            freed_bytes,
+                            "Checkpointing SQLite WAL...",
+                        );
+                        if is_async_job {
+                            let _ = state_work.db.checkpoint_wal_passive();
+                        } else {
+                            let _ = state_work.db.checkpoint_wal_truncate();
+                        }
+                    }
+                    CleanupTarget::Previews => {
+                        tracker_work.report(
+                            CleanupJobPhase::Scanning,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            "Scanning timeline previews & scrubbing frames...",
+                        );
+                        let purged_previews = state_work.db.purge_previews_filtered(
+                            &scope,
+                            camera_for_work.as_deref(),
+                            before_ts,
+                        )?;
+                        total_units = purged_previews.len() as u64;
+                        for (idx, (_id, cam, db_path)) in purged_previews.iter().enumerate() {
+                            deleted_items += 1;
+                            if let Some(safe_rel) = resolve_safe_preview_rel_path(db_path, cam) {
+                                freed_bytes = freed_bytes.saturating_add(
+                                    media_lifecycle::remove_non_symlink_under_media_dir_bytes(
+                                        &state_work.media_dir,
+                                        &safe_rel,
+                                    ),
+                                );
+                            }
+                            if is_safe_id(cam)
+                                && let Some(fname) =
+                                    Path::new(db_path).file_name().and_then(|n| n.to_str())
+                                && is_safe_id(fname)
+                            {
+                                let fallback_rel =
+                                    Path::new("clips").join("previews").join(cam).join(fname);
+                                freed_bytes = freed_bytes.saturating_add(
+                                    media_lifecycle::remove_non_symlink_under_media_dir_bytes(
+                                        &state_work.media_dir,
+                                        &fallback_rel,
+                                    ),
+                                );
+                            }
+                            processed_units = (idx + 1) as u64;
+                            if idx % 50 == 0 {
+                                tracker_work.report(
+                                    CleanupJobPhase::UnlinkingMedia,
+                                    processed_units,
+                                    total_units,
+                                    deleted_items,
+                                    deleted_segments,
+                                    freed_bytes,
+                                    "Unlinking preview MP4s...",
+                                );
+                            }
+                        }
+                        if before_ts.is_none() && !tracker_work.is_cancelled() {
+                            let previews_root = state_work.media_dir.join("clips").join("previews");
+                            if std::fs::symlink_metadata(&previews_root)
+                                .is_ok_and(|m| m.file_type().is_dir())
+                                && let Ok(cam_dirs) = std::fs::read_dir(&previews_root)
+                            {
+                                for cam_entry in cam_dirs.flatten().take(1024) {
+                                    if tracker_work.is_cancelled() {
+                                        break;
+                                    }
+                                    let cp = cam_entry.path();
+                                    let Some(cam_name) = cp.file_name().and_then(|n| n.to_str())
+                                    else {
+                                        continue;
+                                    };
+                                    if !is_safe_id(cam_name) {
+                                        continue;
+                                    }
+                                    if let Some(ref only_cam) = camera_for_work {
+                                        if cam_name != only_cam {
+                                            continue;
+                                        }
+                                    } else if !scope.allows(cam_name) {
+                                        continue;
+                                    }
+                                    if std::fs::symlink_metadata(&cp)
+                                        .is_ok_and(|m| m.file_type().is_dir())
+                                        && let Ok(files) = std::fs::read_dir(&cp)
+                                    {
+                                        for f in files.flatten().take(MAX_SCAN_ENTRIES_PER_DIR) {
+                                            if tracker_work.is_cancelled() {
+                                                break;
+                                            }
+                                            if let Some(fname) = f.file_name().to_str()
+                                                && is_safe_id(fname)
+                                            {
+                                                let rel = Path::new("clips")
+                                                    .join("previews")
+                                                    .join(cam_name)
+                                                    .join(fname);
+                                                let b = media_lifecycle::remove_non_symlink_under_media_dir_bytes(
+                                                    &state_work.media_dir,
+                                                    &rel,
+                                                );
+                                                if b > 0 {
+                                                    deleted_items += 1;
+                                                    freed_bytes = freed_bytes.saturating_add(b);
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    let before_ms = before_ts.map(|t| (t.max(0.0) * 1000.0) as u64);
-                    let (pf_cnt, pf_bytes) = state_work.preview_frames.purge_filtered(
-                        &scope,
-                        camera_for_work.as_deref(),
-                        before_ms,
-                    );
-                    deleted_items += pf_cnt as u64;
-                    freed_bytes += pf_bytes;
+                        if !tracker_work.is_cancelled() {
+                            let before_ms = before_ts.map(|t| (t.max(0.0) * 1000.0) as u64);
+                            let (pf_cnt, pf_bytes) = state_work.preview_frames.purge_filtered(
+                                &scope,
+                                camera_for_work.as_deref(),
+                                before_ms,
+                            );
+                            deleted_items += pf_cnt as u64;
+                            freed_bytes = freed_bytes.saturating_add(pf_bytes);
+                        }
 
-                    if !scope.is_restricted() && camera_for_work.is_none() && before_ts.is_none() {
-                        let (rf_cnt, rf_bytes) = remove_regular_files_under_media_subdir(
-                            &state_work.media_dir,
-                            &Path::new("clips").join("review_frames"),
-                            2,
-                        );
-                        deleted_items += rf_cnt;
-                        freed_bytes += rf_bytes;
-                    }
-
-                    let _ = state_work.db.checkpoint_wal_truncate();
-                }
-                CleanupTarget::Exports => {
-                    let export_ids = state_work.db.list_completed_exports_filtered(
-                        &scope,
-                        camera_for_work.as_deref(),
-                        before_ts,
-                    )?;
-                    for exp_id in &export_ids {
-                        state_work.export_jobs.remove(exp_id);
-                        if let Ok((deleted, bytes)) =
-                            media_lifecycle::delete_export_with_artifacts_bytes(
-                                &state_work.db,
-                                &state_work.media_dir,
-                                exp_id,
-                            )
-                            && deleted
+                        if !tracker_work.is_cancelled()
+                            && !scope.is_restricted()
+                            && camera_for_work.is_none()
+                            && before_ts.is_none()
                         {
-                            deleted_items += 1;
-                            freed_bytes += bytes;
+                            let (rf_cnt, rf_bytes) = remove_regular_files_under_media_subdir(
+                                &state_work.media_dir,
+                                &Path::new("clips").join("review_frames"),
+                                2,
+                            );
+                            deleted_items += rf_cnt;
+                            freed_bytes = freed_bytes.saturating_add(rf_bytes);
+                        }
+
+                        if is_async_job {
+                            let _ = state_work.db.checkpoint_wal_passive();
+                        } else {
+                            let _ = state_work.db.checkpoint_wal_truncate();
                         }
                     }
-                    if !scope.is_restricted()
-                        && camera_for_work.is_none()
-                        && let Ok(expired_targets) =
-                            state_work.db.list_expired_or_revoked_share_link_targets(now)
-                    {
-                        let _ = state_work.db.prune_expired_share_links(now);
-                        for tid in expired_targets {
-                            if !state_work
-                                .db
-                                .has_active_share_links_for_target(&tid, now)
-                                .unwrap_or(true)
-                                && !state_work
-                                    .db
-                                    .has_recently_accessed_share_links_for_target(&tid, now, 900.0)
-                                    .unwrap_or(true)
-                            {
-                                let b = media_lifecycle::cleanup_share_clip_artifacts_in_dir_bytes(
+                    CleanupTarget::Exports => {
+                        tracker_work.report(
+                            CleanupJobPhase::Scanning,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            "Scanning completed exports & expired shares...",
+                        );
+                        let export_ids = state_work.db.list_completed_exports_filtered(
+                            &scope,
+                            camera_for_work.as_deref(),
+                            before_ts,
+                        )?;
+                        total_units = export_ids.len() as u64;
+                        for (idx, exp_id) in export_ids.iter().enumerate() {
+                            if tracker_work.is_cancelled() {
+                                break;
+                            }
+                            state_work.export_jobs.remove(exp_id);
+                            if let Ok((deleted, bytes)) =
+                                media_lifecycle::delete_export_with_artifacts_bytes(
+                                    &state_work.db,
                                     &state_work.media_dir,
-                                    "",
-                                    &tid,
-                                );
-                                if b > 0 {
-                                    deleted_items += 1;
-                                    freed_bytes += b;
+                                    exp_id,
+                                )
+                                && deleted
+                            {
+                                deleted_items += 1;
+                                freed_bytes = freed_bytes.saturating_add(bytes);
+                            }
+                            processed_units = (idx + 1) as u64;
+                            tracker_work.report(
+                                CleanupJobPhase::UnlinkingMedia,
+                                processed_units,
+                                total_units,
+                                deleted_items,
+                                deleted_segments,
+                                freed_bytes,
+                                "Removing exported clips...",
+                            );
+                        }
+                        if !tracker_work.is_cancelled()
+                            && !scope.is_restricted()
+                            && camera_for_work.is_none()
+                            && let Ok(expired_targets) =
+                                state_work.db.list_expired_or_revoked_share_link_targets(now)
+                        {
+                            let _ = state_work.db.prune_expired_share_links(now);
+                            for tid in expired_targets {
+                                if tracker_work.is_cancelled() {
+                                    break;
+                                }
+                                if !state_work
+                                    .db
+                                    .has_active_share_links_for_target(&tid, now)
+                                    .unwrap_or(true)
+                                    && !state_work
+                                        .db
+                                        .has_recently_accessed_share_links_for_target(
+                                            &tid, now, 900.0,
+                                        )
+                                        .unwrap_or(true)
+                                {
+                                    let b =
+                                        media_lifecycle::cleanup_share_clip_artifacts_in_dir_bytes(
+                                            &state_work.media_dir,
+                                            "",
+                                            &tid,
+                                        );
+                                    if b > 0 {
+                                        deleted_items += 1;
+                                        freed_bytes = freed_bytes.saturating_add(b);
+                                    }
                                 }
                             }
                         }
+                        purge_revoked_share_credits(&state_work);
+                        if is_async_job {
+                            let _ = state_work.db.checkpoint_wal_passive();
+                        } else {
+                            let _ = state_work.db.checkpoint_wal_truncate();
+                        }
                     }
-                    purge_revoked_share_credits(&state_work);
-                    let _ = state_work.db.checkpoint_wal_truncate();
+                    CleanupTarget::WalCheckpoint => {
+                        tracker_work.report(
+                            CleanupJobPhase::CheckpointingWal,
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            "Checkpointing & truncating SQLite WAL...",
+                        );
+                        let wal_before = measure_wal_bytes(state_work.db.path());
+                        let (_log_frames, ckpt_frames) = state_work.db.checkpoint_wal_truncate()?;
+                        let wal_after = measure_wal_bytes(state_work.db.path());
+                        deleted_items = ckpt_frames.max(0) as u64;
+                        freed_bytes = wal_before.saturating_sub(wal_after);
+                    }
+                    CleanupTarget::RetentionPass => unreachable!(),
                 }
-                CleanupTarget::WalCheckpoint => {
-                    let wal_before = measure_wal_bytes(state_work.db.path());
-                    let (_log_frames, ckpt_frames) = state_work.db.checkpoint_wal_truncate()?;
-                    let wal_after = measure_wal_bytes(state_work.db.path());
-                    deleted_items = ckpt_frames.max(0) as u64;
-                    freed_bytes = wal_before.saturating_sub(wal_after);
-                }
-                CleanupTarget::RetentionPass => unreachable!(),
-            }
 
-            Ok((deleted_items, deleted_segments, freed_bytes, invalidated_cameras))
-        })
-        .await;
-
-    let (deleted_items, deleted_segments, freed_bytes, invalidated_cameras) = match work_res {
-        Ok(Ok(tuple)) => tuple,
-        Ok(Err(err)) => {
-            warn!("Storage cleanup ({:?}) failed: {err:#}", req.target);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "success": false,
-                    "message": "Storage cleanup operation failed"
-                })),
-            )
-                .into_response();
-        }
-        Err(err) => {
-            warn!("Storage cleanup worker panicked: {err}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
+                let was_cancelled = tracker_work.is_cancelled();
+                Ok((
+                    deleted_items,
+                    deleted_segments,
+                    freed_bytes,
+                    invalidated_cameras,
+                    was_cancelled,
+                ))
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Storage cleanup worker panicked: {e}"))??;
 
     for cam in &invalidated_cameras {
         state.vod_cache.invalidate_camera(cam);
     }
     state.storage_breakdown_cache.invalidate();
 
+    if is_async_job {
+        tracker.report(
+            CleanupJobPhase::RefreshingBreakdown,
+            deleted_items + deleted_segments,
+            deleted_items + deleted_segments,
+            deleted_items,
+            deleted_segments,
+            freed_bytes,
+            "Refreshing granular storage breakdown...",
+        );
+        let _ = compute_and_store_unscoped_breakdown(&state, None).await;
+    }
+
     let duration_ms = started.elapsed().as_millis() as u64;
     let freed_mb = (freed_bytes as f64) / (1024.0 * 1024.0);
     info!(
-        "Storage cleanup {:?} (camera={:?}): deleted_items={}, deleted_segments={}, freed={:.2} MB in {}ms",
-        req.target, camera_clean, deleted_items, deleted_segments, freed_mb, duration_ms
+        "Storage cleanup {:?} (camera={:?}, cancelled={}): deleted_items={}, deleted_segments={}, freed={:.2} MB in {}ms",
+        params.target,
+        params.camera_clean,
+        cancelled,
+        deleted_items,
+        deleted_segments,
+        freed_mb,
+        duration_ms
     );
 
-    Json(StorageCleanupResponse {
-        success: true,
-        target: req.target,
-        camera: camera_clean,
+    let message = if cancelled {
+        format!(
+            "Cleanup cancelled after removing {deleted_items} item(s) and {deleted_segments} segment(s), freeing {freed_mb:.2} MB"
+        )
+    } else {
+        format!(
+            "Cleaned {deleted_items} item(s) and {deleted_segments} segment(s), freeing {freed_mb:.2} MB"
+        )
+    };
+
+    Ok(CleanupRunOutcome {
         deleted_items,
         deleted_segments,
         freed_bytes,
         duration_ms,
-        message: format!(
-            "Cleaned {deleted_items} item(s) and {deleted_segments} segment(s), freeing {freed_mb:.2} MB"
-        ),
+        cancelled,
+        message,
     })
-    .into_response()
+}
+
+pub async fn api_storage_cleanup(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    uri: Uri,
+    headers: HeaderMap,
+    Json(req): Json<StorageCleanupRequest>,
+) -> Response {
+    let params =
+        match validate_and_authorize_cleanup_request(&state, &jar, &uri, &headers, &req).await {
+            Ok(p) => p,
+            Err(resp) => return *resp,
+        };
+    let target = params.target;
+    let camera_clean = params.camera_clean.clone();
+
+    let now = now_f64();
+    let sync_id = state.cleanup_jobs.next_job_id(now);
+    if let Err(active_opt) = state.cleanup_jobs.try_register_running_inner(
+        sync_id.clone(),
+        target,
+        camera_clean.clone(),
+        false,
+        true,
+        now,
+    ) {
+        let visible_job =
+            active_opt.filter(|j| StorageCleanupJobManager::scope_allows_job(&params.scope, j));
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "success": false,
+                "message": "A storage cleanup job is already in progress",
+                "job": visible_job,
+            })),
+        )
+            .into_response();
+    }
+    let mut guard = ActiveCleanupJobGuard::new(state.clone(), sync_id, Instant::now(), true);
+
+    let res = execute_storage_cleanup_core(state, params, None).await;
+    guard.disarm();
+
+    match res {
+        Ok(outcome) => Json(StorageCleanupResponse {
+            success: true,
+            target,
+            camera: camera_clean,
+            deleted_items: outcome.deleted_items,
+            deleted_segments: outcome.deleted_segments,
+            freed_bytes: outcome.freed_bytes,
+            duration_ms: outcome.duration_ms,
+            message: outcome.message,
+        })
+        .into_response(),
+        Err(err) => {
+            warn!("Storage cleanup ({target:?}) failed: {err:#}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "message": "Storage cleanup operation failed"
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub async fn api_cleanup_jobs_list(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Response {
+    let principal = match authenticate_read(&state, &jar, &headers).await {
+        Ok(p) => p,
+        Err(rej) => return rej.into_response(),
+    };
+    if !principal.is_admin() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "success": false, "message": "Admin role required" })),
+        )
+            .into_response();
+    }
+    let scope = principal.camera_scope();
+    let jobs = state.cleanup_jobs.list_for_scope(&scope, now_f64());
+    Json(json!(jobs)).into_response()
+}
+
+pub async fn api_cleanup_job_start(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    uri: Uri,
+    headers: HeaderMap,
+    Json(req): Json<StorageCleanupRequest>,
+) -> Response {
+    let params =
+        match validate_and_authorize_cleanup_request(&state, &jar, &uri, &headers, &req).await {
+            Ok(p) => p,
+            Err(resp) => return *resp,
+        };
+
+    let now = now_f64();
+    let job_id = state.cleanup_jobs.next_job_id(now);
+    let cancellable = params.target != CleanupTarget::WalCheckpoint;
+    let (initial_snap, cancel_flag) = match state.cleanup_jobs.try_register_running(
+        job_id.clone(),
+        params.target,
+        params.camera_clean.clone(),
+        cancellable,
+        now,
+    ) {
+        Ok(pair) => pair,
+        Err(active_opt) => {
+            let visible_job =
+                active_opt.filter(|j| StorageCleanupJobManager::scope_allows_job(&params.scope, j));
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "success": false,
+                    "message": "A storage cleanup job is already in progress",
+                    "job": visible_job,
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    emit_cleanup_job_ws(&state, &initial_snap);
+
+    let bg_state = state.clone();
+    let bg_job_id = job_id;
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let mut guard =
+            ActiveCleanupJobGuard::new(bg_state.clone(), bg_job_id.clone(), started, false);
+        match execute_storage_cleanup_core(
+            bg_state.clone(),
+            params,
+            Some((bg_job_id.clone(), cancel_flag)),
+        )
+        .await
+        {
+            Ok(outcome) => {
+                if let Some(final_snap) =
+                    bg_state
+                        .cleanup_jobs
+                        .mark_finished(&bg_job_id, &outcome, now_f64())
+                {
+                    emit_cleanup_job_ws(&bg_state, &final_snap);
+                }
+                guard.disarm();
+            }
+            Err(err) => {
+                warn!("Background storage cleanup job '{bg_job_id}' failed: {err:#}");
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                if let Some(failed_snap) = bg_state.cleanup_jobs.mark_failed(
+                    &bg_job_id,
+                    elapsed_ms,
+                    "Storage cleanup operation failed".to_string(),
+                    now_f64(),
+                ) {
+                    emit_cleanup_job_ws(&bg_state, &failed_snap);
+                }
+                guard.disarm();
+            }
+        }
+    });
+
+    (StatusCode::ACCEPTED, Json(initial_snap)).into_response()
+}
+
+pub async fn api_cleanup_job_cancel(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    uri: Uri,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let clean_id = id.trim();
+    if !is_safe_id(clean_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Invalid job identifier" })),
+        )
+            .into_response();
+    }
+    let principal = match state
+        .auth_gate
+        .authorize_mutation(&state, &jar, &uri, &headers, true, AccessTarget::Global)
+        .await
+    {
+        Ok(p) => p,
+        Err(rej) => return rej.into_response(),
+    };
+    let scope = principal.camera_scope();
+    match state
+        .cleanup_jobs
+        .request_cancel(clean_id, &scope, now_f64())
+    {
+        CancelCleanupJobOutcome::Updated(snap) => {
+            emit_cleanup_job_ws(&state, &snap);
+            Json(*snap).into_response()
+        }
+        CancelCleanupJobOutcome::Forbidden => (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Not permitted to cancel this cleanup job"
+            })),
+        )
+            .into_response(),
+        CancelCleanupJobOutcome::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "success": false,
+                "message": "Cleanup job not found"
+            })),
+        )
+            .into_response(),
+    }
 }

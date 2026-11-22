@@ -1992,6 +1992,7 @@ pub async fn auth_gate_middleware(
             || (method != "GET"
                 && method != "HEAD"
                 && path_matches_segment_prefix(&path, "/api/storage"))
+            || path_matches_segment_prefix(&path, "/api/jobs/cleanup")
             || path_matches_segment_prefix(&path, "/api/logs")
             || (path.starts_with("/api/") && path.ends_with("/logs"))
             || path_matches_segment_prefix(&path, "/api/genai/models")
@@ -4904,6 +4905,23 @@ pub fn filter_ws_message_for_allowed_cameras(
             .to_string(),
         );
     }
+    if clean_topic == "storage_cleanup" {
+        let payload_val: Value = match parsed.get("payload") {
+            Some(Value::String(s)) => serde_json::from_str(s).ok()?,
+            Some(v @ Value::Object(_)) => v.clone(),
+            _ => return None,
+        };
+        let cam = payload_val
+            .get("camera")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        return if allow_list.iter().any(|a| a == cam) {
+            Some(msg.to_string())
+        } else {
+            None
+        };
+    }
     if clean_topic == "events" || clean_topic == "reviews" || clean_topic == "exports" {
         let payload_val: Value = match parsed.get("payload") {
             Some(Value::String(s)) => serde_json::from_str(s).ok()?,
@@ -5486,6 +5504,28 @@ cameras:
         })
         .to_string();
         assert!(filter_ws_message_for_allowed_cameras(&ev_back, Some(&allowed)).is_none());
+
+        let cleanup_front = json!({
+            "topic": "ninjanvr/storage_cleanup",
+            "payload": json!({ "id": "cln_1", "target": "events", "camera": "front_door", "status": "running" }).to_string()
+        })
+        .to_string();
+        assert!(filter_ws_message_for_allowed_cameras(&cleanup_front, Some(&allowed)).is_some());
+
+        let cleanup_back = json!({
+            "topic": "ninjanvr/storage_cleanup",
+            "payload": json!({ "id": "cln_2", "target": "events", "camera": "backyard", "status": "running" }).to_string()
+        })
+        .to_string();
+        assert!(filter_ws_message_for_allowed_cameras(&cleanup_back, Some(&allowed)).is_none());
+
+        let cleanup_global = json!({
+            "topic": "ninjanvr/storage_cleanup",
+            "payload": json!({ "id": "cln_3", "target": "events", "camera": null, "status": "running" }).to_string()
+        })
+        .to_string();
+        assert!(filter_ws_message_for_allowed_cameras(&cleanup_global, Some(&allowed)).is_none());
+        assert!(filter_ws_message_for_allowed_cameras(&cleanup_global, None).is_some());
 
         let activity_msg = json!({
             "topic": "camera_activity",

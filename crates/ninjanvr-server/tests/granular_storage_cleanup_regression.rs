@@ -1177,3 +1177,707 @@ cameras:
     state.shutdown().await;
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+#[tokio::test]
+async fn async_cleanup_job_streams_ws_progress_completes_and_enforces_camera_scope() {
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "ninjanvr-async-cleanup-ws-{}",
+        rand::random::<u64>()
+    ));
+    let web_dir = tmp_dir.join("web");
+    let media_dir = tmp_dir.join("media");
+    let seg_dir = media_dir.join("recordings/2026-11-02/09/escritorio");
+    std::fs::create_dir_all(&web_dir).unwrap();
+    std::fs::create_dir_all(media_dir.join("clips/review")).unwrap();
+    std::fs::create_dir_all(media_dir.join("exports")).unwrap();
+    std::fs::create_dir_all(&seg_dir).unwrap();
+    std::fs::write(web_dir.join("index.html"), "<html>Console</html>").unwrap();
+
+    let db_path = tmp_dir.join("ninjanvr.db");
+    let cfg_path = tmp_dir.join("config.yml");
+    let yaml = format!(
+        r#"
+database:
+  path: {}
+auth:
+  enabled: true
+  hash_iterations: 1000
+go2rtc:
+  streams:
+    escritorio:
+      - "rtsp://cam:pass@192.0.2.10:554/stream1"
+    cozinha:
+      - "rtsp://cam:pass@192.0.2.11:554/stream1"
+cameras:
+  escritorio:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/escritorio
+          roles: [detect, record]
+    record:
+      enabled: true
+      continuous:
+        days: 2
+      alerts:
+        retain:
+          days: 14
+  cozinha:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/cozinha
+          roles: [detect, record]
+    record:
+      enabled: true
+      continuous:
+        days: 2
+"#,
+        db_path.display()
+    );
+    std::fs::write(&cfg_path, yaml).unwrap();
+
+    let state = new_app_state(&cfg_path, web_dir, media_dir.clone(), false)
+        .await
+        .unwrap();
+    state
+        .db
+        .create_user_with_cameras("root_admin", "AdminPass#1234", "admin", "*", 1000)
+        .unwrap();
+    state
+        .db
+        .create_user_with_cameras("coz_op", "OpPass#123456", "operator", "cozinha", 1000)
+        .unwrap();
+    state
+        .db
+        .create_user_with_cameras("viewer_user", "ViewerPass#1234", "viewer", "*", 1000)
+        .unwrap();
+
+    let now = now_sec();
+    let five_days_ago = now - 5.0 * 86_400.0;
+    let seven_days_ago = now - 7.0 * 86_400.0;
+
+    // Seed 520 non-pinned events, 260 non-pinned reviews, and 420 excess MP4 segments (multiple micro-batches),
+    // plus 1 pinned event + 1 pinned-overlapping review + 1 pinned MP4 segment that must survive!
+    for i in 0..520 {
+        let snap = media_dir.join(format!("clips/escritorio-ev_batch_{i}.webp"));
+        std::fs::write(&snap, vec![0x42u8; 256]).unwrap();
+        state
+            .db
+            .upsert_event(&EventDto {
+                id: format!("ev_batch_{i}"),
+                camera: "escritorio".to_string(),
+                label: "person".to_string(),
+                zones: json!([]),
+                start_time: five_days_ago + (i as f64),
+                end_time: Some(five_days_ago + (i as f64) + 5.0),
+                has_clip: false,
+                has_snapshot: true,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: None,
+                top_score: Some(0.91),
+                false_positive: Some(false),
+                box_coords: None,
+                data: json!({ "thumb_path": format!("/clips/escritorio-ev_batch_{i}.webp") }),
+                thumbnail: None,
+                area: None,
+                ratio: None,
+                score: Some(0.91),
+                stationary: false,
+            })
+            .unwrap();
+    }
+    for i in 0..260 {
+        let rthumb = media_dir.join(format!("clips/review/thumb-escritorio-rev_batch_{i}.webp"));
+        std::fs::write(&rthumb, vec![0x43u8; 256]).unwrap();
+        state
+            .db
+            .insert_review_segment(&ReviewItemDto {
+                id: format!("rev_batch_{i}"),
+                camera: "escritorio".to_string(),
+                start_time: five_days_ago + (i as f64) * 2.0,
+                end_time: Some(five_days_ago + (i as f64) * 2.0 + 10.0),
+                severity: "alert".to_string(),
+                thumb_path: format!("/clips/review/thumb-escritorio-rev_batch_{i}.webp"),
+                has_been_reviewed: false,
+                data: json!({ "objects": ["person"] }),
+            })
+            .unwrap();
+    }
+    for i in 0..420 {
+        let sname = format!("seg_{i:04}.mp4");
+        std::fs::write(seg_dir.join(&sname), vec![0x44u8; 1024]).unwrap();
+        state
+            .db
+            .insert_recording(&RecordingRow {
+                id: format!("rec_batch_{i}"),
+                camera: "escritorio".to_string(),
+                path: format!("/media/ninjanvr/recordings/2026-11-02/09/escritorio/{sname}"),
+                start_time: five_days_ago + (i as f64),
+                end_time: five_days_ago + (i as f64) + 1.0,
+                duration: 1.0,
+                motion: 80,
+                objects: 1,
+                dbfs: -20,
+                segment_size: 1.0,
+                regions: 1,
+                motion_heatmap: None,
+            })
+            .unwrap();
+    }
+
+    // Pinned event + overlapping review + MP4 at `seven_days_ago`
+    let pin_seg = seg_dir.join("pinned_keep.mp4");
+    let pin_snap = media_dir.join("clips/escritorio-ev_keep_pin.webp");
+    std::fs::write(&pin_seg, vec![0x77u8; 2048]).unwrap();
+    std::fs::write(&pin_snap, vec![0x78u8; 512]).unwrap();
+    state
+        .db
+        .insert_recording(&RecordingRow {
+            id: "rec_keep_pin".to_string(),
+            camera: "escritorio".to_string(),
+            path: "/media/ninjanvr/recordings/2026-11-02/09/escritorio/pinned_keep.mp4".to_string(),
+            start_time: seven_days_ago,
+            end_time: seven_days_ago + 10.0,
+            duration: 10.0,
+            motion: 90,
+            objects: 1,
+            dbfs: -18,
+            segment_size: 2.0,
+            regions: 1,
+            motion_heatmap: None,
+        })
+        .unwrap();
+    state
+        .db
+        .upsert_event(&EventDto {
+            id: "ev_keep_pin".to_string(),
+            camera: "escritorio".to_string(),
+            label: "person".to_string(),
+            zones: json!([]),
+            start_time: seven_days_ago,
+            end_time: Some(seven_days_ago + 8.0),
+            has_clip: false,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: true,
+            sub_label: None,
+            top_score: Some(0.99),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({ "thumb_path": "/clips/escritorio-ev_keep_pin.webp" }),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.99),
+            stationary: false,
+        })
+        .unwrap();
+    state
+        .db
+        .insert_review_segment(&ReviewItemDto {
+            id: "rev_keep_pin".to_string(),
+            camera: "escritorio".to_string(),
+            start_time: seven_days_ago,
+            end_time: Some(seven_days_ago + 10.0),
+            severity: "alert".to_string(),
+            thumb_path: "".to_string(),
+            has_been_reviewed: false,
+            data: json!({ "objects": ["person"] }),
+        })
+        .unwrap();
+
+    let app = build_router_with_auth(state.clone(), true);
+    let admin_cookie = mint_cookie(&state.jwt_secret, "root_admin", "admin", None);
+    let coz_op_cookie = mint_cookie(&state.jwt_secret, "coz_op", "operator", Some("cozinha"));
+    let viewer_cookie = mint_cookie(&state.jwt_secret, "viewer_user", "viewer", None);
+
+    // RBAC + CSRF checks on `/api/jobs/cleanup`
+    let viewer_list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/jobs/cleanup")
+                .header(header::COOKIE, &viewer_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(viewer_list.status(), StatusCode::FORBIDDEN);
+
+    let coz_op_start = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/jobs/cleanup")
+                .header(header::COOKIE, &coz_op_cookie)
+                .header(header::HOST, "localhost")
+                .header(header::ORIGIN, "http://localhost")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"target":"events","camera":"cozinha","include_pinned":false,"prune_retained_segments":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(coz_op_start.status(), StatusCode::FORBIDDEN);
+
+    let csrf_bad_start = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/jobs/cleanup")
+                .header(header::COOKIE, &admin_cookie)
+                .header(header::HOST, "nvr.example.test")
+                .header(header::ORIGIN, "https://evil.example.test")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"target":"events"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(csrf_bad_start.status(), StatusCode::FORBIDDEN);
+
+    let mut ws_rx = state.comms.subscribe_ws();
+
+    // Start async job as `root_admin` -> returns `202 Accepted` immediately without blocking
+    let start_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/jobs/cleanup")
+                .header(header::COOKIE, &admin_cookie)
+                .header(header::HOST, "localhost")
+                .header(header::ORIGIN, "http://localhost")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"target":"events","camera":"escritorio","include_pinned":false,"prune_retained_segments":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start_res.status(), StatusCode::ACCEPTED);
+    let initial_snap: Value =
+        serde_json::from_slice(&to_bytes(start_res.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    let job_id = initial_snap["id"].as_str().unwrap().to_string();
+    assert_eq!(initial_snap["target"], json!("events"));
+    assert_eq!(initial_snap["camera"], json!("escritorio"));
+    assert_eq!(initial_snap["cancellable"], json!(true));
+
+    // Collect `/ws` `"storage_cleanup"` frames until terminal `"completed"`
+    let mut snapshots: Vec<Value> = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        let Ok(Ok(raw)) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), ws_rx.recv()).await
+        else {
+            break;
+        };
+        let Ok(envelope) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        if envelope["topic"] == json!("storage_cleanup") {
+            let payload_val: Value = match &envelope["payload"] {
+                Value::String(s) => serde_json::from_str(s).unwrap(),
+                v => v.clone(),
+            };
+            if payload_val["id"] == json!(job_id) {
+                let is_done = payload_val["status"] == json!("completed")
+                    || payload_val["status"] == json!("failed")
+                    || payload_val["status"] == json!("cancelled");
+                snapshots.push(payload_val);
+                if is_done {
+                    break;
+                }
+            }
+        }
+    }
+
+    assert!(
+        snapshots.len() >= 3,
+        "expected multiple incremental /ws progress frames before completion, got {}",
+        snapshots.len()
+    );
+    for pair in snapshots.windows(2) {
+        let prev_pct = pair[0]["progress_pct"].as_f64().unwrap();
+        let next_pct = pair[1]["progress_pct"].as_f64().unwrap();
+        assert!(
+            next_pct + 1e-6 >= prev_pct,
+            "progress_pct must be monotonically non-decreasing ({prev_pct} -> {next_pct})"
+        );
+    }
+    for snap in &snapshots {
+        if snap["phase"] == json!("purging_catalog") {
+            let pct = snap["progress_pct"].as_f64().unwrap();
+            assert!(
+                pct <= 45.0,
+                "catalog stage must stay <= 45% when MP4 segment pruning follows (got {pct}%)"
+            );
+        }
+    }
+    let final_snap = snapshots.last().unwrap();
+    assert_eq!(final_snap["status"], json!("completed"));
+    assert_eq!(final_snap["progress_pct"], json!(100.0));
+    assert_eq!(final_snap["deleted_items"], json!(780)); // 520 events + 260 reviews
+    assert_eq!(final_snap["deleted_segments"], json!(420));
+    assert!(final_snap["freed_bytes"].as_u64().unwrap() >= 420 * 1024);
+    assert!(
+        pin_seg.exists() && pin_snap.exists(),
+        "pinned event snapshot and MP4 segment must survive async micro-batched cleanup"
+    );
+
+    // Defense-in-depth CameraScope isolation on `StorageCleanupJobManager` + operator 403 on `GET /api/jobs/cleanup`
+    let coz_scope = ninjanvr_db::CameraScope::from_option(Some(vec!["cozinha".to_string()]));
+    assert!(
+        state
+            .cleanup_jobs
+            .list_for_scope(&coz_scope, now_sec())
+            .is_empty(),
+        "restricted CameraScope must not see jobs belonging to another camera"
+    );
+    let esc_scope = ninjanvr_db::CameraScope::from_option(Some(vec!["escritorio".to_string()]));
+    assert_eq!(
+        state
+            .cleanup_jobs
+            .list_for_scope(&esc_scope, now_sec())
+            .len(),
+        1
+    );
+
+    let coz_op_list_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/jobs/cleanup")
+                .header(header::COOKIE, &coz_op_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(coz_op_list_res.status(), StatusCode::FORBIDDEN);
+
+    let admin_list_res = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/jobs/cleanup")
+                .header(header::COOKIE, &admin_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_list_res.status(), StatusCode::OK);
+    let admin_list: Value = serde_json::from_slice(
+        &to_bytes(admin_list_res.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(admin_list.as_array().unwrap().len(), 1);
+    assert_eq!(admin_list[0]["id"], json!(job_id));
+    assert_eq!(admin_list[0]["status"], json!("completed"));
+
+    state.shutdown().await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test]
+async fn async_cleanup_job_conflict_and_cooperative_mid_run_cancellation_leave_zero_orphan_drift() {
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "ninjanvr-async-cleanup-cancel-{}",
+        rand::random::<u64>()
+    ));
+    let web_dir = tmp_dir.join("web");
+    let media_dir = tmp_dir.join("media");
+    let seg_dir = media_dir.join("recordings/2026-11-01/07/escritorio");
+    std::fs::create_dir_all(&web_dir).unwrap();
+    std::fs::create_dir_all(media_dir.join("clips/review")).unwrap();
+    std::fs::create_dir_all(media_dir.join("exports")).unwrap();
+    std::fs::create_dir_all(&seg_dir).unwrap();
+    std::fs::write(web_dir.join("index.html"), "<html>Console</html>").unwrap();
+
+    let db_path = tmp_dir.join("ninjanvr.db");
+    let cfg_path = tmp_dir.join("config.yml");
+    let yaml = format!(
+        r#"
+database:
+  path: {}
+auth:
+  enabled: true
+  hash_iterations: 1000
+go2rtc:
+  streams:
+    escritorio:
+      - "rtsp://cam:pass@192.0.2.10:554/stream1"
+    cozinha:
+      - "rtsp://cam:pass@192.0.2.11:554/stream1"
+cameras:
+  escritorio:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/escritorio
+          roles: [detect, record]
+    record:
+      enabled: true
+      continuous:
+        days: 2
+  cozinha:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/cozinha
+          roles: [detect, record]
+    record:
+      enabled: true
+      continuous:
+        days: 2
+"#,
+        db_path.display()
+    );
+    std::fs::write(&cfg_path, yaml).unwrap();
+
+    let state = new_app_state(&cfg_path, web_dir, media_dir.clone(), false)
+        .await
+        .unwrap();
+    state
+        .db
+        .create_user_with_cameras("root_admin", "AdminPass#1234", "admin", "*", 1000)
+        .unwrap();
+    state
+        .db
+        .create_user_with_cameras("coz_op", "OpPass#123456", "operator", "cozinha", 1000)
+        .unwrap();
+
+    let now = now_sec();
+    let ten_days_ago = now - 10.0 * 86_400.0;
+
+    // Seed 2,400 excess MP4 segments (12 micro-batches of 200 segments) so cooperative cancel catches it mid-flight
+    let total_seeded = 2_400usize;
+    for i in 0..total_seeded {
+        let sname = format!("s_{i:04}.mp4");
+        std::fs::write(seg_dir.join(&sname), vec![0x55u8; 512]).unwrap();
+        state
+            .db
+            .insert_recording(&RecordingRow {
+                id: format!("seg_cancel_{i}"),
+                camera: "escritorio".to_string(),
+                path: format!("/media/ninjanvr/recordings/2026-11-01/07/escritorio/{sname}"),
+                start_time: ten_days_ago + (i as f64),
+                end_time: ten_days_ago + (i as f64) + 1.0,
+                duration: 1.0,
+                motion: 20,
+                objects: 0,
+                dbfs: -25,
+                segment_size: 0.5,
+                regions: 0,
+                motion_heatmap: None,
+            })
+            .unwrap();
+    }
+
+    let app = build_router_with_auth(state.clone(), true);
+    let admin_cookie = mint_cookie(&state.jwt_secret, "root_admin", "admin", None);
+    let coz_op_cookie = mint_cookie(&state.jwt_secret, "coz_op", "operator", Some("cozinha"));
+
+    let mut ws_rx = state.comms.subscribe_ws();
+
+    let start_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/jobs/cleanup")
+                .header(header::COOKIE, &admin_cookie)
+                .header(header::HOST, "localhost")
+                .header(header::ORIGIN, "http://localhost")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"target":"excess_recordings","camera":"escritorio"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start_res.status(), StatusCode::ACCEPTED);
+    let snap0: Value =
+        serde_json::from_slice(&to_bytes(start_res.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    let job_id = snap0["id"].as_str().unwrap().to_string();
+
+    // Operator (`coz_op`) cannot cancel admin cleanup job (`403 Forbidden`), and defense-in-depth
+    // `CameraScope` on `request_cancel` returns `Forbidden` for out-of-scope cameras
+    let coz_scope = ninjanvr_db::CameraScope::from_option(Some(vec!["cozinha".to_string()]));
+    assert!(matches!(
+        state
+            .cleanup_jobs
+            .request_cancel(&job_id, &coz_scope, now_sec()),
+        ninjanvr_server::storage_ops::CancelCleanupJobOutcome::Forbidden
+    ));
+
+    let op_cancel = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/jobs/cleanup/{job_id}/cancel"))
+                .header(header::COOKIE, &coz_op_cookie)
+                .header(header::HOST, "localhost")
+                .header(header::ORIGIN, "http://localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(op_cancel.status(), StatusCode::FORBIDDEN);
+
+    let admin_conflict = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/jobs/cleanup")
+                .header(header::COOKIE, &admin_cookie)
+                .header(header::HOST, "localhost")
+                .header(header::ORIGIN, "http://localhost")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"target":"events","camera":"cozinha"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    if admin_conflict.status() == StatusCode::CONFLICT {
+        let cbody: Value = serde_json::from_slice(
+            &to_bytes(admin_conflict.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cbody["job"]["id"], json!(job_id));
+    }
+
+    // Legacy synchronous `POST /api/storage/cleanup` also respects global single-job mutual exclusion (`409 Conflict`)
+    let legacy_sync_conflict = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/storage/cleanup")
+                .header(header::COOKIE, &admin_cookie)
+                .header(header::HOST, "localhost")
+                .header(header::ORIGIN, "http://localhost")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"target":"events","camera":"cozinha"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    if state
+        .cleanup_jobs
+        .active_snapshots()
+        .iter()
+        .any(|s| s.id == job_id)
+    {
+        assert_eq!(legacy_sync_conflict.status(), StatusCode::CONFLICT);
+    }
+
+    // Request cooperative cancellation as `root_admin`
+    let cancel_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/jobs/cleanup/{job_id}/cancel"))
+                .header(header::COOKIE, &admin_cookie)
+                .header(header::HOST, "localhost")
+                .header(header::ORIGIN, "http://localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancel_res.status(), StatusCode::OK);
+
+    // Wait for terminal `/ws` frame for `job_id`
+    let mut final_snap: Option<Value> = None;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        let Ok(Ok(raw)) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), ws_rx.recv()).await
+        else {
+            break;
+        };
+        let Ok(envelope) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        if envelope["topic"] == json!("storage_cleanup") {
+            let payload_val: Value = match &envelope["payload"] {
+                Value::String(s) => serde_json::from_str(s).unwrap(),
+                v => v.clone(),
+            };
+            if payload_val["id"] == json!(job_id)
+                && (payload_val["status"] == json!("cancelled")
+                    || payload_val["status"] == json!("completed"))
+            {
+                final_snap = Some(payload_val);
+                break;
+            }
+        }
+    }
+
+    let term = final_snap.expect("expected terminal /ws frame after cancellation");
+    assert_eq!(term["cancellable"], json!(false));
+    let deleted_segs = term["deleted_segments"].as_u64().unwrap() as usize;
+    if term["status"] == json!("cancelled") {
+        assert!(
+            deleted_segs < total_seeded,
+            "cooperative cancellation should stop before deleting all {total_seeded} segments (deleted={deleted_segs})"
+        );
+    }
+
+    // Invariant: ZERO DB-vs-disk orphan drift after mid-run cancellation!
+    let surviving_db = state
+        .db
+        .select_recordings_before_cutoff(
+            "escritorio",
+            now + 60.0,
+            0.0,
+            0.0,
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        surviving_db.len() + deleted_segs,
+        total_seeded,
+        "surviving DB rows ({}) + deleted segments ({deleted_segs}) must equal seeded ({total_seeded})",
+        surviving_db.len()
+    );
+    let on_disk_count = if seg_dir.exists() {
+        std::fs::read_dir(&seg_dir).unwrap().flatten().count()
+    } else {
+        0
+    };
+    assert_eq!(
+        on_disk_count,
+        surviving_db.len(),
+        "every surviving DB row must have its MP4 on disk and every deleted DB row must have its MP4 unlinked"
+    );
+
+    state.shutdown().await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}

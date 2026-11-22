@@ -5,6 +5,7 @@ import {
   CameraLiveActivity,
   NinjaConfigResponse,
   NinjaStatsResponse,
+  StorageCleanupJobSnapshot,
 } from "../types/nvr";
 import {
   FirstWeekday,
@@ -356,6 +357,8 @@ interface NvrRealtimeState {
   stats: NinjaStatsResponse | null;
   statsHistory: NinjaStatsResponse[];
   cameraActivity: Record<string, CameraLiveActivity>;
+  cleanupJob: StorageCleanupJobSnapshot | null;
+  cleanupDoneSeq: number;
 
   setActiveTab: (tab: WorkspaceTab) => void;
   setLiveLayout: (layout: LiveLayoutMode) => void;
@@ -400,6 +403,8 @@ interface NvrRealtimeState {
   appendStatsSample: (sample: NinjaStatsResponse) => void;
   setStatsHistory: (history: NinjaStatsResponse[]) => void;
   setCameraActivity: (activity: Record<string, CameraLiveActivity>) => void;
+  setCleanupJob: (job: StorageCleanupJobSnapshot | null) => void;
+  dismissCleanupJob: () => void;
 }
 
 const initialThemeMode = resolveInitialThemeMode();
@@ -444,6 +449,8 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
   stats: null,
   statsHistory: [],
   cameraActivity: {},
+  cleanupJob: null,
+  cleanupDoneSeq: 0,
 
   setActiveTab: (activeTab) => set({ activeTab }),
   setLiveLayout: (liveLayout) => {
@@ -818,5 +825,44 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
         return s;
       }
       return { cameraActivity: merged };
+    }),
+  setCleanupJob: (nextJob) =>
+    set((s) => {
+      if (!nextJob) {
+        return { cleanupJob: null };
+      }
+      const isTerm = (st: StorageCleanupJobSnapshot["status"]) =>
+        st === "completed" || st === "cancelled" || st === "failed";
+      const prev = s.cleanupJob;
+      if (prev && prev.id === nextJob.id) {
+        if (isTerm(prev.status) && !isTerm(nextJob.status)) {
+          return s;
+        }
+        const mergedJob: StorageCleanupJobSnapshot = isTerm(nextJob.status)
+          ? nextJob
+          : {
+              ...nextJob,
+              progress_pct: Math.max(prev.progress_pct, nextJob.progress_pct),
+            };
+        const becameTerminal = !isTerm(prev.status) && isTerm(nextJob.status);
+        return {
+          cleanupJob: mergedJob,
+          cleanupDoneSeq: becameTerminal ? s.cleanupDoneSeq + 1 : s.cleanupDoneSeq,
+        };
+      }
+      const becameTerminal = isTerm(nextJob.status);
+      return {
+        cleanupJob: nextJob,
+        cleanupDoneSeq: becameTerminal ? s.cleanupDoneSeq + 1 : s.cleanupDoneSeq,
+      };
+    }),
+  dismissCleanupJob: () =>
+    set((s) => {
+      if (!s.cleanupJob) return s;
+      const st = s.cleanupJob.status;
+      if (st === "queued" || st === "running" || st === "cancelling") {
+        return s;
+      }
+      return { cleanupJob: null };
     }),
 }));

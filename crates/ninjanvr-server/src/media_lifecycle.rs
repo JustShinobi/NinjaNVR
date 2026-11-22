@@ -421,6 +421,228 @@ fn unlink_indexed_media_file(
 
 /// Batch-removes event snapshots, clips, custom `thumb_path` files, and share artifacts for
 /// `(event_id, camera, thumb_path)` tuples using single-pass directory filename indexes.
+/// Reusable single-pass directory filename index across `clips/`, `clips/review/`, and `exports/`
+/// so multi-chunk background cleanup jobs scan directories once instead of once per micro-batch.
+pub struct MediaArtifactDirIndex {
+    clips_idx: Option<std::collections::HashSet<String>>,
+    exports_idx: Option<std::collections::HashSet<String>>,
+    review_idx: Option<Option<std::collections::HashSet<String>>>,
+}
+
+impl MediaArtifactDirIndex {
+    pub fn build(media_dir: &Path, include_reviews: bool) -> Option<Self> {
+        if !std::fs::symlink_metadata(media_dir).is_ok_and(|m| m.file_type().is_dir()) {
+            return None;
+        }
+        let clips_rel = Path::new("clips");
+        let exports_rel = Path::new("exports");
+        let clips_idx = index_regular_filenames_in_dir(&media_dir.join(clips_rel));
+        let exports_idx = index_regular_filenames_in_dir(&media_dir.join(exports_rel));
+        let review_idx = include_reviews
+            .then(|| index_regular_filenames_in_dir(&media_dir.join(clips_rel).join("review")));
+        Some(Self {
+            clips_idx,
+            exports_idx,
+            review_idx,
+        })
+    }
+
+    pub fn cleanup_events_chunk_bytes(
+        &mut self,
+        media_dir: &Path,
+        purged: &[(String, String, Option<String>)],
+    ) -> u64 {
+        let clips_rel = Path::new("clips");
+        let exports_rel = Path::new("exports");
+        let mut freed = 0u64;
+
+        for (event_id, cam_raw, thumb_opt) in purged {
+            if is_safe_id(event_id) {
+                for suffix in [
+                    ".jpg",
+                    "-clean.jpg",
+                    ".webp",
+                    "-clean.webp",
+                    ".mp4",
+                    "-clean.mp4",
+                ] {
+                    let name = format!("{event_id}{suffix}");
+                    freed +=
+                        unlink_indexed_media_file(media_dir, &mut self.clips_idx, clips_rel, &name);
+                }
+                let cam = cam_raw.trim();
+                if is_safe_id(cam) {
+                    for suffix in [".webp", "-clean.webp", ".jpg", "-clean.jpg", ".mp4"] {
+                        let name = format!("{cam}-{event_id}{suffix}");
+                        freed += unlink_indexed_media_file(
+                            media_dir,
+                            &mut self.clips_idx,
+                            clips_rel,
+                            &name,
+                        );
+                    }
+                }
+                for name in [
+                    format!("share_redacted_{event_id}.mp4"),
+                    format!(".share_redacted_{event_id}.mask_hash"),
+                    format!("share_clip_{event_id}.mp4"),
+                    format!("share_redacted_event_{event_id}.mp4"),
+                    format!(".share_redacted_event_{event_id}.mask_hash"),
+                    format!("share_clip_event_{event_id}.mp4"),
+                ] {
+                    freed += unlink_indexed_media_file(
+                        media_dir,
+                        &mut self.exports_idx,
+                        exports_rel,
+                        &name,
+                    );
+                }
+                for name in [
+                    format!("share_redacted_{event_id}.webp"),
+                    format!("share_clip_{event_id}.webp"),
+                    format!("share_redacted_event_{event_id}.webp"),
+                    format!("share_clip_event_{event_id}.webp"),
+                ] {
+                    freed +=
+                        unlink_indexed_media_file(media_dir, &mut self.clips_idx, clips_rel, &name);
+                }
+            }
+
+            if let Some(tp) = thumb_opt.as_deref() {
+                for rel in resolve_relative_artifact_paths(media_dir, tp) {
+                    let mut comps = rel.components();
+                    let first = comps.next();
+                    let second = comps.next();
+                    let third = comps.next();
+                    if let (Some(Component::Normal(dir_os)), Some(Component::Normal(file_os)), None) =
+                        (first, second, third)
+                        && let Some(fname) = file_os.to_str()
+                    {
+                        if dir_os == "clips" {
+                            freed += unlink_indexed_media_file(
+                                media_dir,
+                                &mut self.clips_idx,
+                                clips_rel,
+                                fname,
+                            );
+                            continue;
+                        } else if dir_os == "exports" {
+                            freed += unlink_indexed_media_file(
+                                media_dir,
+                                &mut self.exports_idx,
+                                exports_rel,
+                                fname,
+                            );
+                            continue;
+                        }
+                    }
+                    freed += remove_non_symlink_under_media_dir_bytes(media_dir, &rel);
+                }
+            }
+        }
+        freed
+    }
+
+    pub fn cleanup_reviews_chunk_bytes(
+        &mut self,
+        media_dir: &Path,
+        purged: &[(String, String, Option<String>)],
+    ) -> u64 {
+        let clips_rel = Path::new("clips");
+        let review_rel = clips_rel.join("review");
+        let exports_rel = Path::new("exports");
+        let review_idx = self
+            .review_idx
+            .get_or_insert_with(|| index_regular_filenames_in_dir(&media_dir.join(&review_rel)));
+        let mut freed = 0u64;
+
+        for (review_id, cam_raw, thumb_opt) in purged {
+            if is_safe_id(review_id) {
+                for name in [
+                    format!("thumb-{review_id}.webp"),
+                    format!("{review_id}.webp"),
+                ] {
+                    freed += unlink_indexed_media_file(media_dir, review_idx, &review_rel, &name);
+                }
+                let cam = cam_raw.trim();
+                if is_safe_id(cam) {
+                    let cam_thumb = format!("thumb-{cam}-{review_id}.webp");
+                    freed +=
+                        unlink_indexed_media_file(media_dir, review_idx, &review_rel, &cam_thumb);
+                }
+                for name in [
+                    format!("review-{review_id}.webp"),
+                    format!("{review_id}.webp"),
+                    format!("{review_id}.jpg"),
+                    format!("share_redacted_{review_id}.webp"),
+                    format!("share_clip_{review_id}.webp"),
+                    format!("share_redacted_review_{review_id}.webp"),
+                    format!("share_clip_review_{review_id}.webp"),
+                ] {
+                    freed +=
+                        unlink_indexed_media_file(media_dir, &mut self.clips_idx, clips_rel, &name);
+                }
+                for name in [
+                    format!("share_redacted_{review_id}.mp4"),
+                    format!(".share_redacted_{review_id}.mask_hash"),
+                    format!("share_clip_{review_id}.mp4"),
+                    format!("share_redacted_review_{review_id}.mp4"),
+                    format!(".share_redacted_review_{review_id}.mask_hash"),
+                    format!("share_clip_review_{review_id}.mp4"),
+                ] {
+                    freed += unlink_indexed_media_file(
+                        media_dir,
+                        &mut self.exports_idx,
+                        exports_rel,
+                        &name,
+                    );
+                }
+            }
+
+            if let Some(tp) = thumb_opt.as_deref() {
+                for rel in resolve_relative_artifact_paths(media_dir, tp) {
+                    let comps: Vec<_> = rel.components().collect();
+                    if comps.len() == 3
+                        && let (Component::Normal(c0), Component::Normal(c1), Component::Normal(c2)) =
+                            (comps[0], comps[1], comps[2])
+                        && c0 == "clips"
+                        && c1 == "review"
+                        && let Some(fname) = c2.to_str()
+                    {
+                        freed +=
+                            unlink_indexed_media_file(media_dir, review_idx, &review_rel, fname);
+                        continue;
+                    }
+                    if comps.len() == 2
+                        && let (Component::Normal(c0), Component::Normal(c1)) = (comps[0], comps[1])
+                        && let Some(fname) = c1.to_str()
+                    {
+                        if c0 == "clips" {
+                            freed += unlink_indexed_media_file(
+                                media_dir,
+                                &mut self.clips_idx,
+                                clips_rel,
+                                fname,
+                            );
+                            continue;
+                        } else if c0 == "exports" {
+                            freed += unlink_indexed_media_file(
+                                media_dir,
+                                &mut self.exports_idx,
+                                exports_rel,
+                                fname,
+                            );
+                            continue;
+                        }
+                    }
+                    freed += remove_non_symlink_under_media_dir_bytes(media_dir, &rel);
+                }
+            }
+        }
+        freed
+    }
+}
+
 pub fn cleanup_events_batch_media_artifacts_bytes(
     media_dir: &Path,
     purged: &[(String, String, Option<String>)],
@@ -438,84 +660,10 @@ pub fn cleanup_events_batch_media_artifacts_bytes(
             })
             .sum();
     }
-    if !std::fs::symlink_metadata(media_dir).is_ok_and(|m| m.file_type().is_dir()) {
+    let Some(mut dir_idx) = MediaArtifactDirIndex::build(media_dir, false) else {
         return 0;
-    }
-    let clips_rel = Path::new("clips");
-    let exports_rel = Path::new("exports");
-    let mut clips_idx = index_regular_filenames_in_dir(&media_dir.join(clips_rel));
-    let mut exports_idx = index_regular_filenames_in_dir(&media_dir.join(exports_rel));
-    let mut freed = 0u64;
-
-    for (event_id, cam_raw, thumb_opt) in purged {
-        if is_safe_id(event_id) {
-            for suffix in [
-                ".jpg",
-                "-clean.jpg",
-                ".webp",
-                "-clean.webp",
-                ".mp4",
-                "-clean.mp4",
-            ] {
-                let name = format!("{event_id}{suffix}");
-                freed += unlink_indexed_media_file(media_dir, &mut clips_idx, clips_rel, &name);
-            }
-            let cam = cam_raw.trim();
-            if is_safe_id(cam) {
-                for suffix in [".webp", "-clean.webp", ".jpg", "-clean.jpg", ".mp4"] {
-                    let name = format!("{cam}-{event_id}{suffix}");
-                    freed += unlink_indexed_media_file(media_dir, &mut clips_idx, clips_rel, &name);
-                }
-            }
-            for name in [
-                format!("share_redacted_{event_id}.mp4"),
-                format!(".share_redacted_{event_id}.mask_hash"),
-                format!("share_clip_{event_id}.mp4"),
-                format!("share_redacted_event_{event_id}.mp4"),
-                format!(".share_redacted_event_{event_id}.mask_hash"),
-                format!("share_clip_event_{event_id}.mp4"),
-            ] {
-                freed += unlink_indexed_media_file(media_dir, &mut exports_idx, exports_rel, &name);
-            }
-            for name in [
-                format!("share_redacted_{event_id}.webp"),
-                format!("share_clip_{event_id}.webp"),
-                format!("share_redacted_event_{event_id}.webp"),
-                format!("share_clip_event_{event_id}.webp"),
-            ] {
-                freed += unlink_indexed_media_file(media_dir, &mut clips_idx, clips_rel, &name);
-            }
-        }
-
-        if let Some(tp) = thumb_opt.as_deref() {
-            for rel in resolve_relative_artifact_paths(media_dir, tp) {
-                let mut comps = rel.components();
-                let first = comps.next();
-                let second = comps.next();
-                let third = comps.next();
-                if let (Some(Component::Normal(dir_os)), Some(Component::Normal(file_os)), None) =
-                    (first, second, third)
-                    && let Some(fname) = file_os.to_str()
-                {
-                    if dir_os == "clips" {
-                        freed +=
-                            unlink_indexed_media_file(media_dir, &mut clips_idx, clips_rel, fname);
-                        continue;
-                    } else if dir_os == "exports" {
-                        freed += unlink_indexed_media_file(
-                            media_dir,
-                            &mut exports_idx,
-                            exports_rel,
-                            fname,
-                        );
-                        continue;
-                    }
-                }
-                freed += remove_non_symlink_under_media_dir_bytes(media_dir, &rel);
-            }
-        }
-    }
-    freed
+    };
+    dir_idx.cleanup_events_chunk_bytes(media_dir, purged)
 }
 
 /// Batch-removes review thumbnails, custom `thumb_path` files, and share artifacts for
@@ -537,91 +685,10 @@ pub fn cleanup_reviews_batch_media_artifacts_bytes(
             })
             .sum();
     }
-    if !std::fs::symlink_metadata(media_dir).is_ok_and(|m| m.file_type().is_dir()) {
+    let Some(mut dir_idx) = MediaArtifactDirIndex::build(media_dir, true) else {
         return 0;
-    }
-    let clips_rel = Path::new("clips");
-    let review_rel = clips_rel.join("review");
-    let exports_rel = Path::new("exports");
-    let mut review_idx = index_regular_filenames_in_dir(&media_dir.join(&review_rel));
-    let mut clips_idx = index_regular_filenames_in_dir(&media_dir.join(clips_rel));
-    let mut exports_idx = index_regular_filenames_in_dir(&media_dir.join(exports_rel));
-    let mut freed = 0u64;
-
-    for (review_id, cam_raw, thumb_opt) in purged {
-        if is_safe_id(review_id) {
-            for name in [
-                format!("thumb-{review_id}.webp"),
-                format!("{review_id}.webp"),
-            ] {
-                freed += unlink_indexed_media_file(media_dir, &mut review_idx, &review_rel, &name);
-            }
-            let cam = cam_raw.trim();
-            if is_safe_id(cam) {
-                let cam_thumb = format!("thumb-{cam}-{review_id}.webp");
-                freed +=
-                    unlink_indexed_media_file(media_dir, &mut review_idx, &review_rel, &cam_thumb);
-            }
-            for name in [
-                format!("review-{review_id}.webp"),
-                format!("{review_id}.webp"),
-                format!("{review_id}.jpg"),
-                format!("share_redacted_{review_id}.webp"),
-                format!("share_clip_{review_id}.webp"),
-                format!("share_redacted_review_{review_id}.webp"),
-                format!("share_clip_review_{review_id}.webp"),
-            ] {
-                freed += unlink_indexed_media_file(media_dir, &mut clips_idx, clips_rel, &name);
-            }
-            for name in [
-                format!("share_redacted_{review_id}.mp4"),
-                format!(".share_redacted_{review_id}.mask_hash"),
-                format!("share_clip_{review_id}.mp4"),
-                format!("share_redacted_review_{review_id}.mp4"),
-                format!(".share_redacted_review_{review_id}.mask_hash"),
-                format!("share_clip_review_{review_id}.mp4"),
-            ] {
-                freed += unlink_indexed_media_file(media_dir, &mut exports_idx, exports_rel, &name);
-            }
-        }
-
-        if let Some(tp) = thumb_opt.as_deref() {
-            for rel in resolve_relative_artifact_paths(media_dir, tp) {
-                let comps: Vec<_> = rel.components().collect();
-                if comps.len() == 3
-                    && let (Component::Normal(c0), Component::Normal(c1), Component::Normal(c2)) =
-                        (comps[0], comps[1], comps[2])
-                    && c0 == "clips"
-                    && c1 == "review"
-                    && let Some(fname) = c2.to_str()
-                {
-                    freed +=
-                        unlink_indexed_media_file(media_dir, &mut review_idx, &review_rel, fname);
-                    continue;
-                }
-                if comps.len() == 2
-                    && let (Component::Normal(c0), Component::Normal(c1)) = (comps[0], comps[1])
-                    && let Some(fname) = c1.to_str()
-                {
-                    if c0 == "clips" {
-                        freed +=
-                            unlink_indexed_media_file(media_dir, &mut clips_idx, clips_rel, fname);
-                        continue;
-                    } else if c0 == "exports" {
-                        freed += unlink_indexed_media_file(
-                            media_dir,
-                            &mut exports_idx,
-                            exports_rel,
-                            fname,
-                        );
-                        continue;
-                    }
-                }
-                freed += remove_non_symlink_under_media_dir_bytes(media_dir, &rel);
-            }
-        }
-    }
-    freed
+    };
+    dir_idx.cleanup_reviews_chunk_bytes(media_dir, purged)
 }
 
 /// Removes review segment thumbnail and share artifacts for `review_id` under `media_dir`.

@@ -126,6 +126,7 @@ pub struct AppState {
     pub storage_degraded: Arc<std::sync::atomic::AtomicBool>,
     pub storage_error: Arc<std::sync::Mutex<Option<String>>>,
     pub storage_breakdown_cache: storage_ops::StorageBreakdownCache,
+    pub cleanup_jobs: storage_ops::StorageCleanupJobManager,
     pub ptz_active_presets: Arc<RwLock<HashMap<String, Option<String>>>>,
     pub camera_driver_runtime: CameraDriverRuntime,
     pub dataset_catalog: DatasetCatalog,
@@ -491,6 +492,11 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/share/{id}", delete(api_share_revoke))
         .route("/jobs/export", get(api_export_jobs_list))
         .route("/jobs/export/{id}/cancel", post(api_export_job_cancel))
+        .route(
+            "/jobs/cleanup",
+            get(api_cleanup_jobs_list).post(api_cleanup_job_start),
+        )
+        .route("/jobs/cleanup/{id}/cancel", post(api_cleanup_job_cancel))
         .route("/cases", get(api_cases).post(api_case_create))
         .route("/cases/{id}", delete(api_case_delete))
         .route(
@@ -12332,6 +12338,8 @@ async fn handle_state_ws(
             .collect()
     };
 
+    let mut rx = state.comms.subscribe_ws();
+
     for init_msg in state.comms.initial_ws_snapshots(&cameras) {
         if let Some(filtered) =
             filter_ws_message_for_allowed_cameras(&init_msg, allowed_cameras.as_deref())
@@ -12348,7 +12356,31 @@ async fn handle_state_ws(
         }
     }
 
-    let mut rx = state.comms.subscribe_ws();
+    if caller_role.trim().eq_ignore_ascii_case("admin") {
+        for snap in state.cleanup_jobs.active_snapshots() {
+            if let Ok(payload_str) = serde_json::to_string(&snap) {
+                let raw_msg = json!({
+                    "topic": "storage_cleanup",
+                    "payload": payload_str
+                })
+                .to_string();
+                if let Some(filtered) =
+                    filter_ws_message_for_allowed_cameras(&raw_msg, allowed_cameras.as_deref())
+                    && !matches!(
+                        tokio::time::timeout(
+                            Duration::from_secs(5),
+                            socket.send(AxumWsMsg::Text(filtered.into())),
+                        )
+                        .await,
+                        Ok(Ok(()))
+                    )
+                {
+                    return;
+                }
+            }
+        }
+    }
+
     loop {
         tokio::select! {
             biased;
@@ -12398,6 +12430,33 @@ async fn handle_state_ws(
                                 )
                                 {
                                     return;
+                                }
+                            }
+                            if role_lc == "admin" {
+                                for snap in state.cleanup_jobs.active_snapshots() {
+                                    if let Ok(payload_str) = serde_json::to_string(&snap) {
+                                        let raw_msg = json!({
+                                            "topic": "storage_cleanup",
+                                            "payload": payload_str
+                                        })
+                                        .to_string();
+                                        if let Some(filtered) =
+                                            filter_ws_message_for_allowed_cameras(
+                                                &raw_msg,
+                                                live_allowed.as_deref(),
+                                            )
+                                            && !matches!(
+                                                tokio::time::timeout(
+                                                    Duration::from_secs(5),
+                                                    socket.send(AxumWsMsg::Text(filtered.into())),
+                                                )
+                                                .await,
+                                                Ok(Ok(()))
+                                            )
+                                        {
+                                            return;
+                                        }
+                                    }
                                 }
                             }
                         } else if let Ok(parsed) = serde_json::from_str::<Value>(&text)
@@ -12453,7 +12512,7 @@ async fn handle_state_ws(
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
-                let Some((_, live_allowed)) = reverify_ws_caller_access_async(
+                let Some((live_role, live_allowed)) = reverify_ws_caller_access_async(
                     &state,
                     caller_user.as_deref(),
                     had_db_user_at_connect,
@@ -12465,6 +12524,20 @@ async fn handle_state_ws(
                 else {
                     break;
                 };
+                if !live_role.trim().eq_ignore_ascii_case("admin")
+                    && msg.contains("storage_cleanup")
+                    && serde_json::from_str::<Value>(&msg)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("topic")
+                                .and_then(Value::as_str)
+                                .map(|t| t.strip_prefix("ninjanvr/").unwrap_or(t).to_string())
+                        })
+                        .as_deref()
+                        == Some("storage_cleanup")
+                {
+                    continue;
+                }
                 if let Some(filtered) =
                     filter_ws_message_for_allowed_cameras(&msg, live_allowed.as_deref())
                     && !matches!(
@@ -13461,6 +13534,7 @@ pub async fn new_app_state(
         storage_degraded,
         storage_error,
         storage_breakdown_cache: storage_ops::StorageBreakdownCache::new(),
+        cleanup_jobs: storage_ops::StorageCleanupJobManager::new(),
         ptz_active_presets,
         camera_driver_runtime,
         dataset_catalog: DatasetCatalog::new(),
