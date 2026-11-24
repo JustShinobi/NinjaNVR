@@ -106,14 +106,18 @@ pub fn spread_evenly(items: &[u64], limit: usize) -> Vec<u64> {
 /// an in-memory index of their timestamps per camera.
 #[derive(Clone)]
 pub struct PreviewFrameStore {
+    media_dir: PathBuf,
     root: PathBuf,
     index: Arc<RwLock<HashMap<String, BTreeSet<u64>>>>,
 }
 
 impl PreviewFrameStore {
     pub fn new(media_dir: &Path) -> Self {
+        // A trailing slash or `/.` would make symlink_metadata follow a symlinked root.
+        let media_dir: PathBuf = media_dir.components().collect();
         Self {
             root: media_dir.join("clips").join("preview_frames"),
+            media_dir,
             index: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -139,45 +143,12 @@ impl PreviewFrameStore {
                 "unsafe camera id",
             ));
         };
-        std::fs::create_dir_all(&dir)?;
-        let meta = std::fs::symlink_metadata(&dir)?;
-        if meta.file_type().is_symlink() || !meta.is_dir() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "preview dir is not a directory",
-            ));
-        }
-        let final_path = dir.join(format!("{ts_ms}.jpg"));
-        if let Ok(fmeta) = std::fs::symlink_metadata(&final_path)
-            && (fmeta.file_type().is_symlink() || fmeta.is_dir())
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "refusing to overwrite symlink or directory at preview frame path",
-            ));
-        }
-        let nonce: u64 = rand::random();
-        let tmp_path = dir.join(format!(".{ts_ms}.{nonce:016x}.tmp"));
-        {
-            use std::io::Write;
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.custom_flags(nix::libc::O_NOFOLLOW);
-            }
-            let mut tmp_file = opts.open(&tmp_path)?;
-            if let Err(err) = tmp_file.write_all(jpeg) {
-                drop(tmp_file);
-                let _ = std::fs::remove_file(&tmp_path);
-                return Err(err);
-            }
-        }
-        if let Err(err) = std::fs::rename(&tmp_path, &final_path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(err);
-        }
+        crate::media_lifecycle::write_contained_media_file(
+            &self.media_dir,
+            &dir,
+            &format!("{ts_ms}.jpg"),
+            jpeg,
+        )?;
         self.insert(camera, ts_ms);
         Ok(())
     }
@@ -542,6 +513,44 @@ mod tests {
         assert_eq!(spread_evenly(&items, 1), vec![50]);
         assert!(spread_evenly(&items, 0).is_empty());
         assert!(spread_evenly(&[], 4).is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_frame_rejects_symlinks_at_every_directory_level() {
+        for (linked_dir, root_name) in [
+            ("", "media"),
+            ("", "media/"),
+            ("", "media/."),
+            ("clips", "media"),
+            ("clips/preview_frames", "media"),
+            ("clips/preview_frames/sala", "media"),
+        ] {
+            let fixture = tmp_root("symlink-write");
+            let media = fixture.join("media");
+            let outside = fixture.join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            let link = if linked_dir.is_empty() {
+                media.clone()
+            } else {
+                media.join(linked_dir)
+            };
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            let store = PreviewFrameStore::new(&fixture.join(root_name));
+
+            let result = store.write_frame("sala", 1_000, b"jpg");
+            let outside_untouched = std::fs::read_dir(&outside).unwrap().next().is_none();
+            let indexed = store.contains("sala", 1_000);
+            std::fs::remove_dir_all(&fixture).unwrap();
+
+            assert!(
+                result.is_err(),
+                "accepted symlink at media/{linked_dir} with root {root_name}"
+            );
+            assert!(outside_untouched, "wrote through media/{linked_dir}");
+            assert!(!indexed, "indexed a rejected write at media/{linked_dir}");
+        }
     }
 
     #[test]
