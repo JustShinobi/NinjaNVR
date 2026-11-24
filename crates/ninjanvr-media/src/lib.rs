@@ -5224,12 +5224,15 @@ pub async fn build_mp4_export_with_progress(req: Mp4ExportRequest<'_>) -> Result
         db: NinjaDatabase,
         export_id: String,
         cancelled: Arc<AtomicBool>,
+        cancel_gate: Arc<std::sync::Mutex<bool>>,
         disarmed: bool,
     }
     impl Drop for ExportCancelGuard {
         fn drop(&mut self) {
             if !self.disarmed {
                 self.cancelled.store(true, Ordering::SeqCst);
+                let mut gate = self.cancel_gate.lock().unwrap_or_else(|e| e.into_inner());
+                *gate = true;
                 if is_safe_identifier(&self.export_id) {
                     let _ = self.db.delete_export(&self.export_id);
                 }
@@ -5240,10 +5243,12 @@ pub async fn build_mp4_export_with_progress(req: Mp4ExportRequest<'_>) -> Result
     let cancelled = req
         .cancel_token
         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let cancel_gate = Arc::new(std::sync::Mutex::new(false));
     let mut cancel_guard = ExportCancelGuard {
         db: req.db.clone(),
         export_id: req.export_id.to_string(),
         cancelled: cancelled.clone(),
+        cancel_gate: cancel_gate.clone(),
         disarmed: false,
     };
 
@@ -5259,6 +5264,7 @@ pub async fn build_mp4_export_with_progress(req: Mp4ExportRequest<'_>) -> Result
         req.include_audio,
         req.privacy_mask,
         cancelled,
+        cancel_gate,
         req.on_progress,
     )
     .await;
@@ -5266,6 +5272,30 @@ pub async fn build_mp4_export_with_progress(req: Mp4ExportRequest<'_>) -> Result
         cancel_guard.disarmed = true;
     }
     res
+}
+
+struct FfmpegChildReapGuard {
+    child: Option<tokio::process::Child>,
+    tmp_path: PathBuf,
+}
+
+impl Drop for FfmpegChildReapGuard {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.start_kill();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if matches!(c.try_wait(), Ok(Some(_)) | Err(_)) {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let _ = std::fs::remove_file(&self.tmp_path);
+        }
+    }
 }
 
 pub fn build_export_temp_paths(
@@ -5293,6 +5323,7 @@ pub fn build_export_temp_paths(
 async fn run_ffmpeg_export_with_progress(
     ffmpeg_bin: &Path,
     ffmpeg_args: &[String],
+    tmp_out_file: &Path,
     target_dur: f64,
     cancelled: &Arc<AtomicBool>,
     on_progress: Option<&Arc<dyn Fn(f64) + Send + Sync>>,
@@ -5313,6 +5344,10 @@ async fn run_ffmpeg_export_with_progress(
         return false;
     };
     let stdout_opt = child.stdout.take();
+    let mut guard = FfmpegChildReapGuard {
+        child: Some(child),
+        tmp_path: tmp_out_file.to_path_buf(),
+    };
     let mut lines_opt = stdout_opt.map(|out| BufReader::new(out).lines());
     let mut poll_tick = tokio::time::interval(std::time::Duration::from_millis(100));
     poll_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -5321,8 +5356,12 @@ async fn run_ffmpeg_export_with_progress(
         tokio::select! {
             _ = poll_tick.tick() => {
                 if cancelled.load(Ordering::SeqCst) {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+                    if let Some(c) = guard.child.as_mut() {
+                        let _ = c.kill().await;
+                        let _ = c.wait().await;
+                    }
+                    guard.child = None;
+                    let _ = std::fs::remove_file(tmp_out_file);
                     return false;
                 }
             }
@@ -5351,8 +5390,15 @@ async fn run_ffmpeg_export_with_progress(
                     }
                 }
             }
-            status_res = child.wait() => {
+            status_res = async {
+                match guard.child.as_mut() {
+                    Some(c) => c.wait().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                guard.child = None;
                 if cancelled.load(Ordering::SeqCst) {
+                    let _ = std::fs::remove_file(tmp_out_file);
                     return false;
                 }
                 return status_res.is_ok_and(|s| s.success());
@@ -5450,6 +5496,7 @@ async fn build_mp4_export_inner(
     include_audio: bool,
     privacy_mask: Option<&serde_json::Value>,
     cancelled: Arc<AtomicBool>,
+    cancel_gate: Arc<std::sync::Mutex<bool>>,
     on_progress: Option<Arc<dyn Fn(f64) + Send + Sync>>,
 ) -> Result<()> {
     struct ExportTempGuard {
@@ -5459,12 +5506,17 @@ async fn build_mp4_export_inner(
         thumb_file: PathBuf,
         out_file: PathBuf,
         cancelled: Arc<AtomicBool>,
+        cancel_gate: Arc<std::sync::Mutex<bool>>,
         disarmed: bool,
     }
     impl Drop for ExportTempGuard {
         fn drop(&mut self) {
             if !self.disarmed {
                 self.cancelled.store(true, Ordering::SeqCst);
+            }
+            let mut gate = self.cancel_gate.lock().unwrap_or_else(|e| e.into_inner());
+            if !self.disarmed {
+                *gate = true;
             }
             let _ = std::fs::remove_file(&self.list_file);
             let _ = std::fs::remove_file(&self.tmp_out_file);
@@ -5500,6 +5552,7 @@ async fn build_mp4_export_inner(
         thumb_file: thumb_file.clone(),
         out_file: out_file.clone(),
         cancelled: cancelled.clone(),
+        cancel_gate: cancel_gate.clone(),
         disarmed: false,
     };
 
@@ -5526,6 +5579,7 @@ async fn build_mp4_export_inner(
     let tmp_out_prep = tmp_out_file.clone();
     let tmp_thumb_prep = tmp_thumb_file.clone();
     let cancel_prep = cancelled.clone();
+    let cancel_gate_prep = cancel_gate.clone();
     let (existing_paths, first_seg_start, any_has_moov, any_has_real_codec) =
         tokio::task::spawn_blocking(move || -> Result<(Vec<PathBuf>, Option<f64>, bool, bool)> {
             if cancel_prep.load(Ordering::SeqCst) {
@@ -5578,14 +5632,20 @@ async fn build_mp4_export_inner(
                 .iter()
                 .take(8)
                 .any(|p| mp4_file_has_real_video_codec(p));
-            let mut lf = create_new_file_nofollow(&list_file_prep)?;
-            std::io::Write::write_all(&mut lf, list_content.as_bytes())?;
-            if cancel_prep.load(Ordering::SeqCst) {
-                let _ = std::fs::remove_file(&list_file_prep);
-                anyhow::bail!("export {exp_id_prep} cancelled");
+            {
+                let gate = cancel_gate_prep.lock().unwrap_or_else(|e| e.into_inner());
+                if *gate || cancel_prep.load(Ordering::SeqCst) {
+                    anyhow::bail!("export {exp_id_prep} cancelled");
+                }
+                let mut lf = create_new_file_nofollow(&list_file_prep)?;
+                if let Err(err) = std::io::Write::write_all(&mut lf, list_content.as_bytes()) {
+                    drop(lf);
+                    let _ = std::fs::remove_file(&list_file_prep);
+                    return Err(err.into());
+                }
+                let _ = std::fs::remove_file(&tmp_out_prep);
+                let _ = std::fs::remove_file(&tmp_thumb_prep);
             }
-            let _ = std::fs::remove_file(&tmp_out_prep);
-            let _ = std::fs::remove_file(&tmp_thumb_prep);
             Ok((
                 existing_paths,
                 first_seg_start,
@@ -5611,6 +5671,7 @@ async fn build_mp4_export_inner(
     let mut ff_ok = run_ffmpeg_export_with_progress(
         &ffmpeg_bin,
         &ffmpeg_args,
+        &tmp_out_file,
         target_dur,
         &cancelled,
         on_progress.as_ref(),
@@ -5634,6 +5695,7 @@ async fn build_mp4_export_inner(
         ff_ok = run_ffmpeg_export_with_progress(
             &ffmpeg_bin,
             &fallback_args,
+            &tmp_out_file,
             target_dur,
             &cancelled,
             on_progress.as_ref(),
@@ -5646,6 +5708,7 @@ async fn build_mp4_export_inner(
     let exp_id_v = export_id.to_string();
     let cam_v = camera.to_string();
     let cancel_v = cancelled.clone();
+    let cancel_gate_v = cancel_gate.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let _ = std::fs::remove_file(&list_file_v);
         if cancel_v.load(Ordering::SeqCst) {
@@ -5673,10 +5736,14 @@ async fn build_mp4_export_inner(
                     existing_paths.len()
                 );
             }
-            copy_file_via_nofollow(&existing_paths[0], &tmp_out_v)?;
-            if cancel_v.load(Ordering::SeqCst) {
+            let gate = cancel_gate_v.lock().unwrap_or_else(|e| e.into_inner());
+            if *gate || cancel_v.load(Ordering::SeqCst) {
                 let _ = std::fs::remove_file(&tmp_out_v);
                 anyhow::bail!("export {exp_id_v} cancelled");
+            }
+            if let Err(err) = copy_file_via_nofollow(&existing_paths[0], &tmp_out_v) {
+                let _ = std::fs::remove_file(&tmp_out_v);
+                return Err(err.into());
             }
         }
         Ok(())
@@ -5692,23 +5759,25 @@ async fn build_mp4_export_inner(
         let tmp_out_share = tmp_out_file.clone();
         let out_share = out_file.clone();
         let cancel_share = cancelled.clone();
+        let cancel_gate_share = cancel_gate.clone();
         let exp_id_share = export_id.to_string();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            if cancel_share.load(Ordering::SeqCst) {
+            let gate = cancel_gate_share.lock().unwrap_or_else(|e| e.into_inner());
+            if *gate || cancel_share.load(Ordering::SeqCst) {
                 let _ = std::fs::remove_file(&tmp_out_share);
                 anyhow::bail!("export {exp_id_share} cancelled");
             }
             std::fs::rename(&tmp_out_share, &out_share)?;
-            if cancel_share.load(Ordering::SeqCst) {
-                let _ = std::fs::remove_file(&out_share);
-                anyhow::bail!("export {exp_id_share} cancelled");
-            }
             Ok(())
         })
         .await
         .context("share export rename task panicked")??;
         temp_guard.disarmed = true;
         return Ok(());
+    }
+
+    if cancelled.load(Ordering::SeqCst) {
+        anyhow::bail!("export {export_id} cancelled");
     }
 
     // Extract a real video frame thumbnail from `tmp_out_file` into `tmp_thumb_file` BEFORE
@@ -5718,24 +5787,6 @@ async fn build_mp4_export_inner(
     } else {
         "scale=320:-1".to_string()
     };
-    struct ThumbChildGuard {
-        child: Option<tokio::process::Child>,
-        tmp_thumb_path: PathBuf,
-    }
-    impl Drop for ThumbChildGuard {
-        fn drop(&mut self) {
-            if let Some(mut c) = self.child.take() {
-                let _ = c.start_kill();
-                for _ in 0..40 {
-                    if matches!(c.try_wait(), Ok(Some(_)) | Err(_)) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-                let _ = std::fs::remove_file(&self.tmp_thumb_path);
-            }
-        }
-    }
 
     let mut thumb_cmd = Command::new(&ffmpeg_bin);
     thumb_cmd
@@ -5749,13 +5800,40 @@ async fn build_mp4_export_inner(
         .arg(sanitize_ffmpeg_path_arg(&tmp_thumb_file));
     let thumb_ok = match thumb_cmd.spawn() {
         Ok(child) => {
-            let mut guard = ThumbChildGuard {
+            let mut guard = FfmpegChildReapGuard {
                 child: Some(child),
-                tmp_thumb_path: tmp_thumb_file.clone(),
+                tmp_path: tmp_thumb_file.clone(),
             };
-            let res = guard.child.as_mut().unwrap().wait().await;
-            guard.child = None;
-            res.is_ok_and(|s| s.success())
+            let mut poll_tick = tokio::time::interval(std::time::Duration::from_millis(50));
+            poll_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = poll_tick.tick() => {
+                        if cancelled.load(Ordering::SeqCst) {
+                            if let Some(c) = guard.child.as_mut() {
+                                let _ = c.kill().await;
+                                let _ = c.wait().await;
+                            }
+                            guard.child = None;
+                            let _ = std::fs::remove_file(&tmp_thumb_file);
+                            anyhow::bail!("export {export_id} cancelled");
+                        }
+                    }
+                    res = async {
+                        match guard.child.as_mut() {
+                            Some(c) => c.wait().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        guard.child = None;
+                        if cancelled.load(Ordering::SeqCst) {
+                            let _ = std::fs::remove_file(&tmp_thumb_file);
+                            anyhow::bail!("export {export_id} cancelled");
+                        }
+                        break res.is_ok_and(|s| s.success());
+                    }
+                }
+            }
         }
         Err(_) => false,
     };
@@ -5768,18 +5846,44 @@ async fn build_mp4_export_inner(
     let tmp_thumb_fin = tmp_thumb_file.clone();
     let thumb_fin = thumb_file.clone();
     let cancel_fin = cancelled.clone();
+    let cancel_gate_fin = cancel_gate.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
         if cancel_fin.load(Ordering::SeqCst) {
             let _ = std::fs::remove_file(&tmp_out_fin);
             let _ = std::fs::remove_file(&tmp_thumb_fin);
             anyhow::bail!("export {exp_id_fin} cancelled");
         }
-        if !thumb_ok || !tmp_thumb_fin.exists() {
-            let mut img = image::RgbImage::new(320, 180);
-            for p in img.pixels_mut() {
-                *p = image::Rgb([24, 30, 38]);
+        let has_valid_thumb = thumb_ok
+            && std::fs::symlink_metadata(&tmp_thumb_fin)
+                .is_ok_and(|m| m.file_type().is_file() && m.len() > 0);
+        let fallback_webp = if !has_valid_thumb {
+            let img = image::RgbImage::from_pixel(320, 180, image::Rgb([24, 30, 38]));
+            let mut webp_buf = std::io::Cursor::new(Vec::with_capacity(4096));
+            if let Err(err) = img.write_to(&mut webp_buf, image::ImageFormat::WebP) {
+                warn!(
+                    "Failed to encode fallback export thumbnail {}: {err}",
+                    tmp_thumb_fin.display()
+                );
+                let _ = std::fs::remove_file(&tmp_out_fin);
+                let _ = std::fs::remove_file(&tmp_thumb_fin);
+                return Err(err.into());
             }
-            if let Err(err) = img.save_with_format(&tmp_thumb_fin, image::ImageFormat::WebP) {
+            Some(webp_buf.into_inner())
+        } else {
+            None
+        };
+
+        let gate = cancel_gate_fin.lock().unwrap_or_else(|e| e.into_inner());
+        if *gate || cancel_fin.load(Ordering::SeqCst) {
+            let _ = std::fs::remove_file(&tmp_out_fin);
+            let _ = std::fs::remove_file(&tmp_thumb_fin);
+            anyhow::bail!("export {exp_id_fin} cancelled");
+        }
+        if let Some(webp_bytes) = fallback_webp {
+            let _ = std::fs::remove_file(&tmp_thumb_fin);
+            let write_res = create_new_file_nofollow(&tmp_thumb_fin)
+                .and_then(|mut tf| std::io::Write::write_all(&mut tf, &webp_bytes));
+            if let Err(err) = write_res {
                 warn!(
                     "Failed to save fallback export thumbnail {}: {err}",
                     tmp_thumb_fin.display()
@@ -5788,11 +5892,6 @@ async fn build_mp4_export_inner(
                 let _ = std::fs::remove_file(&tmp_thumb_fin);
                 return Err(err.into());
             }
-        }
-        if cancel_fin.load(Ordering::SeqCst) {
-            let _ = std::fs::remove_file(&tmp_out_fin);
-            let _ = std::fs::remove_file(&tmp_thumb_fin);
-            anyhow::bail!("export {exp_id_fin} cancelled");
         }
 
         if let Err(err) = std::fs::rename(&tmp_thumb_fin, &thumb_fin) {
@@ -5806,6 +5905,7 @@ async fn build_mp4_export_inner(
         }
         if let Err(err) = std::fs::rename(&tmp_out_fin, &out_fin) {
             let _ = std::fs::remove_file(&thumb_fin);
+            let _ = std::fs::remove_file(&tmp_out_fin);
             return Err(err.into());
         }
 
@@ -5825,12 +5925,6 @@ async fn build_mp4_export_inner(
             return Err(err);
         }
 
-        if cancel_fin.load(Ordering::SeqCst) {
-            let _ = std::fs::remove_file(&out_fin);
-            let _ = std::fs::remove_file(&thumb_fin);
-            let _ = db_fin.delete_export(&exp_id_fin);
-            anyhow::bail!("export {exp_id_fin} cancelled");
-        }
         Ok(())
     })
     .await
@@ -7941,8 +8035,30 @@ cameras:
 
         // CANCELSAFETY-003: Pre-insert an `in_progress: true` row, advance `build_mp4_export_with_privacy`
         // across successive `.await` points, and drop the future before completion; verify the DB row is
-        // deleted and no orphaned `out_file`, `thumb_file`, or `.tmp.*` files remain on disk.
-        for (idx, max_polls) in [1usize, 2, 3].into_iter().enumerate() {
+        // deleted and no orphaned `out_file`, `thumb_file`, or `.tmp.*` files remain on disk either
+        // immediately on `Drop` or after detached `spawn_blocking` workers drain.
+        let assert_no_temp_artifacts = |stage: &str| {
+            if let Ok(entries) = std::fs::read_dir(root.join("exports")) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    assert!(
+                        !name.ends_with(".tmp.mp4"),
+                        "leftover temp MP4 file ({stage}): {name}"
+                    );
+                }
+            }
+            if let Ok(entries) = std::fs::read_dir(root.join("clips")) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    assert!(
+                        !name.ends_with(".tmp.webp"),
+                        "leftover temp WebP file ({stage}): {name}"
+                    );
+                }
+            }
+        };
+
+        for (idx, max_polls) in [1usize, 2, 3, 4, 5].into_iter().enumerate() {
             let export_id = format!("front_door_cancel_test_{idx}");
             db.insert_export(&ninjanvr_db::ExportRow {
                 id: export_id.clone(),
@@ -7982,12 +8098,12 @@ cameras:
                     }
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
+            assert_no_temp_artifacts(&format!("immediate post-drop polls={max_polls}"));
             if !completed_early {
                 assert!(
                     db.get_export_by_id(&export_id).unwrap().is_none(),
-                    "dropping build_mp4_export_with_privacy (polls={max_polls}) must delete the stuck in_progress DB row"
+                    "dropping build_mp4_export_with_privacy (polls={max_polls}) must immediately delete the stuck in_progress DB row"
                 );
                 assert!(
                     !root
@@ -8004,22 +8120,27 @@ cameras:
                     "cancelled export (polls={max_polls}) must never leave an orphaned thumbnail file"
                 );
             }
-        }
-        if let Ok(entries) = std::fs::read_dir(root.join("exports")) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
+
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            assert_no_temp_artifacts(&format!("post-drain polls={max_polls}"));
+            if !completed_early {
                 assert!(
-                    !name.ends_with(".tmp.mp4"),
-                    "leftover temp MP4 file after cancellation: {name}"
+                    db.get_export_by_id(&export_id).unwrap().is_none(),
+                    "detached publish worker must not re-insert cancelled export DB row (polls={max_polls})"
                 );
-            }
-        }
-        if let Ok(entries) = std::fs::read_dir(root.join("clips")) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
                 assert!(
-                    !name.ends_with(".tmp.webp"),
-                    "leftover temp WebP file after cancellation: {name}"
+                    !root
+                        .join("exports")
+                        .join(format!("{export_id}.mp4"))
+                        .exists(),
+                    "detached publish worker must not create orphaned MP4 after cancellation (polls={max_polls})"
+                );
+                assert!(
+                    !root
+                        .join("clips")
+                        .join(format!("{export_id}.webp"))
+                        .exists(),
+                    "detached publish worker must not create orphaned thumbnail after cancellation (polls={max_polls})"
                 );
             }
         }
