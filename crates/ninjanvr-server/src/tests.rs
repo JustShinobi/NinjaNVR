@@ -5597,12 +5597,13 @@ cameras:
 
     let now = unix_now();
     let make_jwt = |sub: &str, role: &str, allowed_cameras: Option<&str>| -> String {
+        let issued_at = unix_now();
         let claims = JwtClaims {
             sub: sub.to_string(),
             role: role.to_string(),
             allowed_cameras: allowed_cameras.map(|s| s.to_string()),
-            iat: now,
-            exp: now + 3600,
+            iat: issued_at,
+            exp: issued_at + 3600,
         };
         jsonwebtoken::encode(
             &Header::new(Algorithm::HS256),
@@ -7281,12 +7282,13 @@ cameras:
 
     let now = unix_now();
     let make_jwt = |sub: &str, role: &str, allowed_cameras: Option<&str>| -> String {
+        let issued_at = unix_now();
         let claims = JwtClaims {
             sub: sub.to_string(),
             role: role.to_string(),
             allowed_cameras: allowed_cameras.map(|s| s.to_string()),
-            iat: now,
-            exp: now + 3600,
+            iat: issued_at,
+            exp: issued_at + 3600,
         };
         jsonwebtoken::encode(
             &Header::new(Algorithm::HS256),
